@@ -1,0 +1,54 @@
+project: chimera
+tasks:
+  builder_Ubuntu22:
+    type: build_container
+    architecture: [ amd64, arm64 ]
+    dockerfile: builders/Ubuntu22/Dockerfile
+    registry_path: chimera/builder_ubuntu22
+    context: builders/Ubuntu22
+  build_debug_Ubuntu22:
+    type: run_container
+    architecture: [ amd64, arm64 ]
+    image: chimera/builder_ubuntu22
+    context: .
+    commands:
+      - mkdir -p /build /dist
+      - cd /build
+      - cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug -DDISABLE_TESTS=ON  -DIO_URING_ENABLED=OFF -DCAIRN_ENABLED=OFF /context
+      - ninja
+      - ninja install
+      - tar cfz /dist/chimera.tar.gz /usr/local
+    assets:
+      - from: /dist
+        to: debug/Ubuntu22
+    dependencies:
+      builder:
+        project: chimera
+        task: builder_Ubuntu22
+        tag: main-quantum
+  build_release_Ubuntu22:
+    type: run_container
+    architecture: [ amd64, arm64 ]
+    image: chimera/builder_ubuntu22
+    context: .
+    commands:
+      - mkdir -p /build /dist
+      - cd /build
+      - cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DDISABLE_TESTS=ON  -DIO_URING_ENABLED=OFF -DCAIRN_ENABLED=OFF /context
+      - ninja
+      - ninja install
+      - tar cfz /dist/chimera.tar.gz /usr/local
+    assets:
+      - from: /dist
+        to: release/Ubuntu22
+    dependencies:
+      builder:
+        project: chimera
+        task: builder_Ubuntu22
+        tag: main-quantum
+aliases:
+  builders:
+    - builder_Ubuntu22
+  build:
+    - build_debug_Ubuntu22
+    - build_release_Ubuntu22
