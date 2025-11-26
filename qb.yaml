@@ -70,17 +70,18 @@ tasks:
         tag: main-quantum
 
   # Ubuntu 24.04 section
+  # TODO: why is ARM64 build failing?
   # ---------------------------------------
   builder_Ubuntu24:
     type: build_container
-    architecture: [ amd64, arm64 ]
+    architecture: [ amd64 ]
     dockerfile: builders/Ubuntu24/Dockerfile
     registry_path: builder_ubuntu24
     context: builders/Ubuntu24
 
   build_debug_Ubuntu24:
     type: run_container
-    architecture: [ amd64, arm64 ]
+    architecture: [ amd64 ]
     variables:
       BUILD_TYPE: Debug
       ASSET_DST: debug/Ubuntu24
@@ -110,7 +111,7 @@ tasks:
 
   build_release_Ubuntu24:
     type: run_container
-    architecture: [ amd64, arm64 ]
+    architecture: [ amd64 ]
     variables:
       BUILD_TYPE: Release
       ASSET_DST: release/Ubuntu24
