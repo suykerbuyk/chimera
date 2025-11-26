@@ -26,7 +26,7 @@ main(
     int    argc,
     char **argv)
 {
-    const char                          *config_path = "/usr/local/etc/chimera.json";
+    const char                          *config_path = "/opt/quantum/chimera/etc/chimera.json";
     extern char                         *optarg;
     int                                  opt;
     const char                          *mount_name;

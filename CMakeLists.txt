@@ -12,7 +12,7 @@ if (EXISTS "/usr/local/cuda")
     set(CMAKE_CUDA_COMPILER /usr/local/cuda/bin/nvcc)
     set(CMAKE_CUDA_ARCHITECTURES 80)
 else()
-    set(CUDA_ENABLED false) 
+    set(CUDA_ENABLED false)
 endif()
 
 if (EXISTS "/fio")
@@ -37,6 +37,11 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/ext/libevpl/ext/prometheus-c)
 
 
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+# Set RPATH for installed binaries
+set(CMAKE_INSTALL_RPATH "${CMAKE_INSTALL_PREFIX}/lib")
+set(CMAKE_BUILD_WITH_INSTALL_RPATH TRUE)
+set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 
 if (NOT DISABLE_TESTS)
     enable_testing()
@@ -86,7 +91,7 @@ else()
     message(STATUS "FIO disabled")
 endif()
 
-if (IO_URING_ENABLED) 
+if (IO_URING_ENABLED)
 
     find_library(URING_LIB NAMES uring)
     find_path(URING_INCLUDE_DIR NAMES liburing/io_uring.h)
