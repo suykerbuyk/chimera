@@ -42,6 +42,16 @@ build_release_Ubuntu24:
   script:
     - ${RUN_QB} build_release_Ubuntu24
 
+syntax_Ubuntu22:
+  stage: build
+  script:
+    - ${RUN_QB} syntax_Ubuntu22
+
+syntax_Ubuntu24:
+  stage: build
+  script:
+    - ${RUN_QB} syntax_Ubuntu24
+
 release:
   stage: publish
   only:

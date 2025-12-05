@@ -8,6 +8,11 @@ tasks:
     dockerfile: builders/Ubuntu22/Dockerfile
     registry_path: builder_ubuntu22
     context: builders/Ubuntu22
+    dependencies:
+      uncrustify:
+        project: uncrustify
+        task: build_Ubuntu22
+        tag: 0.78.1-quantum
 
   build_debug_Ubuntu22:
     type: run_container
@@ -69,19 +74,37 @@ tasks:
         task: builder_Ubuntu22
         tag: main-quantum
 
+  syntax_Ubuntu22:
+    type: run_container
+    image: builder_ubuntu22
+    context: .
+    commands:
+      - cd /context
+      - make syntax-check < /dev/null
+    dependencies:
+      builder:
+        project: chimera
+        task: builder_Ubuntu22
+        tag: main-quantum
+
   # Ubuntu 24.04 section
   # TODO: why is ARM64 build failing?
   # ---------------------------------------
   builder_Ubuntu24:
     type: build_container
-    architecture: [ amd64 ]
+    architecture: [ amd64, arm64 ]
     dockerfile: builders/Ubuntu24/Dockerfile
     registry_path: builder_ubuntu24
     context: builders/Ubuntu24
+    dependencies:
+      uncrustify:
+        project: uncrustify
+        task: build_Ubuntu22
+        tag: 0.78.1-quantum
 
   build_debug_Ubuntu24:
     type: run_container
-    architecture: [ amd64 ]
+    architecture: [ amd64, arm64 ]
     variables:
       BUILD_TYPE: Debug
       ASSET_DST: debug/Ubuntu24
@@ -111,7 +134,7 @@ tasks:
 
   build_release_Ubuntu24:
     type: run_container
-    architecture: [ amd64 ]
+    architecture: [ amd64, arm64 ]
     variables:
       BUILD_TYPE: Release
       ASSET_DST: release/Ubuntu24
@@ -139,6 +162,20 @@ tasks:
         task: builder_Ubuntu24
         tag: main-quantum
 
+  syntax_Ubuntu24:
+    type: run_container
+    image: builder_ubuntu24
+    context: .
+    commands:
+      - cd /context
+      - make syntax-check < /dev/null
+    dependencies:
+      builder:
+        project: chimera
+        task: builder_Ubuntu24
+        tag: main-quantum
+
+# Aliases section
 aliases:
   builders:
     - builder_Ubuntu22
@@ -146,8 +183,10 @@ aliases:
   build:
     - build_debug_Ubuntu22
     - build_release_Ubuntu22
+    - syntax_Ubuntu22
     - build_debug_Ubuntu24
     - build_release_Ubuntu24
+    - syntax_Ubuntu24
   ubuntu22:
     - builder_Ubuntu22
     - build_debug_Ubuntu22
