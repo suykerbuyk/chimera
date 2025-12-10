@@ -11,3 +11,5 @@ target_link_libraries(chimera_common unwind pthread dl)
 add_subdirectory(tests)
 
 install(TARGETS chimera_common DESTINATION lib)
+file(GLOB COMMON_HEADERS "${CMAKE_CURRENT_SOURCE_DIR}/*.h")
+install(FILES ${COMMON_HEADERS} DESTINATION include/common)

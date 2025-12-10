@@ -12,7 +12,7 @@ if (EXISTS "/usr/local/cuda")
     set(CMAKE_CUDA_COMPILER /usr/local/cuda/bin/nvcc)
     set(CMAKE_CUDA_ARCHITECTURES 80)
 else()
-    set(CUDA_ENABLED false) 
+    set(CUDA_ENABLED false)
 endif()
 
 if (EXISTS "/fio")
@@ -86,7 +86,7 @@ else()
     message(STATUS "FIO disabled")
 endif()
 
-if (IO_URING_ENABLED) 
+if (IO_URING_ENABLED)
 
     find_library(URING_LIB NAMES uring)
     find_path(URING_INCLUDE_DIR NAMES liburing/io_uring.h)
