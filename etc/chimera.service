@@ -1,0 +1,23 @@
+[Unit]
+Description=Chimera NASService
+After=network.target
+Wants=network.target
+
+[Service]
+# The program runs in the foreground and writes to stdout
+Type=simple
+
+# If you need a specific working directory:
+WorkingDirectory=/opt/quantum/chimera
+
+# Environment variables (optional); or use EnvironmentFile=/etc/default/chimera
+Environment="NTLM_USER_FILE=/etc/chimera/ntlm.txt"
+
+# The actual command
+ExecStart=/opt/quantum/chimera/sbin/chimera
+
+# Resource limits (optional)
+# LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

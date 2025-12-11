@@ -1,0 +1,30 @@
+{
+    "server": {
+	"delegation_threads": 1,
+	"vfs": {
+	    "snfs": {
+		"config": "@CMAKE_INSTALL_PREFIX@/etc/chimera/snfs.json",
+		"path": "@CMAKE_INSTALL_PREFIX@/lib/libchimera_vfs_snfs.so"
+	    }
+	}
+    },
+    "mounts": {
+	"snfs1": {
+	    "module": "snfs",
+	    "path": "/stornext/snfs1"
+	}
+    },
+    "shares": {
+        "smb1": {
+            "path": "/snfs1/smb1"
+        },
+        "smb2": {
+            "path": "/snfs1/smb2"
+        }
+    },
+    "buckets": {
+	"bucket1": {
+	    "path": "/snfs1/buckets"
+	}
+    }
+}

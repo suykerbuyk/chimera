@@ -1,12 +1,24 @@
 {
+    "server": {
+	"threads": 16,
+	"delegation_threads": 64
+    },
+    "mounts": {
+	"linux_dir": {
+	    "module": "linux",
+	    "path": "/var/tmp"
+	},
+	"memfs_dir": {
+	    "module": "memfs",
+	    "path": "/"
+	}
+    },
     "shares": {
-        "memfs": {
-            "module": "memfs",
-            "path": "/"
+        "smb1": {
+            "path": "/linux_dir"
         },
-        "linux": {
-            "module": "linux",
-            "path": "/share"
+        "smb2": {
+            "path": "/memfs_dir"
         }
     }
 }

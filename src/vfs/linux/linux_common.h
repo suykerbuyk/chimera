@@ -248,7 +248,8 @@ linux_get_fh(
         return -1;
     }
 
-    chimera_linux_abort_if(13 + handle->handle_bytes > CHIMERA_VFS_FH_SIZE,
+    // uint8_t + uint32_t + uint32_t = 9 bytes
+    chimera_linux_abort_if(9 + handle->handle_bytes > CHIMERA_VFS_FH_SIZE,
                            "Returned handle exceeds CHIMERA_VFS_FH_SIZE");
 
     *fhp = fh_magic;

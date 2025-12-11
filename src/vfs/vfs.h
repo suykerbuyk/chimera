@@ -529,7 +529,11 @@ enum CHIMERA_FS_FH_MAGIC {
     CHIMERA_VFS_FH_MAGIC_CAIRN    = 4,
     CHIMERA_VFS_FH_MAGIC_DEMOFS   = 5,
     CHIMERA_VFS_FH_MAGIC_NFS      = 6,
-    CHIMERA_VFS_FH_MAGIC_MAX      = 7
+    // Extra value for QuantumFS
+    CHIMERA_VFS_FH_MAGIC_MYRIAD   = 100,
+    CHIMERA_VFS_FH_MAGIC_SNFS     = 101,
+    // Magic number is limited to 1 byte
+    CHIMERA_VFS_FH_MAGIC_MAX      = 256
 
 };
 

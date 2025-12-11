@@ -7,6 +7,13 @@ cmake_minimum_required(VERSION 3.22)
 option(IO_URING_ENABLED "Enable io_uring support" ON)
 option(CAIRN_ENABLED "Enable cairn support" ON)
 
+# Check for Stornext installation
+if (EXISTS "/usr/cvfs/include")
+    set(STORNEXT_ENABLED true)
+else()
+    set(STORNEXT_ENABLED false)
+endif()
+
 if (EXISTS "/usr/local/cuda")
     set(CUDA_ENABLED true)
     set(CMAKE_CUDA_COMPILER /usr/local/cuda/bin/nvcc)
@@ -117,3 +124,4 @@ add_definitions(-DXDR_CUSTOM_IOVEC=${CHIMERA_EXT_SRC}/libevpl/src/rpc2/xdr_iovec
 add_definitions(-DXDR_CUSTOM_DUMP=1)
 
 add_subdirectory(src)
+add_subdirectory(docs)
