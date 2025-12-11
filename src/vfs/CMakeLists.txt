@@ -28,6 +28,10 @@ add_subdirectory(memfs)
 add_subdirectory(linux)
 add_subdirectory(nfs)
 
+if (STORNEXT_ENABLED)
+    add_subdirectory(snfs)
+endif()
+
 if (IO_URING_ENABLED)
     add_subdirectory(io_uring)
 endif()

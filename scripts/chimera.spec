@@ -1,0 +1,66 @@
+%bcond_with debug_build
+
+Name: quantum-chimera-server
+Version: 0.0.0
+%if %{with debug_build}
+Release: 1%{?dist}.debug
+%else
+Release: 1%{?dist}
+%endif
+
+Summary: Quantum Chimera NAS server
+License: Quantum Corporation
+Packager: Quantum Corporation
+Vendor: Quantum Corporation
+URL: http://www.quantum.com/
+
+Source0: chimera.tar.gz
+Source1: chimera.service
+
+Requires: redhat-release >= 9
+Requires: redhat-release < 10
+Requires: xxhash-libs
+Requires: libunwind
+Requires: liburing
+Requires: gssntlmssp
+
+%description
+Quantum build of the Chimera NAS server for
+the StorNext Filesystem (SNFS)
+
+
+%build
+# nothing to build
+
+%install
+rm -rf %{buildroot}
+mkdir -p %{buildroot}
+tar -xzf %{SOURCE0} -C %{buildroot}
+mkdir -p %{buildroot}/etc/systemd/system
+cp %{SOURCE1} %{buildroot}/etc/systemd/system
+
+
+%post
+%systemd_post chimera.service
+mkdir -p /etc/chimera
+ln -s -f /opt/quantum/chimera/etc/chimera.json /etc/chimera
+echo "/opt/quantum/chimera/lib" > /etc/ld.so.conf.d/chimera.conf
+ldconfig
+exit 0
+
+%postun
+ldconfig
+exit 0
+
+%files
+%defattr(-,root,root)
+%dir /opt/quantum/chimera
+/etc/systemd/system/chimera.service
+/opt/quantum/chimera/bin
+/opt/quantum/chimera/include
+/opt/quantum/chimera/lib
+/opt/quantum/chimera/sbin
+%doc /opt/quantum/chimera/share/*
+%config(noreplace) /opt/quantum/chimera/etc/chimera.json
+%ghost /etc/chimera/chimera.json
+%ghost /etc/ld.so.conf.d/chimera.conf

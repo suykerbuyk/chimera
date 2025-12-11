@@ -1,0 +1,125 @@
+%sntest chimera-single-mdc
+description install chimera on a single MDC.
+
+# Example:
+# sntest -b master -V PKG_TAG=master -e chimera-single-mdc.snt
+
+%include ../include/variables.include
+%ifndef PKG_TAG
+%error need to provide a QB PKG_TAG
+%endif
+
+host mdc1	distro:OS_DISTRO version:OS_VERSION arch:x86_64 cores:2 memory:8192
+
+hostgroup allhosts   mdc1
+
+# Define LUNs for MDCs
+lun snfs1_meta mdc1 8
+lun snfs1_data allhosts 32
+
+failstep 10m Capture debug info on failure
+command allhosts $sntest/bin/capture_debug_info $spool
+
+step 600 Apply work-around to remove IPv6 localhost from /etc/hosts
+command allhosts $sntest/bin/ipv6_hosts_hack
+
+step 10m Preinstall RPM that we might need.
+command allhosts $sntest/utilities/tadpole/pre-install-pkg.sh
+
+step 1m extract the NAS sntest_utils
+command allhosts curl https://nexus.mdh.quantum.com/repository/snnas-binaries/sn_tests/sntest_utils.tar.gz | tar zxf - -C /
+
+step 10m Make sure that the kernel-devel is installed
+command mdc1 dnf install -y kernel-devel
+
+step 5m remove MDH path
+command mdc1 rm -f /etc/profile.d/mdh-env.sh
+
+step 5m disable NFS and RPCBIND to allow chimera to start
+command mdc1 systemctl stop nfs-server; systemctl disable nfs-server; \
+	systemctl stop rpc-statd; systemctl disable rpc-statd ; \
+	systemctl stop rpcbind; systemctl disable rpcbind; systemctl mask rpcbind
+
+#  --------------------   install stornext  ---------------
+step 10m Unpack StorNext
+command mdc1 $sntest/bin/unpack_stornext snfs $sndist /tmp/stornext
+
+step 10m Install StorNext
+command mdc1 $sntest/bin/install_stornext snfs /tmp/stornext
+
+step 10m Set StorNext Name Servers
+command allhosts $sntest/bin/set_fsnameservers $mdc1
+
+step 5m Clear temp licenses
+command mdc1 rm -f /usr/cvfs/config/license.dat
+
+step 600 Start StorNext
+command mdc1 $sntest/bin/cvfs_control start
+
+step 600 Label LUNs
+command mdc1 $sntest/bin/label_lun $snfs1_meta CvfsDisk_snfs1_meta
+command mdc1 $sntest/bin/label_lun $snfs1_data CvfsDisk_snfs1_data
+
+step 600 Force Disk Rescan
+command mdc1 /usr/cvfs/bin/cvadmin -e 'disks refresh'
+
+step 600 Configure File System
+command mdc1 $sntest/bin/configure_fs snfs1 \
+   fileLocks=true \
+   caseInsensitive=true \
+   fileLockResyncTimeOut=20 \
+   enforceAcls=true \
+   quotas=true \
+   sg0:1:metadata,journal:CvfsDisk_snfs1_meta \
+   sg1:1:userdata:CvfsDisk_snfs1_data
+
+step 600 Initialize File Systems
+command mdc1 /usr/cvfs/bin/cvmkfs -F snfs1
+
+step 600 Write FSM list
+command mdc1 $sntest/bin/append_fsmlist snfs1
+
+step 600 Configure File System Mounts
+command allhosts  $sntest/bin/configure_mount snfs1 /stornext/snfs1 defaults
+
+step 5m Restart StorNext on MDC
+command allhosts $sntest/bin/cvfs_control restart
+
+#  --------------------   install Chimera  ---------------
+step 5m setup ntlm authentication.
+command mdc1 mkdir -p /etc/chimera && \
+	echo "WORKGROUP:testuser1:systest" >/etc/chimera/ntlm.txt && \
+	echo "export NTLM_USER_FILE=/etc/chimera/ntlm.txt" > /etc/profile.d/chimera.sh
+
+step 2m Download chimera pkg for Stornext
+command mdc1 /sntest_utils/get_qb_asset.py -p chimera -t PKG_TAG -d /chimera-repo -u release/Rocky9/amd64/repo-chimera.tar.gz
+
+step 2m install the chimera PKG
+command mdc1 dnf install -y /chimera-repo/*.rpm
+
+step 5m prepare SMB1 share
+command mdc1 cp /etc/chimera/chimera.json /etc/chimera/chimera.json.orig && \
+	     cp  /opt/quantum/chimera/share/doc/chimera-snfs.json /etc/chimera/chimera.json && \
+	     mkdir -p /stornext/snfs1/smb1 && \
+	     chmod 777 /stornext/snfs1/smb1
+
+step 5m enable and start chimera
+command mdc1 systemctl enable chimera && \
+	systemctl start chimera && \
+	sleep 5 && \
+	systemctl status chimera
+
+#  --------------------   test Chimera  ---------------
+step 2m install samba client
+command mdc1 dnf install -y samba-client
+
+step 1m check chimera status
+command mdc1 systemctl status chimera
+
+step 1m validate that we have access.
+command mdc1 smbclient -W WORKGROUP -U testuser1%systest //$mdc1/smb1 -c 'ls'
+
+
+
+
+

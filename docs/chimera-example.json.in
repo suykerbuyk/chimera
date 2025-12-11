@@ -1,0 +1,47 @@
+{
+    "server": {
+	"threads": 16,
+	"delegation_threads": 64,
+	"rdma": false,
+	"rdma_hostname": "0.0.0.0",
+	"rdma_port": 20049,
+	"smb_multichannel": [
+	    {
+		"address": "127.0.0.1",
+		"speed": 100000000000,
+		"rdma": false
+	    }],
+	"vfs": {
+	    "snfs": {
+		"config": "@CMAKE_INSTALL_PREFIX@/etc/snfs.json",
+		"path": "@CMAKE_INSTALL_PREFIX@/lib/libchimera_vfs_snfs.so"
+	    }
+	}
+    },
+    "mounts": {
+	"snfs1": {
+	    "module": "snfs",
+	    "path": "/stornext/snfs1"
+	},
+	"memfs_dir": {
+	    "module": "memfs",
+	    "path": "/"
+	}
+    },
+    "shares": {
+        "smb1": {
+            "path": "/snfs1/smb_dir"
+        },
+        "smb2": {
+            "path": "/memfs_dir/smb_dir"
+        }
+    },
+    "buckets": {
+	"bucket1": {
+	    "path": "/snfs1/buckets"
+	},
+	"bucker2": {
+	    "path": "/memfs_dir/buckets"
+	}
+    }
+}

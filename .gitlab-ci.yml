@@ -22,6 +22,11 @@ builder_Ubuntu22:
   script:
     - ${RUN_QB} builder_Ubuntu22
 
+builder_Rocky9:
+  stage: builders
+  script:
+    - ${RUN_QB} builder_Rocky9
+
 build_debug_Ubuntu22:
   stage: build
   script:
@@ -32,15 +37,15 @@ build_release_Ubuntu22:
   script:
     - ${RUN_QB} build_release_Ubuntu22
 
-build_debug_Ubuntu24:
+build_debug_Rocky9:
   stage: build
   script:
-    - ${RUN_QB} build_debug_Ubuntu24
+    - ${RUN_QB} build_debug_Rocky9
 
-build_release_Ubuntu24:
+build_release_Rocky9:
   stage: build
   script:
-    - ${RUN_QB} build_release_Ubuntu24
+    - ${RUN_QB} build_release_Rocky9
 
 syntax_Ubuntu22:
   stage: build

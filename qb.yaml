@@ -175,11 +175,101 @@ tasks:
         task: builder_Ubuntu24
         tag: main-quantum
 
-# Aliases section
+  # Rocky9 section
+  # ---------------------------------------
+  builder_Rocky9:
+    type: build_container
+    architecture: [ amd64 ]
+    dockerfile: builders/Rocky9/Dockerfile
+    registry_path: builder_rocky9
+    context: builders/Rocky9
+
+  build_debug_Rocky9:
+    type: run_container
+    architecture: [ amd64 ]
+    variables:
+      BUILD_TYPE: Debug
+      ASSET_DST: debug/Rocky9
+    image: builder_rocky9
+    context: .
+    dependencies:
+      builder:
+        project: chimera
+        task: builder_Rocky9
+        tag: main-quantum
+    commands:
+      - mkdir -p /build /dist
+      - cd /build
+      - >
+        cmake -G Ninja -DCMAKE_BUILD_TYPE=${BUILD_TYPE}
+        -DDISABLE_TESTS=ON
+        -DIO_URING_ENABLED=OFF
+        -DCAIRN_ENABLED=OFF
+        -DCMAKE_INSTALL_PREFIX=/opt/quantum/chimera
+        -B /build -S /context
+      - ninja -C /build
+      - ninja -C /build install
+      - tar cfz /dist/chimera.tar.gz /opt/quantum/chimera
+      - rpmdev-setuptree
+      - cp /dist/chimera.tar.gz /root/rpmbuild/SOURCES
+      - cp /context/etc/chimera.service /root/rpmbuild/SOURCES
+      - rpmbuild -ba --with debug_build /context/scripts/chimera.spec
+      # Create a repo with prereq RPM.
+      - mkdir -p /repo
+      - cp /root/rpmbuild/RPMS/x86_64/*.rpm /repo
+      - dnf download xxhash-libs libunwind liburing --arch  x86_64 --destdir /repo
+      - cd /repo
+      - tar cfz /dist/repo-chimera.tar.gz .
+    assets:
+      - from: /dist
+        to: ${ASSET_DST}
+
+  build_release_Rocky9:
+    type: run_container
+    architecture: [ amd64 ]
+    variables:
+      BUILD_TYPE: Release
+      ASSET_DST: release/Rocky9
+    image: builder_rocky9
+    context: .
+    dependencies:
+      builder:
+        project: chimera
+        task: builder_Rocky9
+        tag: main-quantum
+    commands:
+      - mkdir -p /build /dist
+      - cd /build
+      - >
+        cmake -G Ninja -DCMAKE_BUILD_TYPE=${BUILD_TYPE}
+        -DDISABLE_TESTS=ON
+        -DIO_URING_ENABLED=OFF
+        -DCAIRN_ENABLED=OFF
+        -DCMAKE_INSTALL_PREFIX=/opt/quantum/chimera
+        -B /build -S /context
+      - ninja -C /build
+      - ninja -C /build install
+      - tar cfz /dist/chimera.tar.gz /opt/quantum/chimera
+      - rpmdev-setuptree
+      - cp /dist/chimera.tar.gz /root/rpmbuild/SOURCES
+      - cp /context/etc/chimera.service /root/rpmbuild/SOURCES
+      - rpmbuild -ba /context/scripts/chimera.spec
+      # Create a repo with prereq RPM.
+      - mkdir -p /repo
+      - cp /root/rpmbuild/RPMS/x86_64/*.rpm /repo
+      - dnf download xxhash-libs libunwind liburing --arch  x86_64 --destdir /repo
+      - cd /repo
+      - tar cfz /dist/repo-chimera.tar.gz .
+    assets:
+      - from: /dist
+        to: ${ASSET_DST}
+
+# Alias section
 aliases:
   builders:
     - builder_Ubuntu22
     - builder_Ubuntu24
+    - builder_Rocky9
   build:
     - build_debug_Ubuntu22
     - build_release_Ubuntu22
@@ -187,6 +277,8 @@ aliases:
     - build_debug_Ubuntu24
     - build_release_Ubuntu24
     - syntax_Ubuntu24
+    - build_debug_Rocky9
+    - build_release_Rocky9
   ubuntu22:
     - builder_Ubuntu22
     - build_debug_Ubuntu22
@@ -195,6 +287,10 @@ aliases:
     - builder_Ubuntu24
     - build_debug_Ubuntu24
     - build_release_Ubuntu24
+  rocky9:
+    - builder_Rocky9
+    - build_debug_Rocky9
+    - build_release_Rocky9
   chimera:
     - builders
     - build
