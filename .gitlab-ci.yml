@@ -73,13 +73,13 @@ dev_branch:
   except: [ schedules, tags ]
   script:
     - >-
-      ./qb/copy_image -p ${QB_PROJECT}/builder_Ubuntu22 -o ${QB_TAG} -n ${CI_COMMIT_REF_SLUG}
+      ./qb/copy_image -p ${QB_PROJECT}/builder_ubuntu22 -o ${QB_TAG} -n ${CI_COMMIT_REF_SLUG}
       -U $publish_username -P $publish_password -I $publish_docker_source -O $publish_docker_dest_development
     - >-
-      ./qb/copy_image -p ${QB_PROJECT}/builder_Ubuntu24 -o ${QB_TAG} -n ${CI_COMMIT_REF_SLUG}
+      ./qb/copy_image -p ${QB_PROJECT}/builder_ubuntu24 -o ${QB_TAG} -n ${CI_COMMIT_REF_SLUG}
       -U $publish_username -P $publish_password -I $publish_docker_source -O $publish_docker_dest_development
     - >-
-      ./qb/copy_image -p ${QB_PROJECT}/builder_Rocky9 -o ${QB_TAG} -n ${CI_COMMIT_REF_SLUG}
+      ./qb/copy_image -p ${QB_PROJECT}/builder_rocky9 -o ${QB_TAG} -n ${CI_COMMIT_REF_SLUG}
       -U $publish_username -P $publish_password -I $publish_docker_source -O $publish_docker_dest_development
     - >-
       ./qb/copy_assets --remove -p ${QB_PROJECT} -o ${QB_TAG} --out_revision ${BRANCH_REV} -n ${BRANCH_NAME}
