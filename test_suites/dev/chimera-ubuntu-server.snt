@@ -1,0 +1,70 @@
+%sntest chimera-ubuntu-server-server.snt
+description install chimera Ubuntu server and share ext4 FS
+
+# Example:
+# sntest -b master -V PKG_TAG=main-quantum -e chimera-ubuntu-server.snt
+
+%include ../include/variables.include
+%ifndef PKG_TAG
+%error need to provide a QB PKG_TAG
+%endif
+
+host srv1	distro:ubuntu-server version:24.04.3 arch:x86_64 cores:2 memory:8192
+
+hostgroup allhosts   srv1
+
+# share FS
+lun share_fs allhosts 100
+
+failstep 10m Capture debug info on failure
+command allhosts $sntest/bin/capture_debug_info $spool
+
+step 1m extract the NAS sntest_utils
+command allhosts curl https://nexus.mdh.quantum.com/repository/snnas-binaries/sn_tests/sntest_utils.tar.gz | tar zxf - -C /
+
+step 5m remove MDH path
+command srv1 rm -f /etc/profile.d/mdh-env.sh
+
+step 5m disable rpcbind to free port 111
+command srv1 systemctl disable rpcbind.socket && \
+	systemctl stop rpcbind.socket && \
+	systemctl disable rpcbind.service && \
+	systemctl stop rpcbind.service && \
+	systemctl mask rpcbind.service && \
+	sleep 5 && ss -ltnp
+
+step 5m install smbclient
+command srv1 apt update && apt install -y smbclient
+
+#  --------------------   install Chimera  ---------------
+step 5m setup ntlm authentication.
+command srv1 mkdir -p /etc/chimera && \
+	echo "WORKGROUP:testuser1:systest" >/etc/chimera/ntlm.txt && \
+	echo "export NTLM_USER_FILE=/etc/chimera/ntlm.txt" > /etc/profile.d/chimera.sh
+
+step 2m Download chimera pkg
+command srv1 /sntest_utils/get_qb_asset.py -p chimera -t PKG_TAG -d /chimera-repo -u release/Ubuntu24/amd64/repo-chimera.tar.gz
+
+step 2m install the chimera PKG
+command srv1 apt install -y -f /chimera-repo/quantum-chimera-server*.deb
+
+
+step 5m setup share filesystem
+command srv1 echo $share_fs && \
+	parted /dev/sda mklabel gpt && \
+	parted /dev/sda mkpart "" ext4 0% 100% && \
+	sleep 5 && mkfs.ext4  /dev/sda1 && \
+	mkdir /shares && \
+	mount /dev/sda1 /shares && \
+	chmod 777 /shares  && \
+	sed -i -e 's%/var/tmp%/shares%' /opt/quantum/chimera/etc/chimera.json
+
+step 5m start chimera
+command srv1 systemctl start chimera.service && \
+	sleep 5 && \
+	systemctl status chimera.service
+
+step 5m test config
+command srv1 smbclient -U testuser1%systest //127.0.0.1/smb1 -c "allinfo /"
+
+

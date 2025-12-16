@@ -1,7 +1,7 @@
 {
     "server": {
 	"threads": 16,
-	"delegation_threads": 64
+	"delegation_threads": 1
     },
     "mounts": {
 	"linux_dir": {

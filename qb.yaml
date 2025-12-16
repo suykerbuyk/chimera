@@ -1,4 +1,8 @@
 project: chimera
+variables:
+  VERSION: 0.0.0
+  REVISION: 1
+
 tasks:
   # Ubuntu22.04 Section
   # ---------------------------------------
@@ -35,6 +39,7 @@ tasks:
       - ninja -C /build
       - ninja -C /build install
       - tar cfz /dist/chimera.tar.gz /opt/quantum/chimera
+      - /context/qtm_build/make_debian_pkg.sh ${VERSION} ${REVISION} $arch
     assets:
       - from: /dist
         to: ${ASSET_DST}
@@ -65,6 +70,7 @@ tasks:
       - ninja -C /build
       - ninja -C /build install
       - tar cfz /dist/chimera.tar.gz /opt/quantum/chimera
+      - /context/qtm_build/make_debian_pkg.sh ${VERSION} ${REVISION} $arch
     assets:
       - from: /dist
         to: ${ASSET_DST}
@@ -88,7 +94,6 @@ tasks:
         tag: main-quantum
 
   # Ubuntu 24.04 section
-  # TODO: why is ARM64 build failing?
   # ---------------------------------------
   builder_Ubuntu24:
     type: build_container
@@ -123,6 +128,7 @@ tasks:
       - ninja -C /build
       - ninja -C /build install
       - tar cfz /dist/chimera.tar.gz /opt/quantum/chimera
+      - /context/qtm_build/make_debian_pkg.sh ${VERSION} ${REVISION} $arch
     assets:
       - from: /dist
         to: ${ASSET_DST}
@@ -153,6 +159,7 @@ tasks:
       - ninja -C /build
       - ninja -C /build install
       - tar cfz /dist/chimera.tar.gz /opt/quantum/chimera
+      - /context/qtm_build/make_debian_pkg.sh ${VERSION} ${REVISION} $arch
     assets:
       - from: /dist
         to: ${ASSET_DST}
@@ -210,16 +217,7 @@ tasks:
       - ninja -C /build
       - ninja -C /build install
       - tar cfz /dist/chimera.tar.gz /opt/quantum/chimera
-      - rpmdev-setuptree
-      - cp /dist/chimera.tar.gz /root/rpmbuild/SOURCES
-      - cp /context/etc/chimera.service /root/rpmbuild/SOURCES
-      - rpmbuild -ba --with debug_build /context/scripts/chimera.spec
-      # Create a repo with prereq RPM.
-      - mkdir -p /repo
-      - cp /root/rpmbuild/RPMS/x86_64/*.rpm /repo
-      - dnf download xxhash-libs libunwind liburing --arch  x86_64 --destdir /repo
-      - cd /repo
-      - tar cfz /dist/repo-chimera.tar.gz .
+      - /context/qtm_build/make_rpm_pkg.sh ${VERSION} ${REVISION} $xarch
     assets:
       - from: /dist
         to: ${ASSET_DST}
@@ -250,16 +248,7 @@ tasks:
       - ninja -C /build
       - ninja -C /build install
       - tar cfz /dist/chimera.tar.gz /opt/quantum/chimera
-      - rpmdev-setuptree
-      - cp /dist/chimera.tar.gz /root/rpmbuild/SOURCES
-      - cp /context/etc/chimera.service /root/rpmbuild/SOURCES
-      - rpmbuild -ba /context/scripts/chimera.spec
-      # Create a repo with prereq RPM.
-      - mkdir -p /repo
-      - cp /root/rpmbuild/RPMS/x86_64/*.rpm /repo
-      - dnf download xxhash-libs libunwind liburing --arch  x86_64 --destdir /repo
-      - cd /repo
-      - tar cfz /dist/repo-chimera.tar.gz .
+      - /context/qtm_build/make_rpm_pkg.sh ${VERSION} ${REVISION} $xarch
     assets:
       - from: /dist
         to: ${ASSET_DST}

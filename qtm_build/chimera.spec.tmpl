@@ -1,12 +1,6 @@
-%bcond_with debug_build
-
 Name: quantum-chimera-server
-Version: 0.0.0
-%if %{with debug_build}
-Release: 1%{?dist}.debug
-%else
-Release: 1%{?dist}
-%endif
+Version: __VERSION__
+Release: __REVISION__
 
 Summary: Quantum Chimera NAS server
 License: Quantum Corporation
