@@ -2,11 +2,6 @@
 #
 # SPDX-License-Identifier: LGPL-2.1-only
 
-# Install docs and config example
-set(DOC_FILES
-  ${CMAKE_CURRENT_SOURCE_DIR}/README.md
-)
-
 foreach(name IN ITEMS chimera-example.json chimera-snfs.json)
   configure_file(
     ${CMAKE_CURRENT_SOURCE_DIR}/${name}.in
@@ -14,4 +9,4 @@ foreach(name IN ITEMS chimera-example.json chimera-snfs.json)
   )
   list(APPEND DOC_FILES ${CMAKE_CURRENT_BINARY_DIR}/${name})
 endforeach()
-install( FILES ${DOC_FILES} DESTINATION share/doc)
+install( FILES ${DOC_FILES} DESTINATION share/examples)

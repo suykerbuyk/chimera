@@ -1,0 +1,11 @@
+#!/bin/sh
+set -e
+mkdir -p /etc/chimera
+ln -sf /opt/quantum/chimera/etc/chimera.json /etc/chimera/chimera.json
+printf '/opt/quantum/chimera/lib\n' > /etc/ld.so.conf.d/chimera.conf
+ldconfig || true
+# Systemd
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload || true
+fi
+exit 0

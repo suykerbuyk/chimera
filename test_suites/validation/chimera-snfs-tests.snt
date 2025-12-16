@@ -143,7 +143,7 @@ command mdc1 dnf install -y /chimera-repo/*.rpm
 
 step 5m prepare SMB1 share
 command mdc1 cp /etc/chimera/chimera.json /etc/chimera/chimera.json.orig && \
-	     cp  /opt/quantum/chimera/share/doc/chimera-snfs.json /etc/chimera/chimera.json && \
+	     cp  /opt/quantum/chimera/share/examples/chimera-snfs.json /etc/chimera/chimera.json && \
 	     mkdir -p /stornext/snfs1/smb1 && \
 	     chmod 777 /stornext/snfs1/smb1
 
