@@ -190,6 +190,11 @@ tasks:
     dockerfile: builders/Rocky9/Dockerfile
     registry_path: builder_rocky9
     context: builders/Rocky9
+    dependencies:
+      uncrustify:
+        project: uncrustify
+        task: build_Ubuntu22
+        tag: 0.78.1-quantum
 
   build_debug_Rocky9:
     type: run_container

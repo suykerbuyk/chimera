@@ -1,6 +1,7 @@
 {
     "server": {
 	"delegation_threads": 1,
+	"external_portmap": true,
 	"vfs": {
 	    "snfs": {
 		"config": "@CMAKE_INSTALL_PREFIX@/etc/chimera/snfs.json",
