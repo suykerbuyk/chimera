@@ -40,11 +40,6 @@ command allhosts dnf install -y kernel-devel
 step 5m remove MDH path
 command mdc1 rm -f /etc/profile.d/mdh-env.sh
 
-step 5m disable NFS and RPCBIND to allow chimera to start
-command mdc1 systemctl stop nfs-server; systemctl disable nfs-server; \
-	systemctl stop rpc-statd; systemctl disable rpc-statd ; \
-	systemctl stop rpcbind; systemctl disable rpcbind; systemctl mask rpcbind
-
 #  --------------------   install stornext  ---------------
 step 10m Unpack StorNext
 command mdc1 $sntest/bin/unpack_stornext full_suite $sndist /tmp/stornext

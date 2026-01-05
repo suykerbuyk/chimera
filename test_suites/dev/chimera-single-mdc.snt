@@ -35,14 +35,6 @@ command mdc1 dnf install -y kernel-devel
 step 5m remove MDH path
 command mdc1 rm -f /etc/profile.d/mdh-env.sh
 
-step 5m disable rpcbind to free port 111
-command mdc1 systemctl disable rpcbind.socket && \
-	systemctl stop rpcbind.socket && \
-	systemctl disable rpcbind.service && \
-	systemctl stop rpcbind.service && \
-	systemctl mask rpcbind.service && \
-	sleep 5 && ss -ltnp
-
 #  --------------------   install stornext  ---------------
 step 10m Unpack StorNext
 command mdc1 $sntest/bin/unpack_stornext snfs $sndist /tmp/stornext
@@ -121,8 +113,3 @@ command mdc1 systemctl status chimera
 
 step 1m validate that we have access.
 command mdc1 smbclient -W WORKGROUP -U testuser1%systest //$mdc1/smb1 -c 'allinfo /'
-
-
-
-
-

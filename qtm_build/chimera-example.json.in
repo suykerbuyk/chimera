@@ -2,7 +2,7 @@
     "server": {
 	"threads": 16,
 	"delegation_threads": 64,
-	"external_portmap": 1,
+	"external_portmap": true,
 	"rdma": false,
 	"rdma_hostname": "0.0.0.0",
 	"rdma_port": 20049,
