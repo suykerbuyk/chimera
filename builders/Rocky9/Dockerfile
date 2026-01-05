@@ -10,6 +10,10 @@ RUN dnf update -y && \
     dnf config-manager --set-enabled crb && \
     dnf install --allowerasing -y $(cat /install/packages.txt)
 
+# install uncrustify version 0.78
+RUN curl -o /usr/local/bin/uncrustify  ${asset:uncrustify:Rocky9/$arch/uncrustify} && \
+    chmod +x /usr/local/bin/uncrustify
+
 # install Stornext dev packages.
 RUN cd /install && \
     curl https://nexus.mdh.quantum.com/repository/snnas-binaries/snfs/snfs-7.2.4-OS9.tar -O && \

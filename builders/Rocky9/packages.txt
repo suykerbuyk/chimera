@@ -49,8 +49,6 @@ libnfsidmap
 libnl3-devel
 libtasn1-devel
 libtasn1-tools
-libtirpc
-libtirpc-devel
 libtool
 libunistring-devel
 liburing-devel

@@ -25,14 +25,6 @@ command allhosts curl https://nexus.mdh.quantum.com/repository/snnas-binaries/sn
 step 5m remove MDH path
 command srv1 rm -f /etc/profile.d/mdh-env.sh
 
-step 5m disable rpcbind to free port 111
-command srv1 systemctl disable rpcbind.socket && \
-	systemctl stop rpcbind.socket && \
-	systemctl disable rpcbind.service && \
-	systemctl stop rpcbind.service && \
-	systemctl mask rpcbind.service && \
-	sleep 5 && ss -ltnp
-
 step 5m install smbclient
 command srv1 apt update && apt install -y smbclient
 
@@ -48,6 +40,13 @@ command srv1 /sntest_utils/get_qb_asset.py -p chimera -t PKG_TAG -d /chimera-rep
 step 2m install the chimera PKG
 command srv1 apt install -y -f /chimera-repo/quantum-chimera-server*.deb
 
+step 1m update chimera.json file
+command srv1 cd /etc/chimera && \
+	cp chimera.json chimera.json.bak && \
+	jq '.server.external_portmap = true | \
+	   .mounts.linux_dir.path = "/shares"' chimera.json > chimera.json.tmp && \
+	mv chimera.json.tmp /opt/quantum/chimera/etc/chimera.json
+
 
 step 5m setup share filesystem
 command srv1 echo $share_fs && \
@@ -56,8 +55,7 @@ command srv1 echo $share_fs && \
 	sleep 5 && mkfs.ext4  /dev/sda1 && \
 	mkdir /shares && \
 	mount /dev/sda1 /shares && \
-	chmod 777 /shares  && \
-	sed -i -e 's%/var/tmp%/shares%' /opt/quantum/chimera/etc/chimera.json
+	chmod 777 /shares
 
 step 5m start chimera
 command srv1 systemctl start chimera.service && \
