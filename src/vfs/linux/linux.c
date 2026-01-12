@@ -16,7 +16,15 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <uthash.h>
+#include <linux/version.h>
 #include "vfs/vfs_error.h"
+
+// fchmodat support for AT_SYMLINK_NOFOLLOW was added in Linux 6.6
+#if defined(LINUX_VERSION_CODE) && defined(KERNEL_VERSION)
+    #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+        #define HAVE_FCHMODAT_AT_SYMLINK_NOFOLLOW 1
+    #endif /* if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0) */
+#endif /* if defined(LINUX_VERSION_CODE) && defined(KERNEL_VERSION) */
 
 #include "evpl/evpl.h"
 
@@ -81,9 +89,13 @@ chimera_linux_set_attrs(
 
     if (attr->va_req_mask & CHIMERA_VFS_ATTR_MODE) {
 
-        rc = fchmodat(fd, "", attr->va_mode, AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH
-                      );
-
+#ifdef HAVE_FCHMODAT_AT_SYMLINK_NOFOLLOW
+        // Use fchmodat with AT_SYMLINK_NOFOLLOW on kernels >= 6.6
+        rc = fchmodat(fd, "", attr->va_mode, AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH);
+#else  /* ifdef HAVE_FCHMODAT_AT_SYMLINK_NOFOLLOW */
+        // Fall back to fchmod on older kernels (AT_SYMLINK_NOFOLLOW not supported)
+        rc = fchmod(fd, attr->va_mode);
+#endif /* ifdef HAVE_FCHMODAT_AT_SYMLINK_NOFOLLOW */
         if (rc) {
             chimera_linux_error("linux_setattr: fchmod(%o) failed: %s",
                                 attr->va_mode,
@@ -637,7 +649,7 @@ chimera_linux_read(
                                             request->read.length,
                                             4096,
                                             8,
-                                            request->read.iov);
+                                            0, request->read.iov);
 
     iov = request->plugin_data;
 
@@ -664,7 +676,7 @@ chimera_linux_read(
         request->status = chimera_linux_errno_to_status(errno);
 
         for (i = 0; i < request->read.r_niov; i++) {
-            evpl_iovec_release(&request->read.iov[i]);
+            evpl_iovec_release(evpl, &request->read.iov[i]);
         }
 
         request->read.r_niov   = 0;
@@ -689,10 +701,12 @@ chimera_linux_write(
     struct chimera_vfs_request *request,
     void                       *private_data)
 {
-    int           fd, i, niov = 0, flags = 0;
-    uint32_t      left, chunk;
-    ssize_t       len;
-    struct iovec *iov;
+    struct chimera_linux_thread *thread = private_data;
+    struct evpl                 *evpl   = thread->evpl;
+    int                          fd, i, niov = 0, flags = 0;
+    uint32_t                     left, chunk;
+    ssize_t                      len;
+    struct iovec                *iov;
 
     request->write.r_sync = request->write.sync;
 
@@ -723,6 +737,8 @@ chimera_linux_write(
                    niov,
                    request->write.offset,
                    flags);
+
+    evpl_iovecs_release(evpl, request->write.iov, request->write.niov);
 
     if (len < 0) {
         request->status         = chimera_linux_errno_to_status(errno);
