@@ -15,10 +15,11 @@ RUN curl -o /usr/local/bin/uncrustify  ${asset:uncrustify:Rocky9/$arch/uncrustif
     chmod +x /usr/local/bin/uncrustify
 
 # install Stornext dev packages.
-RUN cd /install && \
-    curl https://nexus.mdh.quantum.com/repository/snnas-binaries/snfs/snfs-7.2.4-OS9.tar -O && \
-    tar xf snfs-*-OS9.tar && \
-    dnf install -y /install/OS9/*.rpm
+# TODO re-enable
+#RUN cd /install && \
+#    curl https://nexus.mdh.quantum.com/repository/snnas-binaries/snfs/snfs-7.2.4-OS9.tar -O && \
+#    tar xf snfs-*-OS9.tar && \
+#    dnf install -y /install/OS9/*.rpm
 
 # package and install gssntlmssp
 ENV PKG_SRC https://download.fedoraproject.org/pub/fedora/linux/development/rawhide/Everything/source/tree/Packages/g/gssntlmssp-1.3.1-5.fc43.src.rpm
