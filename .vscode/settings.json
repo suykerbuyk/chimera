@@ -1,4 +1,8 @@
 {
+  "clangd.arguments": [
+    "--background-index",
+    "--compile-commands-dir=/build/Debug"
+  ],
   "cmake.buildDirectory": "/build/${buildType}",
   "cmake.saveBeforeBuild": true,
   "cmake.generator": "Ninja",
@@ -21,7 +25,7 @@
   "cmakeExplorer.extraCtestRunArgs": "-V --timeout 300",
   "cmakeExplorer.suiteDelimiter": "/",
   "cmakeExplorer.testFileVar": "TEST_FILE",
-  "cmakeExplorer.parallelJobs": 8,
+  "cmakeExplorer.parallelJobs": 0,
   "cmake.ctest.testExplorerIntegrationEnabled": false,
   "editor.tabSize": 4,
   "editor.formatOnSave": true,

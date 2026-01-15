@@ -10,6 +10,7 @@
 #include "smb_procs.h"
 #include "smb_string.h"
 #include "common/misc.h"
+#include "vfs/vfs.h"
 #include "vfs/vfs_procs.h"
 #include "vfs/vfs_release.h"
 #include "smb_attr.h"
@@ -27,8 +28,6 @@
                          SMB2_WRITE_OWNER | \
                          SMB2_GENERIC_WRITE | \
                          SMB2_GENERIC_ALL)
-
-const uint8_t root_fh = CHIMERA_VFS_FH_MAGIC_ROOT;
 
 static inline void
 chimera_smb_create_unlink_callback(
@@ -60,6 +59,8 @@ chimera_smb_create_unlink(struct chimera_smb_request *request)
         request->create.parent_handle,
         open_file->name,
         open_file->name_len,
+        NULL,
+        0,
         0,
         0,
         chimera_smb_create_unlink_callback,
@@ -456,6 +457,7 @@ chimera_smb_create_process(struct chimera_smb_request *request)
             request->create.parent_path,
             request->create.parent_path_len,
             CHIMERA_VFS_ATTR_FH,
+            CHIMERA_VFS_LOOKUP_FOLLOW,
             chimera_smb_create_lookup_parent_callback,
             request);
     } else if (request->create.name_len) {
@@ -509,14 +511,19 @@ chimera_smb_revalidate_tree(
     struct chimera_smb_request *request)
 {
     struct chimera_vfs_thread *vfs_thread = request->compound->thread->vfs_thread;
+    uint8_t                    root_fh[CHIMERA_VFS_FH_SIZE];
+    uint32_t                   root_fh_len;
+
+    chimera_vfs_get_root_fh(root_fh, &root_fh_len);
 
     chimera_vfs_lookup_path(
         vfs_thread,
-        &root_fh,
-        1,
+        root_fh,
+        root_fh_len,
         tree->share->path,
         strlen(tree->share->path),
         CHIMERA_VFS_ATTR_FH,
+        CHIMERA_VFS_LOOKUP_FOLLOW,
         chimera_smb_revalidate_tree_callback,
         request);
 
@@ -612,6 +619,27 @@ chimera_smb_create_reply(
 
 } /* chimera_smb_create_reply */
 
+/*
+ * Parse SMB2 CREATE request
+ * Offset  Size  Field
+ * ------  ----  -----------------------------------------------------------
+ * 0x00    2     StructureSize = 57 (0x0039)   // fixed for request
+ * 0x02    1     SecurityFlags = 0 (reserved)
+ * 0x03    1     RequestedOplockLevel          // NONE/II/EXCLUSIVE/BATCH/LEASE
+ * 0x04    4     ImpersonationLevel            // Anonymous/Ident./Impersonation/Delegate
+ * 0x08    8     SmbCreateFlags = 0 (reserved; ignore on server)
+ * 0x10    8     Reserved (ignore on server)
+ * 0x18    4     DesiredAccess                 // access mask (see §2.2.13.1)
+ * 0x1C    4     FileAttributes                // FILE_ATTRIBUTE_* (dirs use DIRECTORY)
+ * 0x20    4     ShareAccess                   // READ/WRITE/DELETE mask
+ * 0x24    4     CreateDisposition             // SUPERSEDE, OPEN, CREATE, OPEN_IF, OVERWRITE, OVERWRITE_IF
+ * 0x28    4     CreateOptions                 // FILE_* options (e.g., DIRECTORY_FILE, NON_DIRECTORY_FILE)
+ * 0x2C    2     NameOffset                    // from start of SMB2 header to file name
+ * 0x2E    2     NameLength (bytes; UTF‑16LE; not NUL‑terminated)
+ * 0x30    4     CreateContextsOffset          // 8‑byte aligned if present; 0 if none
+ * 0x34    4     CreateContextsLength          // bytes of concatenated contexts
+ * 0x38    ...   Buffer: FileName then SMB2_CREATE_CONTEXT blobs (if any)
+ */
 int
 chimera_smb_parse_create(
     struct evpl_iovec_cursor   *request_cursor,
@@ -626,6 +654,7 @@ chimera_smb_parse_create(
         chimera_smb_error("Received SMB2 CREATE request with invalid struct size (%u expected %u)",
                           request->smb2_hdr.struct_size,
                           SMB2_CREATE_REQUEST_SIZE);
+        request->status = SMB2_STATUS_INVALID_PARAMETER;
         return -1;
     }
 
