@@ -16,7 +16,7 @@
                                 "fredericbonnet.cmake-test-adapter",
                                 "ms-azuretools.vscode-docker",
                                 "anthropic.claude-code",
-                                "benjarvis.uncrustify"
+                                "zachflower.uncrustify"
                         ]
                 }
         },

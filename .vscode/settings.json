@@ -20,7 +20,7 @@
   "cmake.options.advanced.workflow.statusBarVisibility": "hidden",
   "uncrustify.configPath.linux": "${workspaceFolder}/etc/uncrustify.cfg",
   "[c]": {
-    "editor.defaultFormatter": "benjarvis.uncrustify"
+    "editor.defaultFormatter": "zachflower.uncrustify"
   },
   "cmakeExplorer.extraCtestRunArgs": "-V --timeout 300",
   "cmakeExplorer.suiteDelimiter": "/",

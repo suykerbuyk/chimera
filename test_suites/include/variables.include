@@ -1,37 +1,53 @@
 # Variables:
 #
-#  * OS_DISTRO: rockyl(default)
+#  * MDC_DISTRO:  rockyl(default)
 #    - Specific distribution to use
 #    - Optional.
 #
-#  * OS_VERSION: 9.5(default)
+#  * MDC_VERSION: 9.5(default)
 #    - Specific OS release to utilize.
 #    - Optional.
 #
-#  * LNXCLI_DISTRO: rockyl(default)
+#  * OS_DISTRO:  ubuntu-server(default)
+#    - Specific distribution to use
+#    - Optional.
+#
+#  * OS_VERSION: 24.04(default)
+#    - Specific OS release to utilize.
+#    - Optional.
+#
+#  * LNXCLI_DISTRO: ubuntu-server(default)
 #    - Specific distribution used by NAS clients
 #    - Optional.
 #
-#  * LNXCLI_VERSION: 9.5(default)
+#  * LNXCLI_VERSION: 24.04(default)
 #    - Specific OS release to utilize by NAS Client
 #    - default OS_VERSION
 #    - Optional.
 #
 
-%ifndef OS_VERSION
-%define OS_VERSION 9.5
+%ifndef MDC_DISTRO
+%define MDC_DISTRO rockyl
+%endif
+
+%ifndef MDC_VERSION
+%define MDC_VERSION 9.5
 %endif
 
 %ifndef OS_DISTRO
-%define OS_DISTRO rockyl
+%define OS_DISTRO ubuntu-server
 %endif
 
-%ifndef LNXCLI_VERSION
-%define LNXCLI_VERSION 9.5
+%ifndef OS_VERSION
+%define OS_VERSION 24.04
 %endif
 
 %ifndef LNXCLI_DISTRO
-%define LNXCLI_DISTRO rockyl
+%define LNXCLI_DISTRO ubuntu-server
+%endif
+
+%ifndef LNXCLI_VERSION
+%define LNXCLI_VERSION 24.04
 %endif
 
 

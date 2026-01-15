@@ -9,7 +9,7 @@ description Test various SNFS specific feature with chimera
 %error need to provide a QB PKG_TAG
 %endif
 
-host mdc1	distro:OS_DISTRO version:OS_VERSION arch:x86_64 cores:4 memory:8192
+host mdc1	distro:MDC_DISTRO version:MDC_VERSION arch:x86_64 cores:4 memory:8192
 host lnx1       distro:LNXCLI_DISTRO version:LNXCLI_VERSION arch:x86_64 cores:2 memory:2048
 
 hostgroup allhosts   mdc1 lnx1
@@ -35,7 +35,7 @@ step 1m extract the NAS sntest_utils
 command allhosts curl https://nexus.mdh.quantum.com/repository/snnas-binaries/sn_tests/sntest_utils.tar.gz | tar zxf - -C /
 
 step 10m Make sure that the kernel-devel is installed
-command allhosts dnf install -y kernel-devel
+command mdc1 dnf install -y kernel-devel
 
 step 5m remove MDH path
 command mdc1 rm -f /etc/profile.d/mdh-env.sh
@@ -154,13 +154,18 @@ command mdc1 systemctl enable chimera && \
 step 5m Linux Prepare clients
 command lnx1 echo -e "username=testuser1\npassword=systest\ndomain=WORKGROUP" > /root/.smb_cred
 
+%if LNXCLI_DISTRO == ubuntu-server
+step 5m install smbclient 
+command lnx1 apt update && apt install -y smbclient cifs-utils
+%else
 step 5m setup external yum repo
 command lnx1 dnf reinstall -y rocky-repos && \
 	rm -f /etc/yum.repos.d/mdh.repo && \
 	dnf clean all
 
-step 5m install smbclient 
+step 5m install smbclient
 command lnx1 dnf install -y samba-client cifs-utils
+%endif
 
 step 1m validate that we have access.
 command lnx1 SMBCLIENT -c 'ls'
