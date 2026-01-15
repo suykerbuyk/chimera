@@ -23,6 +23,11 @@
             "path": "/snfs1/smb2"
         }
     },
+    "exports": {
+        "/nfs1": {
+            "path": "/snfs1/nfs1"
+        }
+    },
     "buckets": {
 	"bucket1": {
 	    "path": "/snfs1/buckets"

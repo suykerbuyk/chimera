@@ -1,0 +1,153 @@
+%sntest chimera-linux-tests.snt
+description Test NFS and SMB protocol on a Linux share
+
+# Example:
+# sntest -b master -V PKG_TAG=main-quantum -e chimera-ubuntu-server.snt
+
+%include ../include/variables.include
+%ifndef PKG_TAG
+%error need to provide a QB PKG_TAG
+%endif
+
+%if OS_DISTRO != ubuntu-server
+%error Test only support ubuntu-server server
+%endif
+
+%if LNXCLI_DISTRO != ubuntu-server
+%error Test only support ubuntu-server clients
+%endif
+
+host srv1	distro:OS_DISTRO version:OS_VERSION arch:x86_64 cores:2 memory:8192
+host lnx1       distro:LNXCLI_DISTRO version:LNXCLI_VERSION arch:x86_64 cores:2 memory:2048
+
+hostgroup allhosts   srv1 lnx1
+
+# share FS
+lun share_fs srv1 100
+
+failstep 10m Capture debug info on failure
+command allhosts $sntest/bin/capture_debug_info $spool
+command srv1 journalctl -u chimera -o short-iso | sed 's/ snt.*message="/ /' | tee $spool/chimera_log.txt
+command lnx1 dmesg | tail -100
+
+step 1m extract the NAS sntest_utils
+command allhosts curl https://nexus.mdh.quantum.com/repository/snnas-binaries/sn_tests/sntest_utils.tar.gz | tar zxf - -C /
+
+
+step 5m install extra pkg
+command allhosts apt update && apt install -y smbclient cifs-utils jq
+
+#  --------------------   install Chimera  ---------------
+step 5m setup ntlm authentication.
+command srv1 mkdir -p /etc/chimera && \
+	echo "WORKGROUP:testuser1:systest" >/etc/chimera/ntlm.txt && \
+	echo "export NTLM_USER_FILE=/etc/chimera/ntlm.txt" > /etc/profile.d/chimera.sh
+
+%if OS_VERSION == 24.04
+step 2m Download chimera pkg for Ubuntu24
+command srv1 /sntest_utils/get_qb_asset.py -p chimera -t PKG_TAG -d /chimera-repo -u release/Ubuntu24/amd64/repo-chimera.tar.gz
+%else
+step 2m Download chimera pkg for Ubuntu22
+command srv1 /sntest_utils/get_qb_asset.py -p chimera -t PKG_TAG -d /chimera-repo -u release/Ubuntu22/amd64/repo-chimera.tar.gz
+%endif
+
+
+step 2m install the chimera PKG
+command srv1 apt install -y -f /chimera-repo/quantum-chimera-server*.deb
+
+%if OS_VERSION != 24.04
+step 5m Install gss-ntlmssp 1.3.1 override
+command srv1 curl https://repository.mdh.quantum.com:8443/repository/utils/gss-ntlmssp/1.3.1/gss-ntlmssp-1.3.1.tgz | tar -C / -xzf -
+%endif
+
+step 5m setup share filesystem
+command srv1 echo $share_fs && \
+	parted /dev/sda mklabel gpt && \
+	parted /dev/sda mkpart "" ext4 0% 100% && \
+	sleep 5 && mkfs.ext4  /dev/sda1 && \
+	mkdir /shares && \
+	mount /dev/sda1 /shares && \
+	chmod 777 /shares && \
+	mkdir -m 777 -p /shares/nfs1 /shares/smb1
+
+step 1m update chimera.json file
+command srv1 cd /etc/chimera && \
+	cp chimera.json chimera.json.bak && \
+	jq '.server.external_portmap = true | \
+	   .mounts.linux_dir.path = "/shares" | \
+	   .mounts.nfs1.path = "/shares/nfs1" | \
+	   .mounts.nfs1.module = "linux" | \
+	   .shares.smb1.path = "/linux_dir/smb1" \
+	   ' chimera.json > chimera.json.tmp && \
+	mv chimera.json.tmp /opt/quantum/chimera/etc/chimera.json
+
+
+step 5m start chimera
+command srv1 systemctl start chimera.service && \
+	sleep 5 && \
+	systemctl status chimera.service
+
+# ----------------- Setup linux client -----------------
+step 5m get elbencho
+command lnx1 curl https://repository.mdh.quantum.com/repository/tests/elbencho/elbencho-static-x86_64.tar.gz | \
+	tar zxf - -C /usr/bin
+
+step 5m lnx1 Get connectathon
+command lnx1 curl https://repository.mdh.quantum.com/repository/cthon/cthon04.tar.gz | \
+	tar zxf - -C /root/
+
+# ----------------- Setup/Run SMB test -----------------
+%ifndef NO_SMB
+%define SMBCLIENT smbclient -U WORKGROUP/testuser1%systest //$srv1/smb1
+
+step 5m Linux Prepare clients
+command lnx1 /bin/echo -e "username=testuser1\npassword=systest\ndomain=WORKGROUP" > /root/.smb_cred
+
+step 5m test smb connection config
+command lnx1 SMBCLIENT -c "allinfo /"
+
+step 5m Connect to smb1 share
+command lnx1 mkdir -p /smb1 && mount.cifs -v -ocredentials=/root/.smb_cred //$srv1/smb1 /smb1
+
+step 2m basic tests over SMB
+command lnx1 dd if=/dev/zero count=3 of=/smb1/file1 && stat /smb1/file1 && mv /smb1/file1 /smb1/file1.moved
+
+step 2m rename test over SMB
+command lnx1  mkdir /smb1/rename-test && cd /smb1/rename-test && mkdir -p dir1 dir2 && \
+	      touch file1 dir1/file1 dir1/file2 dir1/file3 && \
+	      mv file1 dir1 && mv dir1/file1 dir2/rename1 && \
+	      cd dir1 && mv file2 ../rename2 && mv file3 /smb1/rename-test/dir2 && cd .. && \
+	      stat dir2/rename1 rename2 dir2/file3
+
+step 10m run elbencho over SMB
+command lnx1 mkdir -p /smb1/lnx1 && \
+	/usr/bin/elbencho /smb1/lnx1 --size=1m --dirs=4 --files=10 --mkdirs --write && \
+	/usr/bin/elbencho /smb1/lnx1 --size=1m --dirs=4 --files=10 --deldirs --delfiles --read
+%endif
+
+# ----------------- Setup/Run NFSv3 test -----------------
+%ifndef NO_NFSv3
+step 5m Mount the NFSv3 share
+command lnx1 mkdir -p /nfs1 && mount -v -o vers=3 $srv1:/nfs1 /nfs1
+
+step 2m	basic tests over NFSv3
+command lnx1 dd if=/dev/zero count=3 of=/nfs1/file1 && stat /nfs1/file1 && mv /nfs1/file1 /nfs1/file1.moved
+command lnx1 touch /nfs1/chmod_file && chmod 600 /nfs1/chmod_file && stat -c '%a' /nfs1/chmod_file | grep 600
+
+step 10m run elbencho over NFSv3
+command lnx1 mkdir -p /nfs1/lnx1 && \
+	/usr/bin/elbencho /nfs1/lnx1 --size=1m --dirs=4 --files=10 --mkdirs --write && \
+	/usr/bin/elbencho /nfs1/lnx1 --size=1m --dirs=4 --files=10 --deldirs --delfiles --read
+
+step 10M Run Connectathon
+command lnx1 cd /root/cthon04/cthon04/basic && \
+	     NFSTESTDIR=/nfs1/cthon_basic ./runtests && \
+	     cd /root/cthon04/cthon04/special && \
+	     NFSTESTDIR=/nfs1/cthon_special ./runtests
+
+%endif
+
+# ----- finish ----
+step 5m gather logs
+command srv1 journalctl -u chimera -o short-iso | sed 's/ snt.*message="/ /' | tee $spool/chimera_log.txt
+command lnx1 dmesg | tail -100

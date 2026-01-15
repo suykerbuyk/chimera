@@ -37,6 +37,14 @@
             "path": "/memfs_dir/smb_dir"
         }
     },
+    "exports": {
+        "/nfs1": {
+            "path": "/snfs1/nfs_dir"
+        },
+        "/nfs2": {
+            "path": "/memfs_dir/nfs_dir"
+        }
+    },
     "buckets": {
 	"bucket1": {
 	    "path": "/snfs1/buckets"

@@ -9,7 +9,7 @@ description install chimera on a single MDC.
 %error need to provide a QB PKG_TAG
 %endif
 
-host mdc1	distro:OS_DISTRO version:OS_VERSION arch:x86_64 cores:2 memory:8192
+host mdc1	distro:MDC_DISTRO version:MDC_VERSION arch:x86_64 cores:2 memory:8192
 
 hostgroup allhosts   mdc1
 
