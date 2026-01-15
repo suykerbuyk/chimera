@@ -13,6 +13,11 @@
 	    "path": "/"
 	}
     },
+    "exports": {
+        "/nfs1": {
+            "path": "/memfs_dir"
+        }
+    },
     "shares": {
         "smb1": {
             "path": "/linux_dir"
