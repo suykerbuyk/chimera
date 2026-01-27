@@ -2,150 +2,108 @@
 description Run smbtorture tests against the Chimera NAS server
 
 # Example:
-# sntest -b master -V PKG_TAG=qtm-master -e vsphere -s chimera-smbtorture.snt
+# sntest -b master -V PKG_TAG=main-quantum -e vsphere -s chimera-smbtorture.snt
 
 %include ../include/variables.include
 %ifndef PKG_TAG
 %error need to provide a QB PKG_TAG
 %endif
 
-host mdc1	distro:OS_DISTRO version:OS_VERSION arch:x86_64 cores:2 memory:8192
-host lnx1       distro:LNXCLI_DISTRO version:LNXCLI_VERSION arch:x86_64 cores:2 memory:8192
+%if OS_DISTRO != ubuntu-server
+%error Test only support ubuntu-server server
+%endif
 
+host srv1	distro:OS_DISTRO version:OS_VERSION arch:x86_64 cores:2 memory:8192
 
-hostgroup allhosts   mdc1 lnx1
+hostgroup allhosts   srv1
 
-
-# Define LUNs for MDCs
-lun snfs1_meta mdc1 8
-lun snfs1_data allhosts 32
+# share FS
+lun share_fs srv1 100
 
 failstep 10m Capture debug info on failure
 command allhosts $sntest/bin/capture_debug_info $spool
-
-step 600 Apply work-around to remove IPv6 localhost from /etc/hosts
-command allhosts $sntest/bin/ipv6_hosts_hack
-
-step 10m Preinstall RPM that we might need.
-command allhosts $sntest/utilities/tadpole/pre-install-pkg.sh
+command srv1 journalctl -u chimera -o short-iso | sed 's/ snt.*message="/ /' | tee $spool/chimera_log.txt
+command srv1 dmesg | tail -100
 
 step 1m extract the NAS sntest_utils
 command allhosts curl https://nexus.mdh.quantum.com/repository/snnas-binaries/sn_tests/sntest_utils.tar.gz | tar zxf - -C /
 
-step 10m Make sure that the kernel-devel is installed
-command allhosts dnf install -y kernel-devel
 
-step 5m remove MDH path
-command mdc1 rm -f /etc/profile.d/mdh-env.sh
+step 5m install extra pkg
+command allhosts apt update && apt install -y smbclient cifs-utils jq
 
-#  --------------------   install stornext  ---------------
-step 10m Unpack StorNext
-command mdc1 $sntest/bin/unpack_stornext snfs $sndist /tmp/stornext
-command lnx1 $sntest/bin/unpack_stornext client $sndist /tmp/stornext
 
-step 10m Install StorNext
-command mdc1 $sntest/bin/install_stornext snfs /tmp/stornext
-command lnx1 $sntest/bin/install_stornext client /tmp/stornext
-
-step 10m Set StorNext Name Servers
-command allhosts $sntest/bin/set_fsnameservers $mdc1
-
-step 5m Clear temp licenses
-command mdc1 rm -f /usr/cvfs/config/license.dat
-
-step 600 Start StorNext
-command mdc1 $sntest/bin/cvfs_control start
-
-step 600 Label LUNs
-command mdc1 $sntest/bin/label_lun $snfs1_meta CvfsDisk_snfs1_meta
-command mdc1 $sntest/bin/label_lun $snfs1_data CvfsDisk_snfs1_data
-
-step 600 Force Disk Rescan
-command mdc1 /usr/cvfs/bin/cvadmin -e 'disks refresh'
-
-step 600 Configure File System
-command mdc1 $sntest/bin/configure_fs snfs1 \
-   fileLocks=true \
-   caseInsensitive=true \
-   fileLockResyncTimeOut=20 \
-   enforceAcls=true \
-   quotas=true \
-   sg0:1:metadata,journal:CvfsDisk_snfs1_meta \
-   sg1:1:userdata:CvfsDisk_snfs1_data
-
-step 600 Initialize File Systems
-command mdc1 /usr/cvfs/bin/cvmkfs -F snfs1
-
-step 600 Write FSM list
-command mdc1 $sntest/bin/append_fsmlist snfs1
-
-step 600 Configure File System Mounts
-command allhosts  $sntest/bin/configure_mount snfs1 /stornext/snfs1 defaults
-
-step 5m Restart StorNext on MDC
-command mdc1 $sntest/bin/cvfs_control restart
-
-step 5m Restart StorNext on clients
-command lnx1 $sntest/bin/cvfs_control restart
 
 #  --------------------   install Chimera  ---------------
 step 5m setup ntlm authentication.
-command mdc1 mkdir -p /etc/chimera && \
+command srv1 mkdir -p /etc/chimera && \
 	echo "WORKGROUP:testuser1:systest" >/etc/chimera/ntlm.txt && \
 	echo "export NTLM_USER_FILE=/etc/chimera/ntlm.txt" > /etc/profile.d/chimera.sh
 
-step 2m Download chimera pkg for Stornext
-command mdc1 /sntest_utils/get_qb_asset.py -p chimera -t PKG_TAG -d /chimera-repo -u release/Rocky9/amd64/repo-chimera.tar.gz
+%if OS_VERSION == 24.04
+step 2m Download chimera pkg for Ubuntu24
+command srv1 /sntest_utils/get_qb_asset.py -p chimera -t PKG_TAG -d /chimera-repo -u release/Ubuntu24/amd64/repo-chimera.tar.gz
+%else
+step 2m Download chimera pkg for Ubuntu22
+command srv1 /sntest_utils/get_qb_asset.py -p chimera -t PKG_TAG -d /chimera-repo -u release/Ubuntu22/amd64/repo-chimera.tar.gz
+%endif
 
 step 2m install the chimera PKG
-command mdc1 dnf install -y /chimera-repo/*.rpm
+command srv1 apt install -y /chimera-repo/*.deb
 
-step 5m prepare SMB1 share
-command mdc1 cp /etc/chimera/chimera.json /etc/chimera/chimera.json.orig && \
-	     cp  /opt/quantum/chimera/share/examples/chimera-snfs.json /etc/chimera/chimera.json && \
-	     mkdir -p /stornext/snfs1/smb1 && \
-	     chmod 777 /stornext/snfs1/smb1
+step 5m setup share filesystem
+command srv1 echo $share_fs && \
+	parted /dev/sda mklabel gpt && \
+	parted /dev/sda mkpart "" ext4 0% 100% && \
+	sleep 5 && mkfs.ext4  /dev/sda1 && \
+	mkdir /shares && \
+	mount /dev/sda1 /shares && \
+	chmod 777 /shares && \
+	mkdir -m 777 -p /shares/nfs1 /shares/smb1
 
-step 5m enable and start chimera
-command mdc1 systemctl enable chimera && \
-	systemctl start chimera && \
+step 1m update chimera.json file
+command srv1 cd /etc/chimera && \
+	cp chimera.json chimera.json.bak && \
+	jq '.server.external_portmap = true | \
+	   .mounts.linux_dir.path = "/shares" | \
+	   .shares.smb1.path = "/linux_dir/smb1" \
+	   ' chimera.json > chimera.json.tmp && \
+	mv chimera.json.tmp /opt/quantum/chimera/etc/chimera.json
+
+
+step 5m start chimera
+command srv1 systemctl start chimera.service && \
 	sleep 5 && \
-	systemctl status chimera
+	systemctl status chimera.service
 
 # ----------------- Setup linux client -----------------
-step 5m setup external yum repo
-command lnx1 dnf reinstall -y rocky-repos && \
-	rm -f /etc/yum.repos.d/mdh.repo && \
-	dnf clean all
-
-
 step 5m install smbclient and smbtorture
-command lnx1 dnf install --enablerepo crb -y samba-client samba-test
+command srv1 apt install -y smbclient samba-testsuite
 
 step 5m Setup Samba config on the client
-command lnx1 net conf setparm global workgroup WORKGROUP
-command lnx1 net conf setparm global torture:samba3 yes
-command lnx1 net conf setparm global torture:localdir /stornext/fs1/smb1
-command lnx1 net conf setparm global torture:filename testfile
-command lnx1 net conf setparm global torture:offset 1
-command lnx1 net conf setparm global torture:beyond_final_zero 131072
+command srv1 net conf setparm global workgroup WORKGROUP
+command srv1 net conf setparm global torture:samba3 yes
+command srv1 net conf setparm global torture:localdir /share
+command srv1 net conf setparm global torture:filename testfile
+command srv1 net conf setparm global torture:offset 1
+command srv1 net conf setparm global torture:beyond_final_zero 131072
 
 step 1m generate config for smbtorture
-command lnx1 net conf list > /etc/samba/smb.conf
+command srv1 net conf list > /etc/samba/smb.conf
 
 step 1m validate SMB config
-command lnx1 testparm -s 2>/dev/null
-command lnx1 net conf list
+command srv1 testparm -s 2>/dev/null
+command srv1 net conf list
 
 step 1m validate that we have access.
-command lnx1 smbclient -U testuser1%systest //$mdc1/smb1 -c 'ls'
+command srv1 smbclient -U testuser1%systest //$srv1/smb1 -c 'ls'
 
 # ----------------- Run test -----------------
 step 5m Gather test groups lists
 command allhosts smbtorture  --list-suites | grep '^smb2' | sort | tee /tmp/smb2-suite-all
 
 step 5m Create test smb2 group list
-command lnx1 echo -e "\
+command srv1 echo -e "\
 smb2.read\n\
 smb2.compound_find\n\
 smb2.sharemode\n\
@@ -164,15 +122,14 @@ smb2.rw\n\
 smb2.acls\n\
 smb2.check-sharemode" | sort | tee /tmp/smb2-suite
 
-# TODO: This should work without crashing
 
-#step 1m Compare the list
-#command lnx1  diff /tmp/smb2-suite /tmp/smb2-suite-all ; true
+step 1m Compare the list
+command srv1  diff /tmp/smb2-suite /tmp/smb2-suite-all ; true
 
-#step 5m smb2 test group
-#command lnx1 $sntest/utilities/tadpole/run_torture.sh WORKGROUP/testuser1%systest \
-#	//$mdc1/smb1 /tmp/smb2-suite -t 600 -r /tmp/result-smb2  2>/tmp/smb2-suite.stderr
+step 5m smb2 test group
+command srv1 $sntest/utilities/tadpole/run_torture.sh WORKGROUP/testuser1%systest \
+	//$srv1/smb1 /tmp/smb2-suite -t 600 -r /tmp/result-smb2  2>/tmp/smb2-suite.stderr
 
 
-#step 1m Make sure all the test passed
-#command lnx1 ! grep "FAILED" /tmp/result-smb2
+step 1m Make sure all the test passed
+command srv1 ! grep "FAILED" /tmp/result-smb2

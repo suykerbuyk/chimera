@@ -21,20 +21,11 @@ RUN curl -o /usr/local/bin/uncrustify  ${asset:uncrustify:Rocky9/$arch/uncrustif
 #    tar xf snfs-*-OS9.tar && \
 #    dnf install -y /install/OS9/*.rpm
 
-# package and install gssntlmssp
-ENV PKG_SRC https://download.fedoraproject.org/pub/fedora/linux/development/rawhide/Everything/source/tree/Packages/g/gssntlmssp-1.3.1-5.fc43.src.rpm
-#ENV PKG_SRC https://dl.rockylinux.org/pub/rocky/8/Devel/source/tree/Packages/g/gssntlmssp-1.2.0-1.el8_8.src.rpm
-RUN cd && rpmdev-setuptree && \
-    rpm -ivh ${PKG_SRC} && \
-    rpmbuild -ba ~/rpmbuild/SPECS/gssntlmssp.spec && \
-    rpm -ivh rpmbuild/RPMS/x86_64/gssntlmssp-[0-9]* && \
-    rpm -ivh rpmbuild/RPMS/x86_64/gssntlmssp-devel-[0-9]*
 
-
-# Make copy for install script
-RUN mkdir /repo && \
-    cp /root/rpmbuild/RPMS/x86_64/gssntlmssp-[0-9]* /repo/ && \
-    rm -rf ./rpmbuild
+# Install gss-ntlmssp 1.3.1 keep copy for build
+RUN mkdir -p /packages && \
+    curl -sS ${asset:gss-ntlmssp:Rocky9/$arch/gss-ntlmssp-1.3.1.tgz} | tar zxvf - -C /packages && \
+    dnf install -y /packages/*
 
 RUN useradd -d /context -ms /bin/bash mockbuild
 WORKDIR /context

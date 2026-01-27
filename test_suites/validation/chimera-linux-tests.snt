@@ -53,12 +53,7 @@ command srv1 /sntest_utils/get_qb_asset.py -p chimera -t PKG_TAG -d /chimera-rep
 
 
 step 2m install the chimera PKG
-command srv1 apt install -y -f /chimera-repo/quantum-chimera-server*.deb
-
-%if OS_VERSION != 24.04
-step 5m Install gss-ntlmssp 1.3.1 override
-command srv1 curl https://repository.mdh.quantum.com:8443/repository/utils/gss-ntlmssp/1.3.1/gss-ntlmssp-1.3.1.tgz | tar -C / -xzf -
-%endif
+command srv1 apt install -y /chimera-repo/*.deb
 
 step 5m setup share filesystem
 command srv1 echo $share_fs && \
@@ -75,9 +70,8 @@ command srv1 cd /etc/chimera && \
 	cp chimera.json chimera.json.bak && \
 	jq '.server.external_portmap = true | \
 	   .mounts.linux_dir.path = "/shares" | \
-	   .mounts.nfs1.path = "/shares/nfs1" | \
-	   .mounts.nfs1.module = "linux" | \
-	   .shares.smb1.path = "/linux_dir/smb1" \
+	   .shares.smb1.path = "/linux_dir/smb1" | \
+	   .exports."/nfs1".path = "/linux_dir/nfs1" \
 	   ' chimera.json > chimera.json.tmp && \
 	mv chimera.json.tmp /opt/quantum/chimera/etc/chimera.json
 
@@ -139,10 +133,12 @@ command lnx1 mkdir -p /nfs1/lnx1 && \
 	/usr/bin/elbencho /nfs1/lnx1 --size=1m --dirs=4 --files=10 --mkdirs --write && \
 	/usr/bin/elbencho /nfs1/lnx1 --size=1m --dirs=4 --files=10 --deldirs --delfiles --read
 
-step 10M Run Connectathon
+step 10M Run Connectathon basic test
 command lnx1 cd /root/cthon04/cthon04/basic && \
-	     NFSTESTDIR=/nfs1/cthon_basic ./runtests && \
-	     cd /root/cthon04/cthon04/special && \
+	     NFSTESTDIR=/nfs1/cthon_basic ./runtests
+
+step 10M Run Connectathon special test
+command lnx1 cd /root/cthon04/cthon04/special && \
 	     NFSTESTDIR=/nfs1/cthon_special ./runtests
 
 %endif
