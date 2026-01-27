@@ -32,6 +32,16 @@ build_debug_Ubuntu22:
   script:
     - ${RUN_QB} build_debug_Ubuntu22
 
+build_release_Ubuntu24:
+  stage: build
+  script:
+    - ${RUN_QB} build_release_Ubuntu24
+
+build_debug_Ubuntu24:
+  stage: build
+  script:
+    - ${RUN_QB} build_debug_Ubuntu24
+
 build_release_Ubuntu22:
   stage: build
   script:
