@@ -20,6 +20,9 @@ cp /context/qtm_build/chimera.service lib/systemd/system
 tar xf /dist/chimera.tar.gz
 cd ..
 dpkg-deb --build ${PKG_DIR}
-tar zcvf /dist/repo-chimera.tar.gz ${PKG_DIR}.deb
 cp ${PKG_DIR}.deb /dist/
+# Add gss-ntlmssp 1.3.1 package to the repo
+cp /packages/gss-ntlmssp_* /dist/
+cd /dist
+tar zcvf repo-chimera.tar.gz *.deb
 

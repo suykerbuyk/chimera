@@ -9,7 +9,7 @@ REVISION=$2
 ARCH=$3
 
 mkdir -p /build /dist /repo
-c /build
+cd /build
 rpmdev-setuptree
 cp /dist/chimera.tar.gz /root/rpmbuild/SOURCES
 cp /context/qtm_build/chimera.service /root/rpmbuild/SOURCES
@@ -23,5 +23,6 @@ rpmbuild -ba  chimera.spec
 cp /root/rpmbuild/RPMS/x86_64/*.rpm /repo
 dnf download xxhash-libs libunwind liburing --arch  ${ARCH} --destdir /repo
 cd /repo
+cp /packages/gssntlmssp-[0-9]*.rpm .
 tar cfz /dist/repo-chimera.tar.gz .
 

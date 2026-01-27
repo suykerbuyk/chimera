@@ -18,23 +18,15 @@ lun share_fs allhosts 100
 
 failstep 10m Capture debug info on failure
 command allhosts $sntest/bin/capture_debug_info $spool
+command srv1 journalctl -u chimera -o short-iso | sed 's/ snt.*message="/ /' | tee $spool/chimera_log.txt
+
 
 step 1m extract the NAS sntest_utils
 command allhosts curl https://nexus.mdh.quantum.com/repository/snnas-binaries/sn_tests/sntest_utils.tar.gz | tar zxf - -C /
 
 
-%if OS_DISTRO == ubuntu-server
-step 5m install smbclient 
-command lnx1 apt update && apt install -y smbclient cifs-utils
-%else
-step 5m setup external yum repo
-command lnx1 dnf reinstall -y rocky-repos && \
-	rm -f /etc/yum.repos.d/mdh.repo && \
-	dnf clean all
-
 step 5m install smbclient
-command lnx1 dnf install -y samba-client cifs-utils
-%endif
+command srv1 apt update && apt install -y smbclient cifs-utils jq
 
 
 #  --------------------   install Chimera  ---------------
@@ -43,7 +35,6 @@ command srv1 mkdir -p /etc/chimera && \
 	echo "WORKGROUP:testuser1:systest" >/etc/chimera/ntlm.txt && \
 	echo "export NTLM_USER_FILE=/etc/chimera/ntlm.txt" > /etc/profile.d/chimera.sh
 
-%if OS_DISTRO == ubuntu-server
 %if OS_VERSION == 24.04
 step 2m Download chimera pkg for Ubuntu24
 command srv1 /sntest_utils/get_qb_asset.py -p chimera -t PKG_TAG -d /chimera-repo -u release/Ubuntu24/amd64/repo-chimera.tar.gz
@@ -51,17 +42,9 @@ command srv1 /sntest_utils/get_qb_asset.py -p chimera -t PKG_TAG -d /chimera-rep
 step 2m Download chimera pkg for Ubuntu22
 command srv1 /sntest_utils/get_qb_asset.py -p chimera -t PKG_TAG -d /chimera-repo -u release/Ubuntu22/amd64/repo-chimera.tar.gz
 %endif
-step 2m install the chimera PKG
-command srv1 apt install -y -f /chimera-repo/quantum-chimera-server*.deb
-
-%else
-# Rocky9 
-step 2m Download chimera pkg for Rocky9
-command mdc1 /sntest_utils/get_qb_asset.py -p chimera -t PKG_TAG -d /chimera-repo -u release/Rocky9/amd64/repo-chimera.tar.gz
 
 step 2m install the chimera PKG
-command mdc1 dnf install -y /chimera-repo/*.rpm
-%endif
+command srv1 apt install -y  /chimera-repo/*.deb
 
 step 1m update chimera.json file
 command srv1 cd /etc/chimera && \
@@ -88,4 +71,6 @@ command srv1 systemctl start chimera.service && \
 step 5m test config
 command srv1 smbclient -U testuser1%systest //127.0.0.1/smb1 -c "allinfo /"
 
+step 5m gather logs
+command srv1 journalctl -u chimera -o short-iso | sed 's/ snt.*message="/ /' | tee $spool/chimera_log.txt
 
