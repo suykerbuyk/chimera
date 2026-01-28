@@ -79,7 +79,7 @@ release:
 dev_branch:
   stage: publish
   only:
-    - main-quantum
+    - develop
   except: [ schedules, tags ]
   script:
     - >-
