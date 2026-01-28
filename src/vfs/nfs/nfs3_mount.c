@@ -13,16 +13,66 @@
 #include "vfs/vfs_internal.h"
 #include "vfs/vfs_fh.h"
 
+#define CHIMERA_NFS_RDMA_PORT 20049
+
 struct chimera_nfs_client_server_thread_ctx {
     struct chimera_nfs_client_server_thread *server_thread;
+    int                                      use_rdma;
+    int                                      rdma_port;
 };
+
+/* Get the rdma mount option
+ * Returns the RDMA protocol to use:
+ *   0 - no RDMA
+ *   EVPL_DATAGRAM_TCP_RDMA - TCP-RDMA (rdma=tcp)
+ *   EVPL_DATAGRAM_RDMACM_RC - native RDMACM (rdma or rdma=rdmacm)
+ */
+static enum evpl_protocol_id
+chimera_nfs_mount_get_rdma_protocol(const struct chimera_vfs_mount_options *options)
+{
+    int i;
+
+    for (i = 0; i < options->num_options; i++) {
+        if (strcmp(options->options[i].key, "rdma") == 0) {
+            /* rdma=tcp -> TCP-RDMA */
+            if (options->options[i].value &&
+                strcmp(options->options[i].value, "tcp") == 0) {
+                return EVPL_DATAGRAM_TCP_RDMA;
+            }
+            /* rdma=rdmacm or just rdma -> native RDMACM */
+            return EVPL_DATAGRAM_RDMACM_RC;
+        }
+    }
+
+    return 0;
+} /* chimera_nfs_mount_get_rdma_protocol */
+
+/* Get the port mount option - returns the port, or default if not specified */
+static int
+chimera_nfs_mount_get_port(
+    const struct chimera_vfs_mount_options *options,
+    int                                     default_port)
+{
+    int i;
+
+    for (i = 0; i < options->num_options; i++) {
+        if (strcmp(options->options[i].key, "port") == 0) {
+            if (options->options[i].value) {
+                return atoi(options->options[i].value);
+            }
+        }
+    }
+
+    return default_port;
+} /* chimera_nfs_mount_get_port */
 
 static void
 chimera_mount_mountd_mnt_callback(
-    struct evpl      *evpl,
-    struct mountres3 *reply,
-    int               status,
-    void             *private_data)
+    struct evpl                 *evpl,
+    const struct evpl_rpc2_verf *verf,
+    struct mountres3            *reply,
+    int                          status,
+    void                        *private_data)
 {
     struct chimera_nfs_client_mount             *mount         = private_data;
     struct chimera_vfs_request                  *request       = mount->mount_request;
@@ -78,7 +128,6 @@ chimera_mount_mountd_mnt_callback(
 
     request->mount.r_mount_private = mount;
 
-    pthread_mutex_unlock(&shared->lock);
     mount->status = CHIMERA_NFS_CLIENT_MOUNT_STATE_MOUNTED;
     pthread_mutex_unlock(&shared->lock);
 
@@ -131,6 +180,7 @@ chimera_nfs3_mount_process_mount(
     shared->mount_v3.send_call_MOUNTPROC3_MNT(&shared->mount_v3.rpc2,
                                               server_thread->thread->evpl,
                                               server_thread->mount_conn,
+                                              NULL,
                                               &mount_arg,
                                               0, 0, 0,
                                               chimera_mount_mountd_mnt_callback, mount);
@@ -157,9 +207,10 @@ chimera_nfs3_mount_discover_callback(
 
 static void
 chimera_nfs3_mount_nfs_null_callback(
-    struct evpl *evpl,
-    int          status,
-    void        *private_data)
+    struct evpl                 *evpl,
+    const struct evpl_rpc2_verf *verf,
+    int                          status,
+    void                        *private_data)
 {
     struct chimera_nfs_client_server_thread *server_thread = private_data;
 
@@ -168,10 +219,11 @@ chimera_nfs3_mount_nfs_null_callback(
 
 static void
 chimera_portmap_getport_nfs_callback(
-    struct evpl *evpl,
-    unsigned int port,
-    int          status,
-    void        *private_data)
+    struct evpl                 *evpl,
+    const struct evpl_rpc2_verf *verf,
+    unsigned int                 port,
+    int                          status,
+    void                        *private_data)
 {
     struct chimera_nfs_client_server_thread *server_thread = private_data;
     struct chimera_nfs_client_server        *server        = server_thread->server;
@@ -194,6 +246,7 @@ chimera_portmap_getport_nfs_callback(
     shared->nfs_v3.send_call_NFSPROC3_NULL(&shared->nfs_v3.rpc2,
                                            server_thread->thread->evpl,
                                            server_thread->nfs_conn,
+                                           NULL,
                                            0, 0, 0,
                                            chimera_nfs3_mount_nfs_null_callback, server_thread);
 
@@ -202,9 +255,10 @@ chimera_portmap_getport_nfs_callback(
 
 static void
 chimera_mount_mountd_null_callback(
-    struct evpl *evpl,
-    int          status,
-    void        *private_data)
+    struct evpl                 *evpl,
+    const struct evpl_rpc2_verf *verf,
+    int                          status,
+    void                        *private_data)
 {
     struct chimera_nfs_client_server_thread *server_thread = private_data;
     struct chimera_nfs_client_server        *server        = server_thread->server;
@@ -217,25 +271,45 @@ chimera_mount_mountd_null_callback(
         return;
     }
 
-    mapping.prog = 100003;
-    mapping.vers = 3;
-    mapping.prot = 6;
-    mapping.port = 0;
+    if (server->use_rdma) {
+        /* For RDMA, skip portmap discovery and connect directly to RDMA port */
+        server->nfs_endpoint = evpl_endpoint_create(server->hostname, server->nfs_port);
 
-    shared->portmap_v2.send_call_PMAPPROC_GETPORT(&shared->portmap_v2.rpc2,
-                                                  server_thread->thread->evpl,
-                                                  server_thread->portmap_conn,
-                                                  &mapping,
-                                                  0, 0, 0,
-                                                  chimera_portmap_getport_nfs_callback, server_thread);
+        server_thread->nfs_conn = evpl_rpc2_client_connect(server_thread->thread->rpc2_thread,
+                                                           server->rdma_protocol,
+                                                           server->nfs_endpoint,
+                                                           NULL, 0, NULL);
+
+        shared->nfs_v3.send_call_NFSPROC3_NULL(&shared->nfs_v3.rpc2,
+                                               server_thread->thread->evpl,
+                                               server_thread->nfs_conn,
+                                               NULL,
+                                               0, 0, 0,
+                                               chimera_nfs3_mount_nfs_null_callback, server_thread);
+    } else {
+        /* For TCP, use portmap to discover NFS port */
+        mapping.prog = 100003;
+        mapping.vers = 3;
+        mapping.prot = 6;
+        mapping.port = 0;
+
+        shared->portmap_v2.send_call_PMAPPROC_GETPORT(&shared->portmap_v2.rpc2,
+                                                      server_thread->thread->evpl,
+                                                      server_thread->portmap_conn,
+                                                      NULL,
+                                                      &mapping,
+                                                      0, 0, 0,
+                                                      chimera_portmap_getport_nfs_callback, server_thread);
+    }
 } /* chimera_mount_mountd_null_callback */
 
 static void
 chimera_portmap_getport_mountd_callback(
-    struct evpl *evpl,
-    unsigned int port,
-    int          status,
-    void        *private_data)
+    struct evpl                 *evpl,
+    const struct evpl_rpc2_verf *verf,
+    unsigned int                 port,
+    int                          status,
+    void                        *private_data)
 {
     struct chimera_nfs_client_server_thread *server_thread = private_data;
     struct chimera_nfs_client_server        *server        = server_thread->server;
@@ -258,15 +332,17 @@ chimera_portmap_getport_mountd_callback(
     shared->mount_v3.send_call_MOUNTPROC3_NULL(&shared->mount_v3.rpc2,
                                                server_thread->thread->evpl,
                                                server_thread->mount_conn,
+                                               NULL,
                                                0, 0, 0,
                                                chimera_mount_mountd_null_callback, server_thread);
 } /* chimera_portmap_getport_mountd_callback */
 
 static void
 chimera_portmap_null_callback(
-    struct evpl *evpl,
-    int          status,
-    void        *private_data)
+    struct evpl                 *evpl,
+    const struct evpl_rpc2_verf *verf,
+    int                          status,
+    void                        *private_data)
 {
     struct chimera_nfs_client_server_thread *server_thread = private_data;
     struct chimera_nfs_client_server        *server        = server_thread->server;
@@ -287,6 +363,7 @@ chimera_portmap_null_callback(
     shared->portmap_v2.send_call_PMAPPROC_GETPORT(&shared->portmap_v2.rpc2,
                                                   server_thread->thread->evpl,
                                                   server_thread->portmap_conn,
+                                                  NULL,
                                                   &mapping,
                                                   0, 0, 0,
                                                   chimera_portmap_getport_mountd_callback, server_thread);
@@ -366,6 +443,13 @@ chimera_nfs3_mount(
         server->nfsvers = 3;
         server->shared  = shared;
 
+        /* Parse RDMA options from mount request */
+        server->rdma_protocol = chimera_nfs_mount_get_rdma_protocol(&request->mount.options);
+        server->use_rdma      = server->rdma_protocol != 0;
+        if (server->use_rdma) {
+            server->nfs_port = chimera_nfs_mount_get_port(&request->mount.options, CHIMERA_NFS_RDMA_PORT);
+        }
+
         strncpy(server->hostname, hostname, hostnamelen);
 
         shared->servers[idx] = server;
@@ -412,6 +496,7 @@ chimera_nfs3_mount(
         shared->portmap_v2.send_call_PMAPPROC_NULL(&shared->portmap_v2.rpc2,
                                                    thread->evpl,
                                                    server_thread->portmap_conn,
+                                                   NULL,
                                                    0, 0, 0,
                                                    chimera_portmap_null_callback, server_thread);
     }

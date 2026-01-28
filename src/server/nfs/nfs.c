@@ -56,13 +56,16 @@ nfs_server_init(
     int                               nfs_rdma;
     const char                       *nfs_rdma_hostname;
     int                               nfs_rdma_port;
+    int                               nfs_tcp_rdma_port;
     int                               external_portmap;
 
     nfs_rdma          = chimera_server_config_get_nfs_rdma(config);
     nfs_rdma_hostname = chimera_server_config_get_nfs_rdma_hostname(config);
     nfs_rdma_port     = chimera_server_config_get_nfs_rdma_port(config);
+    nfs_tcp_rdma_port = chimera_server_config_get_nfs_tcp_rdma_port(config);
     external_portmap  = chimera_server_config_get_external_portmap(config);
     chimera_nfs_debug("NFS RDMA: %s", nfs_rdma ? "enabled" : "disabled");
+    chimera_nfs_debug("NFS TCP-RDMA: %s (port %d)", nfs_tcp_rdma_port > 0 ? "enabled" : "disabled", nfs_tcp_rdma_port);
     chimera_nfs_debug("External Portmap: %s", external_portmap ? "enabled" : "disabled");
 
     clock_gettime(CLOCK_REALTIME, &now);
@@ -151,7 +154,12 @@ nfs_server_init(
     shared->mount_endpoint = evpl_endpoint_create("0.0.0.0", NFS_MOUNT_PORT);
     shared->nfs_endpoint   = evpl_endpoint_create("0.0.0.0", NFS_PORT);
 
-    if (nfs_rdma) {
+    if (nfs_tcp_rdma_port > 0) {
+        /* TCP-RDMA enabled - use TCP-RDMA port (hostname falls back to 0.0.0.0 if not set) */
+        const char *rdma_host = nfs_rdma_hostname ? nfs_rdma_hostname : "0.0.0.0";
+        shared->nfs_rdma_endpoint = evpl_endpoint_create(rdma_host, nfs_tcp_rdma_port);
+    } else if (nfs_rdma) {
+        /* Native RDMA enabled */
         shared->nfs_rdma_endpoint = evpl_endpoint_create(nfs_rdma_hostname, nfs_rdma_port);
     }
     if (external_portmap) {
@@ -188,11 +196,15 @@ void
 nfs_server_start(void *arg)
 {
     struct chimera_server_nfs_shared *shared = arg;
+    enum evpl_protocol_id             rdma_protocol;
 
     evpl_rpc2_server_start(shared->nfs_server, EVPL_STREAM_SOCKET_TCP, shared->nfs_endpoint);
 
     if (shared->nfs_rdma_endpoint) {
-        evpl_rpc2_server_start(shared->nfs_server, EVPL_DATAGRAM_RDMACM_RC, shared->nfs_rdma_endpoint);
+        /* Use TCP-RDMA emulation when nfs_tcp_rdma_port > 0, otherwise use native RDMA */
+        rdma_protocol = chimera_server_config_get_nfs_tcp_rdma_port(shared->config) > 0
+                        ? EVPL_DATAGRAM_TCP_RDMA : EVPL_DATAGRAM_RDMACM_RC;
+        evpl_rpc2_server_start(shared->nfs_server, rdma_protocol, shared->nfs_rdma_endpoint);
     }
 
     evpl_rpc2_server_start(shared->mount_server, EVPL_STREAM_SOCKET_TCP, shared->mount_endpoint);
@@ -252,6 +264,7 @@ nfs_server_destroy(void *data)
         LL_DELETE(shared->exports, export);
         free(export);
     }
+
     free(shared);
 } /* nfs_server_destroy */
 
@@ -266,13 +279,13 @@ chimera_nfs_server_notify(
 
     switch (notify->notify_type) {
         case EVPL_RPC2_NOTIFY_CONNECTED:
-            evpl_bind_get_local_address(conn->bind, local_addr, sizeof(local_addr));
-            evpl_bind_get_remote_address(conn->bind, remote_addr, sizeof(remote_addr));
+            evpl_rpc2_conn_get_local_address(conn, local_addr, sizeof(local_addr));
+            evpl_rpc2_conn_get_remote_address(conn, remote_addr, sizeof(remote_addr));
             chimera_nfs_info("Client connected from %s to %s", remote_addr, local_addr);
             break;
         case EVPL_RPC2_NOTIFY_DISCONNECTED:
-            evpl_bind_get_local_address(conn->bind, local_addr, sizeof(local_addr));
-            evpl_bind_get_remote_address(conn->bind, remote_addr, sizeof(remote_addr));
+            evpl_rpc2_conn_get_local_address(conn, local_addr, sizeof(local_addr));
+            evpl_rpc2_conn_get_remote_address(conn, remote_addr, sizeof(remote_addr));
             chimera_nfs_info("Client disconnected from %s to %s", remote_addr, local_addr);
             break;
     } /* switch */

@@ -2,17 +2,23 @@
 #
 # SPDX-License-Identifier: Unlicense
 
-FROM ubuntu:24.04
+ARG DOCKER_MIRROR=""
+FROM ${DOCKER_MIRROR}ubuntu:24.04
 ARG ENABLE_XLIO=1
 ARG ENABLE_DOCA=0
 ARG ENABLE_FIO=1
 ARG ENABLE_CLAUDE=1
 ARG ENABLE_UV=1
+ARG APT_MIRROR=""
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-RUN sed -i 's|archive.ubuntu.com|azure.archive.ubuntu.com|g' /etc/apt/sources.list.d/ubuntu.sources && \
-    sed -i 's|ports.ubuntu.com|azure.ports.ubuntu.com|g' /etc/apt/sources.list.d/ubuntu.sources
+RUN if [ -n "$APT_MIRROR" ]; then \
+    echo "deb $APT_MIRROR noble main universe" > /etc/apt/sources.list.d/local-mirror.list && \
+    echo "deb $APT_MIRROR noble-updates main universe" >> /etc/apt/sources.list.d/local-mirror.list && \
+    echo "deb $APT_MIRROR noble-security main universe" >> /etc/apt/sources.list.d/local-mirror.list && \
+    rm -f /etc/apt/sources.list.d/ubuntu.sources; \
+    fi
 
 RUN apt-get -y update && \
     apt-get -y --no-install-recommends upgrade && \
@@ -22,7 +28,7 @@ RUN apt-get -y update && \
     net-tools tshark tcpdump uuid-dev iproute2 man-db manpages-dev ca-certificates ssh libjansson-dev libclang-rt-18-dev llvm wget \
     libxxhash-dev liburcu-dev librdmacm-dev liburing-dev libunwind-dev librocksdb-dev libcurl4-openssl-dev clangd uthash-dev libnuma-dev \
     libcurl4-openssl-dev build-essential ruby-full autoconf automake make libtool pkg-config libs3-dev gh npm reuse libssl-dev openssl \
-    gss-ntlmssp-dev libkrb5-3 libkrb5-dev libgssapi-krb5-2 curl && \
+    gss-ntlmssp-dev libkrb5-3 libkrb5-dev libgssapi-krb5-2 curl jq && \
     gem install jekyll bundler 
 
 RUN if [ "$ENABLE_CLAUDE" = "1" ] ; then \

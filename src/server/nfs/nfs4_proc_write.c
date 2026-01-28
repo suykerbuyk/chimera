@@ -11,8 +11,6 @@ chimera_nfs4_write_complete(
     enum chimera_vfs_error    error_code,
     uint32_t                  length,
     uint32_t                  sync,
-    struct evpl_iovec        *iov,
-    int                       niov,
     struct chimera_vfs_attrs *pre_attr,
     struct chimera_vfs_attrs *post_attr,
     void                     *private_data)
@@ -48,7 +46,14 @@ chimera_nfs4_write(
 
     state = nfs4_session_get_state(session, &args->stateid);
 
-    chimera_vfs_write(thread->vfs_thread,
+    /* VFS takes ownership of write iovecs and will release them.
+     * Transfer ownership from the RPC2 message to prevent msg_free
+     * from double-releasing (args->data.iov points to msg->read_chunk.iov
+     * via XDR zerocopy).
+     */
+    evpl_rpc2_encoding_take_read_chunk(req->encoding, NULL, NULL);
+
+    chimera_vfs_write(thread->vfs_thread, &req->cred,
                       state->nfs4_state_handle,
                       args->offset,
                       args->data.length,
