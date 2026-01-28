@@ -88,6 +88,15 @@ chimera_server_config_get_nfs_rdma_port(
     const struct chimera_server_config *config);
 
 void
+chimera_server_config_set_nfs_tcp_rdma_port(
+    struct chimera_server_config *config,
+    int                           port);
+
+int
+chimera_server_config_get_nfs_tcp_rdma_port(
+    const struct chimera_server_config *config);
+
+void
 chimera_server_config_add_module(
     struct chimera_server_config *config,
     const char                   *module_name,
@@ -122,6 +131,24 @@ const struct chimera_server_config_smb_nic *
 chimera_server_config_get_smb_nic_info(
     const struct chimera_server_config *config,
     int                                 index);
+
+void
+chimera_server_config_set_anonuid(
+    struct chimera_server_config *config,
+    uint32_t                      anonuid);
+
+uint32_t
+chimera_server_config_get_anonuid(
+    const struct chimera_server_config *config);
+
+void
+chimera_server_config_set_anongid(
+    struct chimera_server_config *config,
+    uint32_t                      anongid);
+
+uint32_t
+chimera_server_config_get_anongid(
+    const struct chimera_server_config *config);
 
 static void
 chimera_server_thread_wake(

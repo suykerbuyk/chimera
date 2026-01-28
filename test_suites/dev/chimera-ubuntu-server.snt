@@ -2,7 +2,7 @@
 description install chimera on Linux server and share ext4 FS
 
 # Example:
-# sntest -b master -V PKG_TAG=main-quantum -e chimera-ubuntu-server.snt
+# sntest -b master -V PKG_TAG=develop -e chimera-ubuntu-server.snt
 
 %include ../include/variables.include
 %ifndef PKG_TAG

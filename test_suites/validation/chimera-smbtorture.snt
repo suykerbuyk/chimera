@@ -2,7 +2,7 @@
 description Run smbtorture tests against the Chimera NAS server
 
 # Example:
-# sntest -b master -V PKG_TAG=main-quantum -e vsphere -s chimera-smbtorture.snt
+# sntest -b master -V PKG_TAG=develop -e vsphere -s chimera-smbtorture.snt
 
 %include ../include/variables.include
 %ifndef PKG_TAG

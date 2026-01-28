@@ -51,7 +51,7 @@ tasks:
       builder:
         project: chimera
         task: builder_Ubuntu22
-        tag: main-quantum
+        tag: develop
 
   build_release_Ubuntu22:
     type: run_container
@@ -82,7 +82,7 @@ tasks:
       builder:
         project: chimera
         task: builder_Ubuntu22
-        tag: main-quantum
+        tag: develop
 
   syntax_Ubuntu22:
     type: run_container
@@ -95,7 +95,7 @@ tasks:
       builder:
         project: chimera
         task: builder_Ubuntu22
-        tag: main-quantum
+        tag: develop
 
   # Ubuntu 24.04 section
   # ---------------------------------------
@@ -144,7 +144,7 @@ tasks:
       builder:
         project: chimera
         task: builder_Ubuntu24
-        tag: main-quantum
+        tag: develop
 
   build_release_Ubuntu24:
     type: run_container
@@ -175,7 +175,7 @@ tasks:
       builder:
         project: chimera
         task: builder_Ubuntu24
-        tag: main-quantum
+        tag: develop
 
   syntax_Ubuntu24:
     type: run_container
@@ -188,7 +188,7 @@ tasks:
       builder:
         project: chimera
         task: builder_Ubuntu24
-        tag: main-quantum
+        tag: develop
 
   # Rocky9 section
   # ---------------------------------------
@@ -220,7 +220,7 @@ tasks:
       builder:
         project: chimera
         task: builder_Rocky9
-        tag: main-quantum
+        tag: develop
     commands:
       - mkdir -p /build /dist
       - cd /build
@@ -251,7 +251,7 @@ tasks:
       builder:
         project: chimera
         task: builder_Rocky9
-        tag: main-quantum
+        tag: develop
     commands:
       - mkdir -p /build /dist
       - cd /build
