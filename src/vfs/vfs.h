@@ -73,6 +73,10 @@ struct prometheus_metrics;
 
 #define CHIMERA_VFS_TIME_NOW             ((1l << 30) - 3l)
 
+/* FSSTAT values used with builtin backends until statvfs tracking is implemented */
+#define CHIMERA_VFS_SYNTHETIC_FS_BYTES   ((uint64_t) 100 * 1024 * 1024 * 1024)
+#define CHIMERA_VFS_SYNTHETIC_FS_INODES  (1024 * 1024)
+
 /* Flags for chimera_vfs_lookup_path */
 #define CHIMERA_VFS_LOOKUP_FOLLOW        (1U << 0) /* Follow symlinks in final component */
 
@@ -147,7 +151,8 @@ struct chimera_vfs_attrs {
 #define CHIMERA_VFS_OP_SETATTR         17
 #define CHIMERA_VFS_OP_LINK            18
 #define CHIMERA_VFS_OP_CREATE_UNLINKED 19
-#define CHIMERA_VFS_OP_NUM             20
+#define CHIMERA_VFS_OP_MKNOD           20
+#define CHIMERA_VFS_OP_NUM             21
 
 #define CHIMERA_VFS_OPEN_CREATE        (1U << 0)
 #define CHIMERA_VFS_OPEN_PATH          (1U << 1)
@@ -419,6 +424,17 @@ struct chimera_vfs_request {
             struct chimera_vfs_attrs        r_dir_pre_attr;
             struct chimera_vfs_attrs        r_dir_post_attr;
         } mkdir;
+
+        struct {
+            struct chimera_vfs_open_handle *handle;
+            const char                     *name;
+            uint32_t                        name_len;
+            uint64_t                        name_hash;
+            struct chimera_vfs_attrs       *set_attr;
+            struct chimera_vfs_attrs        r_attr;
+            struct chimera_vfs_attrs        r_dir_pre_attr;
+            struct chimera_vfs_attrs        r_dir_post_attr;
+        } mknod;
 
         struct {
             uint32_t flags;
