@@ -10,9 +10,9 @@ ARCH=$3
 
 mkdir -p /build /dist /repo
 cd /build
+echo "%_topdir /build/rpmbuild" > $HOME/.rpmmacros
 rpmdev-setuptree
-cp /dist/chimera.tar.gz /root/rpmbuild/SOURCES
-cp /context/qtm_build/chimera.service /root/rpmbuild/SOURCES
+cp /dist/chimera.tar.gz /build/rpmbuild/SOURCES
 
 sed -e "s/__VERSION__/${VERSION}/" \
     -e "s/__REVISION__/${REVISION}/" \
@@ -20,9 +20,9 @@ sed -e "s/__VERSION__/${VERSION}/" \
 rpmbuild -ba  chimera.spec
 
 # Create a repo with prereq RPM.
-cp /root/rpmbuild/RPMS/x86_64/*.rpm /repo
+cp /build/rpmbuild/RPMS/x86_64/*.rpm /repo
 dnf download xxhash-libs libunwind liburing --arch  ${ARCH} --destdir /repo
 cd /repo
 cp /packages/gssntlmssp-[0-9]*.rpm .
-tar cfz /dist/repo-chimera.tar.gz .
+tar cvfz /dist/repo-chimera.tar.gz .
 

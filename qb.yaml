@@ -31,8 +31,8 @@ tasks:
     image: builder_ubuntu22
     context: .
     commands:
-      - mkdir -p /build /dist
-      - cd /build
+      - export DESTDIR=/build/quantum-chimera-server_${VERSION}-${REVISION}_$arch
+      - mkdir -p ${DESTDIR} /dist
       - >
         cmake -G Ninja -DCMAKE_BUILD_TYPE=${BUILD_TYPE}
         -DDISABLE_TESTS=ON
@@ -42,7 +42,8 @@ tasks:
         -B /build -S /context
       - ninja -C /build
       - ninja -C /build install
-      - tar cfz /dist/chimera.tar.gz /opt/quantum/chimera
+      - cd ${DESTDIR}
+      - tar cfz /dist/chimera.tar.gz .
       - /context/qtm_build/make_debian_pkg.sh ${VERSION} ${REVISION} $arch
     assets:
       - from: /dist
@@ -62,8 +63,8 @@ tasks:
     image: builder_ubuntu22
     context: .
     commands:
-      - mkdir -p /build /dist
-      - cd /build
+      - export DESTDIR=/build/quantum-chimera-server_${VERSION}-${REVISION}_$arch
+      - mkdir -p ${DESTDIR} /dist
       - >
         cmake -G Ninja -DCMAKE_BUILD_TYPE=${BUILD_TYPE}
         -DDISABLE_TESTS=ON
@@ -73,7 +74,8 @@ tasks:
         -B /build -S /context
       - ninja -C /build
       - ninja -C /build install
-      - tar cfz /dist/chimera.tar.gz /opt/quantum/chimera
+      - cd ${DESTDIR}
+      - tar cfz /dist/chimera.tar.gz .
       - /context/qtm_build/make_debian_pkg.sh ${VERSION} ${REVISION} $arch
     assets:
       - from: /dist
@@ -124,8 +126,8 @@ tasks:
     image: builder_ubuntu24
     context: .
     commands:
-      - mkdir -p /build /dist
-      - cd /build
+      - export DESTDIR=/build/quantum-chimera-server_${VERSION}-${REVISION}_$arch
+      - mkdir -p ${DESTDIR} /dist
       - >
         cmake -G Ninja -DCMAKE_BUILD_TYPE=${BUILD_TYPE}
         -DDISABLE_TESTS=ON
@@ -135,7 +137,8 @@ tasks:
         -B /build -S /context
       - ninja -C /build
       - ninja -C /build install
-      - tar cfz /dist/chimera.tar.gz /opt/quantum/chimera
+      - cd ${DESTDIR}
+      - tar cfz /dist/chimera.tar.gz .
       - /context/qtm_build/make_debian_pkg.sh ${VERSION} ${REVISION} $arch
     assets:
       - from: /dist
@@ -155,8 +158,8 @@ tasks:
     image: builder_ubuntu24
     context: .
     commands:
-      - mkdir -p /build /dist
-      - cd /build
+      - export DESTDIR=/build/quantum-chimera-server_${VERSION}-${REVISION}_$arch
+      - mkdir -p ${DESTDIR} /dist
       - >
         cmake -G Ninja -DCMAKE_BUILD_TYPE=${BUILD_TYPE}
         -DDISABLE_TESTS=ON
@@ -166,7 +169,8 @@ tasks:
         -B /build -S /context
       - ninja -C /build
       - ninja -C /build install
-      - tar cfz /dist/chimera.tar.gz /opt/quantum/chimera
+      - cd ${DESTDIR}
+      - tar cfz /dist/chimera.tar.gz .
       - /context/qtm_build/make_debian_pkg.sh ${VERSION} ${REVISION} $arch
     assets:
       - from: /dist
@@ -222,8 +226,8 @@ tasks:
         task: builder_Rocky9
         tag: develop
     commands:
-      - mkdir -p /build /dist
-      - cd /build
+      - export DESTDIR=/build/root
+      - mkdir -p ${DESTDIR} /dist
       - >
         cmake -G Ninja -DCMAKE_BUILD_TYPE=${BUILD_TYPE}
         -DDISABLE_TESTS=ON
@@ -233,7 +237,8 @@ tasks:
         -B /build -S /context
       - ninja -C /build
       - ninja -C /build install
-      - tar cfz /dist/chimera.tar.gz /opt/quantum/chimera
+      - cd ${DESTDIR}
+      - tar cfz /dist/chimera.tar.gz .
       - /context/qtm_build/make_rpm_pkg.sh ${VERSION} ${REVISION} $xarch
     assets:
       - from: /dist
@@ -253,8 +258,8 @@ tasks:
         task: builder_Rocky9
         tag: develop
     commands:
-      - mkdir -p /build /dist
-      - cd /build
+      - export DESTDIR=/build/root
+      - mkdir -p ${DESTDIR} /dist
       - >
         cmake -G Ninja -DCMAKE_BUILD_TYPE=${BUILD_TYPE}
         -DDISABLE_TESTS=ON
@@ -264,7 +269,8 @@ tasks:
         -B /build -S /context
       - ninja -C /build
       - ninja -C /build install
-      - tar cfz /dist/chimera.tar.gz /opt/quantum/chimera
+      - cd ${DESTDIR}
+      - tar cfz /dist/chimera.tar.gz .
       - /context/qtm_build/make_rpm_pkg.sh ${VERSION} ${REVISION} $xarch
     assets:
       - from: /dist
