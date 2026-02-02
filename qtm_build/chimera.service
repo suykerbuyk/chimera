@@ -9,11 +9,7 @@ Type=simple
 
 # If you need a specific working directory:
 WorkingDirectory=/opt/quantum/chimera
-
 EnvironmentFile=-/etc/default/chimera
-
-# Environment variables (optional);
-Environment="NTLM_USER_FILE=/etc/chimera/ntlm.txt"
 
 # The actual command
 ExecStart=/opt/quantum/chimera/sbin/chimera $OPTIONS

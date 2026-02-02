@@ -9,14 +9,13 @@ Vendor: Quantum Corporation
 URL: http://www.quantum.com/
 
 Source0: chimera.tar.gz
-Source1: chimera.service
 
 Requires: redhat-release >= 9
 Requires: redhat-release < 10
 Requires: xxhash-libs
 Requires: libunwind
 Requires: liburing
-Requires: gssntlmssp
+Requires: gssntlmssp >= 1.3.1
 
 %description
 Quantum build of the Chimera NAS server for
@@ -30,15 +29,13 @@ the StorNext Filesystem (SNFS)
 rm -rf %{buildroot}
 mkdir -p %{buildroot}
 tar -xzf %{SOURCE0} -C %{buildroot}
-mkdir -p %{buildroot}/etc/systemd/system
-cp %{SOURCE1} %{buildroot}/etc/systemd/system
+mkdir -p %{buildroot}/etc/ld.so.conf.d/
+echo "/opt/quantum/chimera/lib" > %{buildroot}/etc/ld.so.conf.d/chimera.conf
 
 
 %post
 %systemd_post chimera.service
-mkdir -p /etc/chimera
 ln -s -f /opt/quantum/chimera/etc/chimera.json /etc/chimera
-echo "/opt/quantum/chimera/lib" > /etc/ld.so.conf.d/chimera.conf
 ldconfig
 exit 0
 
@@ -48,8 +45,12 @@ exit 0
 
 %files
 %defattr(-,root,root)
+/usr/lib/systemd/system/chimera.service
+/etc/ld.so.conf.d/chimera.conf
+%dir /etc/chimera
+%config(noreplace) /etc/default/chimera
+%config(noreplace) /etc/chimera/suppressions.txt
 %dir /opt/quantum/chimera
-/etc/systemd/system/chimera.service
 /opt/quantum/chimera/bin
 /opt/quantum/chimera/include
 /opt/quantum/chimera/lib
@@ -57,4 +58,3 @@ exit 0
 %doc /opt/quantum/chimera/share/*
 %config(noreplace) /opt/quantum/chimera/etc/chimera.json
 %ghost /etc/chimera/chimera.json
-%ghost /etc/ld.so.conf.d/chimera.conf

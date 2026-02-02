@@ -1,0 +1,12 @@
+#
+# Default config for Chimera services
+#
+#
+# command arguments
+OPTIONS="-c /etc/chimera/chimera.json"
+
+# SMB user table
+NTLM_USER_FILE=/etc/chimera/ntlm.txt
+
+# Debuging attribute
+LSAN_OPTIONS=suppressions=/etc/chimera/suppressions.txt
