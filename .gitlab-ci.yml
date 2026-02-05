@@ -10,7 +10,13 @@ variables:
 stages:
   - builders
   - build
+  - check
   - publish
+
+chimera-dev:
+  stage: builders
+  script:
+    - ${RUN_QB} chimera-dev
 
 builder_Ubuntu24:
   stage: builders
@@ -57,15 +63,29 @@ build_release_Rocky9:
   script:
     - ${RUN_QB} build_release_Rocky9
 
-syntax_Ubuntu22:
-  stage: build
+syntax:
+  stage: check
+  needs: [ chimera-dev ]
   script:
-    - ${RUN_QB} syntax_Ubuntu22
+    - ${RUN_QB} syntax
 
-syntax_Ubuntu24:
-  stage: build
+static_analysis:
+  stage: check
+  needs: [ chimera-dev ]
   script:
-    - ${RUN_QB} syntax_Ubuntu24
+    - ${RUN_QB} static_analysis
+
+ctest_release:
+  stage: check
+  needs: [ chimera-dev ]
+  script:
+  - ${RUN_QB} -v ctest_release
+
+ctest_debug:
+  stage: check
+  needs: [ chimera-dev ]
+  script:
+  - ${RUN_QB} -v ctest_debug
 
 release:
   stage: publish
@@ -90,6 +110,9 @@ dev_branch:
       -U $publish_username -P $publish_password -I $publish_docker_source -O $publish_docker_dest_development
     - >-
       ./qb/copy_image -p ${QB_PROJECT}/builder_rocky9 -o ${QB_TAG} -n ${CI_COMMIT_REF_SLUG}
+      -U $publish_username -P $publish_password -I $publish_docker_source -O $publish_docker_dest_development
+    - >-
+      ./qb/copy_image -p ${QB_PROJECT}/chimera-dev -o ${QB_TAG} -n ${CI_COMMIT_REF_SLUG}
       -U $publish_username -P $publish_password -I $publish_docker_source -O $publish_docker_dest_development
     - >-
       ./qb/copy_assets --remove -p ${QB_PROJECT} -o ${QB_TAG} --out_revision ${CI_PIPELINE_IID} -n ${CI_COMMIT_BRANCH}

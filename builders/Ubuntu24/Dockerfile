@@ -1,6 +1,4 @@
-# TODO: fix internal repo to allow arm build
-# FROM repository.mdh.quantum.com/ubuntu:24.04 AS build
-FROM ubuntu:24.04 AS build
+FROM repository.mdh.quantum.com/ubuntu:24.04
 ARG BUILD_TYPE=Release
 ENV DEBIAN_FRONTEND noninteractive
 

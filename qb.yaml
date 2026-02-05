@@ -86,19 +86,6 @@ tasks:
         task: builder_Ubuntu22
         tag: develop
 
-  syntax_Ubuntu22:
-    type: run_container
-    image: builder_ubuntu22
-    context: .
-    commands:
-      - cd /context
-      - make syntax-check < /dev/null
-    dependencies:
-      builder:
-        project: chimera
-        task: builder_Ubuntu22
-        tag: develop
-
   # Ubuntu 24.04 section
   # ---------------------------------------
   builder_Ubuntu24:
@@ -175,19 +162,6 @@ tasks:
     assets:
       - from: /dist
         to: ${ASSET_DST}
-    dependencies:
-      builder:
-        project: chimera
-        task: builder_Ubuntu24
-        tag: develop
-
-  syntax_Ubuntu24:
-    type: run_container
-    image: builder_ubuntu24
-    context: .
-    commands:
-      - cd /context
-      - make syntax-check < /dev/null
     dependencies:
       builder:
         project: chimera
@@ -276,6 +250,78 @@ tasks:
       - from: /dist
         to: ${ASSET_DST}
 
+  # Code check
+  # ---------------------------------------
+  # Chimera-dev container
+  chimera-dev:
+    type: build_container
+    architecture: [ amd64, arm64 ]
+    dockerfile: .devcontainer/Dockerfile
+    registry_path: chimera-dev
+    context: .devcontainer/
+    build_args:
+      DOCKER_MIRROR: repository.mdh.quantum.com/
+      APT_MIRROR: http://repository.mdh.quantum.com/repository/pkgs/ubuntu
+
+  syntax:
+    type: run_container
+    image: chimera-dev
+    context: .
+    commands:
+      - cd /context
+      - make syntax-check < /dev/null
+    dependencies:
+      builder:
+        project: chimera
+        task: chimera-dev
+        tag: develop
+
+  ctest_release:
+    type: run_container
+    image: chimera-dev
+    context: .
+    empty_dir:
+      - /build
+    privileged: true
+    commands:
+      - cd /context
+      - make test_release < /dev/null
+    dependencies:
+      builder:
+        project: chimera
+        task: chimera-dev
+        tag: develop
+
+  ctest_debug:
+    type: run_container
+    image: chimera-dev
+    context: .
+    empty_dir:
+      - /build
+    privileged: true
+    commands:
+      - cd /context
+      - make test_debug < /dev/null
+    dependencies:
+      builder:
+        project: chimera
+        task: chimera-dev
+        tag: develop
+
+  static_analysis:
+    type: run_container
+    image: chimera-dev
+    context: .
+    commands:
+      - cd /context
+      - make build_clang_release < /dev/null
+    dependencies:
+      builder:
+        project: chimera
+        task: chimera-dev
+        tag: develop
+
+
 # Alias section
 aliases:
   builders:
@@ -285,10 +331,8 @@ aliases:
   build:
     - build_debug_Ubuntu22
     - build_release_Ubuntu22
-    - syntax_Ubuntu22
     - build_debug_Ubuntu24
     - build_release_Ubuntu24
-    - syntax_Ubuntu24
     - build_debug_Rocky9
     - build_release_Rocky9
   ubuntu22:
@@ -303,6 +347,11 @@ aliases:
     - builder_Rocky9
     - build_debug_Rocky9
     - build_release_Rocky9
+  check:
+    - chimera-dev
+    - static_analysis
+    - syntax
   chimera:
     - builders
     - build
+    - check
