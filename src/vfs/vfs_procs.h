@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2025 Chimera-NAS Project Contributors
+// SPDX-FileCopyrightText: 2025-2026 Chimera-NAS Project Contributors
 //
 // SPDX-License-Identifier: LGPL-2.1-only
 
@@ -137,6 +137,7 @@ chimera_vfs_readdir(
     uint64_t                        attr_mask,
     uint64_t                        dir_attr_mask,
     uint64_t                        cookie,
+    uint64_t                        verifier,
     uint32_t                        flags,
     chimera_vfs_readdir_callback_t  callback,
     chimera_vfs_readdir_complete_t  complete,
@@ -377,8 +378,12 @@ chimera_vfs_readlink(
     void                           *private_data);
 
 typedef void (*chimera_vfs_rename_callback_t)(
-    enum chimera_vfs_error error_code,
-    void                  *private_data);
+    enum chimera_vfs_error    error_code,
+    struct chimera_vfs_attrs *fromdir_pre_attr,
+    struct chimera_vfs_attrs *fromdir_post_attr,
+    struct chimera_vfs_attrs *todir_pre_attr,
+    struct chimera_vfs_attrs *todir_post_attr,
+    void                     *private_data);
 
 void
 chimera_vfs_rename(
@@ -394,12 +399,17 @@ chimera_vfs_rename(
     int                            new_namelen,
     const uint8_t                 *target_fh,
     int                            target_fh_len,
+    uint64_t                       pre_attr_mask,
+    uint64_t                       post_attr_mask,
     chimera_vfs_rename_callback_t  callback,
     void                          *private_data);
 
 typedef void (*chimera_vfs_link_callback_t)(
-    enum chimera_vfs_error error_code,
-    void                  *private_data);
+    enum chimera_vfs_error    error_code,
+    struct chimera_vfs_attrs *r_attr,
+    struct chimera_vfs_attrs *r_dir_pre_attr,
+    struct chimera_vfs_attrs *r_dir_post_attr,
+    void                     *private_data);
 
 void
 chimera_vfs_link(

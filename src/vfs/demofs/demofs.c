@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2025 Chimera-NAS Project Contributors
+// SPDX-FileCopyrightText: 2025-2026 Chimera-NAS Project Contributors
 //
 // SPDX-License-Identifier: LGPL-2.1-only
 
@@ -583,9 +583,9 @@ demofs_init(const char *cfgfile)
     json_error_t                json_error;
 
 
-    cfg = json_load_file(cfgfile, 0, &json_error);
+    cfg = json_loads(cfgfile, 0, &json_error);
 
-    chimera_demofs_abort_if(cfg == NULL, "Error parsing JSON: %s", json_error.text);
+    chimera_demofs_abort_if(cfg == NULL, "Error parsing config: %s", json_error.text);
 
     devices_cfg = json_object_get(cfg, "devices");
 
@@ -2236,9 +2236,9 @@ demofs_write_phase2(
         }
     }
 
-    // Add write data
+    // Add write data - clone to local array (caller retains ownership and releases).
     for (int i = 0; i < request->write.niov; i++) {
-        evpl_iovec_move(&write_iov[write_niov], &request->write.iov[i]);
+        evpl_iovec_clone(&write_iov[write_niov], &request->write.iov[i]);
         write_niov++;
     }
 
@@ -2871,6 +2871,9 @@ demofs_rename(
         }
     }
 
+    demofs_map_attrs(thread, &request->rename.r_fromdir_pre_attr, old_parent_inode);
+    demofs_map_attrs(thread, &request->rename.r_todir_pre_attr, new_parent_inode);
+
     rb_tree_query_exact(&old_parent_inode->dir.dirents, hash, hash, old_dirent);
 
     if (!old_dirent) {
@@ -2903,6 +2906,8 @@ demofs_rename(
         if (existing_dirent->inum == old_dirent->inum &&
             existing_dirent->gen == old_dirent->gen) {
             /* Same inode - do nothing, just return success */
+            demofs_map_attrs(thread, &request->rename.r_fromdir_post_attr, old_parent_inode);
+            demofs_map_attrs(thread, &request->rename.r_todir_post_attr, new_parent_inode);
             pthread_mutex_unlock(&child_inode->lock);
             if (cmp != 0) {
                 pthread_mutex_unlock(&old_parent_inode->lock);
@@ -2977,6 +2982,9 @@ demofs_rename(
     old_parent_inode->ctime_nsec = now.tv_nsec;
     new_parent_inode->mtime_sec  = now.tv_sec;
     new_parent_inode->mtime_nsec = now.tv_nsec;
+
+    demofs_map_attrs(thread, &request->rename.r_fromdir_post_attr, old_parent_inode);
+    demofs_map_attrs(thread, &request->rename.r_todir_post_attr, new_parent_inode);
 
     if (cmp != 0) {
         pthread_mutex_unlock(&old_parent_inode->lock);

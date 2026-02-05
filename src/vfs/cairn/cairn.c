@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2025 Chimera-NAS Project Contributors
+// SPDX-FileCopyrightText: 2025-2026 Chimera-NAS Project Contributors
 //
 // SPDX-License-Identifier: LGPL-2.1-only
 
@@ -539,9 +539,9 @@ cairn_init(const char *cfgfile)
     int                    compression  = 1; // Default to enabled
     int                    bloom_filter = 1; // Default to enabled
 
-    cfg = json_load_file(cfgfile, 0, &json_error);
+    cfg = json_loads(cfgfile, 0, &json_error);
 
-    chimera_cairn_abort_if(!cfg, "Failed to load config file: %s\n", json_error.text);
+    chimera_cairn_abort_if(!cfg, "Failed to parse config: %s\n", json_error.text);
 
     db_path = json_string_value(json_object_get(cfg, "path"));
 
@@ -2035,7 +2035,7 @@ cairn_read(
         eof    = 1;
     }
 
-    request->read.r_niov = evpl_iovec_alloc(thread->evpl, length, 4096, 1, 0, request->read.iov);
+    request->read.r_niov = evpl_iovec_alloc(thread->evpl, length, 4096, 1, EVPL_IOVEC_FLAG_SHARED, request->read.iov);
     iov                  = request->read.iov;
 
     start_key.keytype = CAIRN_KEY_EXTENT;
@@ -2288,7 +2288,10 @@ cairn_write(
     rc = cairn_inode_get_fh(thread, txn, request->fh, request->fh_len, 1, &ih);
 
     if (rc) {
-        evpl_iovecs_release(thread->evpl, request->write.iov, request->write.niov);
+        /* Note: Write iovecs are NOT released here. They were allocated on the
+         * server thread and must be released there. The server's write completion
+         * callback handles the release after this request completes via doorbell.
+         */
         request->status = CHIMERA_VFS_ENOENT;
         request->complete(request);
         return;
@@ -2343,7 +2346,10 @@ cairn_write(
     request->write.r_length = request->write.length;
     request->write.r_sync   = 1;
 
-    evpl_iovecs_release(thread->evpl, request->write.iov, request->write.niov);
+    /* Note: Write iovecs are NOT released here. They were allocated on the
+     * server thread and must be released there. The server's write completion
+     * callback handles the release after this request completes via doorbell.
+     */
 
     DL_APPEND(thread->txn_requests, request);
 } /* cairn_write */

@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2025 Chimera-NAS Project Contributors
+// SPDX-FileCopyrightText: 2025-2026 Chimera-NAS Project Contributors
 //
 // SPDX-License-Identifier: LGPL-2.1-only
 
@@ -820,7 +820,7 @@ memfs_setattr(
 
                 new_block->niov = evpl_iovec_alloc(evpl, 4096, 4096,
                                                    CHIMERA_MEMFS_BLOCK_MAX_IOV,
-                                                   0, new_block->iov);
+                                                   EVPL_IOVEC_FLAG_SHARED, new_block->iov);
 
                 /* Copy the retained portion from the old block */
                 evpl_iovec_cursor_init(&old_cursor, old_block->iov,
@@ -1950,7 +1950,6 @@ memfs_write(
 
         if (!new_blocks) {
             pthread_mutex_unlock(&inode->lock);
-            evpl_iovecs_release(evpl, request->write.iov, request->write.niov);
             request->status = CHIMERA_VFS_ENOSPC;
             request->complete(request);
             return;
@@ -1990,7 +1989,6 @@ memfs_write(
 
         if (!block) {
             pthread_mutex_unlock(&inode->lock);
-            evpl_iovecs_release(evpl, request->write.iov, request->write.niov);
             request->status = CHIMERA_VFS_ENOSPC;
             request->complete(request);
             return;
@@ -2052,8 +2050,6 @@ memfs_write(
     memfs_map_attrs(shared, &request->write.r_post_attr, inode, request->fh);
 
     pthread_mutex_unlock(&inode->lock);
-
-    evpl_iovecs_release(evpl, request->write.iov, request->write.niov);
 
     request->status         = CHIMERA_VFS_OK;
     request->write.r_length = request->write.length;
@@ -2282,6 +2278,9 @@ memfs_rename(
         }
     }
 
+    memfs_map_attrs(shared, &request->rename.r_fromdir_pre_attr, old_parent_inode, request->fh);
+    memfs_map_attrs(shared, &request->rename.r_todir_pre_attr, new_parent_inode, request->rename.new_fh);
+
     rb_tree_query_exact(&old_parent_inode->dir.dirents, hash, hash, old_dirent);
 
     if (!old_dirent) {
@@ -2316,6 +2315,8 @@ memfs_rename(
         if (existing_dirent->inum == old_dirent->inum &&
             existing_dirent->gen == old_dirent->gen) {
             /* Same inode - do nothing, just return success */
+            memfs_map_attrs(shared, &request->rename.r_fromdir_post_attr, old_parent_inode, request->fh);
+            memfs_map_attrs(shared, &request->rename.r_todir_post_attr, new_parent_inode, request->rename.new_fh);
             pthread_mutex_unlock(&child_inode->lock);
             if (cmp != 0) {
                 pthread_mutex_unlock(&old_parent_inode->lock);
@@ -2388,6 +2389,9 @@ memfs_rename(
 
     old_parent_inode->ctime = now;
     new_parent_inode->mtime = now;
+
+    memfs_map_attrs(shared, &request->rename.r_fromdir_post_attr, old_parent_inode, request->fh);
+    memfs_map_attrs(shared, &request->rename.r_todir_post_attr, new_parent_inode, request->rename.new_fh);
 
     pthread_mutex_unlock(&child_inode->lock);
 
