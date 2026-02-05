@@ -1,12 +1,15 @@
-// SPDX-FileCopyrightText: 2025 Chimera-NAS Project Contributors
+// SPDX-FileCopyrightText: 2025-2026 Chimera-NAS Project Contributors
 //
 // SPDX-License-Identifier: LGPL-2.1-only
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <sys/resource.h>
 #include <pthread.h>
 #include <unistd.h>
 #include <utlist.h>
+
+#include <jansson.h>
 
 #include "client.h"
 #include "client_internal.h"
@@ -28,26 +31,26 @@ chimera_client_config_init(void)
     config->max_fds            = 1024;
 
     strncpy(config->modules[0].module_name, "root", sizeof(config->modules[0].module_name));
-    config->modules[0].config_path[0] = '\0';
+    config->modules[0].config_data[0] = '\0';
     config->modules[0].module_path[0] = '\0';
 
     strncpy(config->modules[1].module_name, "nfs", sizeof(config->modules[1].module_name));
-    config->modules[1].config_path[0] = '\0';
+    config->modules[1].config_data[0] = '\0';
     config->modules[1].module_path[0] = '\0';
 
     strncpy(config->modules[2].module_name, "memfs", sizeof(config->modules[2].module_name));
-    config->modules[2].config_path[0] = '\0';
+    config->modules[2].config_data[0] = '\0';
     config->modules[2].module_path[0] = '\0';
 
     strncpy(config->modules[3].module_name, "linux", sizeof(config->modules[3].module_name));
-    config->modules[3].config_path[0] = '\0';
+    config->modules[3].config_data[0] = '\0';
     config->modules[3].module_path[0] = '\0';
 
     config->num_modules = 4;
 
 #ifdef HAVE_IO_URING
     strncpy(config->modules[4].module_name, "io_uring", sizeof(config->modules[4].module_name));
-    config->modules[4].config_path[0] = '\0';
+    config->modules[4].config_data[0] = '\0';
     config->modules[4].module_path[0] = '\0';
 
     config->num_modules = 5;
@@ -62,7 +65,7 @@ chimera_client_config_add_module(
     struct chimera_client_config *config,
     const char                   *module_name,
     const char                   *module_path,
-    const char                   *config_path)
+    const char                   *config_data)
 {
     struct chimera_vfs_module_cfg *module_cfg;
 
@@ -70,7 +73,7 @@ chimera_client_config_add_module(
 
     strncpy(module_cfg->module_name, module_name, sizeof(module_cfg->module_name));
     strncpy(module_cfg->module_path, module_path, sizeof(module_cfg->module_path));
-    strncpy(module_cfg->config_path, config_path, sizeof(module_cfg->config_path));
+    strncpy(module_cfg->config_data, config_data, sizeof(module_cfg->config_data));
 
     config->num_modules++;
 } /* chimera_client_config_add_module */
@@ -147,6 +150,139 @@ chimera_client_init(
 
     return client;
 } /* chimera_client_init */
+
+SYMBOL_EXPORT int
+chimera_client_add_user(
+    struct chimera_client *client,
+    const char            *username,
+    const char            *password,
+    const char            *smbpasswd,
+    uint32_t               uid,
+    uint32_t               gid,
+    uint32_t               ngids,
+    const uint32_t        *gids,
+    int                    pinned)
+{
+    return chimera_vfs_add_user(client->vfs, username, password, smbpasswd,
+                                uid, gid, ngids, gids, pinned);
+} /* chimera_client_add_user */
+
+SYMBOL_EXPORT struct chimera_client *
+chimera_client_init_json(
+    const char                    *config_path,
+    const struct chimera_vfs_cred *cred,
+    struct prometheus_metrics     *metrics)
+{
+    struct chimera_client_config *config;
+    struct chimera_client        *client;
+    json_t                       *root, *config_section, *vfs_modules, *users;
+    json_error_t                  error;
+
+    config = chimera_client_config_init();
+
+    if (!config) {
+        return NULL;
+    }
+
+    root = json_load_file(config_path, 0, &error);
+
+    if (!root) {
+        fprintf(stderr, "Failed to load client config: %s\n", error.text);
+        free(config);
+        return NULL;
+    }
+
+    config_section = json_object_get(root, "config");
+
+    if (config_section && json_is_object(config_section)) {
+        json_t *val;
+
+        val = json_object_get(config_section, "core_threads");
+        if (val && json_is_integer(val)) {
+            config->core_threads = json_integer_value(val);
+        }
+
+        val = json_object_get(config_section, "delegation_threads");
+        if (val && json_is_integer(val)) {
+            config->delegation_threads = json_integer_value(val);
+        }
+
+        val = json_object_get(config_section, "cache_ttl");
+        if (val && json_is_integer(val)) {
+            config->cache_ttl = json_integer_value(val);
+        }
+
+        val = json_object_get(config_section, "max_fds");
+        if (val && json_is_integer(val)) {
+            config->max_fds = json_integer_value(val);
+        }
+
+        vfs_modules = json_object_get(config_section, "vfs");
+        if (vfs_modules && json_is_object(vfs_modules)) {
+            const char *module_name;
+            json_t     *module;
+            json_object_foreach(vfs_modules, module_name, module)
+            {
+                const char *path       = json_string_value(json_object_get(module, "path"));
+                const char *mod_config = json_string_value(json_object_get(module, "config"));
+
+                chimera_client_config_add_module(config, module_name,
+                                                 path ? path : "",
+                                                 mod_config ? mod_config : "");
+            }
+        }
+    }
+
+    client = chimera_client_init(config, cred, metrics);
+
+    if (!client) {
+        free(config);
+        json_decref(root);
+        return NULL;
+    }
+
+    users = json_object_get(root, "users");
+    if (users && json_is_array(users)) {
+        json_t *user_entry;
+        size_t  user_idx;
+
+        json_array_foreach(users, user_idx, user_entry)
+        {
+            const char *username  = json_string_value(json_object_get(user_entry, "username"));
+            const char *password  = json_string_value(json_object_get(user_entry, "password"));
+            const char *smbpasswd = json_string_value(json_object_get(user_entry, "smbpasswd"));
+            int         u_uid     = json_integer_value(json_object_get(user_entry, "uid"));
+            int         u_gid     = json_integer_value(json_object_get(user_entry, "gid"));
+            uint32_t    user_gids[CHIMERA_VFS_CRED_MAX_GIDS];
+            uint32_t    ngids      = 0;
+            json_t     *gids_array = json_object_get(user_entry, "gids");
+
+            if (gids_array && json_is_array(gids_array)) {
+                json_t *gid_val;
+                size_t  gid_idx;
+                json_array_foreach(gids_array, gid_idx, gid_val)
+                {
+                    if (ngids < CHIMERA_VFS_CRED_MAX_GIDS) {
+                        user_gids[ngids++] = json_integer_value(gid_val);
+                    }
+                }
+            }
+
+            if (!username) {
+                continue;
+            }
+
+            chimera_client_add_user(client, username,
+                                    password ? password : "",
+                                    smbpasswd ? smbpasswd : "",
+                                    u_uid, u_gid, ngids, user_gids, 1);
+        }
+    }
+
+    json_decref(root);
+
+    return client;
+} /* chimera_client_init_json */
 
 SYMBOL_EXPORT void
 chimera_destroy(struct chimera_client *client)

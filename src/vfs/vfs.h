@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2025 Chimera-NAS Project Contributors
+// SPDX-FileCopyrightText: 2025-2026 Chimera-NAS Project Contributors
 //
 // SPDX-License-Identifier: LGPL-2.1-only
 
@@ -19,6 +19,8 @@
 struct evpl;
 
 struct chimera_vfs;
+struct chimera_vfs_user;
+struct chimera_vfs_user_cache;
 struct prometheus_metrics;
 
 #define CHIMERA_VFS_ATTR_DEV             (1UL << 0)
@@ -181,6 +183,10 @@ struct chimera_vfs_thread_metrics {
 #define CHIMERA_VFS_OPEN_HANDLE_EXCLUSIVE 0x1
 #define CHIMERA_VFS_OPEN_HANDLE_PENDING   0x2
 #define CHIMERA_VFS_OPEN_HANDLE_FILE_ID   0x4
+#define CHIMERA_VFS_OPEN_HANDLE_DETACHED  0x8
+
+#define CHIMERA_VFS_ACCESS_MODE_RW        0
+#define CHIMERA_VFS_ACCESS_MODE_RO        1
 
 struct chimera_vfs_open_handle {
     struct chimera_vfs_module      *vfs_module;
@@ -188,6 +194,7 @@ struct chimera_vfs_open_handle {
     uint16_t                        fh_len;
     uint8_t                         cache_id;
     uint8_t                         flags;
+    uint8_t                         access_mode;
     uint32_t                        opencnt;
     struct chimera_vfs_request     *blocked_requests;
     uint64_t                        vfs_private;
@@ -196,7 +203,8 @@ struct chimera_vfs_open_handle {
         struct chimera_vfs_open_handle *handle);
     struct chimera_vfs_request     *request;
     struct timespec                 timestamp;
-    struct UT_hash_handle           hh_by_fh;
+    struct chimera_vfs_open_handle *bucket_next;
+    struct chimera_vfs_open_handle *bucket_prev;
     struct chimera_vfs_open_handle *prev;
     struct chimera_vfs_open_handle *next;
     uint8_t                         fh[CHIMERA_VFS_FH_SIZE + 16];
@@ -229,6 +237,7 @@ typedef void (*chimera_vfs_readdir_complete_t)(
     enum chimera_vfs_error          error_code,
     struct chimera_vfs_open_handle *handle,
     uint64_t                        cookie,
+    uint64_t                        verifier,
     uint32_t                        eof,
     struct chimera_vfs_attrs       *attr,
     void                           *private_data);
@@ -401,9 +410,11 @@ struct chimera_vfs_request {
         struct {
             struct chimera_vfs_open_handle *handle;
             uint64_t                        cookie;
+            uint64_t                        verifier;
             uint64_t                        attr_mask;
             uint32_t                        flags;
             uint64_t                        r_cookie;
+            uint64_t                        r_verifier;
             uint32_t                        r_eof;
             struct chimera_vfs_attrs        r_dir_attr;
             chimera_vfs_readdir_callback_t  callback;
@@ -532,17 +543,21 @@ struct chimera_vfs_request {
         } readlink;
 
         struct {
-            const char    *name;
-            int            namelen;
-            uint64_t       name_hash;
-            uint64_t       new_fh_hash;
-            const void    *new_fh;
-            int            new_fhlen;
-            uint64_t       new_name_hash;
-            const char    *new_name;
-            int            new_namelen;
-            const uint8_t *target_fh;     /* Optional: target FH if known (for silly rename) */
-            int            target_fh_len; /* 0 if target_fh not provided */
+            const char              *name;
+            int                      namelen;
+            uint64_t                 name_hash;
+            uint64_t                 new_fh_hash;
+            const void              *new_fh;
+            int                      new_fhlen;
+            uint64_t                 new_name_hash;
+            const char              *new_name;
+            int                      new_namelen;
+            const uint8_t           *target_fh; /* Optional: target FH if known (for silly rename) */
+            int                      target_fh_len; /* 0 if target_fh not provided */
+            struct chimera_vfs_attrs r_fromdir_pre_attr;
+            struct chimera_vfs_attrs r_fromdir_post_attr;
+            struct chimera_vfs_attrs r_todir_pre_attr;
+            struct chimera_vfs_attrs r_todir_post_attr;
         } rename;
 
         struct {
@@ -769,6 +784,7 @@ struct chimera_vfs {
     struct vfs_open_cache                *vfs_open_file_cache;
     struct chimera_vfs_name_cache        *vfs_name_cache;
     struct chimera_vfs_attr_cache        *vfs_attr_cache;
+    struct chimera_vfs_user_cache        *vfs_user_cache;
     struct chimera_vfs_mount_table       *mount_table;
     int                                   num_delegation_threads;
     struct chimera_vfs_delegation_thread *delegation_threads;
@@ -800,7 +816,7 @@ struct chimera_vfs_thread {
 struct chimera_vfs_module_cfg {
     char module_name[64];
     char module_path[256];
-    char config_path[256];
+    char config_data[4096];
 };
 
 struct chimera_vfs *
@@ -840,6 +856,34 @@ void
 chimera_vfs_thread_drain(
     struct chimera_vfs_thread *thread);
 
+
+int
+chimera_vfs_add_user(
+    struct chimera_vfs *vfs,
+    const char         *username,
+    const char         *password,
+    const char         *smbpasswd,
+    uint32_t            uid,
+    uint32_t            gid,
+    uint32_t            ngids,
+    const uint32_t     *gids,
+    int                 pinned);
+
+int
+chimera_vfs_remove_user(
+    struct chimera_vfs *vfs,
+    const char         *username);
+
+const struct chimera_vfs_user *
+chimera_vfs_lookup_user_by_name(
+    struct chimera_vfs *vfs,
+    const char         *username);
+
+int
+chimera_vfs_user_is_member(
+    struct chimera_vfs *vfs,
+    uint32_t            uid,
+    uint32_t            gid);
 void
 chimera_vfs_watchdog(
     struct chimera_vfs_thread *thread);
