@@ -278,6 +278,7 @@ tasks:
 
   ctest_release:
     type: run_container
+    architecture: [ amd64, arm64 ]
     image: chimera-dev
     context: .
     empty_dir:
@@ -294,6 +295,7 @@ tasks:
 
   ctest_debug:
     type: run_container
+    architecture: [ amd64, arm64 ]
     image: chimera-dev
     context: .
     empty_dir:
@@ -308,13 +310,28 @@ tasks:
         task: chimera-dev
         tag: develop
 
-  static_analysis:
+  static_analysis_release:
     type: run_container
+    architecture: [ amd64, arm64 ]
     image: chimera-dev
     context: .
     commands:
       - cd /context
       - make build_clang_release < /dev/null
+    dependencies:
+      builder:
+        project: chimera
+        task: chimera-dev
+        tag: develop
+
+  static_analysis_debug:
+    type: run_container
+    architecture: [ amd64, arm64 ]
+    image: chimera-dev
+    context: .
+    commands:
+      - cd /context
+      - make build_clang_debug < /dev/null
     dependencies:
       builder:
         project: chimera
@@ -349,7 +366,10 @@ aliases:
     - build_release_Rocky9
   check:
     - chimera-dev
-    - static_analysis
+    - ctest_debug
+    - ctest_release
+    - static_analysis_debug
+    - static_analysis_release
     - syntax
   chimera:
     - builders

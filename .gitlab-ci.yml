@@ -69,23 +69,29 @@ syntax:
   script:
     - ${RUN_QB} syntax
 
-static_analysis:
+static_analysis_release:
   stage: check
   needs: [ chimera-dev ]
   script:
-    - ${RUN_QB} static_analysis
+    - ${RUN_QB} static_analysis_release
+
+static_analysis_debug:
+  stage: check
+  needs: [ chimera-dev ]
+  script:
+    - ${RUN_QB} static_analysis_debug
 
 ctest_release:
   stage: check
   needs: [ chimera-dev ]
   script:
-  - ${RUN_QB} -v ctest_release
+  - ${RUN_QB} ctest_release
 
 ctest_debug:
   stage: check
   needs: [ chimera-dev ]
   script:
-  - ${RUN_QB} -v ctest_debug
+  - ${RUN_QB} ctest_debug
 
 release:
   stage: publish
