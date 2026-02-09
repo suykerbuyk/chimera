@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2025 Chimera-NAS Project Contributors
+// SPDX-FileCopyrightText: 2025-2026 Chimera-NAS Project Contributors
 //
 // SPDX-License-Identifier: LGPL-2.1-only
 
@@ -17,6 +17,7 @@
 #include "nfs_portmap.h"
 #include "nfs_common.h"
 #include "nfs_internal.h"
+#include "nfs4_session.h"
 #include "prometheus-c.h"
 #include "nfs_external_portmap.h"
 
@@ -237,6 +238,23 @@ nfs_server_destroy(void *data)
 {
     struct chimera_server_nfs_shared *shared = data;
     struct chimera_nfs_export        *export;
+    struct evpl                      *evpl;
+    struct chimera_vfs_thread        *vfs_thread;
+
+    /* Create a temporary evpl and VFS thread for releasing handles */
+    evpl       = evpl_create(NULL);
+    vfs_thread = chimera_vfs_thread_init(evpl, shared->vfs);
+
+    /* Release all open handles from NFS4 sessions */
+    nfs4_client_table_release_handles(&shared->nfs4_shared_clients, vfs_thread);
+
+    /* Drain all in-flight VFS operations before destroying the thread.
+     * This ensures delegation threads complete before we free the thread. */
+    chimera_vfs_thread_drain(vfs_thread);
+
+    /* Destroy temporary VFS thread and evpl */
+    chimera_vfs_thread_destroy(vfs_thread);
+    evpl_destroy(evpl);
 
     /* Close out all the nfs4 session state */
     nfs4_client_table_free(&shared->nfs4_shared_clients);
@@ -329,6 +347,14 @@ nfs_server_thread_destroy(void *data)
     if (thread->shared->portmap_server) {
         evpl_rpc2_server_detach(thread->rpc2_thread, thread->shared->portmap_server);
     }
+
+    /* Drain all in-flight NFS requests before destroying RPC2 thread.
+     * This prevents use-after-free when request callbacks try to free
+     * to the RPC2 thread's free list after it has been destroyed. */
+    while (thread->active_requests > 0) {
+        evpl_continue(thread->evpl);
+    }
+
     evpl_rpc2_thread_destroy(thread->rpc2_thread);
 
     while (thread->free_requests) {
@@ -357,6 +383,83 @@ chimera_nfs_add_export(
     pthread_mutex_unlock(&shared->exports_lock);
 
 } /* chimera_nfs_add_export */
+
+
+SYMBOL_EXPORT int
+chimera_nfs_remove_export(
+    void       *nfs_shared,
+    const char *name)
+{
+    struct chimera_server_nfs_shared *shared = nfs_shared;
+    struct chimera_nfs_export        *export;
+    int                               found = 0;
+
+    pthread_mutex_lock(&shared->exports_lock);
+    LL_FOREACH(shared->exports, export)
+    {
+        if (strcmp(export->name, name) == 0) {
+            LL_DELETE(shared->exports, export);
+            free(export);
+            found = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&shared->exports_lock);
+
+    return found ? 0 : -1;
+} /* chimera_nfs_remove_export */
+
+SYMBOL_EXPORT const struct chimera_nfs_export *
+chimera_nfs_get_export(
+    void       *nfs_shared,
+    const char *name)
+{
+    struct chimera_server_nfs_shared *shared = nfs_shared;
+    struct chimera_nfs_export        *export;
+
+    pthread_mutex_lock(&shared->exports_lock);
+    LL_FOREACH(shared->exports, export)
+    {
+        if (strcmp(export->name, name) == 0) {
+            pthread_mutex_unlock(&shared->exports_lock);
+            return export;
+        }
+    }
+    pthread_mutex_unlock(&shared->exports_lock);
+
+    return NULL;
+} /* chimera_nfs_get_export */
+
+SYMBOL_EXPORT void
+chimera_nfs_iterate_exports(
+    void                         *nfs_shared,
+    chimera_nfs_export_iterate_cb callback,
+    void                         *data)
+{
+    struct chimera_server_nfs_shared *shared = nfs_shared;
+    struct chimera_nfs_export        *export;
+
+    pthread_mutex_lock(&shared->exports_lock);
+    LL_FOREACH(shared->exports, export)
+    {
+        if (callback(export, data) != 0) {
+            break;
+        }
+    }
+    pthread_mutex_unlock(&shared->exports_lock);
+} /* chimera_nfs_iterate_exports */
+
+SYMBOL_EXPORT const char *
+chimera_nfs_export_get_name(const struct chimera_nfs_export *export)
+{
+    return export->name;
+} /* chimera_nfs_export_get_name */
+
+SYMBOL_EXPORT const char *
+chimera_nfs_export_get_path(const struct chimera_nfs_export *export)
+{
+    return export->path;
+} /* chimera_nfs_export_get_path */
 
 SYMBOL_EXPORT struct chimera_server_protocol nfs_protocol = {
     .init           = nfs_server_init,

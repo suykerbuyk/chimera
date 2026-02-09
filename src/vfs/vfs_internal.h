@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2025 Chimera-NAS Project Contributors
+// SPDX-FileCopyrightText: 2025-2026 Chimera-NAS Project Contributors
 //
 // SPDX-License-Identifier: LGPL-2.1-only
 
@@ -59,6 +59,12 @@
                          __LINE__, \
                          __VA_ARGS__)
 
+/* ERR_PTR style error handling for request allocation */
+#define CHIMERA_VFS_MAX_ERRNO 4095
+#define CHIMERA_VFS_ERR_PTR(err)        ((void *) (long) (-(err)))
+#define CHIMERA_VFS_PTR_ERR(ptr)        ((int) (-(long) (ptr)))
+#define CHIMERA_VFS_IS_ERR(ptr)         ((unsigned long) (ptr) > (unsigned long) -CHIMERA_VFS_MAX_ERRNO)
+
 /* Structure for readdir entries stored in bounce buffer */
 struct chimera_vfs_readdir_entry {
     uint64_t                 inum;
@@ -73,7 +79,11 @@ chimera_vfs_hash(
     const void *data,
     int         len)
 {
-    return XXH3_64bits(data, len);
+    /* Mask the MSB to ensure the result is non-negative when interpreted as
+     * a signed 64-bit value.  NFS readdir cookies are derived from this hash
+     * and the Linux kernel rejects negative loff_t values in nfs_llseek_dir(),
+     * which breaks seekdir()/telldir() for cookies with bit 63 set. */
+    return XXH3_64bits(data, len) & INT64_MAX;
 } /* chimera_vfs_hash */
 
 static inline struct chimera_vfs_find_result *
@@ -124,15 +134,31 @@ chimera_vfs_get_module(
     return module;
 } /* chimera_vfs_get_module */
 
+/*
+ * Common request allocation helper with capability enforcement.
+ * Returns ERR_PTR on failure:
+ *   - CHIMERA_VFS_ESTALE if module is NULL
+ *   - CHIMERA_VFS_ENOTSUP if module lacks required capability
+ */
 static inline struct chimera_vfs_request *
-chimera_vfs_request_alloc_by_hash(
+chimera_vfs_request_alloc_common(
     struct chimera_vfs_thread     *thread,
     const struct chimera_vfs_cred *cred,
+    struct chimera_vfs_module     *module,
     const void                    *fh,
     int                            fhlen,
-    uint64_t                       fh_hash)
+    uint64_t                       fh_hash,
+    uint32_t                       required_cap)
 {
     struct chimera_vfs_request *request;
+
+    if (!module) {
+        return CHIMERA_VFS_ERR_PTR(CHIMERA_VFS_ESTALE);
+    }
+
+    if (!(module->capabilities & required_cap)) {
+        return CHIMERA_VFS_ERR_PTR(CHIMERA_VFS_ENOTSUP);
+    }
 
     if (thread->free_requests) {
         request = thread->free_requests;
@@ -144,10 +170,11 @@ chimera_vfs_request_alloc_by_hash(
     }
     request->status = CHIMERA_VFS_UNSET;
     request->cred   = cred;
+    request->module = module;
 
-    request->module = chimera_vfs_get_module(thread, fh, fhlen);
-
-    memcpy(request->fh, fh, fhlen);
+    if (fh && fhlen > 0) {
+        memcpy(request->fh, fh, fhlen);
+    }
     request->fh_len      = fhlen;
     request->fh_hash     = fh_hash;
     request->active_prev = NULL;
@@ -159,6 +186,20 @@ chimera_vfs_request_alloc_by_hash(
     DL_APPEND2(thread->active_requests, request, active_prev, active_next);
 
     return request;
+} /* chimera_vfs_request_alloc_common */
+
+static inline struct chimera_vfs_request *
+chimera_vfs_request_alloc_by_hash(
+    struct chimera_vfs_thread     *thread,
+    const struct chimera_vfs_cred *cred,
+    const void                    *fh,
+    int                            fhlen,
+    uint64_t                       fh_hash)
+{
+    struct chimera_vfs_module *module = chimera_vfs_get_module(thread, fh, fhlen);
+
+    return chimera_vfs_request_alloc_common(thread, cred, module, fh, fhlen,
+                                            fh_hash, CHIMERA_VFS_CAP_FS);
 } /* chimera_vfs_request_alloc_by_hash */
 
 
@@ -209,33 +250,27 @@ chimera_vfs_request_alloc_with_module(
     uint64_t                       fh_hash,
     struct chimera_vfs_module     *module)
 {
-    struct chimera_vfs_request *request;
-
-    if (thread->free_requests) {
-        request = thread->free_requests;
-        LL_DELETE(thread->free_requests, request);
-    } else {
-        request              = calloc(1, sizeof(struct chimera_vfs_request));
-        request->thread      = thread;
-        request->plugin_data = malloc(4096);
-    }
-    request->status = CHIMERA_VFS_UNSET;
-    request->cred   = cred;
-
-    request->module = module;
-    memcpy(request->fh, fh, fhlen);
-    request->fh_len      = fhlen;
-    request->fh_hash     = fh_hash;
-    request->active_prev = NULL;
-    request->active_next = NULL;
-
-    clock_gettime(CLOCK_MONOTONIC, &request->start_time);
-
-    thread->num_active_requests++;
-    DL_APPEND2(thread->active_requests, request, active_prev, active_next);
-
-    return request;
+    return chimera_vfs_request_alloc_common(thread, cred, module, fh, fhlen,
+                                            fh_hash, CHIMERA_VFS_CAP_FS);
 } /* chimera_vfs_request_alloc_with_module */
+
+/*
+ * Allocate a request for KV operations.
+ * Uses the pre-configured kv_module instead of looking up by FH.
+ * The key is hashed to determine the delegation thread for blocking modules.
+ */
+static inline struct chimera_vfs_request *
+chimera_vfs_request_alloc_kv(
+    struct chimera_vfs_thread *thread,
+    const void                *key,
+    uint32_t                   key_len)
+{
+    struct chimera_vfs *vfs      = thread->vfs;
+    uint64_t            key_hash = chimera_vfs_hash(key, key_len);
+
+    return chimera_vfs_request_alloc_common(thread, NULL, vfs->kv_module,
+                                            NULL, 0, key_hash, CHIMERA_VFS_CAP_KV);
+} /* chimera_vfs_request_alloc_kv */
 
 static inline struct chimera_vfs_open_handle *
 chimera_vfs_synth_handle_alloc(struct chimera_vfs_thread *thread)

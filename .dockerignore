@@ -1,7 +1,9 @@
 .git
+build
 private
 .cache
 .serena
 .vscode
 .claude
-docs
+docs/*
+!docs/openapi.json

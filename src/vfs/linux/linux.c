@@ -188,11 +188,14 @@ chimera_linux_set_attrs(
     }
 
     if (set_mask & CHIMERA_VFS_ATTR_SIZE) {
-        // code assumes that path is empty when dirfd is valid
-        rc = ftruncate(dirfd, attr->va_size);
+        // dirfd might be O_PATH which doesn't support ftruncate directly,
+        // so use truncate() on /proc/self/fd/N path which follows the symlink
+        char procpath[64];
+        snprintf(procpath, sizeof(procpath), "/proc/self/fd/%d", dirfd);
+        rc = truncate(procpath, attr->va_size);
 
         if (rc) {
-            chimera_linux_error("linux_setattr: ftruncate(%ld) failed: %s",
+            chimera_linux_error("linux_setattr: truncate(%ld) failed: %s",
                                 attr->va_size,
                                 strerror(errno));
 
@@ -1137,7 +1140,8 @@ chimera_linux_dispatch(
 SYMBOL_EXPORT struct chimera_vfs_module vfs_linux = {
     .name         = "linux",
     .fh_magic     = CHIMERA_VFS_FH_MAGIC_LINUX,
-    .capabilities = CHIMERA_VFS_CAP_BLOCKING | CHIMERA_VFS_CAP_OPEN_PATH_REQUIRED | CHIMERA_VFS_CAP_OPEN_FILE_REQUIRED
+    .capabilities = CHIMERA_VFS_CAP_BLOCKING | CHIMERA_VFS_CAP_OPEN_PATH_REQUIRED | CHIMERA_VFS_CAP_OPEN_FILE_REQUIRED |
+        CHIMERA_VFS_CAP_FS
     ,
     .init           = chimera_linux_init,
     .destroy        = chimera_linux_destroy,
