@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: 2025 Chimera-NAS Project Contributors
+# SPDX-FileCopyrightText: 2025-2026 Chimera-NAS Project Contributors
 #
 # SPDX-License-Identifier: Unlicense
 
@@ -26,7 +26,7 @@ RUN apt-get -y update && \
     yes | unminimize && \
     apt-get -y --no-install-recommends install clang clang-tools cmake ninja-build git flex bison lldb gdb less libnfs-dev vim psmisc uncrustify \
     net-tools tshark tcpdump uuid-dev iproute2 man-db manpages-dev ca-certificates ssh libjansson-dev libclang-rt-18-dev llvm wget \
-    libxxhash-dev liburcu-dev librdmacm-dev liburing-dev libunwind-dev librocksdb-dev libcurl4-openssl-dev clangd uthash-dev libnuma-dev \
+    libxxhash-dev liburcu-dev librdmacm-dev liburing-dev libaio-dev libunwind-dev librocksdb-dev libcurl4-openssl-dev clangd uthash-dev libnuma-dev \
     libcurl4-openssl-dev build-essential ruby-full autoconf automake make libtool pkg-config libs3-dev gh npm reuse libssl-dev openssl \
     gss-ntlmssp-dev libkrb5-3 libkrb5-dev libgssapi-krb5-2 curl jq && \
     gem install jekyll bundler 
@@ -64,6 +64,18 @@ RUN if [ "$ENABLE_XLIO" = "1" ] ; then \
     make -j8 && \
     make install ; \
     fi
+
+RUN apt-get -y update && \
+    apt-get -y --no-install-recommends install qemu-kvm qemu-utils && \
+    install -m 0755 -d /etc/apt/keyrings && \
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc && \
+    chmod a+r /etc/apt/keyrings/docker.asc && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu noble stable" \
+        > /etc/apt/sources.list.d/docker.list && \
+    apt-get -y update && \
+    apt-get -y --no-install-recommends install docker-ce docker-ce-cli containerd.io && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
 
 RUN if [ "$ENABLE_UV" = "1" ] ; then \
     curl -LsSf https://astral.sh/uv/install.sh | sh ; \

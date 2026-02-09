@@ -22,9 +22,9 @@ EXTRA_ARGS=""
 usage() {
     echo "Usage: $0 -b <backend> [options]"
     echo ""
-    echo "Direct backends:    memfs, demofs, cairn, linux, io_uring"
-    echo "NFS3 backends:      nfs3_memfs, nfs3_demofs, nfs3_cairn, nfs3_linux, nfs3_io_uring"
-    echo "NFS3 RDMA backends: nfs3rdma_memfs, nfs3rdma_demofs, nfs3rdma_cairn, nfs3rdma_linux, nfs3rdma_io_uring"
+    echo "Direct backends:    memfs, demofs_io_uring, demofs_aio, cairn, linux, io_uring"
+    echo "NFS3 backends:      nfs3_memfs, nfs3_demofs_io_uring, nfs3_demofs_aio, nfs3_cairn, nfs3_linux, nfs3_io_uring"
+    echo "NFS3 RDMA backends: nfs3rdma_memfs, nfs3rdma_demofs_io_uring, nfs3rdma_demofs_aio, nfs3rdma_cairn, nfs3rdma_linux, nfs3rdma_io_uring"
     echo ""
     echo "Options:"
     echo "  -b <backend>   VFS backend to use (required)"
@@ -57,9 +57,9 @@ EXTRA_ARGS="$@"
 # Validate backend and check if NFS
 IS_NFS=0
 case "$BACKEND" in
-    memfs|demofs|cairn|linux|io_uring) ;;
-    nfs3_memfs|nfs3_demofs|nfs3_cairn|nfs3_linux|nfs3_io_uring) IS_NFS=1 ;;
-    nfs3rdma_memfs|nfs3rdma_demofs|nfs3rdma_cairn|nfs3rdma_linux|nfs3rdma_io_uring) IS_NFS=1 ;;
+    memfs|demofs_io_uring|demofs_aio|cairn|linux|io_uring) ;;
+    nfs3_memfs|nfs3_demofs_io_uring|nfs3_demofs_aio|nfs3_cairn|nfs3_linux|nfs3_io_uring) IS_NFS=1 ;;
+    nfs3rdma_memfs|nfs3rdma_demofs_io_uring|nfs3rdma_demofs_aio|nfs3rdma_cairn|nfs3rdma_linux|nfs3rdma_io_uring) IS_NFS=1 ;;
     *) echo "Error: Unknown backend '$BACKEND'"; usage ;;
 esac
 
@@ -91,8 +91,13 @@ generate_config() {
             # memfs uses "/" as mount path, no special config needed
             mount_path="/"
             ;;
-        demofs)
+        demofs_io_uring|demofs_aio)
             # Create demofs devices and build inline config
+            if [ "$BACKEND" = "demofs_aio" ]; then
+                DEVICE_TYPE="libaio"
+            else
+                DEVICE_TYPE="io_uring"
+            fi
             DEVICES_JSON=""
             for i in $(seq 0 9); do
                 DEVICE_PATH="${SESSION_DIR}/device-${i}.img"
@@ -100,7 +105,7 @@ generate_config() {
                 if [ $i -gt 0 ]; then
                     DEVICES_JSON="${DEVICES_JSON},"
                 fi
-                DEVICES_JSON="${DEVICES_JSON}{\"type\":\"io_uring\",\"size\":1,\"path\":\"$DEVICE_PATH\"}"
+                DEVICES_JSON="${DEVICES_JSON}{\"type\":\"$DEVICE_TYPE\",\"size\":1,\"path\":\"$DEVICE_PATH\"}"
             done
             mount_path="/"
             modules_section="\"modules\": {
@@ -109,6 +114,7 @@ generate_config() {
             \"config\": {\"devices\":[$DEVICES_JSON]}
         }
     },"
+            BACKEND="demofs"
             ;;
         cairn)
             mount_path="/"
@@ -169,8 +175,7 @@ if [ -n "$EXTRA_ARGS" ]; then
 fi
 
 if [ "$IS_NFS" = "1" ]; then
-    # NFS backend: use --backend option and network namespace wrapper
-    NETNS_WRAPPER="${SCRIPT_DIR}/../../../scripts/netns_test_wrapper.sh"
+    # NFS backend: use --backend option
     FSX_ARGS="--backend=$BACKEND $FSX_ARGS"
 
     if [ "$QUIET" != "1" ]; then
@@ -178,12 +183,11 @@ if [ "$IS_NFS" = "1" ]; then
         echo "  Backend: $BACKEND"
         echo "  Operations: $NUM_OPS"
         echo "  Max file length: $MAX_FILE_LEN"
-        echo "  Command: $NETNS_WRAPPER $FSX_BINARY $FSX_ARGS $TEST_FILE"
+        echo "  Command: $FSX_BINARY $FSX_ARGS $TEST_FILE"
         echo ""
     fi
 
-    # Run fsx in network namespace
-    exec "$NETNS_WRAPPER" "$FSX_BINARY" $FSX_ARGS "$TEST_FILE"
+    exec "$FSX_BINARY" $FSX_ARGS "$TEST_FILE"
 else
     # Direct backend: use --chimera-config with generated config
     generate_config

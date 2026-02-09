@@ -571,10 +571,14 @@ chimera_io_uring_setattr(
     }
 
     if (request->setattr.set_attr->va_set_mask & CHIMERA_VFS_ATTR_SIZE) {
-        rc = ftruncate(fd, request->setattr.set_attr->va_size);
+        // fd might be O_PATH which doesn't support ftruncate directly,
+        // so use truncate() on /proc/self/fd/N path which follows the symlink
+        char procpath[64];
+        snprintf(procpath, sizeof(procpath), "/proc/self/fd/%d", fd);
+        rc = truncate(procpath, request->setattr.set_attr->va_size);
 
         if (rc) {
-            chimera_io_uring_error("io_uring_setattr: ftruncate(%ld) failed: %s",
+            chimera_io_uring_error("io_uring_setattr: truncate(%ld) failed: %s",
                                    request->setattr.set_attr->va_size,
                                    strerror(errno));
 
@@ -1454,7 +1458,7 @@ chimera_io_uring_dispatch(
 SYMBOL_EXPORT struct chimera_vfs_module vfs_io_uring = {
     .name           = "io_uring",
     .fh_magic       = CHIMERA_VFS_FH_MAGIC_IO_URING,
-    .capabilities   = CHIMERA_VFS_CAP_OPEN_PATH_REQUIRED | CHIMERA_VFS_CAP_OPEN_FILE_REQUIRED,
+    .capabilities   = CHIMERA_VFS_CAP_OPEN_PATH_REQUIRED | CHIMERA_VFS_CAP_OPEN_FILE_REQUIRED | CHIMERA_VFS_CAP_FS,
     .init           = chimera_io_uring_init,
     .destroy        = chimera_io_uring_destroy,
     .thread_init    = chimera_io_uring_thread_init,
