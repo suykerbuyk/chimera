@@ -49,8 +49,22 @@ chimera_nfs4_write(
     struct nfs_resop4                *resop)
 {
     struct WRITE4args   *args    = &argop->opwrite;
-    struct nfs4_session *session = req->session;
+    struct WRITE4res    *res     = &resop->opwrite;
+    struct nfs4_session *session = nfs4_resolve_session(
+        req->session, &args->stateid,
+        &thread->shared->nfs4_shared_clients);
     struct nfs4_state   *state;
+
+    if (!session) {
+        res->status = NFS4ERR_BAD_STATEID;
+        chimera_nfs4_compound_complete(req, NFS4_OK);
+        return;
+    }
+
+    if (!req->session) {
+        req->session = session;
+        evpl_rpc2_conn_set_private_data(req->conn, session);
+    }
 
     state = nfs4_session_get_state(session, &args->stateid);
 
@@ -76,3 +90,4 @@ chimera_nfs4_write(
                       chimera_nfs4_write_complete,
                       req);
 } /* chimera_nfs4_write */
+
