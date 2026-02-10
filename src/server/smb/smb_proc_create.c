@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2025 Chimera-NAS Project Contributors
+// SPDX-FileCopyrightText: 2025-2026 Chimera-NAS Project Contributors
 //
 // SPDX-License-Identifier: LGPL-2.1-only
 
@@ -613,10 +613,12 @@ chimera_smb_create_reply(
     chimera_smb_append_network_open_info(reply_cursor, &request->create.r_attrs);
 
     /* File Id (persistent) */
-    evpl_iovec_cursor_append_uint64(reply_cursor, request->create.r_open_file->file_id.pid);
+    evpl_iovec_cursor_append_uint64(reply_cursor, request->create.r_open_file ?
+                                    request->create.r_open_file->file_id.pid : 0);
 
     /* File Id (volatile) */
-    evpl_iovec_cursor_append_uint64(reply_cursor, request->create.r_open_file->file_id.vid);
+    evpl_iovec_cursor_append_uint64(reply_cursor, request->create.r_open_file ?
+                                    request->create.r_open_file->file_id.vid : 0);
 
     /* Create Context Offset */
     evpl_iovec_cursor_append_uint32(reply_cursor, 0);
@@ -658,6 +660,7 @@ chimera_smb_parse_create(
     uint16_t name_offset;
     uint32_t blob_offset, blob_length;
     uint16_t name16[SMB_FILENAME_MAX];
+    int      name_size;
     char    *slash;
 
     if (unlikely(request->request_struct_size != SMB2_CREATE_REQUEST_SIZE)) {
@@ -685,18 +688,24 @@ chimera_smb_parse_create(
     if (request->create.name_len >= SMB_FILENAME_MAX) {
         chimera_smb_error("Create request: UTF-16 name too long (%u bytes)",
                           request->create.name_len);
+        request->status = SMB2_STATUS_NAME_TOO_LONG;
         return -1;
     }
 
     evpl_iovec_cursor_copy(request_cursor, name16, request->create.name_len);
 
-    request->create.parent_path_len = chimera_smb_utf16le_to_utf8(&request->compound->thread->iconv_ctx,
-                                                                  name16,
-                                                                  request->create.name_len,
-                                                                  request->create.parent_path,
-                                                                  sizeof(request->create.parent_path));
-
-    slash = rindex(request->create.parent_path, '\\');
+    name_size = chimera_smb_utf16le_to_utf8(&request->compound->thread->iconv_ctx,
+                                            name16,
+                                            request->create.name_len,
+                                            request->create.parent_path,
+                                            sizeof(request->create.parent_path));
+    if (name_size < 0) {
+        chimera_smb_error("Failed to convert CREATE name from UTF-16LE to UTF-8");
+        request->status = SMB2_STATUS_OBJECT_NAME_INVALID;
+        return -1;
+    }
+    request->create.parent_path_len = name_size;
+    slash                           = rindex(request->create.parent_path, '\\');
 
     if (slash) {
         *slash                          = '\0';
