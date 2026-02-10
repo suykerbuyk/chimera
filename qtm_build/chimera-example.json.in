@@ -3,6 +3,7 @@
 	"threads": 16,
 	"delegation_threads": 64,
 	"external_portmap": true,
+	"max_open_files": 1048576,
 	"rdma": false,
 	"rdma_hostname": "0.0.0.0",
 	"rdma_port": 20049,
