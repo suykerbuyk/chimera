@@ -22,11 +22,6 @@ RUN curl -o /usr/local/bin/uncrustify  ${asset:uncrustify:Rocky9/$arch/uncrustif
 #    dnf install -y /install/OS9/*.rpm
 
 
-# Install gss-ntlmssp 1.3.1 keep copy for build
-RUN mkdir -p /packages && \
-    curl -sS ${asset:gss-ntlmssp:Rocky9/$arch/gss-ntlmssp-1.3.1.tgz} | tar zxvf - -C /packages && \
-    dnf install -y /packages/*
-
 RUN useradd -d /context -ms /bin/bash mockbuild
 WORKDIR /context
 RUN chown -R mockbuild /context

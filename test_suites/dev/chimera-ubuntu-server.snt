@@ -30,29 +30,14 @@ command srv1 apt update && apt install -y smbclient cifs-utils jq
 
 
 #  --------------------   install Chimera  ---------------
-step 5m setup ntlm authentication.
-command srv1 mkdir -p /etc/chimera && \
-	echo "WORKGROUP:testuser1:systest" >/etc/chimera/ntlm.txt && \
-	echo "export NTLM_USER_FILE=/etc/chimera/ntlm.txt" > /etc/profile.d/chimera.sh
+step 2m Download chimera pkg for QB_OS
+command srv1 /sntest_utils/get_qb_asset.py -p chimera -t PKG_TAG -d /chimera-repo -u release/QB_OS/amd64/repo-chimera.tar.gz
 
-%if OS_VERSION == 24.04
-step 2m Download chimera pkg for Ubuntu24
-command srv1 /sntest_utils/get_qb_asset.py -p chimera -t PKG_TAG -d /chimera-repo -u release/Ubuntu24/amd64/repo-chimera.tar.gz
-%else
-step 2m Download chimera pkg for Ubuntu22
-command srv1 /sntest_utils/get_qb_asset.py -p chimera -t PKG_TAG -d /chimera-repo -u release/Ubuntu22/amd64/repo-chimera.tar.gz
-%endif
+step 2m install the chimera Packages for QB_OS
+command srv1 apt-get install -y /chimera-repo/*.deb
 
 step 2m install the chimera PKG
 command srv1 apt install -y  /chimera-repo/*.deb
-
-step 1m update chimera.json file
-command srv1 cd /etc/chimera && \
-	cp chimera.json chimera.json.bak && \
-	jq '.server.external_portmap = true | \
-	   .mounts.linux_dir.path = "/shares"' chimera.json > chimera.json.tmp && \
-	mv chimera.json.tmp /opt/quantum/chimera/etc/chimera.json
-
 
 step 5m setup share filesystem
 command srv1 echo $share_fs && \
@@ -63,10 +48,43 @@ command srv1 echo $share_fs && \
 	mount /dev/sda1 /shares && \
 	chmod 777 /shares
 
-step 5m start chimera
-command srv1 systemctl start chimera.service && \
-	sleep 5 && \
-	systemctl status chimera.service
+step 1m Create base chimera.json file
+command srv1 sed -i.back 's/\/chimera.json/\/sntest-chimera.json/'  /etc/default/chimera && \
+	     jq -n '{ \
+                 server: { \
+                    threads: 16, \
+                    external_portmap: true, \
+                    max_open_files: 1048576, \
+                    rest_http_port: 8080 \
+                 }, \
+		 users: [ \
+		    { username: "testuser1", smbpasswd: "systest", uid: 5000, gid: 50} \
+                 ], \
+                 mounts: { \
+                    sntest_dir: { \
+                       path: "/shares", \
+                       module: "linux" \
+                    } \
+                }, \
+                shares: { \
+                   smb1: { path: "/sntest_dir" } \
+                }, \
+                exports: { \
+                   "/nfs1": { path: "/sntest_dir" } \
+                } }'  > /etc/chimera/sntest-chimera.json
+
+step 5m enable and start chimera
+command srv1 cat /etc/default/chimera
+command srv1 jq . /etc/chimera/sntest-chimera.json
+command srv1 systemctl enable chimera && \
+	     systemctl start chimera && \
+	     sleep 5 && \
+	     systemctl status chimera
+
+step 5m check chimera config
+command srv1 curl -s "http://127.0.0.1:8080/api/v1/users" | jq
+command srv1 curl -s "http://127.0.0.1:8080/api/v1/shares" | jq
+command srv1 curl -s "http://127.0.0.1:8080/api/v1/exports" | jq
 
 step 5m test config
 command srv1 smbclient -U testuser1%systest //127.0.0.1/smb1 -c "allinfo /"

@@ -17,10 +17,6 @@ tasks:
         project: uncrustify
         task: build_Ubuntu22
         tag: 0.78.1-quantum
-      gss-ntlmssp:
-        project: gss-ntlmssp
-        task: build_Ubuntu22
-        tag: 1.3.1-qtm
 
   build_debug_Ubuntu22:
     type: run_container
@@ -99,10 +95,6 @@ tasks:
         project: uncrustify
         task: build_Ubuntu22
         tag: 0.78.1-quantum
-      gss-ntlmssp:
-        project: gss-ntlmssp
-        task: build_Ubuntu24
-        tag: 1.3.1-qtm
 
   build_debug_Ubuntu24:
     type: run_container
@@ -181,10 +173,6 @@ tasks:
         project: uncrustify
         task: build_Rocky9
         tag: 0.78.1-quantum
-      gss-ntlmssp:
-        project: gss-ntlmssp
-        task: build_Rocky9
-        tag: 1.3.1-qtm
 
   build_debug_Rocky9:
     type: run_container

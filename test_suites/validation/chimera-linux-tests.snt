@@ -9,14 +9,6 @@ description Test NFS and SMB protocol on a Linux share
 %error need to provide a QB PKG_TAG
 %endif
 
-%if OS_DISTRO != ubuntu-server
-%error Test only support ubuntu-server server
-%endif
-
-%if LNXCLI_DISTRO != ubuntu-server
-%error Test only support ubuntu-server clients
-%endif
-
 host srv1	distro:OS_DISTRO version:OS_VERSION arch:x86_64 cores:2 memory:8192
 host lnx1       distro:LNXCLI_DISTRO version:LNXCLI_VERSION arch:x86_64 cores:2 memory:2048
 
@@ -35,25 +27,14 @@ command allhosts curl https://nexus.mdh.quantum.com/repository/snnas-binaries/sn
 
 
 step 5m install extra pkg
-command allhosts apt update && apt install -y smbclient cifs-utils jq
+command allhosts apt-get update && apt-get install -y smbclient cifs-utils jq
 
 #  --------------------   install Chimera  ---------------
-step 5m setup ntlm authentication.
-command srv1 mkdir -p /etc/chimera && \
-	echo "WORKGROUP:testuser1:systest" >/etc/chimera/ntlm.txt && \
-	echo "export NTLM_USER_FILE=/etc/chimera/ntlm.txt" > /etc/profile.d/chimera.sh
+step 2m Download chimera pkg for QB_OS
+command srv1 /sntest_utils/get_qb_asset.py -p chimera -t PKG_TAG -d /chimera-repo -u release/QB_OS/amd64/repo-chimera.tar.gz
 
-%if OS_VERSION == 24.04
-step 2m Download chimera pkg for Ubuntu24
-command srv1 /sntest_utils/get_qb_asset.py -p chimera -t PKG_TAG -d /chimera-repo -u release/Ubuntu24/amd64/repo-chimera.tar.gz
-%else
-step 2m Download chimera pkg for Ubuntu22
-command srv1 /sntest_utils/get_qb_asset.py -p chimera -t PKG_TAG -d /chimera-repo -u release/Ubuntu22/amd64/repo-chimera.tar.gz
-%endif
-
-
-step 2m install the chimera PKG
-command srv1 apt install -y /chimera-repo/*.deb
+step 2m install the chimera Packages for QB_OS
+command srv1 apt-get install -y /chimera-repo/*.deb
 
 step 5m setup share filesystem
 command srv1 echo $share_fs && \
@@ -65,30 +46,48 @@ command srv1 echo $share_fs && \
 	chmod 777 /shares && \
 	mkdir -m 777 -p /shares/nfs1 /shares/smb1
 
-step 1m update chimera.json file
-command srv1 cd /etc/chimera && \
-	cp chimera.json chimera.json.bak && \
-	jq '.server.external_portmap = true | \
-	   .mounts.linux_dir.path = "/shares" | \
-	   .shares.smb1.path = "/linux_dir/smb1" | \
-	   .exports."/nfs1".path = "/linux_dir/nfs1" \
-	   ' chimera.json > chimera.json.tmp && \
-	mv chimera.json.tmp /opt/quantum/chimera/etc/chimera.json
+step 1m Create base chimera.json file
+command srv1 sed -i.back 's/\/chimera.json/\/sntest-chimera.json/'  /etc/default/chimera && \
+	     jq -n '{ \
+                 server: { \
+                    threads: 16, \
+                    external_portmap: true, \
+                    max_open_files: 1048576, \
+                    rest_http_port: 8080 \
+                 }, \
+		 users: [ \
+		    { username: "testuser1", smbpasswd: "systest", uid: 5000, gid: 50} \
+                 ], \
+                 mounts: { \
+                    sntest_dir: { \
+                       path: "/shares", \
+                       module: "linux" \
+                    } \
+                }, \
+                shares: { \
+                   smb1: { path: "/sntest_dir/smb1" } \
+                }, \
+                exports: { \
+                   "/nfs1": { path: "/sntest_dir/nfs1" } \
+                } }'  > /etc/chimera/sntest-chimera.json
 
+step 5m enable and start chimera
+command srv1 cat /etc/default/chimera
+command srv1 jq . /etc/chimera/sntest-chimera.json
+command srv1 systemctl enable chimera && \
+	     systemctl start chimera && \
+	     sleep 5 && \
+	     systemctl status chimera
 
-step 5m start chimera
-command srv1 systemctl start chimera.service && \
-	sleep 5 && \
-	systemctl status chimera.service
+step 5m check chimera config
+command srv1 curl -s "http://127.0.0.1:8080/api/v1/users" | jq
+command srv1 curl -s "http://127.0.0.1:8080/api/v1/shares" | jq
+command srv1 curl -s "http://127.0.0.1:8080/api/v1/exports" | jq
 
 # ----------------- Setup linux client -----------------
 step 5m get elbencho
 command lnx1 curl https://repository.mdh.quantum.com/repository/tests/elbencho/elbencho-static-x86_64.tar.gz | \
 	tar zxf - -C /usr/bin
-
-step 5m lnx1 Get connectathon
-command lnx1 curl https://repository.mdh.quantum.com/repository/cthon/cthon04.tar.gz | \
-	tar zxf - -C /root/
 
 # ----------------- Setup/Run SMB test -----------------
 %ifndef NO_SMB
@@ -133,6 +132,11 @@ command lnx1 mkdir -p /nfs1/lnx1 && \
 	/usr/bin/elbencho /nfs1/lnx1 --size=1m --dirs=4 --files=10 --mkdirs --write && \
 	/usr/bin/elbencho /nfs1/lnx1 --size=1m --dirs=4 --files=10 --deldirs --delfiles --read
 
+# Connectathon testing
+step 5m lnx1 Get connectathon
+command lnx1 curl https://repository.mdh.quantum.com/repository/cthon/cthon04.tar.gz | \
+	tar zxf - -C /root/
+
 step 10M Run Connectathon basic test
 command lnx1 cd /root/cthon04/cthon04/basic && \
 	     NFSTESTDIR=/nfs1/cthon_basic ./runtests
@@ -141,6 +145,16 @@ step 10M Run Connectathon special test
 command lnx1 cd /root/cthon04/cthon04/special && \
 	     NFSTESTDIR=/nfs1/cthon_special ./runtests
 
+%ifndef SKIP_FAIL
+# NFStest-3.2 testing
+step 5m lnx1 Get NFStest-3.2
+command lnx1 curl https://repository.mdh.quantum.com:8443/repository/nfs_protocol_test/3.2/NFStest-3.2.tar.gz | \
+	tar zxf - -C /root/
+
+step 10M Run NFStest-3.2 nfstest_posix
+command lnx1 cd /root/NFStest-3.2 && \
+	     PYTHONPATH=`pwd` ./test/nfstest_posix  -o timeo=600,intr --nfsversion=3 -s $srv1 -e /nfs1
+%endif
 %endif
 
 # ----- finish ----

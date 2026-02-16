@@ -1,0 +1,9 @@
+%sngroup chimera-full-suite
+#
+# Run a series of sntest for basic validation.
+#
+
+test linux-tests_ubuntu24   validation/chimera-linux-tests.snt CHIM_OS=24
+test linux-tests_ubuntu22   validation/chimera-linux-tests.snt CHIM_OS=22
+test smbtorture_ubuntu24    validation/chimera-smbtorture.snt CHIM_OS=24
+test snfs-tests_rocky9	    validation/chimera-snfs-tests.snt
