@@ -18,8 +18,6 @@ echo "/opt/quantum/chimera/lib" > etc/ld.so.conf.d/chimera.conf
 cd ..
 dpkg-deb --build ${PKG_DIR}
 cp ${PKG_DIR}.deb /dist/
-# Add gss-ntlmssp 1.3.1 package to the repo
-cp /packages/gss-ntlmssp_[0-9]* /dist/
 cd /dist
 tar zcvf repo-chimera.tar.gz *.deb
 

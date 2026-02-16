@@ -540,7 +540,7 @@ memfs_kv_entry_release(
 } /* memfs_kv_entry_release */
 
 static void *
-memfs_init(const char *cfgfile)
+memfs_init(const char *cfgdata)
 {
     struct memfs_shared     *shared = calloc(1, sizeof(*shared));
     struct memfs_inode_list *inode_list;
@@ -1107,7 +1107,7 @@ memfs_umount(
 } /* memfs_umount */
 
 static void
-memfs_lookup(
+memfs_lookup_at(
     struct memfs_thread        *thread,
     struct memfs_shared        *shared,
     struct chimera_vfs_request *request,
@@ -1116,10 +1116,10 @@ memfs_lookup(
     struct memfs_inode  *inode, *child;
     struct memfs_dirent *dirent;
     uint64_t             hash;
-    const char          *name    = request->lookup.component;
-    uint32_t             namelen = request->lookup.component_len;
+    const char          *name    = request->lookup_at.component;
+    uint32_t             namelen = request->lookup_at.component_len;
 
-    hash = request->lookup.component_hash;
+    hash = request->lookup_at.component_hash;
 
     inode = memfs_inode_get_fh(shared, request->fh, request->fh_len);
 
@@ -1136,11 +1136,11 @@ memfs_lookup(
         return;
     }
 
-    memfs_map_attrs(shared, &request->lookup.r_dir_attr, inode, request->fh);
+    memfs_map_attrs(shared, &request->lookup_at.r_dir_attr, inode, request->fh);
 
     /* Handle "." - return the directory itself */
     if (namelen == 1 && name[0] == '.') {
-        memfs_map_attrs(shared, &request->lookup.r_attr, inode, request->fh);
+        memfs_map_attrs(shared, &request->lookup_at.r_attr, inode, request->fh);
         pthread_mutex_unlock(&inode->lock);
         request->status = CHIMERA_VFS_OK;
         request->complete(request);
@@ -1156,7 +1156,7 @@ memfs_lookup(
             request->complete(request);
             return;
         }
-        memfs_map_attrs(shared, &request->lookup.r_attr, child, request->fh);
+        memfs_map_attrs(shared, &request->lookup_at.r_attr, child, request->fh);
         pthread_mutex_unlock(&child->lock);
         pthread_mutex_unlock(&inode->lock);
         request->status = CHIMERA_VFS_OK;
@@ -1182,7 +1182,7 @@ memfs_lookup(
         return;
     }
 
-    memfs_map_attrs(shared, &request->lookup.r_attr, child, request->fh);
+    memfs_map_attrs(shared, &request->lookup_at.r_attr, child, request->fh);
 
     pthread_mutex_unlock(&child->lock);
 
@@ -1190,10 +1190,10 @@ memfs_lookup(
 
     request->status = CHIMERA_VFS_OK;
     request->complete(request);
-} /* memfs_lookup */
+} /* memfs_lookup_at */
 
 static void
-memfs_mkdir(
+memfs_mkdir_at(
     struct memfs_thread        *thread,
     struct memfs_shared        *shared,
     struct chimera_vfs_request *request,
@@ -1201,15 +1201,15 @@ memfs_mkdir(
 {
     struct memfs_inode       *parent_inode, *inode, *existing_inode;
     struct memfs_dirent      *dirent, *existing_dirent;
-    struct chimera_vfs_attrs *r_attr          = &request->mkdir.r_attr;
-    struct chimera_vfs_attrs *r_dir_pre_attr  = &request->mkdir.r_dir_pre_attr;
-    struct chimera_vfs_attrs *r_dir_post_attr = &request->mkdir.r_dir_post_attr;
+    struct chimera_vfs_attrs *r_attr          = &request->mkdir_at.r_attr;
+    struct chimera_vfs_attrs *r_dir_pre_attr  = &request->mkdir_at.r_dir_pre_attr;
+    struct chimera_vfs_attrs *r_dir_post_attr = &request->mkdir_at.r_dir_post_attr;
     struct timespec           now;
     uint64_t                  hash;
 
     clock_gettime(CLOCK_REALTIME, &now);
 
-    hash = request->mkdir.name_hash;
+    hash = request->mkdir_at.name_hash;
 
     /* Optimistically allocate an inode */
     inode = memfs_inode_alloc_thread(thread);
@@ -1226,7 +1226,7 @@ memfs_mkdir(
 
     rb_tree_init(&inode->dir.dirents);
 
-    memfs_apply_attrs(inode, request->mkdir.set_attr);
+    memfs_apply_attrs(inode, request->mkdir_at.set_attr);
 
     memfs_map_attrs(shared, r_attr, inode, request->fh);
 
@@ -1235,8 +1235,8 @@ memfs_mkdir(
                                 inode->inum,
                                 inode->gen,
                                 hash,
-                                request->mkdir.name,
-                                request->mkdir.name_len);
+                                request->mkdir_at.name,
+                                request->mkdir_at.name_len);
 
     parent_inode = memfs_inode_get_fh(shared, request->fh, request->fh_len);
 
@@ -1298,10 +1298,10 @@ memfs_mkdir(
 
     request->status = CHIMERA_VFS_OK;
     request->complete(request);
-} /* memfs_mkdir */
+} /* memfs_mkdir_at */
 
 static void
-memfs_mknod(
+memfs_mknod_at(
     struct memfs_thread        *thread,
     struct memfs_shared        *shared,
     struct chimera_vfs_request *request,
@@ -1309,15 +1309,15 @@ memfs_mknod(
 {
     struct memfs_inode       *parent_inode, *inode, *existing_inode;
     struct memfs_dirent      *dirent, *existing_dirent;
-    struct chimera_vfs_attrs *r_attr          = &request->mknod.r_attr;
-    struct chimera_vfs_attrs *r_dir_pre_attr  = &request->mknod.r_dir_pre_attr;
-    struct chimera_vfs_attrs *r_dir_post_attr = &request->mknod.r_dir_post_attr;
+    struct chimera_vfs_attrs *r_attr          = &request->mknod_at.r_attr;
+    struct chimera_vfs_attrs *r_dir_pre_attr  = &request->mknod_at.r_dir_pre_attr;
+    struct chimera_vfs_attrs *r_dir_post_attr = &request->mknod_at.r_dir_post_attr;
     struct timespec           now;
     uint64_t                  hash;
 
     clock_gettime(CLOCK_REALTIME, &now);
 
-    hash = request->mknod.name_hash;
+    hash = request->mknod_at.name_hash;
 
     /* Optimistically allocate an inode */
     inode = memfs_inode_alloc_thread(thread);
@@ -1334,17 +1334,17 @@ memfs_mknod(
 
     /* The mode (including file type bits S_IFCHR/S_IFBLK/S_IFSOCK/S_IFIFO)
      * and rdev are set via set_attr by the caller */
-    if (request->mknod.set_attr->va_set_mask & CHIMERA_VFS_ATTR_MODE) {
-        inode->mode = request->mknod.set_attr->va_mode;
+    if (request->mknod_at.set_attr->va_set_mask & CHIMERA_VFS_ATTR_MODE) {
+        inode->mode = request->mknod_at.set_attr->va_mode;
     } else {
         inode->mode = S_IFREG | 0644;
     }
 
-    if (request->mknod.set_attr->va_set_mask & CHIMERA_VFS_ATTR_RDEV) {
-        inode->rdev = request->mknod.set_attr->va_rdev;
+    if (request->mknod_at.set_attr->va_set_mask & CHIMERA_VFS_ATTR_RDEV) {
+        inode->rdev = request->mknod_at.set_attr->va_rdev;
     }
 
-    memfs_apply_attrs(inode, request->mknod.set_attr);
+    memfs_apply_attrs(inode, request->mknod_at.set_attr);
 
     memfs_map_attrs(shared, r_attr, inode, request->fh);
 
@@ -1353,8 +1353,8 @@ memfs_mknod(
                                 inode->inum,
                                 inode->gen,
                                 hash,
-                                request->mknod.name,
-                                request->mknod.name_len);
+                                request->mknod_at.name,
+                                request->mknod_at.name_len);
 
     parent_inode = memfs_inode_get_fh(shared, request->fh, request->fh_len);
 
@@ -1410,10 +1410,10 @@ memfs_mknod(
 
     request->status = CHIMERA_VFS_OK;
     request->complete(request);
-} /* memfs_mknod */
+} /* memfs_mknod_at */
 
 static void
-memfs_remove(
+memfs_remove_at(
     struct memfs_thread        *thread,
     struct memfs_shared        *shared,
     struct chimera_vfs_request *request,
@@ -1426,7 +1426,7 @@ memfs_remove(
 
     clock_gettime(CLOCK_REALTIME, &now);
 
-    hash = request->remove.name_hash;
+    hash = request->remove_at.name_hash;
 
     parent_inode = memfs_inode_get_fh(shared, request->fh, request->fh_len);
 
@@ -1436,7 +1436,7 @@ memfs_remove(
         return;
     }
 
-    memfs_map_attrs(shared, &request->remove.r_dir_pre_attr, parent_inode, request->fh);
+    memfs_map_attrs(shared, &request->remove_at.r_dir_pre_attr, parent_inode, request->fh);
 
     if (!S_ISDIR(parent_inode->mode)) {
         pthread_mutex_unlock(&parent_inode->lock);
@@ -1485,10 +1485,10 @@ memfs_remove(
     }
 
     if (inode->nlink == 0) {
-        request->remove.r_removed_attr.va_req_mask = CHIMERA_VFS_ATTR_FH;
+        request->remove_at.r_removed_attr.va_req_mask = CHIMERA_VFS_ATTR_FH;
     }
 
-    memfs_map_attrs(shared, &request->remove.r_removed_attr, inode, request->fh);
+    memfs_map_attrs(shared, &request->remove_at.r_removed_attr, inode, request->fh);
 
     if (inode->nlink == 0) {
         --inode->refcnt;
@@ -1497,7 +1497,7 @@ memfs_remove(
             memfs_inode_free(thread, inode);
         }
     }
-    memfs_map_attrs(shared, &request->remove.r_dir_post_attr, parent_inode, request->fh);
+    memfs_map_attrs(shared, &request->remove_at.r_dir_post_attr, parent_inode, request->fh);
 
     pthread_mutex_unlock(&parent_inode->lock);
     pthread_mutex_unlock(&inode->lock);
@@ -1506,7 +1506,7 @@ memfs_remove(
 
     request->status = CHIMERA_VFS_OK;
     request->complete(request);
-} /* memfs_remove */
+} /* memfs_remove_at */
 
 /*
  * Cookie values for readdir:
@@ -1673,7 +1673,7 @@ memfs_readdir(
 } /* memfs_readdir */
 
 static void
-memfs_open(
+memfs_open_fh(
     struct memfs_thread        *thread,
     struct memfs_shared        *shared,
     struct chimera_vfs_request *request,
@@ -1692,11 +1692,11 @@ memfs_open(
     inode->refcnt++;
     pthread_mutex_unlock(&inode->lock);
 
-    request->open.r_vfs_private = (uint64_t) inode;
+    request->open_fh.r_vfs_private = (uint64_t) inode;
 
     request->status = CHIMERA_VFS_OK;
     request->complete(request);
-} /* memfs_open */
+} /* memfs_open_fh */
 
 static void
 memfs_open_at(
@@ -2164,8 +2164,230 @@ memfs_write(
     request->complete(request);
 } /* memfs_write */
 
+
 static void
-memfs_symlink(
+memfs_allocate(
+    struct memfs_thread        *thread,
+    struct memfs_shared        *shared,
+    struct chimera_vfs_request *request,
+    void                       *private_data)
+{
+    struct evpl        *evpl = thread->evpl;
+    struct memfs_inode *inode;
+    struct timespec     now;
+
+    clock_gettime(CLOCK_REALTIME, &now);
+
+    if (request->allocate.handle->vfs_private) {
+        inode = (struct memfs_inode *) request->allocate.handle->vfs_private;
+        pthread_mutex_lock(&inode->lock);
+    } else {
+        inode = memfs_inode_get_fh(shared, request->fh, request->fh_len);
+
+        if (unlikely(!inode)) {
+            request->status = CHIMERA_VFS_ENOENT;
+            request->complete(request);
+            return;
+        }
+    }
+
+    memfs_map_attrs(shared, &request->allocate.r_pre_attr, inode, request->fh);
+
+    if (request->allocate.flags & CHIMERA_VFS_ALLOCATE_DEALLOCATE) {
+        /* DEALLOCATE: punch hole in [offset, offset+length) */
+        uint64_t hole_start = request->allocate.offset;
+        uint64_t hole_end   = hole_start + request->allocate.length;
+        uint64_t first_block, last_block, bi;
+
+        if (hole_end > inode->size) {
+            hole_end = inode->size;
+        }
+
+        if (hole_start < hole_end && inode->file.blocks) {
+            first_block = hole_start >> CHIMERA_MEMFS_BLOCK_SHIFT;
+            last_block  = (hole_end - 1) >> CHIMERA_MEMFS_BLOCK_SHIFT;
+
+            for (bi = first_block; bi <= last_block && bi < inode->file.num_blocks; bi++) {
+                if (!inode->file.blocks[bi]) {
+                    continue;
+                }
+
+                uint64_t block_start = bi << CHIMERA_MEMFS_BLOCK_SHIFT;
+                uint64_t block_end   = block_start + CHIMERA_MEMFS_BLOCK_SIZE;
+
+                if (hole_start <= block_start && hole_end >= block_end) {
+                    /* Entire block is within hole - free it */
+                    memfs_block_free(thread, inode->file.blocks[bi]);
+                    inode->file.blocks[bi] = NULL;
+                } else {
+                    /* Partial block - COW and zero the hole portion */
+                    struct memfs_block      *old_block = inode->file.blocks[bi];
+                    struct memfs_block      *new_block;
+                    struct evpl_iovec_cursor old_cursor;
+                    uint32_t                 zero_start, zero_end;
+
+                    zero_start = (hole_start > block_start) ?
+                        (hole_start - block_start) : 0;
+                    zero_end = (hole_end < block_end) ?
+                        (hole_end - block_start) : CHIMERA_MEMFS_BLOCK_SIZE;
+
+                    new_block = memfs_block_alloc(thread);
+
+                    if (!new_block) {
+                        pthread_mutex_unlock(&inode->lock);
+                        request->status = CHIMERA_VFS_ENOSPC;
+                        request->complete(request);
+                        return;
+                    }
+
+                    new_block->niov = evpl_iovec_alloc(evpl, 4096, 4096,
+                                                       CHIMERA_MEMFS_BLOCK_MAX_IOV,
+                                                       EVPL_IOVEC_FLAG_SHARED,
+                                                       new_block->iov);
+
+                    /* Copy entire old block, then zero the hole portion */
+                    evpl_iovec_cursor_init(&old_cursor, old_block->iov,
+                                           old_block->niov);
+                    evpl_iovec_cursor_copy(&old_cursor,
+                                           new_block->iov[0].data,
+                                           CHIMERA_MEMFS_BLOCK_SIZE);
+
+                    memset(new_block->iov[0].data + zero_start, 0,
+                           zero_end - zero_start);
+
+                    memfs_block_free(thread, old_block);
+                    inode->file.blocks[bi] = new_block;
+                }
+            }
+
+            inode->space_used = 0;
+
+            for (bi = 0; bi < inode->file.num_blocks; bi++) {
+                if (inode->file.blocks[bi]) {
+                    inode->space_used += CHIMERA_MEMFS_BLOCK_SIZE;
+                }
+            }
+        }
+    } else {
+        /* ALLOCATE: extend file size if needed */
+        uint64_t new_end = request->allocate.offset + request->allocate.length;
+
+        if (new_end > inode->size) {
+            inode->size = new_end;
+        }
+    }
+
+    inode->mtime = now;
+    inode->ctime = now;
+
+    memfs_map_attrs(shared, &request->allocate.r_post_attr, inode, request->fh);
+
+    pthread_mutex_unlock(&inode->lock);
+
+    request->status = CHIMERA_VFS_OK;
+    request->complete(request);
+} /* memfs_allocate */
+
+static void
+memfs_seek(
+    struct memfs_thread        *thread,
+    struct memfs_shared        *shared,
+    struct chimera_vfs_request *request,
+    void                       *private_data)
+{
+    struct memfs_inode *inode;
+    uint64_t            offset = request->seek.offset;
+    uint64_t            bi, block_start;
+
+    if (request->seek.handle->vfs_private) {
+        inode = (struct memfs_inode *) request->seek.handle->vfs_private;
+        pthread_mutex_lock(&inode->lock);
+    } else {
+        inode = memfs_inode_get_fh(shared, request->fh, request->fh_len);
+
+        if (unlikely(!inode)) {
+            request->status = CHIMERA_VFS_ENOENT;
+            request->complete(request);
+            return;
+        }
+    }
+
+    if (offset >= inode->size) {
+        pthread_mutex_unlock(&inode->lock);
+        request->seek.r_eof    = 1;
+        request->seek.r_offset = 0;
+        request->status        = CHIMERA_VFS_OK;
+        request->complete(request);
+        return;
+    }
+
+    if (request->seek.what == 0) {
+        /* SEEK_DATA: find first non-NULL block from offset forward */
+        bi = offset >> CHIMERA_MEMFS_BLOCK_SHIFT;
+
+        while (bi < inode->file.num_blocks) {
+            if (inode->file.blocks && inode->file.blocks[bi]) {
+                block_start = bi << CHIMERA_MEMFS_BLOCK_SHIFT;
+
+                request->seek.r_offset = (block_start > offset) ?
+                    block_start : offset;
+                request->seek.r_eof = 0;
+                pthread_mutex_unlock(&inode->lock);
+                request->status = CHIMERA_VFS_OK;
+                request->complete(request);
+                return;
+            }
+            bi++;
+        }
+
+        /* No data found */
+        pthread_mutex_unlock(&inode->lock);
+        request->seek.r_eof    = 1;
+        request->seek.r_offset = 0;
+        request->status        = CHIMERA_VFS_OK;
+        request->complete(request);
+        return;
+    } else {
+        /* SEEK_HOLE: find first NULL block or past num_blocks from offset */
+        bi = offset >> CHIMERA_MEMFS_BLOCK_SHIFT;
+
+        while (bi < inode->file.num_blocks) {
+            if (!inode->file.blocks || !inode->file.blocks[bi]) {
+                block_start = bi << CHIMERA_MEMFS_BLOCK_SHIFT;
+
+                request->seek.r_offset = (block_start > offset) ?
+                    block_start : offset;
+                request->seek.r_eof = 0;
+                pthread_mutex_unlock(&inode->lock);
+                request->status = CHIMERA_VFS_OK;
+                request->complete(request);
+                return;
+            }
+            bi++;
+        }
+
+        /* Virtual hole at EOF - all blocks are data */
+        request->seek.r_offset = inode->file.num_blocks <<
+            CHIMERA_MEMFS_BLOCK_SHIFT;
+
+        if (request->seek.r_offset < offset) {
+            request->seek.r_offset = offset;
+        }
+
+        if (request->seek.r_offset >= inode->size) {
+            request->seek.r_offset = inode->size;
+        }
+
+        request->seek.r_eof = 0;
+        pthread_mutex_unlock(&inode->lock);
+        request->status = CHIMERA_VFS_OK;
+        request->complete(request);
+        return;
+    }
+} /* memfs_seek */
+
+static void
+memfs_symlink_at(
     struct memfs_thread        *thread,
     struct memfs_shared        *shared,
     struct chimera_vfs_request *request,
@@ -2178,13 +2400,13 @@ memfs_symlink(
 
     clock_gettime(CLOCK_REALTIME, &now);
 
-    hash = request->symlink.name_hash;
+    hash = request->symlink_at.name_hash;
 
     /* Optimistically allocate an inode */
     inode = memfs_inode_alloc_thread(thread);
 
-    inode->size       = request->symlink.targetlen;
-    inode->space_used = request->symlink.targetlen;
+    inode->size       = request->symlink_at.targetlen;
+    inode->space_used = request->symlink_at.targetlen;
     inode->uid        = 0;
     inode->gid        = 0;
     inode->nlink      = 1;
@@ -2195,20 +2417,20 @@ memfs_symlink(
 
     inode->symlink.target = memfs_symlink_target_alloc(thread);
 
-    inode->symlink.target->length = request->symlink.targetlen;
+    inode->symlink.target->length = request->symlink_at.targetlen;
     memcpy(inode->symlink.target->data,
-           request->symlink.target,
-           request->symlink.targetlen);
+           request->symlink_at.target,
+           request->symlink_at.targetlen);
 
-    memfs_map_attrs(shared, &request->symlink.r_attr, inode, request->fh);
+    memfs_map_attrs(shared, &request->symlink_at.r_attr, inode, request->fh);
 
     /* Optimistically allocate a dirent */
     dirent = memfs_dirent_alloc(thread,
                                 inode->inum,
                                 inode->gen,
                                 hash,
-                                request->symlink.name,
-                                request->symlink.namelen);
+                                request->symlink_at.name,
+                                request->symlink_at.namelen);
 
     parent_inode = memfs_inode_get_fh(shared, request->fh, request->fh_len);
 
@@ -2240,19 +2462,19 @@ memfs_symlink(
         return;
     }
 
-    memfs_map_attrs(shared, &request->symlink.r_dir_pre_attr, parent_inode, request->fh);
+    memfs_map_attrs(shared, &request->symlink_at.r_dir_pre_attr, parent_inode, request->fh);
 
     rb_tree_insert(&parent_inode->dir.dirents, hash, dirent);
 
     parent_inode->mtime = now;
 
-    memfs_map_attrs(shared, &request->symlink.r_dir_post_attr, parent_inode, request->fh);
+    memfs_map_attrs(shared, &request->symlink_at.r_dir_post_attr, parent_inode, request->fh);
 
     pthread_mutex_unlock(&parent_inode->lock);
 
     request->status = CHIMERA_VFS_OK;
     request->complete(request);
-} /* memfs_symlink */
+} /* memfs_symlink_at */
 
 static void
 memfs_readlink(
@@ -2277,6 +2499,8 @@ memfs_readlink(
            inode->symlink.target->data,
            inode->symlink.target->length);
 
+    memfs_map_attrs(shared, &request->readlink.r_attr, inode, request->fh);
+
     pthread_mutex_unlock(&inode->lock);
 
     request->status = CHIMERA_VFS_OK;
@@ -2297,7 +2521,7 @@ memfs_fh_compare(
 } /* memfs_fh_compare */
 
 static void
-memfs_rename(
+memfs_rename_at(
     struct memfs_thread        *thread,
     struct memfs_shared        *shared,
     struct chimera_vfs_request *request,
@@ -2312,13 +2536,13 @@ memfs_rename(
 
     clock_gettime(CLOCK_REALTIME, &now);
 
-    hash     = request->rename.name_hash;
-    new_hash = request->rename.new_name_hash;
+    hash     = request->rename_at.name_hash;
+    new_hash = request->rename_at.new_name_hash;
 
     cmp = memfs_fh_compare(request->fh,
                            request->fh_len,
-                           request->rename.new_fh,
-                           request->rename.new_fhlen);
+                           request->rename_at.new_fh,
+                           request->rename_at.new_fhlen);
 
     if (cmp == 0) {
         old_parent_inode = memfs_inode_get_fh(shared,
@@ -2346,12 +2570,12 @@ memfs_rename(
                                                   request->fh_len);
 
             new_parent_inode = memfs_inode_get_fh(shared,
-                                                  request->rename.new_fh,
-                                                  request->rename.new_fhlen);
+                                                  request->rename_at.new_fh,
+                                                  request->rename_at.new_fhlen);
         } else {
             new_parent_inode = memfs_inode_get_fh(shared,
-                                                  request->rename.new_fh,
-                                                  request->rename.new_fhlen);
+                                                  request->rename_at.new_fh,
+                                                  request->rename_at.new_fhlen);
             old_parent_inode = memfs_inode_get_fh(shared,
                                                   request->fh,
                                                   request->fh_len);
@@ -2384,8 +2608,8 @@ memfs_rename(
         }
     }
 
-    memfs_map_attrs(shared, &request->rename.r_fromdir_pre_attr, old_parent_inode, request->fh);
-    memfs_map_attrs(shared, &request->rename.r_todir_pre_attr, new_parent_inode, request->rename.new_fh);
+    memfs_map_attrs(shared, &request->rename_at.r_fromdir_pre_attr, old_parent_inode, request->fh);
+    memfs_map_attrs(shared, &request->rename_at.r_todir_pre_attr, new_parent_inode, request->rename_at.new_fh);
 
     rb_tree_query_exact(&old_parent_inode->dir.dirents, hash, hash, old_dirent);
 
@@ -2421,8 +2645,8 @@ memfs_rename(
         if (existing_dirent->inum == old_dirent->inum &&
             existing_dirent->gen == old_dirent->gen) {
             /* Same inode - do nothing, just return success */
-            memfs_map_attrs(shared, &request->rename.r_fromdir_post_attr, old_parent_inode, request->fh);
-            memfs_map_attrs(shared, &request->rename.r_todir_post_attr, new_parent_inode, request->rename.new_fh);
+            memfs_map_attrs(shared, &request->rename_at.r_fromdir_post_attr, old_parent_inode, request->fh);
+            memfs_map_attrs(shared, &request->rename_at.r_todir_post_attr, new_parent_inode, request->rename_at.new_fh);
             pthread_mutex_unlock(&child_inode->lock);
             if (cmp != 0) {
                 pthread_mutex_unlock(&old_parent_inode->lock);
@@ -2481,8 +2705,8 @@ memfs_rename(
                                     old_dirent->inum,
                                     old_dirent->gen,
                                     new_hash,
-                                    request->rename.new_name,
-                                    request->rename.new_namelen);
+                                    request->rename_at.new_name,
+                                    request->rename_at.new_namelen);
 
     rb_tree_insert(&new_parent_inode->dir.dirents, hash, new_dirent);
 
@@ -2496,8 +2720,8 @@ memfs_rename(
     old_parent_inode->ctime = now;
     new_parent_inode->mtime = now;
 
-    memfs_map_attrs(shared, &request->rename.r_fromdir_post_attr, old_parent_inode, request->fh);
-    memfs_map_attrs(shared, &request->rename.r_todir_post_attr, new_parent_inode, request->rename.new_fh);
+    memfs_map_attrs(shared, &request->rename_at.r_fromdir_post_attr, old_parent_inode, request->fh);
+    memfs_map_attrs(shared, &request->rename_at.r_todir_post_attr, new_parent_inode, request->rename_at.new_fh);
 
     pthread_mutex_unlock(&child_inode->lock);
 
@@ -2513,10 +2737,10 @@ memfs_rename(
     request->status = CHIMERA_VFS_OK;
     request->complete(request);
 
-} /* memfs_rename */
+} /* memfs_rename_at */
 
 static void
-memfs_link(
+memfs_link_at(
     struct memfs_thread        *thread,
     struct memfs_shared        *shared,
     struct chimera_vfs_request *request,
@@ -2529,11 +2753,11 @@ memfs_link(
 
     clock_gettime(CLOCK_REALTIME, &now);
 
-    hash = request->link.name_hash;
+    hash = request->link_at.name_hash;
 
     parent_inode = memfs_inode_get_fh(shared,
-                                      request->link.dir_fh,
-                                      request->link.dir_fhlen);
+                                      request->link_at.dir_fh,
+                                      request->link_at.dir_fhlen);
 
     if (!parent_inode) {
         request->status = CHIMERA_VFS_ENOENT;
@@ -2541,7 +2765,7 @@ memfs_link(
         return;
     }
 
-    memfs_map_attrs(shared, &request->link.r_dir_pre_attr, parent_inode, request->link.dir_fh);
+    memfs_map_attrs(shared, &request->link_at.r_dir_pre_attr, parent_inode, request->link_at.dir_fh);
 
     if (!S_ISDIR(parent_inode->mode)) {
         pthread_mutex_unlock(&parent_inode->lock);
@@ -2581,8 +2805,8 @@ memfs_link(
                                 inode->inum,
                                 inode->gen,
                                 hash,
-                                request->link.name,
-                                request->link.namelen);
+                                request->link_at.name,
+                                request->link_at.namelen);
 
     rb_tree_insert(&parent_inode->dir.dirents, hash, dirent);
 
@@ -2591,8 +2815,8 @@ memfs_link(
     inode->ctime        = now;
     parent_inode->mtime = now;
 
-    memfs_map_attrs(shared, &request->link.r_dir_post_attr, parent_inode, request->link.dir_fh);
-    memfs_map_attrs(shared, &request->link.r_attr, inode, request->fh);
+    memfs_map_attrs(shared, &request->link_at.r_dir_post_attr, parent_inode, request->link_at.dir_fh);
+    memfs_map_attrs(shared, &request->link_at.r_attr, inode, request->fh);
 
     pthread_mutex_unlock(&parent_inode->lock);
     pthread_mutex_unlock(&inode->lock);
@@ -2600,7 +2824,7 @@ memfs_link(
     request->status = CHIMERA_VFS_OK;
     request->complete(request);
 
-} /* memfs_link */
+} /* memfs_link_at */
 
 
 static void
@@ -2823,8 +3047,8 @@ memfs_dispatch(
         case CHIMERA_VFS_OP_UMOUNT:
             memfs_umount(thread, shared, request, private_data);
             break;
-        case CHIMERA_VFS_OP_LOOKUP:
-            memfs_lookup(thread, shared, request, private_data);
+        case CHIMERA_VFS_OP_LOOKUP_AT:
+            memfs_lookup_at(thread, shared, request, private_data);
             break;
         case CHIMERA_VFS_OP_GETATTR:
             memfs_getattr(thread, shared, request, private_data);
@@ -2832,14 +3056,14 @@ memfs_dispatch(
         case CHIMERA_VFS_OP_SETATTR:
             memfs_setattr(thread, shared, request, private_data);
             break;
-        case CHIMERA_VFS_OP_MKDIR:
-            memfs_mkdir(thread, shared, request, private_data);
+        case CHIMERA_VFS_OP_MKDIR_AT:
+            memfs_mkdir_at(thread, shared, request, private_data);
             break;
-        case CHIMERA_VFS_OP_MKNOD:
-            memfs_mknod(thread, shared, request, private_data);
+        case CHIMERA_VFS_OP_MKNOD_AT:
+            memfs_mknod_at(thread, shared, request, private_data);
             break;
-        case CHIMERA_VFS_OP_REMOVE:
-            memfs_remove(thread, shared, request, private_data);
+        case CHIMERA_VFS_OP_REMOVE_AT:
+            memfs_remove_at(thread, shared, request, private_data);
             break;
         case CHIMERA_VFS_OP_READDIR:
             memfs_readdir(thread, shared, request, private_data);
@@ -2847,8 +3071,8 @@ memfs_dispatch(
         case CHIMERA_VFS_OP_OPEN_AT:
             memfs_open_at(thread, shared, request, private_data);
             break;
-        case CHIMERA_VFS_OP_OPEN:
-            memfs_open(thread, shared, request, private_data);
+        case CHIMERA_VFS_OP_OPEN_FH:
+            memfs_open_fh(thread, shared, request, private_data);
             break;
         case CHIMERA_VFS_OP_CREATE_UNLINKED:
             memfs_create_unlinked(thread, shared, request, private_data);
@@ -2866,17 +3090,23 @@ memfs_dispatch(
             request->status = CHIMERA_VFS_OK;
             request->complete(request);
             break;
-        case CHIMERA_VFS_OP_SYMLINK:
-            memfs_symlink(thread, shared, request, private_data);
+        case CHIMERA_VFS_OP_ALLOCATE:
+            memfs_allocate(thread, shared, request, private_data);
+            break;
+        case CHIMERA_VFS_OP_SEEK:
+            memfs_seek(thread, shared, request, private_data);
+            break;
+        case CHIMERA_VFS_OP_SYMLINK_AT:
+            memfs_symlink_at(thread, shared, request, private_data);
             break;
         case CHIMERA_VFS_OP_READLINK:
             memfs_readlink(thread, shared, request, private_data);
             break;
-        case CHIMERA_VFS_OP_RENAME:
-            memfs_rename(thread, shared, request, private_data);
+        case CHIMERA_VFS_OP_RENAME_AT:
+            memfs_rename_at(thread, shared, request, private_data);
             break;
-        case CHIMERA_VFS_OP_LINK:
-            memfs_link(thread, shared, request, private_data);
+        case CHIMERA_VFS_OP_LINK_AT:
+            memfs_link_at(thread, shared, request, private_data);
             break;
         case CHIMERA_VFS_OP_PUT_KEY:
             memfs_put_key(thread, shared, request, private_data);
@@ -2900,9 +3130,10 @@ memfs_dispatch(
 } /* memfs_dispatch */
 
 SYMBOL_EXPORT struct chimera_vfs_module vfs_memfs = {
-    .name           = "memfs",
-    .fh_magic       = CHIMERA_VFS_FH_MAGIC_MEMFS,
-    .capabilities   = CHIMERA_VFS_CAP_CREATE_UNLINKED | CHIMERA_VFS_CAP_FS | CHIMERA_VFS_CAP_KV,
+    .name         = "memfs",
+    .fh_magic     = CHIMERA_VFS_FH_MAGIC_MEMFS,
+    .capabilities = CHIMERA_VFS_CAP_CREATE_UNLINKED | CHIMERA_VFS_CAP_FS | CHIMERA_VFS_CAP_KV |
+        CHIMERA_VFS_CAP_FS_RELATIVE_OP,
     .init           = memfs_init,
     .destroy        = memfs_destroy,
     .thread_init    = memfs_thread_init,

@@ -2,55 +2,14 @@
 #
 # SPDX-License-Identifier: Unlicense
 
-ARG DOCKER_MIRROR
-FROM ${DOCKER_MIRROR}ubuntu:22.04 AS build
-ARG BUILD_TYPE=Release
-ARG APT_MIRROR
-
-RUN if [ -n "$APT_MIRROR" ]; then \
-    echo "deb $APT_MIRROR jammy main universe" > /etc/apt/sources.list && \
-    echo "deb $APT_MIRROR jammy-updates main universe" >> /etc/apt/sources.list && \
-    echo "deb $APT_MIRROR jammy-security main universe" >> /etc/apt/sources.list; \
-    fi
-
-RUN apt-get -y update && \
-    apt-get -y --no-install-recommends upgrade && \
-    apt-get -y --no-install-recommends install gcc g++ cmake ninja-build git flex bison uuid-dev uthash-dev libkrb5-3 libkrb5-dev libgssapi-krb5-2  gss-ntlmssp-dev \
-    librdmacm-dev libjansson-dev libxxhash-dev liburcu-dev libunwind-dev libssl-dev openssl libnuma-dev \
-    python3 python3-pip python3-venv python3-requests pkg-config && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
-
-
-RUN if [ "$ENABLE_XLIO" = "1" ] ; then \
-git clone https://github.com/Mellanox/libdpcp.git /libdpcp && \
-cd /libdpcp && \
-./autogen.sh && \
-./configure && \
-make -j8 && \
-make install && \
-git clone https://github.com/benjarvis/libxlio.git /libxlio  && \
-cd /libxlio && \
-git checkout 3.60.2-nlfix && \
-./autogen.sh && \
-./configure --with-dpcp=/usr/local && \
-make -j8 && \
-make install ; \
-fi
-
-COPY / /chimera
-
-RUN mkdir -p /build
-WORKDIR /build
-
-RUN cmake -G Ninja -DCMAKE_BUILD_TYPE=${BUILD_TYPE} -DDISABLE_TESTS=ON -DIO_URING_ENABLED=OFF -DCAIRN_ENABLED=OFF /chimera && \
-    ninja && \
-    ninja install
-
+ARG DOCKER_MIRROR=""
 FROM ${DOCKER_MIRROR}ubuntu:22.04
-ARG BUILD_TYPE=Release
+ARG ENABLE_XLIO=1
+ARG ENABLE_FIO=0
 ARG APT_MIRROR=""
 
+ENV DEBIAN_FRONTEND=noninteractive
+
 RUN if [ -n "$APT_MIRROR" ]; then \
     echo "deb $APT_MIRROR jammy main universe" > /etc/apt/sources.list && \
     echo "deb $APT_MIRROR jammy-updates main universe" >> /etc/apt/sources.list && \
@@ -59,27 +18,46 @@ RUN if [ -n "$APT_MIRROR" ]; then \
 
 RUN apt-get -y update && \
     apt-get -y --no-install-recommends upgrade && \
-    apt-get -y --no-install-recommends install libuuid1 librdmacm1 libjansson4 liburcu8 ibverbs-providers \
-    libunwind8 gss-ntlmssp libkrb5-3 libkrb5-dev libgssapi-krb5-2 gss-ntlmssp-dev openssl libnuma1 \
-    python3 python3-requests && \
-    if [ "${BUILD_TYPE}" = "Debug" ]; then \
-    apt-get -y --no-install-recommends install libasan6 gdb ; \
-    fi && \
+    apt-get -y --no-install-recommends install gcc g++ clang-tools cmake ninja-build git flex bison \
+    uuid-dev uthash-dev libkrb5-dev libgssapi-krb5-2 gss-ntlmssp-dev \
+    librdmacm-dev libjansson-dev libxxhash-dev liburcu-dev liburing-dev libunwind-dev \
+    librocksdb-dev libssl-dev openssl libnuma-dev libcurl4-openssl-dev libs3-dev libaio-dev \
+    build-essential autoconf automake libtool pkg-config ca-certificates uncrustify iproute2 curl \
+    libwbclient-dev smbclient krb5-kdc krb5-admin-server krb5-user samba winbind samba-dsdb-modules samba-vfs-modules && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-ENV LD_LIBRARY_PATH=/usr/local/lib
+RUN if [ "$ENABLE_FIO" = "1" ] ; then \
+    git clone --depth 1 --branch fio-3.40 https://github.com/axboe/fio.git /fio && \
+    cd /fio && \
+    ./configure --disable-libnfs && \
+    make -j8 && \
+    make install ; \
+    fi
 
-COPY --from=build /usr/local/etc/chimera.json /usr/local/etc/chimera.json
-COPY --from=build /usr/local/sbin/chimera /usr/local/sbin/chimera
-COPY --from=build /usr/local/lib/* /usr/local/lib/
+RUN if [ "$ENABLE_XLIO" = "1" ] ; then \
+    git clone --depth 1 https://github.com/Mellanox/libdpcp.git /libdpcp && \
+    cd /libdpcp && \
+    ./autogen.sh && \
+    ./configure && \
+    make -j8 && \
+    make install && \
+    git clone --depth 1 --branch 3.60.2-nlfix https://github.com/benjarvis/libxlio.git /libxlio && \
+    cd /libxlio && \
+    ./autogen.sh && \
+    ./configure --with-dpcp=/usr/local && \
+    make -j8 && \
+    make install ; \
+    fi
 
-COPY /suppressions.txt /suppressions.txt
-
-ENV LSAN_OPTIONS=suppressions=/suppressions.txt
-
-# Just to check it will at least execute at build time
-RUN /usr/local/sbin/chimera -v
-
-ENTRYPOINT ["/usr/local/sbin/chimera"]
-
+RUN apt-get -y update && \
+    apt-get -y --no-install-recommends install qemu-kvm qemu-utils && \
+    install -m 0755 -d /etc/apt/keyrings && \
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc && \
+    chmod a+r /etc/apt/keyrings/docker.asc && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu jammy stable" \
+        > /etc/apt/sources.list.d/docker.list && \
+    apt-get -y update && \
+    apt-get -y --no-install-recommends install docker-ce docker-ce-cli containerd.io && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*

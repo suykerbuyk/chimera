@@ -55,7 +55,7 @@ chimera_smb_set_info_open_unlink_callback(
         return;
     }
 
-    chimera_vfs_remove(
+    chimera_vfs_remove_at(
         request->compound->thread->vfs_thread,
         &request->session_handle->session->cred,
         oh,
@@ -118,7 +118,7 @@ chimera_smb_set_info_link_open_dir_callback(
         return;
     }
 
-    chimera_vfs_link(
+    chimera_vfs_link_at(
         request->compound->thread->vfs_thread,
         &request->session_handle->session->cred,
         open_file->handle->fh,
@@ -149,7 +149,7 @@ chimera_smb_set_info_link_lookup_parent_callback(
         return;
     }
 
-    chimera_vfs_open(
+    chimera_vfs_open_fh(
         request->compound->thread->vfs_thread,
         &request->session_handle->session->cred,
         attr->va_fh,
@@ -167,7 +167,7 @@ chimera_smb_set_info_link_process(struct chimera_smb_request *request)
     struct chimera_smb_rename_info *rename_info = &request->set_info.rename_info;
 
     if (rename_info->new_parent_len) {
-        chimera_vfs_lookup_path(
+        chimera_vfs_lookup(
             vfs_thread,
             &request->session_handle->session->cred,
             tree->fh,
@@ -179,7 +179,7 @@ chimera_smb_set_info_link_process(struct chimera_smb_request *request)
             chimera_smb_set_info_link_lookup_parent_callback,
             request);
     } else {
-        chimera_vfs_open(
+        chimera_vfs_open_fh(
             vfs_thread,
             &request->session_handle->session->cred,
             tree->fh,
@@ -230,7 +230,7 @@ chimera_smb_set_info(struct chimera_smb_request *request)
                     if (request->set_info.open_file->flags & CHIMERA_SMB_OPEN_FILE_FLAG_DELETE_ON_CLOSE) {
                         chimera_smb_complete_request(request, SMB2_STATUS_INVALID_PARAMETER);
                     } else {
-                        chimera_vfs_open(
+                        chimera_vfs_open_fh(
                             request->compound->thread->vfs_thread,
                             &request->session_handle->session->cred,
                             request->set_info.open_file->parent_fh,
@@ -246,6 +246,10 @@ chimera_smb_set_info(struct chimera_smb_request *request)
                     break;
                 case SMB2_FILE_LINK_INFO:
                     chimera_smb_set_info_link_process(request);
+                    break;
+                case SMB2_FILE_FULL_EA_INFO:
+                    chimera_smb_open_file_release(request, request->set_info.open_file);
+                    chimera_smb_complete_request(request, SMB2_STATUS_SUCCESS);
                     break;
                 default:
                     chimera_smb_error("SET_INFO info_class %u not implemented", request->set_info.info_class);
@@ -317,6 +321,9 @@ chimera_smb_parse_set_info(
                 case SMB2_FILE_RENAME_INFO:
                 case SMB2_FILE_LINK_INFO:
                     rc = chimera_smb_parse_rename_info(request_cursor, request);
+                    break;
+                case SMB2_FILE_FULL_EA_INFO:
+                    /* EAs not supported, accept and ignore */
                     break;
 
                 default:

@@ -11,7 +11,8 @@
 #include <time.h>
 #include <utlist.h>
 #include <netinet/in.h>
-#include <gssapi/gssapi_ntlmssp.h>
+#include <gssapi/gssapi.h>
+#include <gssapi/gssapi_krb5.h>
 #include "evpl/evpl.h"
 #include "common/logging.h"
 #include "common/misc.h"
@@ -20,6 +21,8 @@
 #include "smb_attr.h"
 #include "smb_session.h"
 #include "smb_string.h"
+#include "smb_ntlm.h"
+#include "smb_gssapi.h"
 #include "vfs/vfs_release.h"
 
 #define SMB2_MAX_DIALECTS           16
@@ -71,15 +74,24 @@ struct chimera_smb_rdma_element {
     uint64_t offset;
 };
 
+struct chimera_smb_auth_config {
+    int  winbind_enabled;
+    int  kerberos_enabled;
+    char winbind_domain[256];
+    char kerberos_keytab[256];
+    char kerberos_realm[256];
+};
+
 struct chimera_smb_config {
-    char                        identity[80];
-    int                         port;
-    int                         rdma_port;
-    int                         num_dialects;
-    int                         num_nic_info;
-    uint32_t                    capabilities;
-    uint32_t                    dialects[16];
-    struct chimera_smb_nic_info nic_info[16];
+    char                           identity[80];
+    int                            port;
+    int                            rdma_port;
+    int                            num_dialects;
+    int                            num_nic_info;
+    uint32_t                       capabilities;
+    uint32_t                       dialects[16];
+    struct chimera_smb_nic_info    nic_info[16];
+    struct chimera_smb_auth_config auth;
 };
 
 struct netbios_header {
@@ -212,8 +224,8 @@ struct chimera_smb_request {
             struct chimera_smb_file_id      file_id;
             struct chimera_smb_open_file   *open_file;
             struct chimera_smb_rdma_element rdma_elements[8];
-            struct evpl_iovec               iov[64];
-            struct evpl_iovec               chunk_iov[64];
+            struct evpl_iovec               iov[256];
+            struct evpl_iovec               chunk_iov[256];
 
         } write;
 
@@ -232,8 +244,8 @@ struct chimera_smb_request {
             struct chimera_smb_file_id      file_id;
             struct chimera_smb_open_file   *open_file;
             struct chimera_smb_rdma_element rdma_elements[8];
-            struct evpl_iovec               iov[64];
-            struct evpl_iovec               chunk_iov[64];
+            struct evpl_iovec               iov[256];
+            struct evpl_iovec               chunk_iov[256];
         } read;
 
         struct {
@@ -242,30 +254,43 @@ struct chimera_smb_request {
         } flush;
 
         struct {
-            uint32_t                   ctl_code;
-            struct chimera_smb_file_id file_id;
-            uint32_t                   input_offset;
-            uint32_t                   input_count;
-            uint32_t                   max_input_response;
-            uint32_t                   output_offset;
-            uint32_t                   output_count;
-            uint32_t                   max_output_response;
-            uint32_t                   input_niov;
-            uint32_t                   flags;
+            uint32_t                        ctl_code;
+            struct chimera_smb_file_id      file_id;
+            uint32_t                        input_offset;
+            uint32_t                        input_count;
+            uint32_t                        max_input_response;
+            uint32_t                        output_offset;
+            uint32_t                        output_count;
+            uint32_t                        max_output_response;
+            uint32_t                        input_niov;
+            uint32_t                        flags;
             /* Validate Negotiate Info fields */
-            uint32_t                   vni_capabilities;
-            uint8_t                    vni_guid[16];
-            uint8_t                    vni_security_mode;
-            uint16_t                   vni_dialect_count;
-            uint16_t                   vni_dialects[SMB2_MAX_DIALECTS];
+            uint32_t                        vni_capabilities;
+            uint8_t                         vni_guid[16];
+            uint8_t                         vni_security_mode;
+            uint16_t                        vni_dialect_count;
+            uint16_t                        vni_dialects[SMB2_MAX_DIALECTS];
             /* Response fields */
-            uint32_t                   r_capabilities;
-            uint8_t                    r_guid[16];
-            uint8_t                    r_security_mode;
+            uint32_t                        r_capabilities;
+            uint8_t                         r_guid[16];
+            uint8_t                         r_security_mode;
 
-            uint16_t                   r_dialect;
-            struct evpl_iovec          input_iov[64];
-            struct evpl_iovec          output_iov;
+            uint16_t                        r_dialect;
+            struct evpl_iovec               input_iov[64];
+            struct evpl_iovec               output_iov;
+            /* Reparse point fields */
+            struct chimera_smb_open_file   *rp_open_file;
+            struct chimera_vfs_open_handle *rp_parent_handle;
+            uint32_t                        rp_reparse_tag;
+            uint64_t                        rp_nfs_type;
+            uint32_t                        rp_device_major;
+            uint32_t                        rp_device_minor;
+            int                             rp_target_len;
+            char                            rp_target[CHIMERA_VFS_PATH_MAX];
+            struct chimera_vfs_attrs        rp_set_attr;
+            /* GET response buffer */
+            uint8_t                         rp_response[16 + (CHIMERA_VFS_PATH_MAX - 1) * 2];
+            int                             rp_response_len;
         } ioctl;
         struct {
             uint8_t                       info_type;
@@ -318,15 +343,17 @@ struct chimera_smb_request {
 
 #define CHIMERA_SMB_COMPOUND_MAX_REQUESTS 64
 struct chimera_smb_compound {
-    int                               num_requests;
-    int                               complete_requests;
-    uint64_t                          saved_session_id;
-    uint64_t                          saved_tree_id;
-    struct chimera_smb_file_id        saved_file_id;
-    struct chimera_server_smb_thread *thread;
-    struct chimera_smb_conn          *conn;
-    struct chimera_smb_compound      *next;
-    struct chimera_smb_request       *requests[CHIMERA_SMB_COMPOUND_MAX_REQUESTS];
+    int                                num_requests;
+    int                                complete_requests;
+    uint64_t                           saved_session_id;
+    uint64_t                           saved_tree_id;
+    struct chimera_smb_file_id         saved_file_id;
+    struct chimera_smb_session_handle *saved_session_handle;
+    struct chimera_smb_tree           *saved_tree;
+    struct chimera_server_smb_thread  *thread;
+    struct chimera_smb_conn           *conn;
+    struct chimera_smb_compound       *next;
+    struct chimera_smb_request        *requests[CHIMERA_SMB_COMPOUND_MAX_REQUESTS];
 };
 
 struct chimera_smb_session_handle {
@@ -347,6 +374,10 @@ struct chimera_smb_conn {
     OM_uint32                          gss_flags;
     gss_ctx_id_t                       nascent_ctx;
     gss_buffer_desc                    gss_output;
+    struct smb_ntlm_ctx                ntlm_ctx;
+    struct smb_gssapi_ctx              gssapi_ctx;
+    uint8_t                           *ntlm_output;
+    size_t                             ntlm_output_len;
     unsigned int                       flags;
     enum evpl_protocol_id              protocol;
     uint16_t                           dialect;
@@ -549,6 +580,7 @@ chimera_smb_session_release(
             tree = session->trees[i];
 
             if (tree) {
+                session->trees[i] = NULL;
                 chimera_smb_tree_free(thread, shared, tree);
             }
         }
@@ -634,6 +666,15 @@ chimera_smb_conn_free(
         conn->gss_output.value  = NULL;
         conn->gss_output.length = 0;
     }
+
+    if (conn->ntlm_output) {
+        free(conn->ntlm_output);
+        conn->ntlm_output     = NULL;
+        conn->ntlm_output_len = 0;
+    }
+
+    // Cleanup GSSAPI context if initialized
+    smb_gssapi_cleanup(&conn->gssapi_ctx);
 
     LL_PREPEND(thread->free_conns, conn);
 } /* chimera_smb_conn_free */

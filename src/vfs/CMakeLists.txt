@@ -4,15 +4,19 @@
 
 add_library(chimera_vfs SHARED vfs.c
             vfs_proc_mount.c vfs_proc_umount.c
-            vfs_proc_mkdir.c vfs_proc_mknod.c vfs_proc_close.c vfs_proc_open.c
-            vfs_proc_readdir.c vfs_proc_getattr.c vfs_proc_lookup.c
-            vfs_proc_lookup_path.c vfs_proc_read.c
-            vfs_proc_remove.c vfs_proc_write.c vfs_proc_commit.c
-            vfs_proc_open_at.c vfs_proc_symlink.c vfs_proc_link.c
-            vfs_proc_readlink.c vfs_proc_rename.c vfs_proc_setattr.c
-            vfs_proc_create_path.c vfs_proc_create_unlinked.c
+            vfs_proc_mkdir_at.c vfs_proc_mknod_at.c vfs_proc_close.c vfs_proc_open_fh.c
+            vfs_proc_readdir.c vfs_proc_getattr.c vfs_proc_lookup_at.c
+            vfs_proc_lookup.c vfs_proc_read.c
+            vfs_proc_remove_at.c vfs_proc_write.c vfs_proc_commit.c
+            vfs_proc_open_at.c vfs_proc_symlink_at.c vfs_proc_link_at.c
+            vfs_proc_readlink.c vfs_proc_rename_at.c vfs_proc_setattr.c
+            vfs_proc_create.c vfs_proc_create_unlinked.c
+            vfs_proc_open.c vfs_proc_mkdir.c vfs_proc_remove.c
+            vfs_proc_rename.c vfs_proc_symlink.c vfs_proc_link.c
+            vfs_proc_mknod.c
             vfs_proc_find.c vfs_proc_put_key.c vfs_proc_get_key.c
-            vfs_proc_delete_key.c vfs_proc_search_keys.c vfs_dump.c)
+            vfs_proc_delete_key.c vfs_proc_search_keys.c
+            vfs_proc_allocate.c vfs_proc_seek.c vfs_dump.c)
 
 target_compile_definitions(chimera_vfs PRIVATE
     XXH_INLINE_ALL
@@ -33,7 +37,7 @@ if (STORNEXT_ENABLED)
     add_subdirectory(snfs)
 endif()
 
-if (IO_URING_ENABLED)
+if (CHIMERA_VFS_IO_URING)
     add_subdirectory(io_uring)
 endif()
 
@@ -48,7 +52,7 @@ target_link_libraries(chimera_vfs
     chimera_vfs_nfs
     chimera_common prometheus-c xxhash dl urcu)
 
-if (IO_URING_ENABLED)
+if (CHIMERA_VFS_IO_URING)
     target_link_libraries(chimera_vfs chimera_vfs_io_uring)
 endif()
 

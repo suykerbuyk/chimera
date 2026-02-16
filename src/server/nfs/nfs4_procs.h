@@ -218,6 +218,27 @@ chimera_nfs4_secinfo_no_name(
     struct nfs_resop4                *resop);
 
 void
+chimera_nfs4_allocate(
+    struct chimera_server_nfs_thread *thread,
+    struct nfs_request               *req,
+    struct nfs_argop4                *argop,
+    struct nfs_resop4                *resop);
+
+void
+chimera_nfs4_deallocate(
+    struct chimera_server_nfs_thread *thread,
+    struct nfs_request               *req,
+    struct nfs_argop4                *argop,
+    struct nfs_resop4                *resop);
+
+void
+chimera_nfs4_seek(
+    struct chimera_server_nfs_thread *thread,
+    struct nfs_request               *req,
+    struct nfs_argop4                *argop,
+    struct nfs_resop4                *resop);
+
+void
 chimera_nfs4_compound_process(
     struct nfs_request *req,
     nfsstat4            status);
@@ -235,12 +256,13 @@ chimera_nfs4_compound_complete(
         /* Set the status for the failed operation */
         req->res_compound.resarray[req->index].opillegal.status = status;
 
-        req->index++;
-
-        while (req->index < req->res_compound.num_resarray) {
-            req->res_compound.resarray[req->index].opillegal.status = NFS4ERR_NOTSUPP;
-            req->index++;
-        }
+        /* Per RFC 7530 section 15.2, the response must only include
+         * operations up to and including the one that failed. Truncate
+         * num_resarray so that the XDR encoder does not attempt to
+         * serialize subsequent entries whose resop discriminant is
+         * uninitialized, which produces a malformed response. */
+        req->res_compound.num_resarray = req->index + 1;
+        req->index                     = req->res_compound.num_resarray;
     }
 
     if (thread->active) {

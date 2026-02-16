@@ -23,6 +23,5 @@ rpmbuild -ba  chimera.spec
 cp /build/rpmbuild/RPMS/x86_64/*.rpm /repo
 dnf download xxhash-libs libunwind liburing --arch  ${ARCH} --destdir /repo
 cd /repo
-cp /packages/gssntlmssp-[0-9]*.rpm .
 tar cvfz /dist/repo-chimera.tar.gz .
 

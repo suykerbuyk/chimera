@@ -8,6 +8,7 @@ ARG ENABLE_XLIO=1
 ARG ENABLE_DOCA=0
 ARG ENABLE_FIO=1
 ARG ENABLE_CLAUDE=1
+ARG ENABLE_CODEX=1
 ARG ENABLE_UV=1
 FROM ${DOCKER_MIRROR}ubuntu:24.04
 
@@ -24,15 +25,21 @@ RUN apt-get -y update && \
     apt-get -y --no-install-recommends upgrade && \
     apt-get -y --no-install-recommends install unminimize apt-utils && \
     yes | unminimize && \
-    apt-get -y --no-install-recommends install clang clang-tools cmake ninja-build git flex bison lldb gdb less libnfs-dev vim psmisc uncrustify \
+    apt-get -y --no-install-recommends install clang clang-tools cmake ninja-build git flex bison lldb gdb less vim psmisc uncrustify \
     net-tools tshark tcpdump uuid-dev iproute2 man-db manpages-dev ca-certificates ssh libjansson-dev libclang-rt-18-dev llvm wget \
     libxxhash-dev liburcu-dev librdmacm-dev liburing-dev libaio-dev libunwind-dev librocksdb-dev libcurl4-openssl-dev clangd uthash-dev libnuma-dev \
     libcurl4-openssl-dev build-essential ruby-full autoconf automake make libtool pkg-config libs3-dev gh npm reuse libssl-dev openssl \
-    gss-ntlmssp-dev libkrb5-3 libkrb5-dev libgssapi-krb5-2 curl jq && \
+    libkrb5-3 libkrb5-dev libgssapi-krb5-2 libwbclient-dev curl jq \
+    krb5-kdc krb5-admin-server krb5-user \
+    samba samba-ad-dc samba-ad-provision samba-vfs-modules smbclient && \
     gem install jekyll bundler 
 
 RUN if [ "$ENABLE_CLAUDE" = "1" ] ; then \
     npm install -g @anthropic-ai/claude-code ; \
+    fi
+
+RUN if [ "$ENABLE_CODEX" = "1" ] ; then \
+    npm install -g @openai/codex ; \
     fi
 
 RUN if [ "$ENABLE_FIO" = "1" ] ; then \

@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2025 Chimera-NAS Project Contributors
+// SPDX-FileCopyrightText: 2025-2026 Chimera-NAS Project Contributors
 //
 // SPDX-License-Identifier: LGPL-2.1-only
 
@@ -114,15 +114,21 @@ chimera_smb_marshal_basic_attrs(
         smb_attr->smb_attributes |= 0x10; /* FILE_ATTRIBUTE_DIRECTORY */
     }
 
-    if ((attr->va_mode & S_IFMT) == S_IFLNK) {
-        smb_attr->smb_attributes |= 0x400; /* FILE_ATTRIBUTE_REPARSE_POINT */
-        smb_attr->smb_reparse_tag = 0xA000000C; /* IO_REPARSE_TAG_SYMLINK */
-        smb_attr->smb_attr_mask  |= SMB_ATTR_REPARSE_TAG;
-    }
+    switch (attr->va_mode & S_IFMT) {
+        case S_IFLNK:
+        case S_IFCHR:
+        case S_IFBLK:
+        case S_IFIFO:
+        case S_IFSOCK:
+            smb_attr->smb_attributes |= SMB2_FILE_ATTRIBUTE_REPARSE_POINT;
+            smb_attr->smb_reparse_tag = SMB2_IO_REPARSE_TAG_NFS;
+            smb_attr->smb_attr_mask  |= SMB_ATTR_REPARSE_TAG;
+            break;
+    } // switch
 
     /* Set default for normal file if no attributes are set */
     if (smb_attr->smb_attributes == 0 && (attr->va_mode & S_IFMT) == S_IFREG) {
-        smb_attr->smb_attributes = 0x80; /* FILE_ATTRIBUTE_NORMAL */
+        smb_attr->smb_attributes = SMB2_FILE_ATTRIBUTE_ARCHIVE;
     }
     smb_attr->smb_attr_mask |= SMB_ATTR_ATTRIBUTES;
 } /* chimera_smb_marshal_basic_attrs */
@@ -335,8 +341,8 @@ chimera_smb_unmarshal_basic_info(
     chimera_nt_to_epoch(smb_attrs->smb_mtime, &attr->va_mtime);
     chimera_nt_to_epoch(smb_attrs->smb_ctime, &attr->va_ctime);
 
-    attr->va_req_mask |= SMB_ATTR_ATIME | SMB_ATTR_MTIME | SMB_ATTR_CTIME;
-    attr->va_set_mask |= SMB_ATTR_ATIME | SMB_ATTR_MTIME | SMB_ATTR_CTIME;
+    attr->va_req_mask |= CHIMERA_VFS_ATTR_ATIME | CHIMERA_VFS_ATTR_MTIME | CHIMERA_VFS_ATTR_CTIME;
+    attr->va_set_mask |= CHIMERA_VFS_ATTR_ATIME | CHIMERA_VFS_ATTR_MTIME | CHIMERA_VFS_ATTR_CTIME;
 } // chimera_smb_unmarshal_basic_info
 
 static inline void
@@ -348,8 +354,8 @@ chimera_smb_unmarshal_end_of_file_info(
     attr->va_set_mask = 0;
 
     attr->va_size      = smb_attrs->smb_size;
-    attr->va_req_mask |= SMB_ATTR_SIZE;
-    attr->va_set_mask |= SMB_ATTR_SIZE;
+    attr->va_req_mask |= CHIMERA_VFS_ATTR_SIZE;
+    attr->va_set_mask |= CHIMERA_VFS_ATTR_SIZE;
 } // chimera_smb_unmarshal_end_of_file_info
 
 static inline void

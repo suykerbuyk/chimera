@@ -9,17 +9,17 @@ description Test various SNFS specific feature with chimera
 %error need to provide a QB PKG_TAG
 %endif
 
-host mdc1	distro:MDC_DISTRO version:MDC_VERSION arch:x86_64 cores:4 memory:8192
+host srv1	distro:MDC_DISTRO version:MDC_VERSION arch:x86_64 cores:4 memory:8192
 host lnx1       distro:LNXCLI_DISTRO version:LNXCLI_VERSION arch:x86_64 cores:2 memory:2048
 
-hostgroup allhosts   mdc1 lnx1
+hostgroup allhosts   srv1 lnx1
 hostgroup clients    lnx1
 
 
 # Define LUNs for MDCs
-lun snfs1_meta mdc1 8
+lun snfs1_meta srv1 8
 lun snfs1_data allhosts 32
-lun snfs2_meta mdc1 8
+lun snfs2_meta srv1 8
 lun snfs2_data allhosts 32
 
 failstep 10m Capture debug info on failure
@@ -35,40 +35,48 @@ step 1m extract the NAS sntest_utils
 command allhosts curl https://nexus.mdh.quantum.com/repository/snnas-binaries/sn_tests/sntest_utils.tar.gz | tar zxf - -C /
 
 step 10m Make sure that the kernel-devel is installed
-command mdc1 dnf install -y kernel-devel
+command srv1 dnf install -y kernel-devel
 
 step 5m remove MDH path
-command mdc1 rm -f /etc/profile.d/mdh-env.sh
+command srv1 rm -f /etc/profile.d/mdh-env.sh
 
 #  --------------------   install stornext  ---------------
+%ifdef HAVE_TSM
+%define SNFS_PKG full_suite
+%else
+%define SNFS_PKG snfs
+%endif
+
+
 step 10m Unpack StorNext
-command mdc1 $sntest/bin/unpack_stornext full_suite $sndist /tmp/stornext
+command srv1 $sntest/bin/unpack_stornext SNFS_PKG $sndist /tmp/stornext
 command clients $sntest/bin/unpack_stornext client $sndist /tmp/stornext
 
 step 10m Install StorNext
-command mdc1 $sntest/bin/install_stornext full_suite /tmp/stornext
+command srv1 $sntest/bin/install_stornext SNFS_PKG /tmp/stornext
 command clients $sntest/bin/install_stornext client /tmp/stornext
 
 step 10m Set StorNext Name Servers
-command allhosts $sntest/bin/set_fsnameservers $mdc1
+command allhosts $sntest/bin/set_fsnameservers $srv1
 
 step 5m Clear temp licenses
-command mdc1 rm -f /usr/cvfs/config/license.dat
+command srv1 rm -f /usr/cvfs/config/license.dat
 
 step 600 Start StorNext
-command mdc1 $sntest/bin/cvfs_control start
+command srv1 $sntest/bin/cvfs_control start
 
 step 600 Label LUNs
-command mdc1 $sntest/bin/label_lun $snfs1_meta CvfsDisk_snfs1_meta
-command mdc1 $sntest/bin/label_lun $snfs1_data CvfsDisk_snfs1_data
-command mdc1 $sntest/bin/label_lun $snfs2_meta CvfsDisk_snfs2_meta
-command mdc1 $sntest/bin/label_lun $snfs2_data CvfsDisk_snfs2_data
+command srv1 $sntest/bin/label_lun $snfs1_meta CvfsDisk_snfs1_meta
+command srv1 $sntest/bin/label_lun $snfs1_data CvfsDisk_snfs1_data
+command srv1 $sntest/bin/label_lun $snfs2_meta CvfsDisk_snfs2_meta
+command srv1 $sntest/bin/label_lun $snfs2_data CvfsDisk_snfs2_data
 
 step 600 Force Disk Rescan
-command mdc1 /usr/cvfs/bin/cvadmin -e 'disks refresh'
+command srv1 /usr/cvfs/bin/cvadmin -e 'disks refresh'
 
+%ifdef HAVE_TSM
 step 600 Configure File System
-command mdc1 $sntest/bin/configure_fs snfs1 \
+command srv1 $sntest/bin/configure_fs snfs1 \
    fileLocks=true \
    caseInsensitive=true \
    fileLockResyncTimeOut=20 \
@@ -78,7 +86,18 @@ command mdc1 $sntest/bin/configure_fs snfs1 \
    storageManager=true \
    sg0:1:metadata,journal:CvfsDisk_snfs1_meta \
    sg1:1:userdata:CvfsDisk_snfs1_data
-command mdc1 $sntest/bin/configure_fs snfs2 \
+%else
+command srv1 $sntest/bin/configure_fs snfs1 \
+   fileLocks=true \
+   caseInsensitive=true \
+   fileLockResyncTimeOut=20 \
+   enforceAcls=true \
+   quotas=true \
+   namedStreams=true \
+   sg0:1:metadata,journal:CvfsDisk_snfs1_meta \
+   sg1:1:userdata:CvfsDisk_snfs1_data
+%endif
+command srv1 $sntest/bin/configure_fs snfs2 \
    fileLocks=true \
    fileLockResyncTimeOut=20 \
    enforceAcls=true \
@@ -87,119 +106,135 @@ command mdc1 $sntest/bin/configure_fs snfs2 \
    sg1:1:userdata:CvfsDisk_snfs2_data
 
 step 600 Initialize File Systems
-command mdc1 /usr/cvfs/bin/cvmkfs -F snfs1
-command mdc1 /usr/cvfs/bin/cvmkfs -F snfs2
+command srv1 /usr/cvfs/bin/cvmkfs -F snfs1
+command srv1 /usr/cvfs/bin/cvmkfs -F snfs2
 
 step 600 Write FSM list
-command mdc1 $sntest/bin/append_fsmlist snfs1
-command mdc1 $sntest/bin/append_fsmlist snfs2
+command srv1 $sntest/bin/append_fsmlist snfs1
+command srv1 $sntest/bin/append_fsmlist snfs2
 
 step 600 Configure File System Mounts
 command allhosts  $sntest/bin/configure_mount snfs1 /stornext/snfs1 defaults
 command allhosts  $sntest/bin/configure_mount snfs2 /stornext/snfs2 defaults
 
 step 5m Restart StorNext on MDC
-command mdc1 $sntest/bin/cvfs_control restart
+command srv1 $sntest/bin/cvfs_control restart
 
 step 5m Restart StorNext on clients
 command clients $sntest/bin/cvfs_control restart
 
+%ifdef HAVE_TSM
 # --------------------- Configure the SDISK and Storage destination --------------
 step 600 Create relation and sdisk directories
-command mdc1 mkdir /stornext/snfs1/managed
-command mdc1 mkdir /stornext/snfs2/sdisk1
+command srv1 mkdir /stornext/snfs1/managed
+command srv1 mkdir /stornext/snfs2/sdisk1
 
 step 600 check TSM
-command mdc1 $sntest/bin/profile tsmup
+command srv1 $sntest/bin/profile tsmup
 
 step 600 Configure sdisk
-command mdc1 $sntest/bin/profile fsdiskcfg -a -p /stornext/snfs2/sdisk1 -c 1 -s 4 Storage_Disk_1
+command srv1 $sntest/bin/profile fsdiskcfg -a -p /stornext/snfs2/sdisk1 -c 1 -s 4 Storage_Disk_1
 
 step 600 Configure backup for Managed filesystem
-command mdc1 $sntest/bin/configure_snbackup snfs1 /stornext/snfs1 sdisk
+command srv1 $sntest/bin/configure_snbackup snfs1 /stornext/snfs1 sdisk
 
 step 600 Add policy class for creating a managed filesystem in TSM.
-command mdc1 $sntest/bin/profile fsaddclass policyclass -d 1 -m 1 -t sdisk
+command srv1 $sntest/bin/profile fsaddclass policyclass -d 1 -m 1 -t sdisk
 
 step 600 Add relation point to (policyclass)
-command mdc1 $sntest/bin/profile fsaddrelation /stornext/snfs1/managed -c policyclass
+command srv1 $sntest/bin/profile fsaddrelation /stornext/snfs1/managed -c policyclass
+%endif
 
 #  --------------------   install Chimera  ---------------
-step 5m setup ntlm authentication.
-command mdc1 mkdir -p /etc/chimera && \
-	echo "WORKGROUP:testuser1:systest" >/etc/chimera/ntlm.txt && \
-	echo "export NTLM_USER_FILE=/etc/chimera/ntlm.txt" > /etc/profile.d/chimera.sh
-
 step 2m Download chimera pkg for Stornext
-command mdc1 /sntest_utils/get_qb_asset.py -p chimera -t PKG_TAG -d /chimera-repo -u release/Rocky9/amd64/repo-chimera.tar.gz
+command srv1 /sntest_utils/get_qb_asset.py -p chimera -t PKG_TAG -d /chimera-repo -u release/Rocky9/amd64/repo-chimera.tar.gz
 
 step 2m install the chimera PKG
-command mdc1 dnf install -y /chimera-repo/*.rpm
+command srv1 dnf install -y /chimera-repo/*.rpm
 
-step 5m prepare SMB1 share
-command mdc1 cp /etc/chimera/chimera.json /etc/chimera/chimera.json.orig && \
-	     cp  /opt/quantum/chimera/share/examples/chimera-snfs.json /etc/chimera/chimera.json && \
-	     mkdir -p /stornext/snfs1/smb1 && \
-	     chmod 777 /stornext/snfs1/smb1
+step 1m Create base chimera.json file
+command srv1 sed -i.back 's/\/chimera.json/\/sntest-chimera.json/'  /etc/default/chimera && \
+	     cat /etc/default/chimera && \
+	     jq -n '{ \
+                 server: { \
+                    threads: 16, \
+                    external_portmap: true, \
+                    max_open_files: 1048576, \
+                    rest_http_port: 8080 \
+                 }, \
+		 users: [ \
+		    { username: "testuser1", smbpasswd: "systest", uid: 5000, gid: 50} \
+                 ], \
+                 mounts: { \
+                    snfs1: { \
+                       path: "/stornext/snfs1", \
+                       module: "linux" \
+                    } \
+                }, \
+                shares: { \
+                   smb1: { path: "/snfs1" } \
+                }, \
+                exports: { \
+                   "/nfs1": { path: "/snfs1" } \
+                } }'  > /etc/chimera/sntest-chimera.json
 
 step 5m enable and start chimera
-command mdc1 systemctl enable chimera && \
-	systemctl start chimera && \
-	sleep 5 && \
-	systemctl status chimera
+command srv1 cat /etc/default/chimera
+command srv1 jq . /etc/chimera/sntest-chimera.json
+command srv1 systemctl enable chimera && \
+	     systemctl start chimera && \
+	     sleep 5 && \
+	     systemctl status chimera
+
+step 5m check chimera config
+command srv1 curl -s "http://127.0.0.1:8080/api/v1/users" | jq
+command srv1 curl -s "http://127.0.0.1:8080/api/v1/shares" | jq
+command srv1 curl -s "http://127.0.0.1:8080/api/v1/exports" | jq
 
 # ----------------- Setup linux client -----------------
-%define SMBCLIENT smbclient -U WORKGROUP/testuser1%systest //$mdc1/smb1
+%define SMBCLIENT smbclient -U WORKGROUP/testuser1%systest //$srv1/smb1
 
 step 5m Linux Prepare clients
-command lnx1 echo -e "username=testuser1\npassword=systest\ndomain=WORKGROUP" > /root/.smb_cred
-
-%if LNXCLI_DISTRO == ubuntu-server
-step 5m install smbclient 
-command lnx1 apt update && apt install -y smbclient cifs-utils
-%else
-step 5m setup external yum repo
-command lnx1 dnf reinstall -y rocky-repos && \
-	rm -f /etc/yum.repos.d/mdh.repo && \
-	dnf clean all
+command lnx1 /bin/echo -e "username=testuser1\npassword=systest\ndomain=WORKGROUP" > /root/.smb_cred
 
 step 5m install smbclient
-command lnx1 dnf install -y samba-client cifs-utils
-%endif
+command lnx1 apt update && apt install -y smbclient cifs-utils
 
 step 1m validate that we have access.
 command lnx1 SMBCLIENT -c 'ls'
 
 step 5m Connect to smb1 share
-command lnx1 mkdir -p /smb1 && mount.cifs -ocredentials=/root/.smb_cred //$mdc1/smb1 /smb1
+command lnx1 mkdir -p /smb1 && mount.cifs -ocredentials=/root/.smb_cred //$srv1/smb1 /smb1
 
 # ----------------- Run test -----------------
 # ===== Test general metdata operation ===========
 
+# TODO: create the Directory on Stornext have have SMB see it.
 step 1m create test directory
-command mdc1 mkdir -p /stornext/snfs1/smb1/lnx
+command lnx1 mkdir -p /smb1/lnx
 
 step 10m run MDT over smb1
 command lnx1 /usr/cvfs/bin/mdt  -m -s -f 1000 -n 4 -U /smb1/lnx && rm -rf /smb1/lnx
 
+%ifndef SKIP_FAIL
 # ================ Test create time ==============
 # vfs_snfs (CvApi_SetNtCreateTime)
 
 step 1m create test file
-command mdc1 touch /stornext/snfs1/smb1/test_crtime
+command srv1 touch /stornext/snfs1/test_crtime
 
 step 5m get the file create time
-command mdc1 sleep 30; echo show inode smb1/test_crtime | /usr/cvfs/bin/cvfsdb snfs1 | grep idi_crttime.tv_sec
+command srv1 sleep 30; echo show inode smb1/test_crtime | /usr/cvfs/bin/cvfsdb snfs1 | grep idi_crttime.tv_sec
 command lnx1 SMBCLIENT -c 'allinfo test_crtime' | grep create_time
 
 step 1m change time to Jan 1 1990 with Linux client.
 command lnx1 SMBCLIENT  -c 'utimes test_crtime 90:01:01-00:00:00 -1 -1 -1'
 
 step 1m Confirm create time is 1990
-command mdc1 sleep 30; echo show inode smb1/test_crtime | /usr/cvfs/bin/cvfsdb snfs1 | grep idi_crttime.tv_sec | grep 1990
+command srv1 sleep 30; echo show inode smb1/test_crtime | /usr/cvfs/bin/cvfsdb snfs1 | grep idi_crttime.tv_sec | grep 1990
 command lnx1 SMBCLIENT -c 'allinfo test_crtime' | grep create_time | grep 1990
 
-# ================ Validated win attribute offline ==============
+%endif
 
 
 

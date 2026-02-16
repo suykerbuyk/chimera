@@ -25,7 +25,7 @@ CMAKE_ARGS := -DCMAKE_EXPORT_COMPILE_COMMANDS=1 -G Ninja
 CMAKE_ARGS_RELEASE := -DCMAKE_BUILD_TYPE=Release
 CMAKE_ARGS_DEBUG := -DCMAKE_BUILD_TYPE=Debug
 CTEST_PARALLEL := $(shell n=$$(nproc); echo $$(( n < 64 ? n : 64 )))
-CTEST_ARGS := --output-on-failure -j $(CTEST_PARALLEL)
+CTEST_ARGS := --output-on-failure --timeout 30 -j $(CTEST_PARALLEL)
 
 default: build_debug
 
@@ -73,14 +73,14 @@ syntax:
 build_clang_debug:
 	@rm -rf ${CHIMERA_BUILD_DIR}/ClangDebug
 	@mkdir -p ${CHIMERA_BUILD_DIR}/ClangDebug
-	@LC_ALL=C scan-build --status-bugs --exclude ext/libsmb2 -o ${CHIMERA_BUILD_DIR}/ClangDebug/ScanReport \
+	@LC_ALL=C scan-build --status-bugs -o ${CHIMERA_BUILD_DIR}/ClangDebug/ScanReport \
 		sh -c "cmake ${CMAKE_ARGS} ${CMAKE_ARGS_DEBUG} -S . -B ${CHIMERA_BUILD_DIR}/ClangDebug && ninja -C ${CHIMERA_BUILD_DIR}/ClangDebug"
 
 .PHONY: build_clang_release
 build_clang_release:
 	@rm -rf ${CHIMERA_BUILD_DIR}/ClangRelease
 	@mkdir -p ${CHIMERA_BUILD_DIR}/ClangRelease
-	@LC_ALL=C scan-build --status-bugs --exclude ext/libsmb2 -o ${CHIMERA_BUILD_DIR}/ClangRelease/ScanReport \
+	@LC_ALL=C scan-build --status-bugs -o ${CHIMERA_BUILD_DIR}/ClangRelease/ScanReport \
 		sh -c "cmake ${CMAKE_ARGS} ${CMAKE_ARGS_RELEASE} -S . -B ${CHIMERA_BUILD_DIR}/ClangRelease && ninja -C ${CHIMERA_BUILD_DIR}/ClangRelease"
 
 .PHONY: build_clang

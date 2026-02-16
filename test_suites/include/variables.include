@@ -8,11 +8,18 @@
 #    - Specific OS release to utilize.
 #    - Optional.
 #
+#  * CHIM_OS:  24(default)
+#    - specify what version for Chimera Server
+#    -  9 == Rocky9
+#    - 22 == Ubuntu22
+#    - 24 == Ubuntu24
+#    - Optional.
+#
 #  * OS_DISTRO:  ubuntu-server(default)
 #    - Specific distribution to use
 #    - Optional.
 #
-#  * OS_VERSION: 24.04(default)
+#  * OS_VERSION: 24.04.3(default)
 #    - Specific OS release to utilize.
 #    - Optional.
 #
@@ -20,7 +27,7 @@
 #    - Specific distribution used by NAS clients
 #    - Optional.
 #
-#  * LNXCLI_VERSION: 24.04(default)
+#  * LNXCLI_VERSION: 24.04.3(default)
 #    - Specific OS release to utilize by NAS Client
 #    - default OS_VERSION
 #    - Optional.
@@ -34,20 +41,67 @@
 %define MDC_VERSION 9.5
 %endif
 
-%ifndef OS_DISTRO
-%define OS_DISTRO ubuntu-server
-%endif
-
-%ifndef OS_VERSION
-%define OS_VERSION 24.04
-%endif
-
 %ifndef LNXCLI_DISTRO
 %define LNXCLI_DISTRO ubuntu-server
 %endif
 
 %ifndef LNXCLI_VERSION
-%define LNXCLI_VERSION 24.04
+%define LNXCLI_VERSION 24.04.3
 %endif
+
+
+%ifndef CHIM_OS
+%define CHIM_OS 24
+%define QB_OS Ubuntu24
+%endif
+
+# Ubuntu 24
+%if CHIM_OS == 24
+%define QB_OS Ubuntu24
+
+%ifndef OS_DISTRO
+%define OS_DISTRO ubuntu-server
+%endif
+
+%ifndef OS_VERSION
+%define OS_VERSION 24.04.3
+%endif
+
+# endif CHIM_OS == 24
+%endif
+
+# Ubuntu 22
+%if CHIM_OS == 22
+%define QB_OS Ubuntu22
+
+%ifndef OS_DISTRO
+%define OS_DISTRO ubuntu-server
+%endif
+
+%ifndef OS_VERSION
+%define OS_VERSION 22.04.1
+%endif
+
+# endif CHIM_OS == 22
+%endif
+
+
+# Rocky9
+%if CHIM_OS == 9
+%define QB_OS Rock9
+
+%ifndef OS_DISTRO
+%define OS_DISTRO rockyl
+%endif
+
+%ifndef OS_VERSION
+%define OS_VERSION 9.5
+%endif
+
+# endif CHIM_OS == 9
+%endif
+
+
+
 
 

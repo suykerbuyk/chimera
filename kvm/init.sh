@@ -22,13 +22,50 @@ TEST_CMD=`cat /proc/cmdline | sed -e 's/^.*test_cmd="//' -e 's/".*$//'`
 
 echo "Executing: $TEST_CMD"
 
-eval "$TEST_CMD"
+# Run the test command in background so we can monitor it
+eval "$TEST_CMD" &
+TEST_PID=$!
+
+# Background watchdog: if test runs longer than 10s, dump diagnostics
+(
+    ELAPSED=0
+    while kill -0 $TEST_PID 2>/dev/null; do
+        sleep 5
+        ELAPSED=$((ELAPSED + 5))
+        if [ $ELAPSED -ge 10 ]; then
+            echo "=== WATCHDOG: test PID $TEST_PID still running after ${ELAPSED}s ==="
+            echo "--- All processes ---"
+            for pid in $(ls -d /proc/[0-9]* 2>/dev/null | cut -d/ -f3); do
+                COMM=$(cat /proc/$pid/comm 2>/dev/null) || continue
+                WCHAN=$(cat /proc/$pid/wchan 2>/dev/null)
+                STATE=$(cat /proc/$pid/stat 2>/dev/null | cut -d' ' -f3)
+                echo "PID $pid ($COMM) state=$STATE wchan=$WCHAN"
+                if [ "$STATE" = "D" ]; then
+                    cat /proc/$pid/stack 2>/dev/null
+                fi
+            done
+            echo "--- NFS mount stats ---"
+            cat /proc/self/mountstats 2>/dev/null | head -60
+            echo "--- NFS RPC stats ---"
+            cat /proc/net/rpc/nfs 2>/dev/null
+            echo "--- dmesg (last 30 lines) ---"
+            dmesg 2>/dev/null | tail -30
+            echo "=== END WATCHDOG ==="
+        fi
+    done
+) &
+WATCHDOG_PID=$!
+
+wait $TEST_PID
 EXIT_CODE=$?
 
-echo "CHIMERA_KVM_EXIT_CODE=${EXIT_CODE}"
+# Stop the watchdog
+kill $WATCHDOG_PID 2>/dev/null
+wait $WATCHDOG_PID 2>/dev/null
 
-# Flush all kernel buffers (including serial console) before power off
-sync
+# Write exit code via kmsg so it goes through the kernel console driver
+# synchronously, guaranteeing it reaches the serial log before power off
+echo "CHIMERA_KVM_EXIT_CODE=${EXIT_CODE}" > /dev/kmsg
 
 # Tell kernel to power off; QEMU with -no-reboot will exit
 echo o > /proc/sysrq-trigger

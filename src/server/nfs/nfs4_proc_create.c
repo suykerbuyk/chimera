@@ -118,16 +118,16 @@ chimera_nfs4_create_open_callback(
         switch (args->objtype.type) {
             case NF4DIR:
                 req->handle = handle;
-                chimera_vfs_mkdir(thread->vfs_thread, &req->cred,
-                                  handle,
-                                  args->objname.data,
-                                  args->objname.len,
-                                  attr,
-                                  CHIMERA_VFS_ATTR_FH,
-                                  CHIMERA_VFS_ATTR_MTIME,
-                                  CHIMERA_VFS_ATTR_MTIME,
-                                  chimera_nfs4_create_complete,
-                                  req);
+                chimera_vfs_mkdir_at(thread->vfs_thread, &req->cred,
+                                     handle,
+                                     args->objname.data,
+                                     args->objname.len,
+                                     attr,
+                                     CHIMERA_VFS_ATTR_FH,
+                                     CHIMERA_VFS_ATTR_MTIME,
+                                     CHIMERA_VFS_ATTR_MTIME,
+                                     chimera_nfs4_create_complete,
+                                     req);
                 break;
             case NF4BLK:
             case NF4CHR:
@@ -141,7 +141,7 @@ chimera_nfs4_create_open_callback(
             case NF4LNK:
                 req->handle = handle;
 
-                chimera_vfs_symlink(
+                chimera_vfs_symlink_at(
                     thread->vfs_thread,
                     &req->cred,
                     handle,
@@ -176,11 +176,20 @@ chimera_nfs4_create(
     struct nfs_argop4                *argop,
     struct nfs_resop4                *resop)
 {
-    chimera_vfs_open(thread->vfs_thread, &req->cred,
-                     req->fh,
-                     req->fhlen,
-                     CHIMERA_VFS_OPEN_INFERRED | CHIMERA_VFS_OPEN_PATH | CHIMERA_VFS_OPEN_DIRECTORY,
-                     chimera_nfs4_create_open_callback,
-                     req);
+    struct CREATE4args *args = &argop->opcreate;
+    struct CREATE4res  *res  = &resop->opcreate;
+
+    if (args->objname.len == 0) {
+        res->status = NFS4ERR_INVAL;
+        chimera_nfs4_compound_complete(req, NFS4ERR_INVAL);
+        return;
+    }
+
+    chimera_vfs_open_fh(thread->vfs_thread, &req->cred,
+                        req->fh,
+                        req->fhlen,
+                        CHIMERA_VFS_OPEN_INFERRED | CHIMERA_VFS_OPEN_PATH | CHIMERA_VFS_OPEN_DIRECTORY,
+                        chimera_nfs4_create_open_callback,
+                        req);
 
 } /* chimera_nfs4_create */

@@ -240,6 +240,7 @@ main(
     evpl_global_config_set_buffer_size(evpl_global_config, 8 * 1024 * 1024);
     evpl_global_config_set_spin_ns(evpl_global_config, 1000000UL);
     evpl_global_config_set_huge_pages(evpl_global_config, 1);
+    evpl_global_config_set_libaio_max_pending(evpl_global_config, 8192);
 
     /* Configure TLS if HTTPS is enabled */
     if (rest_https_port != 0) {
@@ -341,6 +342,38 @@ main(
         }
     }
 
+    // Parse SMB auth configuration
+    json_t *smb_auth = json_object_get(server_params, "smb_auth");
+    if (smb_auth && json_is_object(smb_auth)) {
+        json_t *winbind_enabled = json_object_get(smb_auth, "winbind_enabled");
+        if (winbind_enabled && json_is_true(winbind_enabled)) {
+            chimera_server_config_set_smb_winbind_enabled(server_config, 1);
+        }
+
+        json_t *winbind_domain = json_object_get(smb_auth, "winbind_domain");
+        if (winbind_domain && json_is_string(winbind_domain)) {
+            chimera_server_config_set_smb_winbind_domain(server_config,
+                                                         json_string_value(winbind_domain));
+        }
+
+        json_t *kerberos_enabled = json_object_get(smb_auth, "kerberos_enabled");
+        if (kerberos_enabled && json_is_true(kerberos_enabled)) {
+            chimera_server_config_set_smb_kerberos_enabled(server_config, 1);
+        }
+
+        json_t *kerberos_keytab = json_object_get(smb_auth, "kerberos_keytab");
+        if (kerberos_keytab && json_is_string(kerberos_keytab)) {
+            chimera_server_config_set_smb_kerberos_keytab(server_config,
+                                                          json_string_value(kerberos_keytab));
+        }
+
+        json_t *kerberos_realm = json_object_get(smb_auth, "kerberos_realm");
+        if (kerberos_realm && json_is_string(kerberos_realm)) {
+            chimera_server_config_set_smb_kerberos_realm(server_config,
+                                                         json_string_value(kerberos_realm));
+        }
+    }
+
     json_t *smb_multichannel = json_object_get(server_params, "smb_multichannel");
     if (json_is_array(smb_multichannel)) {
         json_t *smb_nic_info_json;
@@ -377,6 +410,8 @@ main(
 
             if (json_is_object(config_obj)) {
                 config_str = json_dumps(config_obj, JSON_COMPACT);
+            } else if (config_obj) {
+                chimera_server_error("VFS module config for module %s is not an object, skipping", module_name);
             }
 
             chimera_server_config_add_module(server_config, module_name, mod_path,
@@ -423,6 +458,7 @@ main(
             chimera_server_add_user(server, username,
                                     password ? password : "",
                                     smbpasswd ? smbpasswd : "",
+                                    NULL,  // SID - synthesized for builtin users
                                     uid, gid, ngids, user_gids, 1);
         }
     }
