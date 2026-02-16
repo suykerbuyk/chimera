@@ -2,45 +2,47 @@
 #
 # SPDX-License-Identifier: LGPL-2.1-only
 
-macro(add_libsmb2_testprog name)
-    add_executable(${name} ${name}.c)
-    target_link_libraries(${name} smb2 chimera_server jansson gssapi_krb5)
-    set_target_properties(${name} PROPERTIES
-    TEST_FILE "${CMAKE_CURRENT_SOURCE_DIR}/${name}.c")
-endmacro()
 
-macro(add_libsmb2_test testname prog)
-    add_test(NAME chimera/server/smb/${testname} COMMAND ${CMAKE_SOURCE_DIR}/scripts/netns_test_wrapper.sh  ${CMAKE_CURRENT_BINARY_DIR}/${prog} ${ARGN})
-    get_target_property(test_file ${prog} TEST_FILE)
-    set_tests_properties(chimera/server/smb/${testname} PROPERTIES 
-        ENVIRONMENT "TEST_FILE=${test_file};LSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/suppressions.txt")
-endmacro()
+# SMB authentication test program
+add_executable(smb_auth_test smb_auth_test.c)
+target_link_libraries(smb_auth_test chimera_vfs urcu urcu-cds)
+target_include_directories(smb_auth_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
-add_libsmb2_testprog(libsmb2_basic)
-add_libsmb2_testprog(libsmb2_bigdir)
-add_libsmb2_testprog(libsmb2_echo)
-add_libsmb2_testprog(libsmb2_rename)
+add_test(NAME chimera/server/smb/auth_test
+    COMMAND ${CMAKE_CURRENT_BINARY_DIR}/smb_auth_test --mode=local)
+set_tests_properties(chimera/server/smb/auth_test PROPERTIES
+    ENVIRONMENT "LSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/suppressions.txt")
 
-add_libsmb2_test(libsmb2_memfs_basic libsmb2_basic -b memfs)
-add_libsmb2_test(libsmb2_memfs_bigdir libsmb2_bigdir -b memfs)
-add_libsmb2_test(libsmb2_memfs_echo libsmb2_echo -b memfs)
-add_libsmb2_test(libsmb2_memfs_rename libsmb2_rename -b memfs)
+# SMB smbclient authentication test
+add_executable(smbclient_auth_test smbclient_auth_test.c)
+target_link_libraries(smbclient_auth_test chimera_server chimera_metrics jansson)
+target_include_directories(smbclient_auth_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
+add_test(NAME chimera/server/smb/smbclient_ntlm
+    COMMAND ${CMAKE_SOURCE_DIR}/scripts/netns_test_wrapper.sh
+            ${CMAKE_CURRENT_BINARY_DIR}/smbclient_auth_test --mode=ntlm)
+set_tests_properties(chimera/server/smb/smbclient_ntlm PROPERTIES
+    ENVIRONMENT "LSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/suppressions.txt")
 
-add_libsmb2_test(libsmb2_linux_basic libsmb2_basic -b linux)
-add_libsmb2_test(libsmb2_linux_bigdir libsmb2_bigdir -b linux)
-add_libsmb2_test(libsmb2_linux_echo libsmb2_echo -b linux)
-add_libsmb2_test(libsmb2_linux_rename libsmb2_rename -b linux)
+add_test(NAME chimera/server/smb/smbclient_kerberos
+    COMMAND ${CMAKE_SOURCE_DIR}/scripts/kerberos_test_wrapper.sh
+            ${CMAKE_CURRENT_BINARY_DIR}/smbclient_auth_test --mode=kerberos)
+set_tests_properties(chimera/server/smb/smbclient_kerberos PROPERTIES
+    ENVIRONMENT "LSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/suppressions.txt")
 
+add_test(NAME chimera/server/smb/smbclient_winbind
+    COMMAND ${CMAKE_SOURCE_DIR}/scripts/ad_test_wrapper.sh
+            ${CMAKE_CURRENT_BINARY_DIR}/smbclient_auth_test --mode=winbind)
+set_tests_properties(chimera/server/smb/smbclient_winbind PROPERTIES
+    ENVIRONMENT "LSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/suppressions.txt")
 
-add_libsmb2_test(libsmb2_demofs_io_uring_basic libsmb2_basic -b demofs_io_uring)
-add_libsmb2_test(libsmb2_demofs_io_uring_bigdir libsmb2_bigdir -b demofs_io_uring)
-add_libsmb2_test(libsmb2_demofs_io_uring_echo libsmb2_echo -b demofs_io_uring)
-add_libsmb2_test(libsmb2_demofs_io_uring_rename libsmb2_rename -b demofs_io_uring)
+# REST API user/share manipulation test
+add_executable(rest_user_manip_test rest_user_manip_test.c)
+target_link_libraries(rest_user_manip_test chimera_server chimera_metrics jansson)
+target_include_directories(rest_user_manip_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
-if(HAVE_LIBAIO)
-    add_libsmb2_test(libsmb2_demofs_aio_basic libsmb2_basic -b demofs_aio)
-    add_libsmb2_test(libsmb2_demofs_aio_bigdir libsmb2_bigdir -b demofs_aio)
-    add_libsmb2_test(libsmb2_demofs_aio_echo libsmb2_echo -b demofs_aio)
-    add_libsmb2_test(libsmb2_demofs_aio_rename libsmb2_rename -b demofs_aio)
-endif()
+add_test(NAME chimera/server/smb/rest_user_manip
+    COMMAND ${CMAKE_SOURCE_DIR}/scripts/netns_test_wrapper.sh
+            ${CMAKE_CURRENT_BINARY_DIR}/rest_user_manip_test)
+set_tests_properties(chimera/server/smb/rest_user_manip PROPERTIES
+    ENVIRONMENT "LSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/suppressions.txt")

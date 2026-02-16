@@ -10,6 +10,7 @@
 #include "vfs/vfs.h"
 #include "nfs.h"
 #include "nfs_internal.h"
+#include "nfs3_open_state.h"
 #include "common/logging.h"
 #include "common/macros.h"
 #include "evpl/evpl.h"
@@ -78,7 +79,7 @@ chimera_nfs_get_mount_port(
 } /* chimera_nfs_get_mount_port */
 
 static void *
-chimera_nfs_init(const char *cfgfile)
+chimera_nfs_init(const char *cfgdata)
 {
     struct chimera_nfs_shared *shared = calloc(1, sizeof(*shared));
 
@@ -241,6 +242,20 @@ chimera_nfs_dispatch(
     } else if (request->opcode == CHIMERA_VFS_OP_UMOUNT) {
         mount   = request->umount.mount_private;
         nfsvers = mount->nfsvers;
+    } else if (request->opcode == CHIMERA_VFS_OP_CLOSE) {
+        /* Close requests get server routing from the open state stored in
+         * vfs_private, since the request may not carry a valid fh. */
+        struct chimera_nfs3_open_state *open_state =
+            (struct chimera_nfs3_open_state *) request->close.vfs_private;
+
+        if (!open_state) {
+            request->status = CHIMERA_VFS_OK;
+            request->complete(request);
+            return;
+        }
+
+        server  = shared->servers[open_state->server_index];
+        nfsvers = server->nfsvers;
     } else {
         fh = request->fh;
 
@@ -281,7 +296,7 @@ chimera_nfs_dispatch(
 SYMBOL_EXPORT struct chimera_vfs_module vfs_nfs = {
     .name           = "nfs",
     .fh_magic       = CHIMERA_VFS_FH_MAGIC_NFS,
-    .capabilities   = CHIMERA_VFS_CAP_OPEN_FILE_REQUIRED | CHIMERA_VFS_CAP_FS,
+    .capabilities   = CHIMERA_VFS_CAP_OPEN_FILE_REQUIRED | CHIMERA_VFS_CAP_FS | CHIMERA_VFS_CAP_FS_RELATIVE_OP,
     .init           = chimera_nfs_init,
     .destroy        = chimera_nfs_destroy,
     .thread_init    = chimera_nfs_thread_init,

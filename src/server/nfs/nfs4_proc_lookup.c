@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2025 Chimera-NAS Project Contributors
+// SPDX-FileCopyrightText: 2025-2026 Chimera-NAS Project Contributors
 //
 // SPDX-License-Identifier: LGPL-2.1-only
 
@@ -45,14 +45,14 @@ chimera_nfs4_lookup_open_callback(
     if (error_code == CHIMERA_VFS_OK) {
         req->handle = handle;
 
-        chimera_vfs_lookup(req->thread->vfs_thread, &req->cred,
-                           handle,
-                           args->objname.data,
-                           args->objname.len,
-                           CHIMERA_VFS_ATTR_FH,
-                           0,
-                           chimera_nfs4_lookup_complete,
-                           req);
+        chimera_vfs_lookup_at(req->thread->vfs_thread, &req->cred,
+                              handle,
+                              args->objname.data,
+                              args->objname.len,
+                              CHIMERA_VFS_ATTR_FH,
+                              0,
+                              chimera_nfs4_lookup_complete,
+                              req);
     } else {
         res->status = status;
         chimera_nfs4_compound_complete(req, status);
@@ -66,10 +66,27 @@ chimera_nfs4_lookup(
     struct nfs_argop4                *argop,
     struct nfs_resop4                *resop)
 {
-    chimera_vfs_open(thread->vfs_thread, &req->cred,
-                     req->fh,
-                     req->fhlen,
-                     CHIMERA_VFS_OPEN_INFERRED | CHIMERA_VFS_OPEN_PATH | CHIMERA_VFS_OPEN_DIRECTORY,
-                     chimera_nfs4_lookup_open_callback,
-                     req);
+    struct LOOKUP4args *args = &argop->oplookup;
+    struct LOOKUP4res  *res  = &resop->oplookup;
+
+    if (args->objname.len == 0) {
+        res->status = NFS4ERR_INVAL;
+        chimera_nfs4_compound_complete(req, NFS4ERR_INVAL);
+        return;
+    }
+
+    if ((args->objname.len == 1 && ((const char *) args->objname.data)[0] == '.') ||
+        (args->objname.len == 2 && ((const char *) args->objname.data)[0] == '.' &&
+         ((const char *) args->objname.data)[1] == '.')) {
+        res->status = NFS4ERR_BADNAME;
+        chimera_nfs4_compound_complete(req, NFS4ERR_BADNAME);
+        return;
+    }
+
+    chimera_vfs_open_fh(thread->vfs_thread, &req->cred,
+                        req->fh,
+                        req->fhlen,
+                        CHIMERA_VFS_OPEN_INFERRED | CHIMERA_VFS_OPEN_PATH | CHIMERA_VFS_OPEN_DIRECTORY,
+                        chimera_nfs4_lookup_open_callback,
+                        req);
 } /* chimera_nfs4_lookup */

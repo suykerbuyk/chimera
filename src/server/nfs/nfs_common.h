@@ -24,6 +24,7 @@ struct nfs_nfs3_readdir_cursor {
 
 struct nfs_nfs3_readdirplus_cursor {
     uint64_t           count;
+    uint64_t           dircount;
     struct entryplus3 *entries;
     struct entryplus3 *last;
 };
@@ -37,6 +38,7 @@ struct nfs_nfs4_readdir_cursor {
 struct nfs_request {
     struct chimera_server_nfs_thread *thread;
     struct nfs4_session              *session;
+    struct nfs4_state                *nfs4_state;
     struct chimera_vfs_cred           cred;
     uint8_t                           fh[NFS4_FHSIZE];
     int                               fhlen;

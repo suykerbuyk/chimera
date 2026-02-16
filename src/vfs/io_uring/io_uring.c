@@ -24,6 +24,7 @@
 #include <linux/version.h>
 
 #include "vfs/vfs_error.h"
+#include "vfs/vfs_internal.h"
 
 #include "evpl/evpl.h"
 
@@ -95,7 +96,7 @@ struct chimera_io_uring_thread {
 };
 
 static void *
-chimera_io_uring_init(const char *cfgfile)
+chimera_io_uring_init(const char *cfgdata)
 {
     struct chimera_io_uring_shared *shared;
     struct io_uring_params          params = { 0 };
@@ -112,14 +113,14 @@ chimera_io_uring_init(const char *cfgfile)
         return NULL;
     }
 
-    if (cfgfile && cfgfile[0] != '\0') {
+    if (cfgdata && cfgdata[0] != '\0') {
         json_error_t json_error;
-        json_t      *cfg = json_loads(cfgfile, 0, &json_error);
+        json_t      *cfg = json_loads(cfgdata, 0, &json_error);
 
         if (cfg) {
             json_t *verf = json_object_get(cfg, "readdir_verifier");
 
-            if (verf && json_is_boolean(verf)) {
+            if (json_is_boolean(verf)) {
                 shared->readdir_verifier = json_boolean_value(verf);
             }
 
@@ -192,7 +193,7 @@ chimera_io_uring_complete(
         request = container_of(handle, struct chimera_vfs_request, handle[handle->slot]);
 
         switch (request->opcode) {
-            case CHIMERA_VFS_OP_LOOKUP:
+            case CHIMERA_VFS_OP_LOOKUP_AT:
                 if (cqe->res >= 0) {
                     request->status = CHIMERA_VFS_OK;
 
@@ -200,11 +201,11 @@ chimera_io_uring_complete(
 
                     name = (char *) (stx + 1);
 
-                    parent_fd = request->lookup.handle->vfs_private;
+                    parent_fd = request->lookup_at.handle->vfs_private;
 
                     chimera_linux_map_child_attrs_statx(CHIMERA_VFS_FH_MAGIC_IO_URING,
                                                         request,
-                                                        &request->lookup.r_attr,
+                                                        &request->lookup_at.r_attr,
                                                         parent_fd,
                                                         name,
                                                         stx);
@@ -236,7 +237,14 @@ chimera_io_uring_complete(
 
                         sqe = chimera_io_uring_get_sqe(thread, request, 1, 0);
 
-                        io_uring_prep_statx(sqe, parent_fd, name, 0, AT_STATX_SYNC_AS_STAT, stx);
+                        if (request->open_at.flags & CHIMERA_VFS_OPEN_NOFOLLOW) {
+                            io_uring_prep_statx(sqe, cqe->res, "",
+                                                AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW,
+                                                AT_STATX_SYNC_AS_STAT, stx);
+                        } else {
+                            io_uring_prep_statx(sqe, parent_fd, name, 0,
+                                                AT_STATX_SYNC_AS_STAT, stx);
+                        }
 
                         sqe = chimera_io_uring_get_sqe(thread, request, 2, 0);
 
@@ -253,14 +261,25 @@ chimera_io_uring_complete(
                         stx     = (struct statx *) (dir_stx + 1);
                         name    = (char *) (stx + 1);
 
-                        parent_fd = request->open_at.handle->vfs_private;
+                        if (request->open_at.flags & CHIMERA_VFS_OPEN_NOFOLLOW) {
+                            chimera_linux_map_child_attrs_statx(CHIMERA_VFS_FH_MAGIC_IO_URING,
+                                                                request,
+                                                                &request->open_at.r_attr,
+                                                                request->open_at.r_vfs_private,
+                                                                "",
+                                                                stx);
+                        } else {
+                            parent_fd = request->open_at.handle->vfs_private;
 
-                        chimera_linux_map_child_attrs_statx(CHIMERA_VFS_FH_MAGIC_IO_URING,
-                                                            request,
-                                                            &request->open_at.r_attr,
-                                                            parent_fd,
-                                                            name,
-                                                            stx);
+                            chimera_linux_map_child_attrs_statx(CHIMERA_VFS_FH_MAGIC_IO_URING,
+                                                                request,
+                                                                &request->open_at.r_attr,
+                                                                parent_fd,
+                                                                name,
+                                                                stx);
+                        }
+                    } else {
+                        request->status = chimera_linux_errno_to_status(-cqe->res);
                     }
 
                 } else if (handle->slot == 2) {
@@ -274,11 +293,11 @@ chimera_io_uring_complete(
                     }
                 }
                 break;
-            case CHIMERA_VFS_OP_REMOVE:
+            case CHIMERA_VFS_OP_REMOVE_AT:
                 /* Remove is now synchronous, so this should never be reached */
                 chimera_io_uring_abort("io_uring completion for synchronous remove operation");
                 break;
-            case CHIMERA_VFS_OP_MKDIR:
+            case CHIMERA_VFS_OP_MKDIR_AT:
                 if (handle->slot == 0) {
                     if (cqe->res == 0) {
                         request->status = CHIMERA_VFS_OK;
@@ -294,9 +313,9 @@ chimera_io_uring_complete(
                     stx      = (struct statx *) scratch;
                     scratch += sizeof(*stx);
 
-                    TERM_STR(fullname, request->mkdir.name, request->mkdir.name_len, scratch);
+                    TERM_STR(fullname, request->mkdir_at.name, request->mkdir_at.name_len, scratch);
 
-                    parent_fd = request->mkdir.handle->vfs_private;
+                    parent_fd = request->mkdir_at.handle->vfs_private;
 
                     sqe = chimera_io_uring_get_sqe(thread, request, 1, 0);
 
@@ -312,11 +331,11 @@ chimera_io_uring_complete(
                         dir_stx   = (struct statx *) request->plugin_data;
                         stx       = (struct statx *) (dir_stx + 1);
                         name      = (char *) (stx + 1);
-                        parent_fd = request->mkdir.handle->vfs_private;
+                        parent_fd = request->mkdir_at.handle->vfs_private;
 
                         chimera_linux_map_child_attrs_statx(CHIMERA_VFS_FH_MAGIC_IO_URING,
                                                             request,
-                                                            &request->mkdir.r_attr,
+                                                            &request->mkdir_at.r_attr,
                                                             parent_fd,
                                                             name,
                                                             stx);
@@ -324,7 +343,7 @@ chimera_io_uring_complete(
                 } else if (handle->slot == 2) {
                     if (cqe->res == 0) {
                         dir_stx = (struct statx *) request->plugin_data;
-                        chimera_linux_statx_to_attr(&request->mkdir.r_dir_post_attr, dir_stx);
+                        chimera_linux_statx_to_attr(&request->mkdir_at.r_dir_post_attr, dir_stx);
                     }
                 }
                 break;
@@ -695,7 +714,7 @@ chimera_io_uring_umount(
 } /* chimera_io_uring_umount */
 
 static void
-chimera_io_uring_lookup(
+chimera_io_uring_lookup_at(
     struct chimera_vfs_request *request,
     void                       *private_data)
 {
@@ -705,13 +724,13 @@ chimera_io_uring_lookup(
     char                           *scratch = (char *) request->plugin_data;
     struct statx                   *stx;
 
-    parent_fd = (int) request->lookup.handle->vfs_private;
+    parent_fd = (int) request->lookup_at.handle->vfs_private;
 
     stx = (struct statx *) scratch;
 
     scratch += sizeof(*stx);
 
-    TERM_STR(fullname, request->lookup.component, request->lookup.component_len, scratch);
+    TERM_STR(fullname, request->lookup_at.component, request->lookup_at.component_len, scratch);
 
     sqe = chimera_io_uring_get_sqe(thread, request, 0, 0);
 
@@ -824,7 +843,7 @@ chimera_io_uring_readdir(
 } /* io_uring_readdir */ /* io_uring_readdir */
 
 static void
-chimera_io_uring_open(
+chimera_io_uring_open_fh(
     struct chimera_vfs_request *request,
     void                       *private_data)
 {
@@ -835,14 +854,14 @@ chimera_io_uring_open(
     --thread->inflight;
 
 
-    if (request->open.flags & CHIMERA_VFS_OPEN_PATH) {
+    if (request->open_fh.flags & CHIMERA_VFS_OPEN_PATH) {
         flags |= O_PATH;
     }
 
-    if (request->open.flags & CHIMERA_VFS_OPEN_DIRECTORY) {
+    if (request->open_fh.flags & CHIMERA_VFS_OPEN_DIRECTORY) {
         flags |= O_DIRECTORY;
     }
-    if (request->open.flags & (CHIMERA_VFS_OPEN_READ_ONLY | CHIMERA_VFS_OPEN_PATH | CHIMERA_VFS_OPEN_DIRECTORY)) {
+    if (request->open_fh.flags & (CHIMERA_VFS_OPEN_READ_ONLY | CHIMERA_VFS_OPEN_PATH | CHIMERA_VFS_OPEN_DIRECTORY)) {
         flags |= O_RDONLY;
     } else {
         flags |= O_RDWR;
@@ -859,7 +878,7 @@ chimera_io_uring_open(
         return;
     }
 
-    request->open.r_vfs_private = fd;
+    request->open_fh.r_vfs_private = fd;
 
     request->status = CHIMERA_VFS_OK;
     request->complete(request);
@@ -885,7 +904,7 @@ chimera_io_uring_open_at(
 
     flags = 0;
 
-    if (request->open_at.flags & (CHIMERA_VFS_OPEN_PATH | CHIMERA_VFS_OPEN_DIRECTORY)) {
+    if (request->open_at.flags & (CHIMERA_VFS_OPEN_READ_ONLY | CHIMERA_VFS_OPEN_PATH | CHIMERA_VFS_OPEN_DIRECTORY)) {
         flags |= O_RDONLY;
     } else {
         flags |= O_RDWR;
@@ -901,6 +920,10 @@ chimera_io_uring_open_at(
 
     if (request->open_at.flags & CHIMERA_VFS_OPEN_CREATE) {
         flags |= O_CREAT;
+    }
+
+    if (request->open_at.flags & CHIMERA_VFS_OPEN_NOFOLLOW) {
+        flags = O_PATH | O_NOFOLLOW;
     }
 
     if (request->open_at.flags & CHIMERA_VFS_OPEN_EXCLUSIVE) {
@@ -939,7 +962,7 @@ chimera_io_uring_close(
 } /* chimera_io_uring_close */
 
 static void
-chimera_io_uring_mkdir(
+chimera_io_uring_mkdir_at(
     struct chimera_vfs_request *request,
     void                       *private_data)
 {
@@ -951,14 +974,14 @@ chimera_io_uring_mkdir(
 
     scratch += sizeof(struct statx) * 2;
 
-    TERM_STR(fullname, request->mkdir.name, request->mkdir.name_len, scratch);
+    TERM_STR(fullname, request->mkdir_at.name, request->mkdir_at.name_len, scratch);
 
-    fd = request->mkdir.handle->vfs_private;
+    fd = request->mkdir_at.handle->vfs_private;
 
     sqe = chimera_io_uring_get_sqe(thread, request, 0, 0);
 
-    if (request->mkdir.set_attr->va_set_mask & CHIMERA_VFS_ATTR_MODE) {
-        mode = request->mkdir.set_attr->va_mode;
+    if (request->mkdir_at.set_attr->va_set_mask & CHIMERA_VFS_ATTR_MODE) {
+        mode = request->mkdir_at.set_attr->va_mode;
     } else {
         mode = S_IRWXU;
     }
@@ -966,10 +989,10 @@ chimera_io_uring_mkdir(
     io_uring_prep_mkdirat(sqe, fd, fullname, mode);
 
     evpl_defer(thread->evpl, &thread->deferral);
-} /* chimera_io_uring_mkdir */
+} /* chimera_io_uring_mkdir_at */
 
 static void
-chimera_io_uring_mknod(
+chimera_io_uring_mknod_at(
     struct chimera_vfs_request *request,
     void                       *private_data)
 {
@@ -981,29 +1004,29 @@ chimera_io_uring_mknod(
 
     --thread->inflight;
 
-    TERM_STR(fullname, request->mknod.name, request->mknod.name_len, scratch);
+    TERM_STR(fullname, request->mknod_at.name, request->mknod_at.name_len, scratch);
 
-    fd = request->mknod.handle->vfs_private;
+    fd = request->mknod_at.handle->vfs_private;
 
-    if (request->mknod.set_attr->va_set_mask & CHIMERA_VFS_ATTR_MODE) {
-        mode = request->mknod.set_attr->va_mode;
+    if (request->mknod_at.set_attr->va_set_mask & CHIMERA_VFS_ATTR_MODE) {
+        mode = request->mknod_at.set_attr->va_mode;
     } else {
         mode = S_IFREG | 0644;
     }
 
-    if (request->mknod.set_attr->va_set_mask & CHIMERA_VFS_ATTR_RDEV) {
-        dev = makedev(request->mknod.set_attr->va_rdev >> 32,
-                      request->mknod.set_attr->va_rdev & 0xFFFFFFFF);
+    if (request->mknod_at.set_attr->va_set_mask & CHIMERA_VFS_ATTR_RDEV) {
+        dev = makedev(request->mknod_at.set_attr->va_rdev >> 32,
+                      request->mknod_at.set_attr->va_rdev & 0xFFFFFFFF);
     }
 
     chimera_linux_map_attrs(CHIMERA_VFS_FH_MAGIC_IO_URING,
-                            &request->mknod.r_dir_pre_attr,
+                            &request->mknod_at.r_dir_pre_attr,
                             fd);
 
     rc = mknodat(fd, fullname, mode, dev);
 
     chimera_linux_map_attrs(CHIMERA_VFS_FH_MAGIC_IO_URING,
-                            &request->mknod.r_dir_post_attr,
+                            &request->mknod_at.r_dir_post_attr,
                             fd);
 
     if (rc < 0) {
@@ -1011,7 +1034,7 @@ chimera_io_uring_mknod(
         if (errno == EEXIST) {
             chimera_linux_map_child_attrs(CHIMERA_VFS_FH_MAGIC_IO_URING,
                                           request,
-                                          &request->mknod.r_attr,
+                                          &request->mknod_at.r_attr,
                                           fd,
                                           fullname);
         }
@@ -1023,16 +1046,16 @@ chimera_io_uring_mknod(
 
     chimera_linux_map_child_attrs(CHIMERA_VFS_FH_MAGIC_IO_URING,
                                   request,
-                                  &request->mknod.r_attr,
+                                  &request->mknod_at.r_attr,
                                   fd,
                                   fullname);
 
     request->status = CHIMERA_VFS_OK;
     request->complete(request);
-} /* chimera_io_uring_mknod */
+} /* chimera_io_uring_mknod_at */
 
 static void
-chimera_io_uring_remove(
+chimera_io_uring_remove_at(
     struct chimera_vfs_request *request,
     void                       *private_data)
 {
@@ -1042,16 +1065,16 @@ chimera_io_uring_remove(
 
     --thread->inflight;
 
-    TERM_STR(fullname, request->remove.name, request->remove.namelen, scratch);
+    TERM_STR(fullname, request->remove_at.name, request->remove_at.namelen, scratch);
 
-    fd = request->remove.handle->vfs_private;
+    fd = request->remove_at.handle->vfs_private;
 
     /* Get the file handle before removing, so VFS can invalidate attribute cache */
-    request->remove.r_removed_attr.va_req_mask = CHIMERA_VFS_ATTR_FH;
+    request->remove_at.r_removed_attr.va_req_mask = CHIMERA_VFS_ATTR_FH;
 
     chimera_linux_map_child_attrs(CHIMERA_VFS_FH_MAGIC_IO_URING,
                                   request,
-                                  &request->remove.r_removed_attr,
+                                  &request->remove_at.r_removed_attr,
                                   fd,
                                   fullname);
 
@@ -1068,7 +1091,7 @@ chimera_io_uring_remove(
     }
 
     request->complete(request);
-} /* chimera_io_uring_remove */ /* chimera_io_uring_remove */
+} /* chimera_io_uring_remove_at */ /* chimera_io_uring_remove_at */
 
 static void
 chimera_io_uring_read(
@@ -1203,7 +1226,71 @@ chimera_io_uring_commit(
 } /* chimera_io_uring_commit */
 
 static void
-chimera_io_uring_symlink(
+chimera_io_uring_allocate(
+    struct chimera_vfs_request *request,
+    void                       *private_data)
+{
+    int fd   = (int) request->allocate.handle->vfs_private;
+    int mode = 0;
+    int rc;
+
+    if (request->allocate.flags & CHIMERA_VFS_ALLOCATE_DEALLOCATE) {
+        mode = FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE;
+    }
+
+    rc = fallocate(fd, mode, request->allocate.offset, request->allocate.length);
+
+    if (rc < 0) {
+        request->status = chimera_linux_errno_to_status(errno);
+        request->complete(request);
+        return;
+    }
+
+    chimera_linux_map_attrs(CHIMERA_VFS_FH_MAGIC_IO_URING, &request->allocate.r_post_attr, fd);
+
+    request->status = CHIMERA_VFS_OK;
+    request->complete(request);
+
+} /* chimera_io_uring_allocate */
+
+static void
+chimera_io_uring_seek(
+    struct chimera_vfs_request *request,
+    void                       *private_data)
+{
+    int   fd = (int) request->seek.handle->vfs_private;
+    int   whence;
+    off_t result;
+
+    if (request->seek.what == 0) {
+        whence = SEEK_DATA;
+    } else {
+        whence = SEEK_HOLE;
+    }
+
+    result = lseek(fd, request->seek.offset, whence);
+
+    if (result < 0) {
+        if (errno == ENXIO) {
+            request->seek.r_eof    = 1;
+            request->seek.r_offset = 0;
+            request->status        = CHIMERA_VFS_OK;
+        } else {
+            request->status = chimera_linux_errno_to_status(errno);
+        }
+        request->complete(request);
+        return;
+    }
+
+    request->seek.r_eof    = 0;
+    request->seek.r_offset = result;
+    request->status        = CHIMERA_VFS_OK;
+    request->complete(request);
+
+} /* chimera_io_uring_seek */
+
+static void
+chimera_io_uring_symlink_at(
     struct chimera_vfs_request *request,
     void                       *private_data)
 {
@@ -1213,11 +1300,17 @@ chimera_io_uring_symlink(
 
     --thread->inflight;
 
+    if (request->symlink_at.namelen + request->symlink_at.targetlen + 2 >
+        CHIMERA_VFS_PLUGIN_DATA_SIZE) {
+        request->status = CHIMERA_VFS_ENAMETOOLONG;
+        request->complete(request);
+        return;
+    }
 
-    TERM_STR(fullname, request->symlink.name, request->symlink.namelen, scratch);
-    TERM_STR(target, request->symlink.target, request->symlink.targetlen, scratch);
+    TERM_STR(fullname, request->symlink_at.name, request->symlink_at.namelen, scratch);
+    TERM_STR(target, request->symlink_at.target, request->symlink_at.targetlen, scratch);
 
-    fd = request->mkdir.handle->vfs_private;
+    fd = request->symlink_at.handle->vfs_private;
 
     rc = symlinkat(target, fd, fullname);
 
@@ -1228,18 +1321,18 @@ chimera_io_uring_symlink(
     }
 
     chimera_linux_map_attrs(CHIMERA_VFS_FH_MAGIC_IO_URING,
-                            &request->symlink.r_dir_post_attr,
+                            &request->symlink_at.r_dir_post_attr,
                             fd);
 
     chimera_linux_map_child_attrs(CHIMERA_VFS_FH_MAGIC_IO_URING,
                                   request,
-                                  &request->symlink.r_attr,
+                                  &request->symlink_at.r_attr,
                                   fd,
                                   fullname);
 
     request->status = CHIMERA_VFS_OK;
     request->complete(request);
-} /* chimera_io_uring_symlink */
+} /* chimera_io_uring_symlink_at */
 
 static void
 chimera_io_uring_readlink(
@@ -1265,12 +1358,14 @@ chimera_io_uring_readlink(
 
     request->readlink.r_target_length = rc;
 
+    chimera_linux_map_attrs(CHIMERA_VFS_FH_MAGIC_IO_URING, &request->readlink.r_attr, fd);
+
     request->status = CHIMERA_VFS_OK;
     request->complete(request);
 } /* chimera_io_uring_readlink */
 
 static void
-chimera_io_uring_rename(
+chimera_io_uring_rename_at(
     struct chimera_vfs_request *request,
     void                       *private_data)
 {
@@ -1281,8 +1376,8 @@ chimera_io_uring_rename(
     --thread->inflight;
 
 
-    TERM_STR(fullname, request->rename.name, request->rename.namelen, scratch);
-    TERM_STR(full_newname, request->rename.new_name, request->rename.new_namelen, scratch);
+    TERM_STR(fullname, request->rename_at.name, request->rename_at.namelen, scratch);
+    TERM_STR(full_newname, request->rename_at.new_name, request->rename_at.new_namelen, scratch);
 
     old_fd = linux_open_by_handle(&thread->mount_table,
                                   request->fh,
@@ -1296,8 +1391,8 @@ chimera_io_uring_rename(
     }
 
     new_fd = linux_open_by_handle(&thread->mount_table,
-                                  request->rename.new_fh,
-                                  request->rename.new_fhlen,
+                                  request->rename_at.new_fh,
+                                  request->rename_at.new_fhlen,
                                   O_PATH | O_RDONLY | O_NOFOLLOW);
 
     if (new_fd < 0) {
@@ -1319,10 +1414,10 @@ chimera_io_uring_rename(
     close(new_fd);
 
     request->complete(request);
-} /* chimera_io_uring_rename */
+} /* chimera_io_uring_rename_at */
 
 static void
-chimera_io_uring_link(
+chimera_io_uring_link_at(
     struct chimera_vfs_request *request,
     void                       *private_data)
 {
@@ -1332,7 +1427,7 @@ chimera_io_uring_link(
 
     --thread->inflight;
 
-    TERM_STR(fullname, request->link.name, request->link.namelen, scratch);
+    TERM_STR(fullname, request->link_at.name, request->link_at.namelen, scratch);
 
     fd = linux_open_by_handle(&thread->mount_table,
                               request->fh,
@@ -1346,8 +1441,8 @@ chimera_io_uring_link(
     }
 
     dir_fd = linux_open_by_handle(&thread->mount_table,
-                                  request->link.dir_fh,
-                                  request->link.dir_fhlen,
+                                  request->link_at.dir_fh,
+                                  request->link_at.dir_fhlen,
                                   O_PATH | O_RDONLY | O_NOFOLLOW);
 
     if (dir_fd < 0) {
@@ -1370,7 +1465,7 @@ chimera_io_uring_link(
 
     request->complete(request);
 
-} /* chimera_io_uring_link */
+} /* chimera_io_uring_link_at */
 
 static void
 chimera_io_uring_dispatch(
@@ -1394,14 +1489,14 @@ chimera_io_uring_dispatch(
         case CHIMERA_VFS_OP_UMOUNT:
             chimera_io_uring_umount(request, private_data);
             break;
-        case CHIMERA_VFS_OP_LOOKUP:
-            chimera_io_uring_lookup(request, private_data);
+        case CHIMERA_VFS_OP_LOOKUP_AT:
+            chimera_io_uring_lookup_at(request, private_data);
             break;
         case CHIMERA_VFS_OP_GETATTR:
             chimera_io_uring_getattr(request, private_data);
             break;
-        case CHIMERA_VFS_OP_OPEN:
-            chimera_io_uring_open(request, private_data);
+        case CHIMERA_VFS_OP_OPEN_FH:
+            chimera_io_uring_open_fh(request, private_data);
             break;
         case CHIMERA_VFS_OP_OPEN_AT:
             chimera_io_uring_open_at(request, private_data);
@@ -1409,17 +1504,17 @@ chimera_io_uring_dispatch(
         case CHIMERA_VFS_OP_CLOSE:
             chimera_io_uring_close(request, private_data);
             break;
-        case CHIMERA_VFS_OP_MKDIR:
-            chimera_io_uring_mkdir(request, private_data);
+        case CHIMERA_VFS_OP_MKDIR_AT:
+            chimera_io_uring_mkdir_at(request, private_data);
             break;
-        case CHIMERA_VFS_OP_MKNOD:
-            chimera_io_uring_mknod(request, private_data);
+        case CHIMERA_VFS_OP_MKNOD_AT:
+            chimera_io_uring_mknod_at(request, private_data);
             break;
         case CHIMERA_VFS_OP_READDIR:
             chimera_io_uring_readdir(request, private_data);
             break;
-        case CHIMERA_VFS_OP_REMOVE:
-            chimera_io_uring_remove(request, private_data);
+        case CHIMERA_VFS_OP_REMOVE_AT:
+            chimera_io_uring_remove_at(request, private_data);
             break;
         case CHIMERA_VFS_OP_READ:
             chimera_io_uring_read(request, private_data);
@@ -1430,20 +1525,26 @@ chimera_io_uring_dispatch(
         case CHIMERA_VFS_OP_COMMIT:
             chimera_io_uring_commit(request, private_data);
             break;
-        case CHIMERA_VFS_OP_SYMLINK:
-            chimera_io_uring_symlink(request, private_data);
+        case CHIMERA_VFS_OP_SYMLINK_AT:
+            chimera_io_uring_symlink_at(request, private_data);
             break;
         case CHIMERA_VFS_OP_READLINK:
             chimera_io_uring_readlink(request, private_data);
             break;
-        case CHIMERA_VFS_OP_RENAME:
-            chimera_io_uring_rename(request, private_data);
+        case CHIMERA_VFS_OP_RENAME_AT:
+            chimera_io_uring_rename_at(request, private_data);
             break;
-        case CHIMERA_VFS_OP_LINK:
-            chimera_io_uring_link(request, private_data);
+        case CHIMERA_VFS_OP_LINK_AT:
+            chimera_io_uring_link_at(request, private_data);
             break;
         case CHIMERA_VFS_OP_SETATTR:
             chimera_io_uring_setattr(request, private_data);
+            break;
+        case CHIMERA_VFS_OP_ALLOCATE:
+            chimera_io_uring_allocate(request, private_data);
+            break;
+        case CHIMERA_VFS_OP_SEEK:
+            chimera_io_uring_seek(request, private_data);
             break;
         default:
             chimera_io_uring_error("io_uring_dispatch: unknown operation %d",
@@ -1456,9 +1557,10 @@ chimera_io_uring_dispatch(
 } /* io_uring_dispatch */
 
 SYMBOL_EXPORT struct chimera_vfs_module vfs_io_uring = {
-    .name           = "io_uring",
-    .fh_magic       = CHIMERA_VFS_FH_MAGIC_IO_URING,
-    .capabilities   = CHIMERA_VFS_CAP_OPEN_PATH_REQUIRED | CHIMERA_VFS_CAP_OPEN_FILE_REQUIRED | CHIMERA_VFS_CAP_FS,
+    .name         = "io_uring",
+    .fh_magic     = CHIMERA_VFS_FH_MAGIC_IO_URING,
+    .capabilities = CHIMERA_VFS_CAP_OPEN_PATH_REQUIRED | CHIMERA_VFS_CAP_OPEN_FILE_REQUIRED | CHIMERA_VFS_CAP_FS |
+        CHIMERA_VFS_CAP_FS_PATH_OP,
     .init           = chimera_io_uring_init,
     .destroy        = chimera_io_uring_destroy,
     .thread_init    = chimera_io_uring_thread_init,

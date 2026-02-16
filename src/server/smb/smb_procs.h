@@ -173,6 +173,11 @@ void chimera_smb_query_security_reply(
     struct evpl_iovec_cursor   *reply_cursor,
     struct chimera_smb_request *request);
 
+void chimera_smb_parse_sd_to_attrs(
+    const uint8_t            *sd_buf,
+    uint32_t                  sd_len,
+    struct chimera_vfs_attrs *attrs);
+
 int chimera_smb_parse_echo(
     struct evpl_iovec_cursor   *request_cursor,
     struct chimera_smb_request *request);
@@ -182,4 +187,10 @@ void chimera_smb_echo_reply(
     struct chimera_smb_request *request);
 
 void chimera_smb_echo(
+    struct chimera_smb_request *request);
+
+void chimera_smb_ioctl_set_reparse(
+    struct chimera_smb_request *request);
+
+void chimera_smb_ioctl_get_reparse(
     struct chimera_smb_request *request);

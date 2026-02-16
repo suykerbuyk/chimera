@@ -60,7 +60,7 @@ chimera_nfs4_link_open_callback(
 
     req->handle = handle;
 
-    chimera_vfs_link(
+    chimera_vfs_link_at(
         thread->vfs_thread,
         &req->cred,
         req->saved_fh,
@@ -86,12 +86,29 @@ chimera_nfs4_link(
     struct nfs_argop4                *argop,
     struct nfs_resop4                *resop)
 {
-    chimera_vfs_open(thread->vfs_thread,
-                     &req->cred,
-                     req->fh,
-                     req->fhlen,
-                     CHIMERA_VFS_OPEN_INFERRED | CHIMERA_VFS_OPEN_PATH | CHIMERA_VFS_OPEN_DIRECTORY,
-                     chimera_nfs4_link_open_callback,
-                     req);
+    struct LINK4args *args = &argop->oplink;
+    struct LINK4res  *res  = &resop->oplink;
+
+    if (args->newname.len == 0) {
+        res->status = NFS4ERR_INVAL;
+        chimera_nfs4_compound_complete(req, NFS4ERR_INVAL);
+        return;
+    }
+
+    if ((args->newname.len == 1 && ((const char *) args->newname.data)[0] == '.') ||
+        (args->newname.len == 2 && ((const char *) args->newname.data)[0] == '.' &&
+         ((const char *) args->newname.data)[1] == '.')) {
+        res->status = NFS4ERR_BADNAME;
+        chimera_nfs4_compound_complete(req, NFS4ERR_BADNAME);
+        return;
+    }
+
+    chimera_vfs_open_fh(thread->vfs_thread,
+                        &req->cred,
+                        req->fh,
+                        req->fhlen,
+                        CHIMERA_VFS_OPEN_INFERRED | CHIMERA_VFS_OPEN_PATH | CHIMERA_VFS_OPEN_DIRECTORY,
+                        chimera_nfs4_link_open_callback,
+                        req);
 
 } /* chimera_nfs4_create */

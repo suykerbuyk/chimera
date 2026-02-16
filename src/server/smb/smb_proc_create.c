@@ -54,7 +54,7 @@ chimera_smb_create_unlink(struct chimera_smb_request *request)
     struct chimera_vfs_thread    *vfs_thread = request->compound->thread->vfs_thread;
     struct chimera_smb_open_file *open_file  = request->create.r_open_file;
 
-    chimera_vfs_remove(
+    chimera_vfs_remove_at(
         vfs_thread,
         &request->session_handle->session->cred,
         request->create.parent_handle,
@@ -215,7 +215,9 @@ chimera_smb_create_mkdir_callback(
 
     if (error_code != CHIMERA_VFS_OK) {
         chimera_vfs_release(vfs_thread, request->create.parent_handle);
-        chimera_smb_complete_request(request, SMB2_STATUS_OBJECT_NAME_NOT_FOUND);
+        chimera_smb_complete_request(request, error_code == CHIMERA_VFS_EEXIST ?
+                                     SMB2_STATUS_OBJECT_NAME_COLLISION :
+                                     SMB2_STATUS_OBJECT_NAME_NOT_FOUND);
         return;
     }
 
@@ -225,7 +227,7 @@ chimera_smb_create_mkdir_callback(
 
     request->create.r_attrs.smb_attributes |= SMB2_FILE_ATTRIBUTE_DIRECTORY;
 
-    chimera_vfs_open(
+    chimera_vfs_open_fh(
         vfs_thread,
         &request->session_handle->session->cred,
         attr->va_fh,
@@ -252,7 +254,9 @@ chimera_smb_create_open_at_callback(
 
     if (error_code != CHIMERA_VFS_OK) {
         chimera_vfs_release(vfs_thread, request->create.parent_handle);
-        chimera_smb_complete_request(request, SMB2_STATUS_OBJECT_NAME_NOT_FOUND);
+        chimera_smb_complete_request(request, error_code == CHIMERA_VFS_EEXIST ?
+                                     SMB2_STATUS_OBJECT_NAME_COLLISION :
+                                     SMB2_STATUS_OBJECT_NAME_NOT_FOUND);
         return;
     }
 
@@ -357,13 +361,10 @@ chimera_smb_create_open_parent_callback(
 
     request->create.parent_handle = oh;
 
-    request->create.set_attr.va_req_mask = 0;
-    request->create.set_attr.va_set_mask = 0;
-
     if ((request->create.create_options & SMB2_FILE_DIRECTORY_FILE) &&
         request->create.create_disposition == SMB2_FILE_CREATE) {
 
-        chimera_vfs_mkdir(
+        chimera_vfs_mkdir_at(
             vfs_thread,
             &request->session_handle->session->cred,
             oh,
@@ -387,6 +388,11 @@ chimera_smb_create_open_parent_callback(
 
         if (!(request->create.desired_access & SMB2_WRITE_MASK)) {
             flags |= CHIMERA_VFS_OPEN_READ_ONLY;
+        }
+
+        if ((request->create.create_options & SMB2_FILE_OPEN_REPARSE_POINT) &&
+            request->create.create_disposition == SMB2_FILE_OPEN) {
+            flags |= CHIMERA_VFS_OPEN_NOFOLLOW;
         }
 
         switch (request->create.create_disposition) {
@@ -439,7 +445,7 @@ chimera_smb_create_lookup_parent_callback(
         return;
     }
 
-    chimera_vfs_open(
+    chimera_vfs_open_fh(
         vfs_thread,
         &request->session_handle->session->cred,
         attr->va_fh,
@@ -456,7 +462,7 @@ chimera_smb_create_process(struct chimera_smb_request *request)
     struct chimera_smb_tree   *tree       = request->tree;
 
     if (request->create.parent_path_len) {
-        chimera_vfs_lookup_path(
+        chimera_vfs_lookup(
             vfs_thread,
             &request->session_handle->session->cred,
             tree->fh,
@@ -468,7 +474,7 @@ chimera_smb_create_process(struct chimera_smb_request *request)
             chimera_smb_create_lookup_parent_callback,
             request);
     } else if (request->create.name_len) {
-        chimera_vfs_open(
+        chimera_vfs_open_fh(
             vfs_thread,
             &request->session_handle->session->cred,
             request->tree->fh,
@@ -477,7 +483,7 @@ chimera_smb_create_process(struct chimera_smb_request *request)
             chimera_smb_create_open_parent_callback,
             request);
     } else {
-        chimera_vfs_open(
+        chimera_vfs_open_fh(
             vfs_thread,
             &request->session_handle->session->cred,
             request->tree->fh,
@@ -525,7 +531,7 @@ chimera_smb_revalidate_tree(
 
     chimera_vfs_get_root_fh(root_fh, &root_fh_len);
 
-    chimera_vfs_lookup_path(
+    chimera_vfs_lookup(
         vfs_thread,
         &request->session_handle->session->cred,
         root_fh,
@@ -685,6 +691,11 @@ chimera_smb_parse_create(
     evpl_iovec_cursor_get_uint32(request_cursor, &blob_offset);
     evpl_iovec_cursor_get_uint32(request_cursor, &blob_length);
 
+    if (request->create.impersonation_level > SMB2_IMPERSONATION_DELEGATE) {
+        request->status = SMB2_STATUS_BAD_IMPERSONATION_LEVEL;
+        return -1;
+    }
+
     if (request->create.name_len >= SMB_FILENAME_MAX) {
         chimera_smb_error("Create request: UTF-16 name too long (%u bytes)",
                           request->create.name_len);
@@ -705,7 +716,14 @@ chimera_smb_parse_create(
         return -1;
     }
     request->create.parent_path_len = name_size;
-    slash                           = rindex(request->create.parent_path, '\\');
+
+    /* Reject paths with a leading backslash separator */
+    if (name_size > 0 && request->create.parent_path[0] == '\\') {
+        request->status = SMB2_STATUS_INVALID_PARAMETER;
+        return -1;
+    }
+
+    slash = rindex(request->create.parent_path, '\\');
 
     if (slash) {
         *slash                          = '\0';
@@ -720,5 +738,53 @@ chimera_smb_parse_create(
         request->create.parent_path_len = 0;
     }
 
+    /* Initialize create-time attributes (may be populated by SD create context) */
+    request->create.set_attr.va_req_mask = 0;
+    request->create.set_attr.va_set_mask = 0;
+
+    /* Parse create contexts for security descriptor (modefromsid) */
+    if (blob_offset > 0 && blob_length > 0 && blob_length <= 1024) {
+        uint8_t  ctx_buf[1024];
+        uint32_t skip = blob_offset - evpl_iovec_cursor_consumed(request_cursor);
+
+        evpl_iovec_cursor_skip(request_cursor, skip);
+
+        if (evpl_iovec_cursor_get_blob(request_cursor, ctx_buf, blob_length) == 0) {
+            uint32_t pos = 0;
+
+            while (pos + 16 <= blob_length) {
+                uint32_t next = ctx_buf[pos]    | (ctx_buf[pos + 1] << 8) |
+                    (ctx_buf[pos + 2] << 16) | (ctx_buf[pos + 3] << 24);
+                uint16_t name_off = ctx_buf[pos + 4] | (ctx_buf[pos + 5] << 8);
+                uint16_t name_len = ctx_buf[pos + 6] | (ctx_buf[pos + 7] << 8);
+                uint16_t data_off = ctx_buf[pos + 10] | (ctx_buf[pos + 11] << 8);
+                uint32_t data_len = ctx_buf[pos + 12] | (ctx_buf[pos + 13] << 8) |
+                    (ctx_buf[pos + 14] << 16) | (ctx_buf[pos + 15] << 24);
+
+                /* Look for SMB2_CREATE_SD_BUFFER ("SecD") */
+                if (name_len == 4 &&
+                    pos + name_off + 4 <= blob_length &&
+                    ctx_buf[pos + name_off]     == 'S' &&
+                    ctx_buf[pos + name_off + 1] == 'e' &&
+                    ctx_buf[pos + name_off + 2] == 'c' &&
+                    ctx_buf[pos + name_off + 3] == 'D' &&
+                    data_off > 0 &&
+                    pos + data_off + data_len <= blob_length) {
+
+                    chimera_smb_parse_sd_to_attrs(
+                        ctx_buf + pos + data_off,
+                        data_len,
+                        &request->create.set_attr);
+                    break;
+                }
+
+                if (next == 0) {
+                    break;
+                }
+                pos += next;
+            }
+        }
+    }
+
     return 0;
-} /* chimera_smb_parse_create */
+} /* chimera_smb_parse_create */ /* chimera_smb_parse_create */

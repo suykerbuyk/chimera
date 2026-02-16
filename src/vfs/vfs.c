@@ -101,7 +101,6 @@ chimera_vfs_close_thread_callback(
     struct chimera_vfs_close_thread *close_thread = private_data;
 
     close_thread->num_pending--;
-    /* Handle is freed by chimera_vfs_close() */
 } /* chimera_vfs_close_thread_callback */
 
 static uint64_t
@@ -128,7 +127,9 @@ chimera_vfs_close_thread_sweep(
         close_thread->num_pending++;
 
         chimera_vfs_close(thread,
-                          handle,
+                          handle->vfs_module,
+                          handle->vfs_private,
+                          handle->fh_hash,
                           chimera_vfs_close_thread_callback,
                           close_thread);
 
@@ -672,11 +673,11 @@ void
 chimera_vfs_register(
     struct chimera_vfs        *vfs,
     struct chimera_vfs_module *module,
-    const char                *cfgfile)
+    const char                *cfgdata)
 {
     vfs->modules[module->fh_magic] = module;
 
-    vfs->module_private[module->fh_magic] = module->init(cfgfile);
+    vfs->module_private[module->fh_magic] = module->init(cfgdata);
 
     if (vfs->module_private[module->fh_magic] == NULL) {
         chimera_vfs_error("Failed to initialize module %s", module->name);
@@ -706,6 +707,7 @@ chimera_vfs_add_user(
     const char         *username,
     const char         *password,
     const char         *smbpasswd,
+    const char         *sid,
     uint32_t            uid,
     uint32_t            gid,
     uint32_t            ngids,
@@ -713,7 +715,7 @@ chimera_vfs_add_user(
     int                 pinned)
 {
     return chimera_vfs_user_cache_add(vfs->vfs_user_cache,
-                                      username, password, smbpasswd,
+                                      username, password, smbpasswd, sid,
                                       uid, gid, ngids, gids, pinned);
 } /* chimera_vfs_add_user */
 

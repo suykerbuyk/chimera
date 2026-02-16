@@ -6,6 +6,7 @@ cmake_minimum_required(VERSION 3.22)
 
 option(IO_URING_ENABLED "Enable io_uring support" ON)
 option(CAIRN_ENABLED "Enable cairn support" ON)
+option(CHIMERA_VFS_IO_URING "Enable chimera VFS io_uring backend" ON)
 
 # Check for Stornext installation
 if (EXISTS "/usr/cvfs/include")
@@ -102,13 +103,19 @@ if (IO_URING_ENABLED)
     find_path(URING_INCLUDE_DIR NAMES liburing/io_uring.h)
 
     if (URING_LIB AND URING_INCLUDE_DIR)
-        add_definitions(-DHAVE_IO_URING=1)
         message(STATUS "IO_URING enabled")
+        if (CHIMERA_VFS_IO_URING)
+            add_definitions(-DHAVE_IO_URING=1)
+            message(STATUS "Chimera VFS io_uring backend enabled")
+        else()
+            message(STATUS "Chimera VFS io_uring backend disabled (libevpl io_uring still active)")
+        endif()
     else()
         message(FATAL_ERROR "io_uring enabled but library not found.")
     endif()
 else()
     message(STATUS "IO_URING disabled")
+    set(CHIMERA_VFS_IO_URING OFF CACHE BOOL "Chimera VFS io_uring requires IO_URING_ENABLED" FORCE)
 endif()
 
 find_library(AIO_LIB NAMES aio)
@@ -128,7 +135,14 @@ endif()
 
 # KVM testing detection
 find_program(DOCKER_EXECUTABLE docker)
-find_program(QEMU_EXECUTABLE qemu-system-x86_64)
+
+# Find architecture-appropriate QEMU binary
+execute_process(COMMAND uname -m OUTPUT_VARIABLE HOST_ARCH OUTPUT_STRIP_TRAILING_WHITESPACE)
+if(HOST_ARCH STREQUAL "aarch64")
+    find_program(QEMU_EXECUTABLE qemu-system-aarch64)
+else()
+    find_program(QEMU_EXECUTABLE qemu-system-x86_64)
+endif()
 
 set(KVM_TESTING_AVAILABLE FALSE)
 
@@ -161,7 +175,7 @@ else()
         message(STATUS "KVM testing: docker not found")
     endif()
     if(NOT QEMU_EXECUTABLE)
-        message(STATUS "KVM testing: qemu-system-x86_64 not found")
+        message(STATUS "KVM testing: QEMU not found for ${HOST_ARCH}")
     endif()
 endif()
 
@@ -175,7 +189,18 @@ endif()
 add_subdirectory(ext)
 
 include_directories(ext/libevpl/include)
-include_directories(ext/libsmb2/include)
+
+# Find libwbclient (optional - for AD/Winbind integration)
+find_package(PkgConfig QUIET)
+if(PKG_CONFIG_FOUND)
+    pkg_check_modules(WBCLIENT QUIET wbclient)
+    if(WBCLIENT_FOUND)
+        message(STATUS "libwbclient found - Winbind integration enabled")
+        add_definitions(-DHAVE_WBCLIENT=1)
+    else()
+        message(STATUS "libwbclient not found - Winbind integration disabled")
+    endif()
+endif()
 
 add_definitions(-DXDR_CUSTOM_IOVEC=${CHIMERA_EXT_SRC}/libevpl/src/rpc2/xdr_iovec.h)
 add_definitions(-DXDR_CUSTOM_DUMP=1)

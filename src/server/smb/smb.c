@@ -6,7 +6,8 @@
 #include <stdlib.h>
 #include <pthread.h>
 #include <arpa/inet.h>
-#include <gssapi/gssapi_ntlmssp.h>
+#include <gssapi/gssapi.h>
+#include <gssapi/gssapi_krb5.h>
 #include <openssl/hmac.h>
 
 
@@ -99,6 +100,38 @@ chimera_smb_server_init(
     }
 
     snprintf(shared->config.identity, sizeof(shared->config.identity), "chimera");
+
+    // Copy SMB auth config from server config
+    shared->config.auth.winbind_enabled  = chimera_server_config_get_smb_winbind_enabled(config);
+    shared->config.auth.kerberos_enabled = chimera_server_config_get_smb_kerberos_enabled(config);
+
+    const char *winbind_domain = chimera_server_config_get_smb_winbind_domain(config);
+    if (winbind_domain && winbind_domain[0]) {
+        strncpy(shared->config.auth.winbind_domain, winbind_domain,
+                sizeof(shared->config.auth.winbind_domain) - 1);
+    }
+
+    const char *kerberos_keytab = chimera_server_config_get_smb_kerberos_keytab(config);
+    if (kerberos_keytab && kerberos_keytab[0]) {
+        strncpy(shared->config.auth.kerberos_keytab, kerberos_keytab,
+                sizeof(shared->config.auth.kerberos_keytab) - 1);
+    }
+
+    const char *kerberos_realm = chimera_server_config_get_smb_kerberos_realm(config);
+    if (kerberos_realm && kerberos_realm[0]) {
+        strncpy(shared->config.auth.kerberos_realm, kerberos_realm,
+                sizeof(shared->config.auth.kerberos_realm) - 1);
+    }
+
+    if (shared->config.auth.winbind_enabled) {
+        chimera_smb_info("SMB Auth: Winbind integration enabled (domain: %s)",
+                         shared->config.auth.winbind_domain[0] ? shared->config.auth.winbind_domain : "(not set)");
+    }
+    if (shared->config.auth.kerberos_enabled) {
+        chimera_smb_info("SMB Auth: Kerberos enabled (realm: %s, keytab: %s)",
+                         shared->config.auth.kerberos_realm[0] ? shared->config.auth.kerberos_realm : "(not set)",
+                         shared->config.auth.kerberos_keytab[0] ? shared->config.auth.kerberos_keytab : "(default)");
+    }
 
     shared->vfs     = vfs;
     shared->metrics = metrics;
@@ -205,7 +238,7 @@ chimera_smb_compound_reply(struct chimera_smb_compound *compound)
     struct evpl                      *evpl   = thread->evpl;
     struct chimera_smb_conn          *conn   = compound->conn;
     struct evpl_iovec_cursor          reply_cursor;
-    struct evpl_iovec                 reply_iov[65];
+    struct evpl_iovec                 reply_iov[260];
     struct netbios_header            *netbios_hdr = NULL;
     struct smb2_header               *reply_hdr;
     struct smb_direct_hdr            *direct_hdr = NULL;
@@ -260,14 +293,15 @@ chimera_smb_compound_reply(struct chimera_smb_compound *compound)
         reply_hdr->protocol_id[2]          = 0x4D;
         reply_hdr->protocol_id[3]          = 0x42;
         reply_hdr->struct_size             = 64;
-        reply_hdr->credit_charge           = 256;//request->smb2_hdr.credit_charge;
+        reply_hdr->credit_charge           = request->smb2_hdr.credit_charge;
         reply_hdr->status                  = request->status;
         reply_hdr->command                 = request->smb2_hdr.command;
-        reply_hdr->credit_request_response = request->smb2_hdr.credit_request_response;
-        reply_hdr->flags                   = request->smb2_hdr.flags | SMB2_FLAGS_SERVER_TO_REDIR;
-        reply_hdr->next_command            = 0;
-        reply_hdr->message_id              = request->smb2_hdr.message_id;
-        reply_hdr->session_id              = request->session_handle && request->session_handle->session ?
+        reply_hdr->credit_request_response = request->smb2_hdr.credit_request_response ?
+            request->smb2_hdr.credit_request_response : 1;
+        reply_hdr->flags        = request->smb2_hdr.flags | SMB2_FLAGS_SERVER_TO_REDIR;
+        reply_hdr->next_command = 0;
+        reply_hdr->message_id   = request->smb2_hdr.message_id;
+        reply_hdr->session_id   = request->session_handle && request->session_handle->session ?
             request->session_handle->session->session_id : 0;
         reply_hdr->sync.process_id = request->smb2_hdr.sync.process_id;
         reply_hdr->sync.tree_id    = request->tree ? request->tree->tree_id : 0;
@@ -334,7 +368,13 @@ chimera_smb_compound_reply(struct chimera_smb_compound *compound)
 
     }
 
-    rc = chimera_smb_sign_compound(thread->signing_ctx, compound, reply_iov, reply_cursor.niov,
+    /* Calculate actual number of iovecs after potential inject operations.
+     * reply_cursor.niov tracks remaining slots, but after inject the cursor
+     * advances and niov is incremented without accounting for the split.
+     * The correct count is the cursor position (index) plus 1. */
+    int reply_niov = (int) (reply_cursor.iov - reply_iov) + 1;
+
+    rc = chimera_smb_sign_compound(thread->signing_ctx, compound, reply_iov, reply_niov,
                                    evpl_iovec_cursor_consumed(&reply_cursor) + reply_hdr_len
                                    );
 
@@ -365,12 +405,12 @@ chimera_smb_compound_reply(struct chimera_smb_compound *compound)
         direct_hdr->data_offset       = 24;
         direct_hdr->data_length       = chunk;
 
-        evpl_sendv(evpl, conn->bind, reply_iov, reply_cursor.niov, direct_hdr->data_length + 24,
+        evpl_sendv(evpl, conn->bind, reply_iov, reply_niov, direct_hdr->data_length + 24,
                    EVPL_SEND_FLAG_TAKE_REF);
 
         left -= direct_hdr->data_length;
 
-        evpl_iovec_cursor_init(&reply_cursor, reply_iov, reply_cursor.niov);
+        evpl_iovec_cursor_init(&reply_cursor, reply_iov, reply_niov);
         evpl_iovec_cursor_skip(&reply_cursor, direct_hdr->data_length + 24);
 
         while (left) {
@@ -403,7 +443,7 @@ chimera_smb_compound_reply(struct chimera_smb_compound *compound)
     } else {
         netbios_hdr->word = __builtin_bswap32(reply_payload_length);
 
-        evpl_sendv(evpl, conn->bind, reply_iov, reply_cursor.niov, reply_payload_length + reply_hdr_len,
+        evpl_sendv(evpl, conn->bind, reply_iov, reply_niov, reply_payload_length + reply_hdr_len,
                    EVPL_SEND_FLAG_TAKE_REF);
     }
 
@@ -436,11 +476,13 @@ chimera_smb_complete_request(
     } else {
 
         if (request->session_handle && request->session_handle->session) {
-            compound->saved_session_id = request->session_handle->session->session_id;
+            compound->saved_session_id     = request->session_handle->session->session_id;
+            compound->saved_session_handle = request->session_handle;
         }
 
         if (request->tree) {
             compound->saved_tree_id = request->tree->tree_id;
+            compound->saved_tree    = request->tree;
         }
 
         chimera_smb_compound_advance(compound);
@@ -462,6 +504,28 @@ chimera_smb_compound_advance(struct chimera_smb_compound *compound)
     }
 
     request = compound->requests[compound->complete_requests];
+
+    /* Propagate session/tree from previous request for compound related operations */
+    if (request->smb2_hdr.flags & SMB2_FLAGS_RELATED_OPERATIONS) {
+        if (compound->saved_session_handle) {
+            request->session_handle = compound->saved_session_handle;
+        }
+        if (compound->saved_tree) {
+            request->tree = compound->saved_tree;
+        }
+    }
+
+    /* Reject commands that require a valid tree connection */
+    if (unlikely(!request->tree &&
+                 request->smb2_hdr.command != SMB2_NEGOTIATE &&
+                 request->smb2_hdr.command != SMB2_SESSION_SETUP &&
+                 request->smb2_hdr.command != SMB2_LOGOFF &&
+                 request->smb2_hdr.command != SMB2_TREE_CONNECT &&
+                 request->smb2_hdr.command != SMB2_TREE_DISCONNECT &&
+                 request->smb2_hdr.command != SMB2_ECHO)) {
+        chimera_smb_complete_request(request, SMB2_STATUS_NETWORK_NAME_DELETED);
+        return;
+    }
 
     switch (request->smb2_hdr.command) {
         case SMB2_NEGOTIATE:
@@ -586,10 +650,12 @@ chimera_smb_server_handle_smb2(
     compound->thread = thread;
     compound->conn   = conn;
 
-    compound->saved_session_id  = UINT64_MAX;
-    compound->saved_tree_id     = UINT64_MAX;
-    compound->saved_file_id.pid = UINT64_MAX;
-    compound->saved_file_id.vid = UINT64_MAX;
+    compound->saved_session_id     = UINT64_MAX;
+    compound->saved_tree_id        = UINT64_MAX;
+    compound->saved_file_id.pid    = UINT64_MAX;
+    compound->saved_file_id.vid    = UINT64_MAX;
+    compound->saved_session_handle = NULL;
+    compound->saved_tree           = NULL;
 
     compound->num_requests      = 0;
     compound->complete_requests = 0;
@@ -632,7 +698,10 @@ chimera_smb_server_handle_smb2(
 
 
 
-        if (request->smb2_hdr.session_id) {
+        /* Compound related requests inherit session/tree from previous request */
+        if (request->smb2_hdr.flags & SMB2_FLAGS_RELATED_OPERATIONS) {
+            request->session_handle = NULL;
+        } else if (request->smb2_hdr.session_id) {
 
             if (conn->last_session_handle &&
                 conn->last_session_handle->session->session_id == request->smb2_hdr.session_id) {
@@ -703,16 +772,20 @@ chimera_smb_server_handle_smb2(
             }
         }
 
-        if (unlikely(!request->session_handle && (request->smb2_hdr.command != SMB2_NEGOTIATE &&
-                                                  request->smb2_hdr.command != SMB2_SESSION_SETUP &&
-                                                  request->smb2_hdr.command != SMB2_ECHO))) {
+        if (unlikely(!request->session_handle &&
+                     !(request->smb2_hdr.flags & SMB2_FLAGS_RELATED_OPERATIONS) &&
+                     (request->smb2_hdr.command != SMB2_NEGOTIATE &&
+                      request->smb2_hdr.command != SMB2_SESSION_SETUP &&
+                      request->smb2_hdr.command != SMB2_ECHO))) {
             chimera_smb_error("Received SMB2 message with invalid command and no session");
             chimera_smb_complete_request(request, SMB2_STATUS_NO_SUCH_LOGON_SESSION);
             chimera_smb_request_free(thread, request);
             return;
         }
 
-        if (request->session_handle && request->smb2_hdr.sync.tree_id < request->session_handle->session->max_trees) {
+        if (request->session_handle &&
+            !(request->smb2_hdr.flags & SMB2_FLAGS_RELATED_OPERATIONS) &&
+            request->smb2_hdr.sync.tree_id < request->session_handle->session->max_trees) {
             request->tree = request->session_handle->session->trees[request->smb2_hdr.sync.tree_id];
         }
 
@@ -766,8 +839,10 @@ chimera_smb_server_handle_smb2(
                 chimera_smb_error("Received SMB2 message with unimplemented command %u",
                                   request->smb2_hdr.command);
                 request->status = SMB2_STATUS_NOT_IMPLEMENTED;
-                rc              = -1;
+                rc              = 0;
         } /* switch */
+
+        compound->requests[compound->num_requests++] = request;
 
         if (rc) {
             chimera_smb_error("smb_server_handle_msg: failed to parse command %u", request->smb2_hdr.command);
@@ -776,15 +851,9 @@ chimera_smb_server_handle_smb2(
             } else {
                 chimera_smb_complete_request(request, SMB2_STATUS_INVALID_PARAMETER);
             }
-            chimera_smb_request_free(thread, request);
-            /* TODO: Should I return here, or should I try to continue parsing the rest of the compound?
-             * SMB2_STATUS_INVALID_PARAMETER will cause the client to drop the connection,
-             * so it may not matter either way
-             */
+            evpl_finish(evpl, conn->bind);
             return;
         }
-
-        compound->requests[compound->num_requests++] = request;
 
         more_requests = request->smb2_hdr.next_command != 0;
 
@@ -903,10 +972,12 @@ chimera_smb_server_handle_smb1(
     compound->thread = thread;
     compound->conn   = conn;
 
-    compound->saved_session_id  = UINT64_MAX;
-    compound->saved_tree_id     = UINT64_MAX;
-    compound->saved_file_id.pid = UINT64_MAX;
-    compound->saved_file_id.vid = UINT64_MAX;
+    compound->saved_session_id     = UINT64_MAX;
+    compound->saved_tree_id        = UINT64_MAX;
+    compound->saved_file_id.pid    = UINT64_MAX;
+    compound->saved_file_id.vid    = UINT64_MAX;
+    compound->saved_session_handle = NULL;
+    compound->saved_tree           = NULL;
 
     compound->num_requests      = 0;
     compound->complete_requests = 0;
@@ -1143,8 +1214,12 @@ chimera_smb_server_accept(
     conn->gss_output.value  = NULL;
     conn->gss_output.length = 0;
     conn->nascent_ctx       = GSS_C_NO_CONTEXT;
-    conn->rdma_niov         = 0;
-    conn->rdma_length       = 0;
+    conn->ntlm_output       = NULL;
+    conn->ntlm_output_len   = 0;
+    smb_ntlm_ctx_init(&conn->ntlm_ctx);
+    memset(&conn->gssapi_ctx, 0, sizeof(conn->gssapi_ctx));
+    conn->rdma_niov   = 0;
+    conn->rdma_length = 0;
 
     evpl_bind_get_local_address(bind, conn->local_addr, sizeof(conn->local_addr));
     evpl_bind_get_remote_address(bind, conn->remote_addr, sizeof(conn->remote_addr));
