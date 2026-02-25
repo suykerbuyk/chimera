@@ -1408,6 +1408,8 @@ demofs_mkdir_at(
 
     parent_inode->mtime_sec  = now.tv_sec;
     parent_inode->mtime_nsec = now.tv_nsec;
+    parent_inode->ctime_sec  = now.tv_sec;
+    parent_inode->ctime_nsec = now.tv_nsec;
 
     demofs_map_attrs(thread, &request->mkdir_at.r_dir_post_attr, parent_inode);
 
@@ -1512,6 +1514,8 @@ demofs_mknod_at(
 
     parent_inode->mtime_sec  = now.tv_sec;
     parent_inode->mtime_nsec = now.tv_nsec;
+    parent_inode->ctime_sec  = now.tv_sec;
+    parent_inode->ctime_nsec = now.tv_nsec;
 
     demofs_map_attrs(thread, &request->mknod_at.r_dir_post_attr, parent_inode);
 
@@ -1586,6 +1590,8 @@ demofs_remove_at(
 
     parent_inode->mtime_sec  = now.tv_sec;
     parent_inode->mtime_nsec = now.tv_nsec;
+    parent_inode->ctime_sec  = now.tv_sec;
+    parent_inode->ctime_nsec = now.tv_nsec;
 
     rb_tree_remove(&parent_inode->dir.dirents, &dirent->node);
 
@@ -1881,6 +1887,8 @@ demofs_open_at(
 
         parent_inode->mtime_sec  = now.tv_sec;
         parent_inode->mtime_nsec = now.tv_nsec;
+        parent_inode->ctime_sec  = now.tv_sec;
+        parent_inode->ctime_nsec = now.tv_nsec;
 
     } else if (flags & CHIMERA_VFS_OPEN_EXCLUSIVE) {
         pthread_mutex_unlock(&parent_inode->lock);
@@ -2184,10 +2192,32 @@ demofs_read(
 
             chunk_iov = &demofs_private->iov[demofs_private->niov];
 
-            chunk_niov = evpl_iovec_cursor_move(&cursor, chunk_iov, 32, chunk, 1);
+            uint64_t dev_offset = extent->device_offset + overlap_start;
+            uint32_t dev_pad    = (uint32_t) (dev_offset & 4095ULL);
+            int      pad_niov   = 0;
 
-            if (chunk & 4095) {
-                evpl_iovec_clone_segment(&chunk_iov[chunk_niov], &thread->pad, 0, 4096 - (chunk & 4095));
+            if (dev_pad) {
+                /* Device offset is not 4K-aligned (can happen after
+                 * DEALLOCATE trims an extent at a non-block boundary).
+                 * Prepend a discard buffer so the block-device read
+                 * starts at an aligned offset. */
+                evpl_iovec_clone_segment(&chunk_iov[0], &thread->pad,
+                                         0, dev_pad);
+                pad_niov    = 1;
+                dev_offset -= dev_pad;
+            }
+
+            chunk_niov = evpl_iovec_cursor_move(&cursor,
+                                                &chunk_iov[pad_niov],
+                                                32, chunk, 1);
+            chunk_niov += pad_niov;
+
+            uint32_t total = dev_pad + chunk;
+
+            if (total & 4095) {
+                evpl_iovec_clone_segment(&chunk_iov[chunk_niov],
+                                         &thread->pad, 0,
+                                         4096 - (total & 4095));
                 chunk_niov++;
             }
 
@@ -2200,7 +2230,7 @@ demofs_read(
                             thread->queue[extent->device_id],
                             chunk_iov,
                             chunk_niov,
-                            extent->device_offset + overlap_start,
+                            dev_offset,
                             demofs_io_callback,
                             request);
 
@@ -2635,14 +2665,20 @@ demofs_write(
             // Trim extent that extends before aligned_start AND overlaps
             extent->length = aligned_start - extent_start;
         } else if (extent_start < aligned_end && extent_end > aligned_end) {
-            // Trim extent that starts within write region but extends past
+            // Trim extent that starts within write region but extends past.
+            // Must remove/re-insert because file_offset is the rb-tree key.
             uint64_t shift = aligned_end - extent_start;
+
+            rb_tree_remove(&inode->file.extents, &extent->node);
+
             extent->file_offset    = aligned_end;
             extent->device_offset += shift;
             extent->length        -= shift;
             if (extent->buffer) {
                 extent->buffer = (char *) extent->buffer + shift;
             }
+
+            rb_tree_insert(&inode->file.extents, file_offset, extent);
         }
 
         extent = next_extent;
@@ -2669,6 +2705,8 @@ demofs_write(
 
     inode->mtime_sec  = now.tv_sec;
     inode->mtime_nsec = now.tv_nsec;
+    inode->ctime_sec  = now.tv_sec;
+    inode->ctime_nsec = now.tv_nsec;
 
     demofs_map_attrs(thread, &request->write.r_post_attr, inode);
 
@@ -2817,8 +2855,12 @@ demofs_allocate(
                     /* Extent overlaps start of hole - trim end */
                     extent->length = hole_start - extent_start;
                 } else {
-                    /* Extent overlaps end of hole - trim start */
+                    /* Extent overlaps end of hole - trim start.
+                     * Must remove/re-insert because file_offset is
+                     * the rb-tree key. */
                     uint64_t shift = hole_end - extent_start;
+
+                    rb_tree_remove(&inode->file.extents, &extent->node);
 
                     extent->file_offset    = hole_end;
                     extent->device_offset += shift;
@@ -2827,6 +2869,9 @@ demofs_allocate(
                     if (extent->buffer) {
                         extent->buffer = (char *) extent->buffer + shift;
                     }
+
+                    rb_tree_insert(&inode->file.extents, file_offset,
+                                   extent);
                 }
 
                 extent = next_extent;
@@ -3062,6 +3107,8 @@ demofs_symlink_at(
 
     parent_inode->mtime_sec  = now.tv_sec;
     parent_inode->mtime_nsec = now.tv_nsec;
+    parent_inode->ctime_sec  = now.tv_sec;
+    parent_inode->ctime_nsec = now.tv_nsec;
 
     demofs_map_attrs(thread, &request->symlink_at.r_dir_post_attr, parent_inode);
 
@@ -3317,10 +3364,14 @@ demofs_rename_at(
         new_parent_inode->nlink++;
     }
 
+    old_parent_inode->mtime_sec  = now.tv_sec;
+    old_parent_inode->mtime_nsec = now.tv_nsec;
     old_parent_inode->ctime_sec  = now.tv_sec;
     old_parent_inode->ctime_nsec = now.tv_nsec;
     new_parent_inode->mtime_sec  = now.tv_sec;
     new_parent_inode->mtime_nsec = now.tv_nsec;
+    new_parent_inode->ctime_sec  = now.tv_sec;
+    new_parent_inode->ctime_nsec = now.tv_nsec;
 
     demofs_map_attrs(thread, &request->rename_at.r_fromdir_post_attr, old_parent_inode);
     demofs_map_attrs(thread, &request->rename_at.r_todir_post_attr, new_parent_inode);
@@ -3439,6 +3490,8 @@ demofs_link_at(
     inode->ctime_nsec        = now.tv_nsec;
     parent_inode->mtime_sec  = now.tv_sec;
     parent_inode->mtime_nsec = now.tv_nsec;
+    parent_inode->ctime_sec  = now.tv_sec;
+    parent_inode->ctime_nsec = now.tv_nsec;
 
     demofs_map_attrs(thread, &request->link_at.r_attr, inode);
     demofs_map_attrs(thread, &request->link_at.r_dir_post_attr, parent_inode);
