@@ -1,7 +1,6 @@
-// SPDX-FileCopyrightText: 2025 Chimera-NAS Project Contributors
-//
-// SPDX-License-Identifier: LGPL-2.1-only
-
+/*
+ * Copyright 2025-2026. Quantum Corporation. All Rights Reserved.
+ */
 #pragma once
 
 #include "common/varint.h"
