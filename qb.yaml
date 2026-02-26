@@ -258,6 +258,8 @@ tasks:
     commands:
       - cd /context
       - make syntax-check < /dev/null
+      - export BASE=origin/develop
+      - make copyright-check <  /dev/null
     dependencies:
       builder:
         project: chimera
@@ -303,29 +305,102 @@ tasks:
     architecture: [ amd64, arm64 ]
     image: chimera-dev
     context: .
+    variables:
+      BUILD_TYPE: Release
     commands:
       - cd /context
-      - make build_clang_release < /dev/null
+      - export LC_ALL=C
+      - >
+        scan-build --status-bugs
+        cmake -G Ninja -DCMAKE_BUILD_TYPE=${BUILD_TYPE} -S . -B /build
+      - scan-build --status-bugs ninja -C /build
     dependencies:
       builder:
         project: chimera
         task: chimera-dev
         tag: develop
+
+  static_analysis_release_report:
+    type: run_container
+    architecture: [ amd64, arm64 ]
+    image: chimera-dev
+    context: .
+    variables:
+      BUILD_TYPE: Release
+      ASSET_DST: release/scan-report
+    commands:
+      - cd /context
+      - mkdir -p /scan-report /dist
+      - export LC_ALL=C
+      - >
+        scan-build -o /scan-report
+        cmake -G Ninja -DCMAKE_BUILD_TYPE=${BUILD_TYPE} -S . -B /build
+      - >
+        scan-build --keep-empty -o /scan-report ninja -C /build 2>&1 |
+        tee /dist/scan-build-output.txt
+      - mv /scan-report/* /tmp/analysis
+      - tar -C /tmp -czf /dist/report.tar.gz analysis
+      - num_bugs=$(grep -i "bugs* found" /dist/scan-build-output.txt | tr -d -c 0-9)
+      - echo "$num_bugs" > /dist/num_bugs
+    dependencies:
+      builder:
+        project: chimera
+        task: chimera-dev
+        tag: develop
+    assets:
+      - from: /dist
+        to: ${ASSET_DST}
 
   static_analysis_debug:
     type: run_container
     architecture: [ amd64, arm64 ]
     image: chimera-dev
     context: .
+    variables:
+      BUILD_TYPE: Debug
     commands:
       - cd /context
-      - make build_clang_debug < /dev/null
+      - export LC_ALL=C
+      - >
+        scan-build --status-bugs
+        cmake -G Ninja -DCMAKE_BUILD_TYPE=${BUILD_TYPE} -S . -B /build
+      - scan-build --status-bugs ninja -C /build
     dependencies:
       builder:
         project: chimera
         task: chimera-dev
         tag: develop
 
+  static_analysis_debug_report:
+    type: run_container
+    architecture: [ amd64, arm64 ]
+    image: chimera-dev
+    context: .
+    variables:
+      BUILD_TYPE: Debug
+      ASSET_DST: debug/scan-report
+    commands:
+      - cd /context
+      - mkdir -p /scan-report /dist
+      - export LC_ALL=C
+      - >
+        scan-build -o /scan-report
+        cmake -G Ninja -DCMAKE_BUILD_TYPE=${BUILD_TYPE} -S . -B /build
+      - >
+        scan-build --keep-empty -o /scan-report ninja -C /build 2>&1 |
+        tee /dist/scan-build-output.txt
+      - mv /scan-report/* /tmp/analysis
+      - tar -C /tmp -czf /dist/report.tar.gz analysis
+      - num_bugs=$(grep -i "bugs* found" /dist/scan-build-output.txt | tr -d -c 0-9)
+      - echo "$num_bugs" > /dist/num_bugs
+    dependencies:
+      builder:
+        project: chimera
+        task: chimera-dev
+        tag: develop
+    assets:
+      - from: /dist
+        to: ${ASSET_DST}
 
 # Alias section
 aliases:

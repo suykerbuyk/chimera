@@ -1,6 +1,4 @@
-# SPDX-FileCopyrightText: 2025 Ben Jarvis
-#
-# SPDX-License-Identifier: LGPL-2.1-only
+# Copyright 2020-2026. Quantum Corporation. All Rights Reserved.
 
 add_library(chimera_vfs_snfs SHARED  snfs.c )
 

@@ -73,13 +73,23 @@ static_analysis_release:
   stage: check
   needs: [ chimera-dev ]
   script:
-    - ${RUN_QB} static_analysis_release
+    - >
+      if ! ${RUN_QB} static_analysis_release ; then
+         echo "Static Analysis Fail generating report"
+         ${RUN_QB} static_analysis_release_report
+         exit 1
+      fi
 
 static_analysis_debug:
   stage: check
   needs: [ chimera-dev ]
   script:
-    - ${RUN_QB} static_analysis_debug
+    - >
+      if ! ${RUN_QB} static_analysis_debug ; then
+         echo "Static Analysis Fail generating report"
+         ${RUN_QB} static_analysis_debug_report
+         exit 1
+      fi
 
 ctest_release:
   stage: check

@@ -1,6 +1,6 @@
-// SPDX-FileCopyrightText: 2025 Chimera-NAS Project Contributors
-//
-// SPDX-License-Identifier: LGPL-2.1-only
+/*
+ * Copyright 2020-2026. Quantum Corporation. All Rights Reserved.
+ */
 
 #define _GNU_SOURCE
 #include <stdio.h>
