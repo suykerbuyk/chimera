@@ -1,0 +1,227 @@
+%sntest win-proto-test-suite-chimera.snt
+description Let's test using FileServer from WindowsProtocolTestSuites with Chimera
+
+host lsrv distro:ubuntu-server version:24.04 cores:4 memory:6144 arch:x86_64
+
+hostgroup all lsrv
+
+lun share_fs lsrv 100
+
+failstep 10m Capture debug info on failure
+command all $sntest/bin/capture_debug_info $spool
+
+%ifndef PKG_TAG
+%error PKG_TAG must be defined.
+i.e. use -vPKG_TAG=<tag> when running sntest.
+%endif
+
+step 60 Install test utils
+command lsrv curl https://nexus.mdh.quantum.com/repository/snnas-binaries/sn_tests/sntest_utils.tar.gz | tar zxf - -C /
+
+step 10m Install extra packages
+command lsrv apt-get update; apt install -y smbclient cifs-utils jq gdb
+
+step 10m Download chimera package
+command lsrv /sntest_utils/get_qb_asset.py -p chimera -t PKG_TAG -d /chimera-repo -u release/Ubuntu24/amd64/repo-chimera.tar.gz
+
+step 10m Install chimera package
+command lsrv apt install -y -f /chimera-repo/quantum-chimera-server*.deb
+
+step 10m setup share filesystem
+command lsrv echo $share_fs && parted /dev/sda mklabel gpt && parted /dev/sda mkpart  ext4 0% 100% && sleep 5 && mkfs.ext4 /dev/sda1 && mkdir /shares && mount /dev/sda1 /shares && chmod 777 /shares && mkdir -m 777 -p /shares/nfs1 /shares/smb1
+
+step 10m update chimera.json
+command lsrv echo '{\
+    "mounts": {\
+        "linux_dir": {\
+            "path": "/shares", \
+            "module": "linux"\
+        }\
+    }, \
+    "users": [ \
+        { "username": "testuser1", "smbpasswd": "systest", "uid": "5000", "gid": "50"} \
+    ], \
+    "shares": {\
+        "smb1": {\
+            "path": "/linux_dir/smb1"\
+        }\
+    }, \
+    "server": {\
+        "external_portmap": true, \
+        "delegation_threads": 1, \
+        "threads": 16\
+    }\
+}' > /etc/chimera/chimera.json
+
+step 10m start chimera service
+command lsrv systemctl start chimera.service && sleep 5 && systemctl status chimera.service
+
+step 10m Unpack dotnet-sdk-8.0.418-linux-x64.tar.gz
+command lsrv mkdir -p /opt/dotnet-sdk-8.0.418-linux-x64; curl https://repository.mdh.quantum.com/repository/tests/win_proto/dotnet-sdk-8.0.418-linux-x64.tar.gz | tar zxf - -C /opt/dotnet-sdk-8.0.418-linux-x64
+
+step 10m Unpack FileServer-TestSuite-ServerEP.tar.gz
+command lsrv mkdir -p /opt/FileServer-TestSuite-ServerEP; curl https://repository.mdh.quantum.com/repository/tests/win_proto/FileServer-TestSuite-ServerEP.tar.gz | tar zxf - -C /opt/FileServer-TestSuite-ServerEP
+
+step 10m Update config p1
+command lsrv sed \
+    -e "s/node01.contoso.com/$lsrv/" \
+    -e 's;<Property name="SutIPAddress" value="192.168.1.11" >;<Property name="SutIPAddress" value="$lsrv" >;' \
+    -e 's/DC01.contoso.com/dc1.mdh.quantum.com/' \
+    -e 's;<Property name="DomainName" value="contoso.com" >;<Property name="DomainName" value="WORKGROUP" >;' \
+    -e 's;<Property name="AdminUserName" value="Administrator">;<Property name="AdminUserName" value="testuser1">;' \
+    -e 's/nonadmin/testuser1/' \
+    -e 's;<Property name="GuestUserName" value="Guest">;<Property name="GuestUserName" value="">;' \
+    -e 's/Password01!/systest/' \
+    -e 's/SMBBasic/smb1/' \
+    -e 's/SMBEncrypted//' \
+    -e 's/SMBCompressed//' \
+    -e 's/SMBClustered//' \
+    -e 's/GeneralFS.contoso.com//' \
+    -e 's;<Property name="ClientNic1IPAddress" value="192.168.1.111">;<Property name="ClientNic1IPAddress" value="$lsrv">;' \
+    -e 's;<Property name="ClientNic2IPAddress" value="192.168.2.111">;<Property name="ClientNic2IPAddress" value="">;' \
+    -e 's;<Property name="SupportedSecurityPackage" value="Negotiate">;<Property name="SupportedSecurityPackage" value="Ntlm">;' \
+    -e 's;<Property name="Platform" value="WindowsServer2016">;<Property name="Platform" value="NonWindows">;' \
+        < /opt/FileServer-TestSuite-ServerEP/Bin/CommonTestSuite.deployment.ptfconfig \
+        > /opt/FileServer-TestSuite-ServerEP/Bin/CommonTestSuite.deployment.ptfconfig.new
+
+step 10m Rename config p2
+command lsrv /bin/mv /opt/FileServer-TestSuite-ServerEP/Bin/CommonTestSuite.deployment.ptfconfig \
+        /opt/FileServer-TestSuite-ServerEP/Bin/CommonTestSuite.deployment.ptfconfig.orig
+
+step 10m Rename config p3
+command lsrv /bin/mv /opt/FileServer-TestSuite-ServerEP/Bin/CommonTestSuite.deployment.ptfconfig.new \
+        /opt/FileServer-TestSuite-ServerEP/Bin/CommonTestSuite.deployment.ptfconfig
+
+step 10m Show differences in config for debug
+command lsrv diff /opt/FileServer-TestSuite-ServerEP/Bin/CommonTestSuite.deployment.ptfconfig.orig \
+        /opt/FileServer-TestSuite-ServerEP/Bin/CommonTestSuite.deployment.ptfconfig; exit 0
+
+step 10m Informational: list ALL tests in MS-SMB2_ServerTestSuite.dll including ones we don't run
+command lsrv cd /opt/FileServer-TestSuite-ServerEP/Bin && ../../dotnet-sdk-8.0.418-linux-x64/dotnet vstest MS-SMB2_ServerTestSuite.dll --ListTests | sed '1,/The following Tests are available/d' | tee /tmp/testlist
+
+%ifndef TEST_LIST 
+%ifndef RUN_WORKING
+step 10m Create list of tests we will run. These are known to pass when using a Samba server.
+command lsrv echo \
+BVT_MultiCredit_OneRequestWithMultiCredit \
+BVT_SMB2Basic_CancelRegisteredChangeNotify \
+BVT_SMB2Basic_QueryAndSet_FileInfo \
+BVT_SMB2Basic_Query_FileAllInformation \
+BVT_SMB2Basic_Query_FileNormalizedNameInformation_DataFile \
+BVT_SMB2Basic_Query_FileNormalizedNameInformation_DirectoryFile \
+BVT_SMB2Basic_LockAndUnLock \
+InvalidCreateRequestStructureSize \
+BVT_SMB2Basic_QueryDir_Reopen_OnDir \
+BVT_SMB2Basic_ChangeNotify_ChangeFileName \
+BVT_SMB2Basic_ChangeNotify_ChangeDirName \
+BVT_SMB2Basic_ChangeNotify_ChangeAttributes \
+BVT_SMB2Basic_ChangeNotify_ChangeSize \
+BVT_SMB2Basic_ChangeNotify_ChangeLastAccess \
+BVT_SMB2Basic_ChangeNotify_ChangeLastWrite \
+BVT_SMB2Basic_ChangeNotify_ChangeCreation \
+BVT_SMB2Basic_ChangeNotify_ChangeEa \
+BVT_SMB2Basic_ChangeNotify_NonDirectoryFile \
+BVT_SMB2Basic_ChangeNotify_MaxTransactSizeCheck_Smb2002 \
+BVT_SMB2Basic_ChangeNotify_MaxTransactSizeCheck_Smb21 \
+BVT_SMB2Basic_ChangeNotify_MaxTransactSizeCheck_Smb30 \
+BVT_SMB2Basic_ChangeNotify_MaxTransactSizeCheck_Smb302 \
+BVT_SMB2Basic_ChangeNotify_MaxTransactSizeCheck_Smb311 \
+BVT_SMB2Basic_ChangeNotify_NoFileListDirectoryInGrantedAccess \
+DurableHandleV2_NoPersistenceGrantedOnNonCAShare \
+DurableHandleV2_WithLeaseV2_WithoutHandleCaching \
+BVT_Encryption_GlobalEncryptionEnabled \
+BVT_ValidateNegotiateInfo \
+ValidateNegotiateInfo_Negative_InvalidDialects_NoCommonDialect \
+ValidateNegotiateInfo_Negative_InvalidDialects_CommonDialectNotExpected \
+ValidateNegotiateInfo_Negative_InvalidGuid \
+ValidateNegotiateInfo_Negative_InvalidSecurityMode \
+ValidateNegotiateInfo_Negative_InvalidCapabilities \
+DirectoryLeasing_Negative_SMB21 \
+DirectoryLeasing_Negative_SMB2002 \
+BVT_Negotiate_Compatible_2002 \
+BVT_Negotiate_SMB2002 \
+Negotiate_SMB311_WithoutAnyContexts \
+Negotiate_SMB311_WithEncryptionContextWithoutIntegrityContext \
+Negotiate_SMB311_WithCompressionContextWithoutIntegrityContext \
+Negotiate_SMB311_WithEncryptionAndCompressionContextsWithoutIntegrityContext \
+Negotiate_SMB311_InvalidHashAlgorithm \
+Negotiate_SMB311_InvalidCipher \
+Negotiate_SMB311_IsTransportCapabilitiesSupported \
+Negotiate_SMB311_ContextID_NetName \
+BVT_Signing \
+Signing_VerifyAesGmacSigning \
+BVT_TreeMgmt_TreeConnectAndDisconnect \
+TreeMgmt_SMB311_CLUSTER_RECONNECT \
+BVT_SessionMgmt_NewSession \
+SessionMgmt_SupportsNotificationsMismatch \
+BVT_SessionMgmt_Reauthentication \
+BVT_SessionMgmt_ReconnectSessionSetup \
+BVT_OpLockBreak \
+DurableHandleV1_WithLeaseV1_WithoutHandleCaching \
+DurableHandleV1_Reconnect_LeaseIsNull \
+DurableHandleV1_Reconnect_WithoutDurableHandle \
+BVT_CreateClose_CreateAndCloseFile \
+BVT_CreateClose_CreateAndCloseDirectory \
+CreateClose_DeleteFile_DesiredAccessNotIncludeDeleteOrGenericAll \
+BVT_Compound_RelatedRequests \
+BVT_Compound_UnRelatedRequests \
+Compound_Encrypt_RelatedRequests \
+Compound_Encrypt_UnrelatedRequests > /tmp/samba_working_list 
+%endif
+%endif
+
+%ifdef RUN_WORKING
+step 10m create working list
+command lsrv echo BVT_MultiCredit_OneRequestWithMultiCredit \
+BVT_SMB2Basic_QueryAndSet_FileInfo \
+BVT_SMB2Basic_Query_FileAllInformation \
+DurableHandleV2_NoPersistenceGrantedOnNonCAShare \
+DurableHandleV2_WithLeaseV2_WithoutHandleCaching \
+BVT_ValidateNegotiateInfo \
+Negotiate_SMB311_InvalidCipher \
+Negotiate_SMB311_IsTransportCapabilitiesSupported \
+Negotiate_SMB311_ContextID_NetName \
+BVT_Signing \
+Signing_VerifyAesGmacSigning \
+BVT_TreeMgmt_TreeConnectAndDisconnect \
+TreeMgmt_SMB311_CLUSTER_RECONNECT \
+BVT_SessionMgmt_NewSession \
+BVT_SessionMgmt_Reauthentication \
+BVT_SessionMgmt_ReconnectSessionSetup \
+DurableHandleV1_WithLeaseV1_WithoutHandleCaching \
+BVT_CreateClose_CreateAndCloseFile \
+BVT_CreateClose_CreateAndCloseDirectory \
+BVT_Compound_UnRelatedRequests > /tmp/chimera_working_list
+%endif
+
+%ifdef DEBUG
+step 10m kick off strace
+command lsrv (for i in \`pgrep chimera\`; do (nohup strace -tt -f -o /tmp/tr.\$i -p \$i &); done)
+%endif
+
+%ifdef PACKET_CAPTURE
+step 10m kick off tcpdump
+command lsrv systemd-run --unit=tcpdump-any --property=Restart=no tcpdump -i any -w /tmp/out.pcap port 445
+%endif
+
+%ifdef TEST_LIST
+step 80m Run requested tests
+command lsrv for test in TEST_LIST; do cd /opt/FileServer-TestSuite-ServerEP/Bin && echo ==== TEST \$test @ \`date\` ==== && ../../dotnet-sdk-8.0.418-linux-x64/dotnet vstest MS-SMB2_ServerTestSuite.dll --TestCaseFilter:"FullyQualifiedName~\$test"; journalctl -u chimera | tail -500; done | tee /tmp/out
+%else
+%ifdef RUN_WORKING
+step 80m Run tests currently "known" to work on Chimera
+command lsrv (for test in \`cat /tmp/chimera_working_list\`; do cd /opt/FileServer-TestSuite-ServerEP/Bin && echo ==== TEST \$test @ \`date\` ==== && ../../dotnet-sdk-8.0.418-linux-x64/dotnet vstest MS-SMB2_ServerTestSuite.dll --TestCaseFilter:"FullyQualifiedName~\$test" > /tmp/out 2>&1; grep "Passed:     0" /tmp/out >/dev/null; if [ \$? -eq 0 ]; then grep -v "Passed:" /tmp/out; journalctl -u chimera | tail -500; systemctl stop chimera; systemctl start chimera; sleep 1; fi; echo ""; grep "Passed: " /tmp/out; done) > $spool/test-output.txt 2>&1
+step 1m check for errors
+command lsrv grep "Failed:     [^0]" $spool/test-output.txt; if [ \$? -eq 0 ]; then echo "failed tests found"; exit 1; fi
+command lsrv grep "Skipped:     [^0]" $spool/test-output.txt; if [ \$? -eq 0 ]; then echo "skipped tests found"; exit 1; fi
+command lsrv grep "Passed:     1" $spool/test-output.txt | wc -l > /tmp/passed; ntests=\`wc -w < /tmp/chimera_working_list\`; if [ ! "\`cat /tmp/passed\`" = "\$ntests" ]; then echo expected \$ntests to pass, got \`cat /tmp/passed\`; exit 1; fi
+%else
+step 80m Run list of tests known to work with Samba
+command lsrv (for test in \`cat /tmp/samba_working_list\`; do cd /opt/FileServer-TestSuite-ServerEP/Bin && echo ==== TEST \$test @ \`date\` ==== && ../../dotnet-sdk-8.0.418-linux-x64/dotnet vstest MS-SMB2_ServerTestSuite.dll --TestCaseFilter:"FullyQualifiedName~\$test" > /tmp/out 2>&1; grep "Passed:     0" /tmp/out >/dev/null; if [ \$? -eq 0 ]; then grep -v "Passed:" /tmp/out; journalctl -u chimera | tail -500; systemctl stop chimera; systemctl start chimera; sleep 1; fi; echo ""; grep "Passed: " /tmp/out; done) > $spool/test-output.txt 2>&1
+%endif
+%endif
+
+%ifdef PACKET_CAPTURE
+step 10m stop tcpdump
+command lsrv systemctl stop tcpdump-any
+%endif
