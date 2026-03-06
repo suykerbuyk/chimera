@@ -25,7 +25,8 @@ target_compile_definitions(chimera_vfs PRIVATE
 )
 
 install(TARGETS chimera_vfs DESTINATION lib)
-set(VFS_HEADERS vfs.h vfs_fh.h vfs_dump.h vfs_error.h vfs_cred.h)
+set(VFS_HEADERS vfs.h vfs_fh.h vfs_dump.h vfs_error.h vfs_cred.h
+		vfs_attrs.h)
 install(FILES ${VFS_HEADERS} DESTINATION include/vfs)
 
 add_subdirectory(root)
