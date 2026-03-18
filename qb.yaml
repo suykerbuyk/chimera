@@ -244,12 +244,9 @@ tasks:
   chimera-dev:
     type: build_container
     architecture: [ amd64, arm64 ]
-    dockerfile: .devcontainer/Dockerfile
+    dockerfile: builders/dev/Dockerfile
     registry_path: chimera-dev
-    context: .devcontainer/
-    build_args:
-      DOCKER_MIRROR: repository.mdh.quantum.com/
-      APT_MIRROR: http://repository.mdh.quantum.com/repository/pkgs/ubuntu
+    context: builders/dev
 
   syntax:
     type: run_container
