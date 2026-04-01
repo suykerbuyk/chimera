@@ -58,12 +58,13 @@ chimera_nfs4_open_exclusive_verify(
     state                    = nfs4_session_alloc_slot(session);
     state->nfs4_state_handle = handle;
 
-    res->status                            = NFS4_OK;
-    res->resok4.stateid                    = state->nfs4_state_id;
-    res->resok4.cinfo.atomic               = 0;
-    res->resok4.cinfo.before               = 0;
-    res->resok4.cinfo.after                = 0;
-    res->resok4.rflags                     = 0;
+    res->status              = NFS4_OK;
+    res->resok4.stateid      = state->nfs4_state_id;
+    res->resok4.cinfo.atomic = 0;
+    res->resok4.cinfo.before = 0;
+    res->resok4.cinfo.after  = 0;
+    res->resok4.rflags       = (handle->vfs_module->capabilities & CHIMERA_VFS_CAP_FS_LOCK) ?
+        OPEN4_RESULT_LOCKTYPE_POSIX : 0;
     res->resok4.num_attrset                = 0;
     res->resok4.delegation.delegation_type = OPEN_DELEGATE_NONE;
 
@@ -121,12 +122,13 @@ chimera_nfs4_open_at_complete(
     state                    = nfs4_session_alloc_slot(session);
     state->nfs4_state_handle = handle;
 
-    res->status                            = NFS4_OK;
-    res->resok4.stateid                    = state->nfs4_state_id;
-    res->resok4.cinfo.atomic               = 0;
-    res->resok4.cinfo.before               = 0;
-    res->resok4.cinfo.after                = 0;
-    res->resok4.rflags                     = 0;
+    res->status              = NFS4_OK;
+    res->resok4.stateid      = state->nfs4_state_id;
+    res->resok4.cinfo.atomic = 0;
+    res->resok4.cinfo.before = 0;
+    res->resok4.cinfo.after  = 0;
+    res->resok4.rflags       = (handle->vfs_module->capabilities & CHIMERA_VFS_CAP_FS_LOCK) ?
+        OPEN4_RESULT_LOCKTYPE_POSIX : 0;
     res->resok4.num_attrset                = 0;
     res->resok4.delegation.delegation_type = OPEN_DELEGATE_NONE;
 
@@ -182,12 +184,13 @@ chimera_nfs4_open_complete(
     state                    = nfs4_session_alloc_slot(session);
     state->nfs4_state_handle = handle;
 
-    res->status                            = NFS4_OK;
-    res->resok4.stateid                    = state->nfs4_state_id;
-    res->resok4.cinfo.atomic               = 0;
-    res->resok4.cinfo.before               = 0;
-    res->resok4.cinfo.after                = 0;
-    res->resok4.rflags                     = 0;
+    res->status              = NFS4_OK;
+    res->resok4.stateid      = state->nfs4_state_id;
+    res->resok4.cinfo.atomic = 0;
+    res->resok4.cinfo.before = 0;
+    res->resok4.cinfo.after  = 0;
+    res->resok4.rflags       = (handle->vfs_module->capabilities & CHIMERA_VFS_CAP_FS_LOCK) ?
+        OPEN4_RESULT_LOCKTYPE_POSIX : 0;
     res->resok4.num_attrset                = 0;
     res->resok4.delegation.delegation_type = OPEN_DELEGATE_NONE;
 
@@ -210,6 +213,7 @@ chimera_nfs4_open_parent_complete(
     struct nfs_request       *req   = private_data;
     struct OPEN4args         *args  = &req->args_compound->argarray[req->index].opopen;
     unsigned int              flags = 0;
+    nfsstat4                  status;
     struct chimera_vfs_attrs *attr;
 
     req->handle = parent_handle;
@@ -236,6 +240,16 @@ chimera_nfs4_open_parent_complete(
                 flags |= CHIMERA_VFS_OPEN_EXCLUSIVE;
             /* fallthrough */
             case UNCHECKED4:
+                status = chimera_nfs4_validate_createattrs(
+                    args->openhow.how.createattrs.num_attrmask,
+                    args->openhow.how.createattrs.attrmask);
+                if (status != NFS4_OK) {
+                    struct OPEN4res *res = &req->res_compound.resarray[req->index].opopen;
+                    chimera_vfs_release(req->thread->vfs_thread, parent_handle);
+                    res->status = status;
+                    chimera_nfs4_compound_complete(req, status);
+                    return;
+                }
                 chimera_nfs4_unmarshall_attrs(attr,
                                               args->openhow.how.createattrs.num_attrmask,
                                               args->openhow.how.createattrs.attrmask,
@@ -244,6 +258,16 @@ chimera_nfs4_open_parent_complete(
                 break;
             case EXCLUSIVE4_1:
                 flags |= CHIMERA_VFS_OPEN_EXCLUSIVE;
+                status = chimera_nfs4_validate_createattrs(
+                    args->openhow.how.ch_createboth.cva_attrs.num_attrmask,
+                    args->openhow.how.ch_createboth.cva_attrs.attrmask);
+                if (status != NFS4_OK) {
+                    struct OPEN4res *res = &req->res_compound.resarray[req->index].opopen;
+                    chimera_vfs_release(req->thread->vfs_thread, parent_handle);
+                    res->status = status;
+                    chimera_nfs4_compound_complete(req, status);
+                    return;
+                }
                 chimera_nfs4_unmarshall_attrs(attr,
                                               args->openhow.how.ch_createboth.cva_attrs.num_attrmask,
                                               args->openhow.how.ch_createboth.cva_attrs.attrmask,
@@ -277,6 +301,16 @@ chimera_nfs4_open_parent_complete(
 
     switch (args->claim.claim) {
         case CLAIM_NULL:
+            status = chimera_nfs4_validate_name(&args->claim.file);
+
+            if (status != NFS4_OK) {
+                struct OPEN4res *res = &req->res_compound.resarray[req->index].opopen;
+                chimera_vfs_release(req->thread->vfs_thread, parent_handle);
+                res->status = status;
+                chimera_nfs4_compound_complete(req, status);
+                return;
+            }
+
             chimera_vfs_open_at(req->thread->vfs_thread, &req->cred,
                                 parent_handle,
                                 args->claim.file.data,
@@ -312,6 +346,13 @@ chimera_nfs4_open(
     struct nfs_resop4                *resop)
 {
     struct OPEN4args *args = &argop->opopen;
+    struct OPEN4res  *res  = &resop->opopen;
+
+    if (req->fhlen == 0) {
+        res->status = NFS4ERR_NOFILEHANDLE;
+        chimera_nfs4_compound_complete(req, res->status);
+        return;
+    }
 
     if (!req->session) {
         req->session = nfs4_session_find_by_clientid(

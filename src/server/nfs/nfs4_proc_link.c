@@ -89,17 +89,16 @@ chimera_nfs4_link(
     struct LINK4args *args = &argop->oplink;
     struct LINK4res  *res  = &resop->oplink;
 
-    if (args->newname.len == 0) {
-        res->status = NFS4ERR_INVAL;
-        chimera_nfs4_compound_complete(req, NFS4ERR_INVAL);
+    if (req->fhlen == 0 || req->saved_fhlen == 0) {
+        res->status = NFS4ERR_NOFILEHANDLE;
+        chimera_nfs4_compound_complete(req, res->status);
         return;
     }
 
-    if ((args->newname.len == 1 && ((const char *) args->newname.data)[0] == '.') ||
-        (args->newname.len == 2 && ((const char *) args->newname.data)[0] == '.' &&
-         ((const char *) args->newname.data)[1] == '.')) {
-        res->status = NFS4ERR_BADNAME;
-        chimera_nfs4_compound_complete(req, NFS4ERR_BADNAME);
+    res->status = chimera_nfs4_validate_name(&args->newname);
+
+    if (res->status != NFS4_OK) {
+        chimera_nfs4_compound_complete(req, res->status);
         return;
     }
 

@@ -71,17 +71,16 @@ chimera_nfs4_remove(
     struct REMOVE4args *args = &argop->opremove;
     struct REMOVE4res  *res  = &resop->opremove;
 
-    if (args->target.len == 0) {
-        res->status = NFS4ERR_INVAL;
-        chimera_nfs4_compound_complete(req, NFS4ERR_INVAL);
+    if (req->fhlen == 0) {
+        res->status = NFS4ERR_NOFILEHANDLE;
+        chimera_nfs4_compound_complete(req, res->status);
         return;
     }
 
-    if ((args->target.len == 1 && ((const char *) args->target.data)[0] == '.') ||
-        (args->target.len == 2 && ((const char *) args->target.data)[0] == '.' &&
-         ((const char *) args->target.data)[1] == '.')) {
-        res->status = NFS4ERR_BADNAME;
-        chimera_nfs4_compound_complete(req, NFS4ERR_BADNAME);
+    res->status = chimera_nfs4_validate_name(&args->target);
+
+    if (res->status != NFS4_OK) {
+        chimera_nfs4_compound_complete(req, res->status);
         return;
     }
 

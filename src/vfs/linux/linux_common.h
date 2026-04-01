@@ -63,6 +63,8 @@ chimera_linux_errno_to_status(int err)
             return CHIMERA_VFS_EIO;
         case ENXIO:
             return CHIMERA_VFS_ENXIO;
+        case EAGAIN:
+            return CHIMERA_VFS_EAGAIN;
         case EACCES:
             return CHIMERA_VFS_EACCES;
         case EFAULT:
@@ -117,17 +119,18 @@ chimera_linux_stat_to_attr(
 
     attr->va_set_mask |= CHIMERA_VFS_ATTR_MASK_STAT;
 
-    attr->va_dev   = st->st_dev;
-    attr->va_ino   = st->st_ino;
-    attr->va_mode  = st->st_mode;
-    attr->va_nlink = st->st_nlink;
-    attr->va_uid   = st->st_uid;
-    attr->va_gid   = st->st_gid;
-    attr->va_rdev  = st->st_rdev;
-    attr->va_size  = st->st_size;
-    attr->va_atime = st->st_atim;
-    attr->va_mtime = st->st_mtim;
-    attr->va_ctime = st->st_ctim;
+    attr->va_dev        = st->st_dev;
+    attr->va_ino        = st->st_ino;
+    attr->va_mode       = st->st_mode;
+    attr->va_nlink      = st->st_nlink;
+    attr->va_uid        = st->st_uid;
+    attr->va_gid        = st->st_gid;
+    attr->va_rdev       = st->st_rdev;
+    attr->va_size       = st->st_size;
+    attr->va_space_used = st->st_blocks * 512;
+    attr->va_atime      = st->st_atim;
+    attr->va_mtime      = st->st_mtim;
+    attr->va_ctime      = st->st_ctim;
 } /* linux_stat_to_chimera_attr */
 
 static inline void
