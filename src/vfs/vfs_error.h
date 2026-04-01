@@ -11,6 +11,7 @@ enum chimera_vfs_error {
     CHIMERA_VFS_ENOENT       = 2,      /* No such file or directory */
     CHIMERA_VFS_EIO          = 5,      /* I/O error */
     CHIMERA_VFS_ENXIO        = 6,      /* No such device or address */
+    CHIMERA_VFS_EAGAIN       = 11,     /* Try again */
     CHIMERA_VFS_EACCES       = 13,     /* Permission denied */
     CHIMERA_VFS_EFAULT       = 14,         /* Bad address */
     CHIMERA_VFS_EEXIST       = 17,     /* File exists */
@@ -31,6 +32,7 @@ enum chimera_vfs_error {
     CHIMERA_VFS_ENOTSUP      = 95,     /* Operation not supported */
     CHIMERA_VFS_EDQUOT       = 122,    /* Quota exceeded */
     CHIMERA_VFS_ESTALE       = 116,    /* Stale file handle */
+    CHIMERA_VFS_ESYMLINK     = 120,    /* Is a symbolic link */
     CHIMERA_VFS_EBADCOOKIE   = 200,    /* Bad readdir cookie/verifier */
     CHIMERA_VFS_UNSET        = 100000  /* Unset error code */
 };

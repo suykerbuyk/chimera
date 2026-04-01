@@ -83,21 +83,6 @@ chimera_nfs4_rename_open_callback(
 } /* chimera_nfs4_rename_open_callback */
 
 
-static nfsstat4
-chimera_nfs4_check_name(const xdr_opaque *name)
-{
-    if (name->len == 0) {
-        return NFS4ERR_INVAL;
-    }
-
-    if ((name->len == 1 && ((const char *) name->data)[0] == '.') ||
-        (name->len == 2 && ((const char *) name->data)[0] == '.' &&
-         ((const char *) name->data)[1] == '.')) {
-        return NFS4ERR_BADNAME;
-    }
-
-    return NFS4_OK;
-} /* chimera_nfs4_check_name */
 
 void
 chimera_nfs4_rename(
@@ -110,10 +95,16 @@ chimera_nfs4_rename(
     struct RENAME4res  *res  = &resop->oprename;
     nfsstat4            status;
 
-    status = chimera_nfs4_check_name(&args->oldname);
+    if (req->fhlen == 0 || req->saved_fhlen == 0) {
+        res->status = NFS4ERR_NOFILEHANDLE;
+        chimera_nfs4_compound_complete(req, res->status);
+        return;
+    }
+
+    status = chimera_nfs4_validate_name(&args->oldname);
 
     if (status == NFS4_OK) {
-        status = chimera_nfs4_check_name(&args->newname);
+        status = chimera_nfs4_validate_name(&args->newname);
     }
 
     if (status != NFS4_OK) {

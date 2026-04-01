@@ -559,6 +559,8 @@ chimera_linux_open_fh(
     struct chimera_linux_thread *thread = private_data;
     int                          flags;
     int                          fd;
+    int                          probe_fd;
+    struct stat                  st;
 
     flags = chimera_linux_set_open_flags(request->open_fh.flags);
 
@@ -568,7 +570,25 @@ chimera_linux_open_fh(
                               flags);
 
     if (fd < 0) {
-        request->status = chimera_linux_errno_to_status(errno);
+        if (errno == ENOTDIR && (request->open_fh.flags & CHIMERA_VFS_OPEN_DIRECTORY)) {
+            probe_fd = linux_open_by_handle(&thread->mount_table,
+                                            request->fh,
+                                            request->fh_len,
+                                            O_PATH | O_NOFOLLOW);
+
+            if (probe_fd >= 0) {
+                if (fstat(probe_fd, &st) == 0 && S_ISLNK(st.st_mode)) {
+                    request->status = CHIMERA_VFS_ESYMLINK;
+                } else {
+                    request->status = CHIMERA_VFS_ENOTDIR;
+                }
+                close(probe_fd);
+            } else {
+                request->status = CHIMERA_VFS_ENOTDIR;
+            }
+        } else {
+            request->status = chimera_linux_errno_to_status(errno);
+        }
         request->complete(request);
         return;
     }
@@ -1257,7 +1277,17 @@ chimera_linux_link_at(
     rc = linkat(fd, "", dir_fd, fullname, AT_EMPTY_PATH);
 
     if (rc < 0) {
-        request->status = chimera_linux_errno_to_status(errno);
+        if (errno == EPERM) {
+            struct stat st;
+
+            if (fstat(fd, &st) == 0 && S_ISDIR(st.st_mode)) {
+                request->status = CHIMERA_VFS_EISDIR;
+            } else {
+                request->status = CHIMERA_VFS_EPERM;
+            }
+        } else {
+            request->status = chimera_linux_errno_to_status(errno);
+        }
     } else {
         request->status = CHIMERA_VFS_OK;
     }
@@ -1268,6 +1298,78 @@ chimera_linux_link_at(
     request->complete(request);
 
 } /* chimera_linux_link_at */
+static void
+chimera_linux_lock(
+    struct chimera_vfs_request *request,
+    void                       *private_data)
+{
+    int          fd = (int) request->lock.handle->vfs_private;
+    int          cmd;
+    struct flock fl = { 0 };
+    int          rc;
+
+    switch (request->lock.lock_type) {
+        case CHIMERA_VFS_LOCK_READ:
+            fl.l_type = F_RDLCK;
+            break;
+        case CHIMERA_VFS_LOCK_WRITE:
+            fl.l_type = F_WRLCK;
+            break;
+        case CHIMERA_VFS_LOCK_UNLOCK:
+            fl.l_type = F_UNLCK;
+            break;
+        default:
+            request->status = chimera_linux_errno_to_status(EINVAL);
+            request->complete(request);
+            return;
+    } /* switch */
+
+    fl.l_whence = request->lock.whence;
+    if (request->lock.whence == SEEK_END) {
+        fl.l_start = (off_t) (int64_t) request->lock.offset;
+        fl.l_len   = (off_t) (int64_t) request->lock.length;
+    } else {
+        fl.l_start = (off_t) request->lock.offset;
+        fl.l_len   = (off_t) request->lock.length; /* 0 = to EOF */
+    }
+    fl.l_pid = 0;
+
+    if (request->lock.flags & CHIMERA_VFS_LOCK_TEST) {
+        cmd = F_GETLK;
+    } else if (request->lock.flags & CHIMERA_VFS_LOCK_WAIT) {
+        cmd = F_SETLKW;
+    } else {
+        cmd = F_SETLK;
+    }
+
+    rc = fcntl(fd, cmd, &fl);
+
+    if (rc < 0) {
+        request->status = chimera_linux_errno_to_status(errno);
+        request->complete(request);
+        return;
+    }
+
+    if (request->lock.flags & CHIMERA_VFS_LOCK_TEST) {
+        if (fl.l_type == F_UNLCK) {
+            request->lock.r_conflict_type   = CHIMERA_VFS_LOCK_UNLOCK;
+            request->lock.r_conflict_offset = 0;
+            request->lock.r_conflict_length = 0;
+            request->lock.r_conflict_pid    = 0;
+        } else {
+            request->lock.r_conflict_type = (fl.l_type == F_RDLCK)
+                ? CHIMERA_VFS_LOCK_READ
+                : CHIMERA_VFS_LOCK_WRITE;
+            request->lock.r_conflict_offset = fl.l_start;
+            request->lock.r_conflict_length = fl.l_len;
+            request->lock.r_conflict_pid    = fl.l_pid;
+        }
+    }
+
+    request->status = CHIMERA_VFS_OK;
+    request->complete(request);
+} /* chimera_linux_lock */
+
 static void
 chimera_linux_dispatch(
     struct chimera_vfs_request *request,
@@ -1337,6 +1439,9 @@ chimera_linux_dispatch(
         case CHIMERA_VFS_OP_SEEK:
             chimera_linux_seek(request, private_data);
             break;
+        case CHIMERA_VFS_OP_LOCK:
+            chimera_linux_lock(request, private_data);
+            break;
         default:
             chimera_linux_error("linux_dispatch: unknown operation %d",
                                 request->opcode);
@@ -1350,7 +1455,8 @@ SYMBOL_EXPORT struct chimera_vfs_module vfs_linux = {
     .name         = "linux",
     .fh_magic     = CHIMERA_VFS_FH_MAGIC_LINUX,
     .capabilities = CHIMERA_VFS_CAP_BLOCKING | CHIMERA_VFS_CAP_OPEN_PATH_REQUIRED | CHIMERA_VFS_CAP_OPEN_FILE_REQUIRED |
-        CHIMERA_VFS_CAP_FS | CHIMERA_VFS_CAP_FS_RELATIVE_OP | CHIMERA_VFS_CAP_FS_PATH_OP
+        CHIMERA_VFS_CAP_FS | CHIMERA_VFS_CAP_FS_RELATIVE_OP | CHIMERA_VFS_CAP_FS_PATH_OP |
+        CHIMERA_VFS_CAP_FS_LOCK
     ,
     .init           = chimera_linux_init,
     .destroy        = chimera_linux_destroy,
