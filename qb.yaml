@@ -93,7 +93,7 @@ tasks:
     dependencies:
       uncrustify:
         project: uncrustify
-        task: build_Ubuntu22
+        task: build_Ubuntu24
         tag: 0.78.1-quantum
 
   build_debug_Ubuntu24:
@@ -158,6 +158,84 @@ tasks:
       builder:
         project: chimera
         task: builder_Ubuntu24
+        tag: develop
+
+  # Ubuntu 26.04 section
+  # ---------------------------------------
+  builder_Ubuntu26:
+    type: build_container
+    architecture: [ amd64, arm64 ]
+    dockerfile: builders/Ubuntu26/Dockerfile
+    registry_path: builder_ubuntu26
+    context: builders/Ubuntu26
+    dependencies:
+      uncrustify:
+        project: uncrustify
+        task: build_Ubuntu26
+        tag: 0.78.1-quantum
+
+  build_debug_Ubuntu26:
+    type: run_container
+    architecture: [ amd64, arm64 ]
+    variables:
+      BUILD_TYPE: Debug
+      ASSET_DST: debug/Ubuntu26
+    image: builder_ubuntu26
+    context: .
+    commands:
+      - export DESTDIR=/build/quantum-chimera-server_${VERSION}-${REVISION}_$arch
+      - mkdir -p ${DESTDIR} /dist
+      - >
+        cmake -G Ninja -DCMAKE_BUILD_TYPE=${BUILD_TYPE}
+        -DDISABLE_TESTS=ON
+        -DIO_URING_ENABLED=OFF
+        -DCAIRN_ENABLED=OFF
+        -DCMAKE_INSTALL_PREFIX=/opt/quantum/chimera
+        -B /build -S /context
+      - ninja -C /build
+      - ninja -C /build install
+      - cd ${DESTDIR}
+      - tar cfz /dist/chimera.tar.gz .
+      - /context/qtm_build/make_debian_pkg.sh ${VERSION} ${REVISION} $arch
+    assets:
+      - from: /dist
+        to: ${ASSET_DST}
+    dependencies:
+      builder:
+        project: chimera
+        task: builder_Ubuntu26
+        tag: develop
+
+  build_release_Ubuntu26:
+    type: run_container
+    architecture: [ amd64, arm64 ]
+    variables:
+      BUILD_TYPE: Release
+      ASSET_DST: release/Ubuntu26
+    image: builder_ubuntu26
+    context: .
+    commands:
+      - export DESTDIR=/build/quantum-chimera-server_${VERSION}-${REVISION}_$arch
+      - mkdir -p ${DESTDIR} /dist
+      - >
+        cmake -G Ninja -DCMAKE_BUILD_TYPE=${BUILD_TYPE}
+        -DDISABLE_TESTS=ON
+        -DIO_URING_ENABLED=OFF
+        -DCAIRN_ENABLED=OFF
+        -DCMAKE_INSTALL_PREFIX=/opt/quantum/chimera
+        -B /build -S /context
+      - ninja -C /build
+      - ninja -C /build install
+      - cd ${DESTDIR}
+      - tar cfz /dist/chimera.tar.gz .
+      - /context/qtm_build/make_debian_pkg.sh ${VERSION} ${REVISION} $arch
+    assets:
+      - from: /dist
+        to: ${ASSET_DST}
+    dependencies:
+      builder:
+        project: chimera
+        task: builder_Ubuntu26
         tag: develop
 
   # Rocky9 section
@@ -404,12 +482,15 @@ aliases:
   builders:
     - builder_Ubuntu22
     - builder_Ubuntu24
+    - builder_Ubuntu26
     - builder_Rocky9
   build:
     - build_debug_Ubuntu22
     - build_release_Ubuntu22
     - build_debug_Ubuntu24
     - build_release_Ubuntu24
+    - build_debug_Ubuntu26
+    - build_release_Ubuntu26
     - build_debug_Rocky9
     - build_release_Rocky9
   ubuntu22:
@@ -420,6 +501,10 @@ aliases:
     - builder_Ubuntu24
     - build_debug_Ubuntu24
     - build_release_Ubuntu24
+  ubuntu26:
+    - builder_Ubuntu26
+    - build_debug_Ubuntu26
+    - build_release_Ubuntu26
   rocky9:
     - builder_Rocky9
     - build_debug_Rocky9
