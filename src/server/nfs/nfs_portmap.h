@@ -1,11 +1,15 @@
-// SPDX-FileCopyrightText: 2025 Chimera-NAS Project Contributors
+// SPDX-FileCopyrightText: 2025-2026 Chimera-NAS Project Contributors
 //
 // SPDX-License-Identifier: LGPL-2.1-only
 
 #pragma once
 
+#include <stdint.h>
 #include "evpl/evpl_rpc2.h"
 #include "portmap_xdr.h"
+
+void portmap_set_nlm_port(
+    uint32_t port);
 
 void chimera_portmap_null_v2(
     struct evpl               *evpl,
