@@ -1,9 +1,11 @@
 /*
- * Copyright 2025-2026. Quantum Corporation. All Rights Reserved.
+ * Copyright 2020-2026. Quantum Corporation. All Rights Reserved.
  */
+
 #pragma once
 
 #include "common/varint.h"
+#include "vfs/vfs_fh.h"
 
 #define snfs_debug(...) chimera_debug("snfs", \
                                       __FILE__, \
@@ -61,6 +63,8 @@ snfs_errno_to_status(int err)
             return CHIMERA_VFS_EIO;
         case ENXIO:
             return CHIMERA_VFS_ENXIO;
+        case EAGAIN:
+            return CHIMERA_VFS_EAGAIN;
         case EACCES:
             return CHIMERA_VFS_EACCES;
         case EFAULT:
@@ -102,6 +106,7 @@ snfs_errno_to_status(int err)
         case ELOOP:
             return CHIMERA_VFS_ELOOP;
         default:
+            snfs_error("Unknown errno value: %d", err);
             return CHIMERA_VFS_UNSET;
     } /* switch */
 } /* snfs_errno_to_status */
@@ -114,18 +119,19 @@ snfs_stat_to_attr(
 
     attr->va_set_mask |= CHIMERA_VFS_ATTR_MASK_STAT;
 
-    attr->va_dev   = st->st_dev;
-    attr->va_ino   = st->st_ino;
-    attr->va_mode  = st->st_mode;
-    attr->va_nlink = st->st_nlink;
-    attr->va_uid   = st->st_uid;
-    attr->va_gid   = st->st_gid;
-    attr->va_rdev  = st->st_rdev;
-    attr->va_size  = st->st_size;
-    attr->va_atime = st->st_atim;
-    attr->va_mtime = st->st_mtim;
-    attr->va_ctime = st->st_ctim;
-} /* snfs_stat_to_attr */
+    attr->va_dev        = st->st_dev;
+    attr->va_ino        = st->st_ino;
+    attr->va_mode       = st->st_mode;
+    attr->va_nlink      = st->st_nlink;
+    attr->va_uid        = st->st_uid;
+    attr->va_gid        = st->st_gid;
+    attr->va_rdev       = st->st_rdev;
+    attr->va_size       = st->st_size;
+    attr->va_space_used = st->st_blocks * 512;
+    attr->va_atime      = st->st_atim;
+    attr->va_mtime      = st->st_mtim;
+    attr->va_ctime      = st->st_ctim;
+} /* snfs_stat_to_chimera_attr */
 
 static inline void
 snfs_statx_to_attr(
@@ -150,7 +156,7 @@ snfs_statx_to_attr(
     attr->va_mtime.tv_nsec = stx->stx_mtime.tv_nsec;
     attr->va_ctime.tv_sec  = stx->stx_ctime.tv_sec;
     attr->va_ctime.tv_nsec = stx->stx_ctime.tv_nsec;
-} /* io_uring_stat_to_attr */
+} /* io_uring_stat_to_chimera_attr */
 
 static inline void
 snfs_statvfs_to_attr(
@@ -167,7 +173,8 @@ snfs_statvfs_to_attr(
     attr->va_fs_files_avail = stvfs->f_ffree;
     attr->va_fs_files_free  = stvfs->f_ffree;
     attr->va_fs_files_total = stvfs->f_files;
-} /* snfs_statvfs_to_attr */
+    attr->va_fsid           = stvfs->f_fsid;
+} /* snfs_statvfs_to_chimera_attr */
 
 static int
 open_mount_path_by_id(int mount_id)
@@ -220,9 +227,15 @@ open_mount_path_by_id(int mount_id)
     return open(mount_path, O_RDONLY);
 } /* open_mount_path_by_id */
 
+/*
+ * Get file handle for a linux filesystem object.
+ *
+ * If parent_fh is provided (non-NULL), copy mount_id from parent.
+ * If parent_fh is NULL, this is a mount operation - use fsid from statvfs.
+ */
 static inline int
 snfs_get_fh(
-    uint8_t     fh_magic,
+    const void *parent_fh,
     int         fd,
     const char *path,
     void       *fh,
@@ -230,13 +243,14 @@ snfs_get_fh(
 {
     uint8_t             buf[sizeof(struct file_handle) + MAX_HANDLE_SZ];
     struct file_handle *handle = (struct file_handle *) buf;
+    uint8_t             fragment[32];   /* varint(mount_id) + varint(type) + handle */
+    uint8_t            *frag_ptr = fragment;
     int                 rc;
     int                 mount_id;
-    uint8_t            *fhp = (uint8_t *) fh;
-
 
     handle->handle_bytes = MAX_HANDLE_SZ;
-    rc                   = name_to_handle_at(
+
+    rc = name_to_handle_at(
         fd,
         path,
         handle,
@@ -247,20 +261,31 @@ snfs_get_fh(
         return -1;
     }
 
-    snfs_debug("Obtained handle for path %s: mount_id=%d, handle_type=%d, handle_bytes=%d\n",
-               path, mount_id, handle->handle_type, handle->handle_bytes);
+    /* Build fh_fragment: varint(mount_id) + varint(handle_type) + f_handle */
+    frag_ptr += chimera_encode_uint32(mount_id, frag_ptr);
+    frag_ptr += chimera_encode_uint32(handle->handle_type, frag_ptr);
+    memcpy(frag_ptr, &handle->f_handle, handle->handle_bytes);
+    frag_ptr += handle->handle_bytes;
 
-    // uint8_t + uint32_t + uint32_t = 9 bytes
-    snfs_abort_if(9 + handle->handle_bytes > CHIMERA_VFS_FH_SIZE,
+    snfs_abort_if(CHIMERA_VFS_MOUNT_ID_SIZE + (frag_ptr - fragment) > CHIMERA_VFS_FH_SIZE,
                   "Returned handle exceeds CHIMERA_VFS_FH_SIZE");
-    *fhp = fh_magic;
-    fhp++;
-    fhp += chimera_encode_uint32(mount_id, fhp);
-    fhp += chimera_encode_uint32(handle->handle_type, fhp);
-    memcpy(fhp, &handle->f_handle, handle->handle_bytes);
-    fhp += handle->handle_bytes;
 
-    *fh_len = fhp - (uint8_t *) fh;
+    if (parent_fh) {
+        /* Copy mount_id from parent */
+        *fh_len = chimera_vfs_encode_fh_parent(parent_fh, fragment, frag_ptr - fragment, fh);
+    } else {
+        /* Mount context: compute mount_id from fsid */
+        struct statvfs stvfs;
+        uint8_t        fsid_buf[CHIMERA_VFS_FSID_SIZE] = { 0 };
+
+        rc = fstatvfs(fd, &stvfs);
+        if (rc < 0) {
+            return -1;
+        }
+
+        memcpy(fsid_buf, &stvfs.f_fsid, sizeof(stvfs.f_fsid));
+        *fh_len = chimera_vfs_encode_fh_mount(fsid_buf, fragment, frag_ptr - fragment, fh);
+    }
 
     return 0;
 } /* snfs_get_fh */
@@ -296,12 +321,12 @@ snfs_open_by_handle(
     uint32_t            handle_type;
     uint8_t             buf[sizeof(struct file_handle) + MAX_HANDLE_SZ];
     struct file_handle *handle = (struct file_handle *) buf;
-    uint8_t            *fhp    = (uint8_t *) fh + 1;
+    const uint8_t      *fhp    = (const uint8_t *) fh + CHIMERA_VFS_MOUNT_ID_SIZE;
 
     fhp                 += chimera_decode_uint32(fhp, &mount_id);
     fhp                 += chimera_decode_uint32(fhp, &handle_type);
     handle->handle_type  = handle_type;
-    handle->handle_bytes = fh_len - (fhp - (uint8_t *) fh);
+    handle->handle_bytes = fh_len - (fhp - (const uint8_t *) fh);
     memcpy(&handle->f_handle, fhp, handle->handle_bytes);
 
     HASH_FIND_INT(mount_table->mounts, &mount_id, mount);
@@ -318,6 +343,7 @@ snfs_open_by_handle(
 
         HASH_ADD_INT(mount_table->mounts, mount_id, mount);
     }
+
     return open_by_handle_at(mount->mount_fd, handle, flags);
 } /* snfs_open_by_handle */
 
@@ -390,6 +416,8 @@ snfs_map_child_attrs(
     struct stat    st;
     struct statvfs stvfs;
 
+    (void) fh_magic; /* No longer used, kept for API compatibility */
+
     attr->va_set_mask = 0;
 
     if (attr->va_req_mask & CHIMERA_VFS_ATTR_MASK_STAT) {
@@ -404,7 +432,7 @@ snfs_map_child_attrs(
     }
 
     if (attr->va_req_mask & CHIMERA_VFS_ATTR_FH) {
-        rc = snfs_get_fh(fh_magic, dirfd, name,
+        rc = snfs_get_fh(request->fh, dirfd, name,
                          attr->va_fh,
                          &attr->va_fh_len);
 
@@ -438,13 +466,15 @@ snfs_map_child_attrs_statx(
     int            rc;
     struct statvfs stvfs;
 
+    (void) fh_magic; /* No longer used, kept for API compatibility */
+
     if (attr->va_req_mask & CHIMERA_VFS_ATTR_MASK_STAT) {
 
         snfs_statx_to_attr(attr, stx);
     }
 
     if (attr->va_req_mask & CHIMERA_VFS_ATTR_FH) {
-        rc = snfs_get_fh(fh_magic, dirfd, name,
+        rc = snfs_get_fh(request->fh, dirfd, name,
                          attr->va_fh,
                          &attr->va_fh_len);
 
@@ -465,3 +495,10 @@ snfs_map_child_attrs_statx(
 
     return CHIMERA_VFS_OK;
 } /* snfs_map_child_attrs */
+
+static inline uint64_t
+snfs_mtime_to_verifier(const struct stat *st)
+{
+    return ((uint64_t) st->st_mtim.tv_sec << 32) |
+           ((uint64_t) st->st_mtim.tv_nsec & 0xFFFFFFFF);
+} /* snfs_mtime_to_verifier */
