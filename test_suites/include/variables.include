@@ -10,9 +10,10 @@
 #
 #  * CHIM_OS:  24(default)
 #    - specify what version for Chimera Server
-#    -  9 == Rocky9
-#    - 22 == Ubuntu22
-#    - 24 == Ubuntu24
+#    -  9 == Rocky 9
+#    - 22 == Ubuntu 22.04
+#    - 24 == Ubuntu 24.04.3
+#    - 26 == Ubuntu 26.04
 #    - Optional.
 #
 #  * OS_DISTRO:  ubuntu-server(default)
@@ -52,7 +53,21 @@
 
 %ifndef CHIM_OS
 %define CHIM_OS 24
-%define QB_OS Ubuntu24
+%endif
+
+# Ubuntu 26
+%if CHIM_OS == 26
+%define QB_OS Ubuntu26
+
+%ifndef OS_DISTRO
+%define OS_DISTRO ubuntu-server
+%endif
+
+%ifndef OS_VERSION
+%define OS_VERSION 26.04
+%endif
+
+# endif CHIM_OS == 26
 %endif
 
 # Ubuntu 24

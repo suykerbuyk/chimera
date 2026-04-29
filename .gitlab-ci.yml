@@ -23,6 +23,11 @@ builder_Ubuntu24:
   script:
     - ${RUN_QB} builder_Ubuntu24
 
+builder_Ubuntu26:
+  stage: builders
+  script:
+    - ${RUN_QB} builder_Ubuntu26
+
 builder_Ubuntu22:
   stage: builders
   script:
@@ -47,6 +52,16 @@ build_debug_Ubuntu24:
   stage: build
   script:
     - ${RUN_QB} build_debug_Ubuntu24
+
+build_release_Ubuntu26:
+  stage: build
+  script:
+    - ${RUN_QB} build_release_Ubuntu26
+
+build_debug_Ubuntu26:
+  stage: build
+  script:
+    - ${RUN_QB} build_debug_Ubuntu26
 
 build_release_Ubuntu22:
   stage: build

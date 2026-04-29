@@ -53,7 +53,13 @@ command srv1 sed -i.back 's/\/chimera.json/\/sntest-chimera.json/'  /etc/default
                     threads: 16, \
                     external_portmap: true, \
                     max_open_files: 1048576, \
-                    rest_http_port: 8080 \
+                    rest_http_port: 8080, \
+		    "smb_multichannel": [ \
+		    	{ \
+			  "address": "$srv1", \
+			  "speed": 100000000000, \
+			  "rdma": false \
+			} ] \
                  }, \
 		 users: [ \
 		    { username: "testuser1", smbpasswd: "systest", uid: 5000, gid: 50} \
@@ -84,10 +90,24 @@ command srv1 curl -s "http://127.0.0.1:8080/api/v1/users" | jq
 command srv1 curl -s "http://127.0.0.1:8080/api/v1/shares" | jq
 command srv1 curl -s "http://127.0.0.1:8080/api/v1/exports" | jq
 
-# ----------------- Setup linux client -----------------
+# ----------------- get test suites -----------------
 step 5m get elbencho
 command lnx1 curl https://repository.mdh.quantum.com/repository/tests/elbencho/elbencho-static-x86_64.tar.gz | \
 	tar zxf - -C /usr/bin
+
+# Connectathon testing
+step 5m lnx1 Get connectathon
+command lnx1 curl https://repository.mdh.quantum.com/repository/cthon/cthon04.tar.gz | \
+	tar zxf - -C /root/
+
+step 5m create nfstest user
+command lnx1 mkdir -p /home1 -m 0755 && useradd -m nfstest -b /home1 && \
+	     echo "nfstest ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/nfstest
+
+# Download NFStest-9408954 pkg
+step 5m lnx1 Get NFStest-9408954
+command lnx1 curl https://repository.mdh.quantum.com:8443/repository/nfs_protocol_test/git/NFStest-9408954.tar.gz | \
+	tar zxf - -C /home1/nfstest
 
 # ----------------- Setup/Run SMB test -----------------
 %ifndef NO_SMB
@@ -100,7 +120,7 @@ step 5m test smb connection config
 command lnx1 SMBCLIENT -c "allinfo /"
 
 step 5m Connect to smb1 share
-command lnx1 mkdir -p /smb1 && mount.cifs -v -ocredentials=/root/.smb_cred //$srv1/smb1 /smb1
+command lnx1 mkdir -p /smb1 && mount.cifs -v -omax_channels=8,credentials=/root/.smb_cred //$srv1/smb1 /smb1
 
 step 2m basic tests over SMB
 command lnx1 dd if=/dev/zero count=3 of=/smb1/file1 && stat /smb1/file1 && mv /smb1/file1 /smb1/file1.moved
@@ -113,9 +133,9 @@ command lnx1  mkdir /smb1/rename-test && cd /smb1/rename-test && mkdir -p dir1 d
 	      stat dir2/rename1 rename2 dir2/file3
 
 step 10m run elbencho over SMB
-command lnx1 mkdir -p /smb1/lnx1 && \
-	/usr/bin/elbencho /smb1/lnx1 --size=1m --dirs=4 --files=10 --mkdirs --write && \
-	/usr/bin/elbencho /smb1/lnx1 --size=1m --dirs=4 --files=10 --deldirs --delfiles --read
+command lnx1 mkdir -p /smb1/lnx1-smb1 && \
+	/usr/bin/elbencho /smb1/lnx1-smb1 --size=1m --dirs=4 --files=10 --mkdirs --write && \
+	/usr/bin/elbencho /smb1/lnx1-smb1 --size=1m --dirs=4 --files=10 --deldirs --delfiles --read
 %endif
 
 # ----------------- Setup/Run NFSv3 test -----------------
@@ -128,9 +148,9 @@ command lnx1 dd if=/dev/zero count=3 of=/nfs1/file1 && stat /nfs1/file1 && mv /n
 command lnx1 touch /nfs1/chmod_file && chmod 600 /nfs1/chmod_file && stat -c '%a' /nfs1/chmod_file | grep 600
 
 step 10m run elbencho over NFSv3
-command lnx1 mkdir -p /nfs1/lnx1 && \
-	/usr/bin/elbencho /nfs1/lnx1 --size=1m --dirs=4 --files=10 --mkdirs --write && \
-	/usr/bin/elbencho /nfs1/lnx1 --size=1m --dirs=4 --files=10 --deldirs --delfiles --read
+command lnx1 mkdir -p /nfs1/lnx1-nfsv3 && \
+	/usr/bin/elbencho /nfs1/lnx1-nfsv3 --size=1m --dirs=4 --files=10 --mkdirs --write && \
+	/usr/bin/elbencho /nfs1/lnx1-nfsv3 --size=1m --dirs=4 --files=10 --deldirs --delfiles --read
 
 # Connectathon testing
 step 5m lnx1 Get connectathon
@@ -145,18 +165,50 @@ step 10M Run Connectathon special test
 command lnx1 cd /root/cthon04/cthon04/special && \
 	     NFSTESTDIR=/nfs1/cthon_special ./runtests
 
-%ifndef SKIP_FAIL
-# NFStest-3.2 testing
-step 5m lnx1 Get NFStest-3.2
-command lnx1 curl https://repository.mdh.quantum.com:8443/repository/nfs_protocol_test/3.2/NFStest-3.2.tar.gz | \
-	tar zxf - -C /root/
+step 5m Umount the NFSv3 directory
+command lnx1 umount /nfs1
 
-step 10M Run NFStest-3.2 nfstest_posix
-command lnx1 cd /root/NFStest-3.2 && \
-	     PYTHONPATH=`pwd` ./test/nfstest_posix  -o timeo=600,intr --nfsversion=3 -s $srv1 -e /nfs1
-%endif
+step 10M Run NFStest-9408954 nfstest_posix
+command lnx1 cd /home1/nfstest/NFStest-9408954 && \
+	     sudo -u nfstest -E bash -c 'PYTHONPATH=./ ./test/nfstest_posix  --nfsversion=3 -s $srv1 -e /nfs1'
 %endif
 
+# ----------------- Setup/Run NFSv4 test -----------------
+%ifndef NO_NFSv4
+step 5m Mount the NFSv4 share
+command lnx1 mkdir -p /nfs1 && mount -v -o vers=4 $srv1:/nfs1 /nfs1
+
+step 2m	basic tests over NFSv4
+command lnx1 dd if=/dev/zero count=3 of=/nfs1/file2 && stat /nfs1/file2 && mv /nfs1/file2 /nfs1/file2.moved
+command lnx1 touch /nfs1/chmod_file2 && chmod 600 /nfs1/chmod_file2 && stat -c '%a' /nfs1/chmod_file2 | grep 600
+
+step 10m run elbencho over NFSv4
+command lnx1 mkdir -p /nfs1/lnx1-nfsv4 && \
+	/usr/bin/elbencho /nfs1/lnx1-nfsv4 --size=1m --dirs=4 --files=10 --mkdirs --write && \
+	/usr/bin/elbencho /nfs1/lnx1-nfsv4 --size=1m --dirs=4 --files=10 --deldirs --delfiles --read
+
+step 10M Run Connectathon basic test
+command lnx1 cd /root/cthon04/cthon04/basic && \
+	     NFSTESTDIR=/nfs1/cthon_basic ./runtests
+
+step 10M Run Connectathon special test
+command lnx1 cd /root/cthon04/cthon04/special && \
+	     NFSTESTDIR=/nfs1/cthon_special ./runtests
+
+step 5m Umount the NFSv4 directory
+command lnx1 umount /nfs1
+
+step 10M Run NFStest-9408954 nfstest_posix
+command lnx1 cd /home1/nfstest/NFStest-9408954 && \
+	     sudo -u nfstest -E bash -c 'PYTHONPATH=./ ./test/nfstest_posix -s $srv1 -e /nfs1'
+%endif
+
+# ----------------- Setup/Run NFSv4 test -----------------
+%if !defined(NO_NFSv4) && !defined(NO_NFSv3)
+step 10M Run NFStest-9408954 nfstest_interop NFSv3/NFSv4
+command lnx1 cd /home1/nfstest/NFStest-9408954 && \
+	     sudo -u nfstest -E bash -c 'PYTHONPATH=./ ./test/nfstest_interop -s $srv1 -e /nfs1'
+%endif
 # ----- finish ----
 step 5m gather logs
 command srv1 journalctl -u chimera -o short-iso | sed 's/ snt.*message="/ /' | tee $spool/chimera_log.txt
