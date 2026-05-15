@@ -8,6 +8,3 @@
 [submodule "ext/libevpl"]
 	path = ext/libevpl
 	url = https://github.com/chimera-nas/libevpl.git
-[submodule "qb"]
-	path = qb
-	url = https://gitlab.mdh.quantum.com/quantum/qb.git

@@ -5,7 +5,7 @@ variables:
   QB_TAG: ci-${CI_PROJECT_NAME}-${CI_PIPELINE_IID}
   GIT_SUBMODULE_STRATEGY: recursive
   QB_PROJECT: chimera
-  RUN_QB: ./qb/qb -g -o ${QB_TAG} -i ${QB_PROJECT}/${QB_TAG} -b ${CI_PIPELINE_IID} --pod-running-timeout=10m
+  RUN_QB: qb -o ${QB_TAG} -i ${QB_PROJECT}/${QB_TAG} -b ${CI_PIPELINE_IID} --pod-running-timeout=10m
 
 stages:
   - builders
@@ -124,7 +124,7 @@ release:
     - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG =~ /^[0-9]+\.[0-9]+\.[0-9]+(-.+)?$/'
   script:
     - >-
-      ./qb/copy_assets --remove -p ${QB_PROJECT} -o ${QB_TAG} -n ${CI_COMMIT_TAG} --out_revision ${CI_PIPELINE_IID}
+      qb assets copy --path ${QB_PROJECT} --tag ${QB_TAG} --dest-tag ${CI_COMMIT_TAG} --out-revision ${CI_PIPELINE_IID}
       -U $publish_username -P $publish_password -I $publish_raw_source -O $publish_raw_dest_internal
 
 dev_branch:
@@ -134,17 +134,17 @@ dev_branch:
   except: [ schedules, tags ]
   script:
     - >-
-      ./qb/copy_image -p ${QB_PROJECT}/builder_ubuntu22 -o ${QB_TAG} -n ${CI_COMMIT_REF_SLUG}
+      qb image copy --path ${QB_PROJECT}/builder_ubuntu22 --old ${QB_TAG} --new ${CI_COMMIT_REF_SLUG}
       -U $publish_username -P $publish_password -I $publish_docker_source -O $publish_docker_dest_development
     - >-
-      ./qb/copy_image -p ${QB_PROJECT}/builder_ubuntu24 -o ${QB_TAG} -n ${CI_COMMIT_REF_SLUG}
+      qb image copy --path ${QB_PROJECT}/builder_ubuntu24 --old ${QB_TAG} --new ${CI_COMMIT_REF_SLUG}
       -U $publish_username -P $publish_password -I $publish_docker_source -O $publish_docker_dest_development
     - >-
-      ./qb/copy_image -p ${QB_PROJECT}/builder_rocky9 -o ${QB_TAG} -n ${CI_COMMIT_REF_SLUG}
+      qb image copy --path ${QB_PROJECT}/builder_rocky9 --old ${QB_TAG} --new ${CI_COMMIT_REF_SLUG}
       -U $publish_username -P $publish_password -I $publish_docker_source -O $publish_docker_dest_development
     - >-
-      ./qb/copy_image -p ${QB_PROJECT}/chimera-dev -o ${QB_TAG} -n ${CI_COMMIT_REF_SLUG}
+      qb image copy --path ${QB_PROJECT}/chimera-dev --old ${QB_TAG} --new ${CI_COMMIT_REF_SLUG}
       -U $publish_username -P $publish_password -I $publish_docker_source -O $publish_docker_dest_development
     - >-
-      ./qb/copy_assets --remove -p ${QB_PROJECT} -o ${QB_TAG} --out_revision ${CI_PIPELINE_IID} -n ${CI_COMMIT_BRANCH}
+      qb assets copy --path ${QB_PROJECT} --tag ${QB_TAG} --out-revision ${CI_PIPELINE_IID} --dest-tag ${CI_COMMIT_BRANCH}
       -U $publish_username -P $publish_password -I $publish_raw_source -O $publish_raw_dest_development

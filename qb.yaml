@@ -21,16 +21,13 @@ tasks:
   build_debug_Ubuntu22:
     type: run_container
     architecture: [ amd64, arm64 ]
-    variables:
-      BUILD_TYPE: Debug
-      ASSET_DST: debug/Ubuntu22
     image: builder_ubuntu22
     context: .
     commands:
       - export DESTDIR=/build/quantum-chimera-server_${VERSION}-${REVISION}_$arch
       - mkdir -p ${DESTDIR} /dist
       - >
-        cmake -G Ninja -DCMAKE_BUILD_TYPE=${BUILD_TYPE}
+        cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug
         -DDISABLE_TESTS=ON
         -DIO_URING_ENABLED=OFF
         -DCAIRN_ENABLED=OFF
@@ -43,7 +40,7 @@ tasks:
       - /context/qtm_build/make_debian_pkg.sh ${VERSION} ${REVISION} $arch
     assets:
       - from: /dist
-        to: ${ASSET_DST}
+        to: debug/Ubuntu22
     dependencies:
       builder:
         project: chimera
@@ -52,9 +49,6 @@ tasks:
 
   build_release_Ubuntu22:
     type: run_container
-    variables:
-      BUILD_TYPE: Release
-      ASSET_DST: release/Ubuntu22
     architecture: [ amd64, arm64 ]
     image: builder_ubuntu22
     context: .
@@ -62,7 +56,7 @@ tasks:
       - export DESTDIR=/build/quantum-chimera-server_${VERSION}-${REVISION}_$arch
       - mkdir -p ${DESTDIR} /dist
       - >
-        cmake -G Ninja -DCMAKE_BUILD_TYPE=${BUILD_TYPE}
+        cmake -G Ninja -DCMAKE_BUILD_TYPE=Release
         -DDISABLE_TESTS=ON
         -DIO_URING_ENABLED=OFF
         -DCAIRN_ENABLED=OFF
@@ -75,7 +69,7 @@ tasks:
       - /context/qtm_build/make_debian_pkg.sh ${VERSION} ${REVISION} $arch
     assets:
       - from: /dist
-        to: ${ASSET_DST}
+        to: release/Ubuntu22
     dependencies:
       builder:
         project: chimera
@@ -99,16 +93,13 @@ tasks:
   build_debug_Ubuntu24:
     type: run_container
     architecture: [ amd64, arm64 ]
-    variables:
-      BUILD_TYPE: Debug
-      ASSET_DST: debug/Ubuntu24
     image: builder_ubuntu24
     context: .
     commands:
       - export DESTDIR=/build/quantum-chimera-server_${VERSION}-${REVISION}_$arch
       - mkdir -p ${DESTDIR} /dist
       - >
-        cmake -G Ninja -DCMAKE_BUILD_TYPE=${BUILD_TYPE}
+        cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug
         -DDISABLE_TESTS=ON
         -DIO_URING_ENABLED=OFF
         -DCAIRN_ENABLED=OFF
@@ -121,7 +112,7 @@ tasks:
       - /context/qtm_build/make_debian_pkg.sh ${VERSION} ${REVISION} $arch
     assets:
       - from: /dist
-        to: ${ASSET_DST}
+        to: debug/Ubuntu24
     dependencies:
       builder:
         project: chimera
@@ -131,16 +122,13 @@ tasks:
   build_release_Ubuntu24:
     type: run_container
     architecture: [ amd64, arm64 ]
-    variables:
-      BUILD_TYPE: Release
-      ASSET_DST: release/Ubuntu24
     image: builder_ubuntu24
     context: .
     commands:
       - export DESTDIR=/build/quantum-chimera-server_${VERSION}-${REVISION}_$arch
       - mkdir -p ${DESTDIR} /dist
       - >
-        cmake -G Ninja -DCMAKE_BUILD_TYPE=${BUILD_TYPE}
+        cmake -G Ninja -DCMAKE_BUILD_TYPE=Release
         -DDISABLE_TESTS=ON
         -DIO_URING_ENABLED=OFF
         -DCAIRN_ENABLED=OFF
@@ -153,7 +141,7 @@ tasks:
       - /context/qtm_build/make_debian_pkg.sh ${VERSION} ${REVISION} $arch
     assets:
       - from: /dist
-        to: ${ASSET_DST}
+        to: release/Ubuntu24
     dependencies:
       builder:
         project: chimera
@@ -177,16 +165,13 @@ tasks:
   build_debug_Ubuntu26:
     type: run_container
     architecture: [ amd64, arm64 ]
-    variables:
-      BUILD_TYPE: Debug
-      ASSET_DST: debug/Ubuntu26
     image: builder_ubuntu26
     context: .
     commands:
       - export DESTDIR=/build/quantum-chimera-server_${VERSION}-${REVISION}_$arch
       - mkdir -p ${DESTDIR} /dist
       - >
-        cmake -G Ninja -DCMAKE_BUILD_TYPE=${BUILD_TYPE}
+        cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug
         -DDISABLE_TESTS=ON
         -DIO_URING_ENABLED=OFF
         -DCAIRN_ENABLED=OFF
@@ -199,7 +184,7 @@ tasks:
       - /context/qtm_build/make_debian_pkg.sh ${VERSION} ${REVISION} $arch
     assets:
       - from: /dist
-        to: ${ASSET_DST}
+        to: debug/Ubuntu26
     dependencies:
       builder:
         project: chimera
@@ -209,16 +194,13 @@ tasks:
   build_release_Ubuntu26:
     type: run_container
     architecture: [ amd64, arm64 ]
-    variables:
-      BUILD_TYPE: Release
-      ASSET_DST: release/Ubuntu26
     image: builder_ubuntu26
     context: .
     commands:
       - export DESTDIR=/build/quantum-chimera-server_${VERSION}-${REVISION}_$arch
       - mkdir -p ${DESTDIR} /dist
       - >
-        cmake -G Ninja -DCMAKE_BUILD_TYPE=${BUILD_TYPE}
+        cmake -G Ninja -DCMAKE_BUILD_TYPE=Release
         -DDISABLE_TESTS=ON
         -DIO_URING_ENABLED=OFF
         -DCAIRN_ENABLED=OFF
@@ -231,7 +213,7 @@ tasks:
       - /context/qtm_build/make_debian_pkg.sh ${VERSION} ${REVISION} $arch
     assets:
       - from: /dist
-        to: ${ASSET_DST}
+        to: release/Ubuntu26
     dependencies:
       builder:
         project: chimera
@@ -255,9 +237,6 @@ tasks:
   build_debug_Rocky9:
     type: run_container
     architecture: [ amd64 ]
-    variables:
-      BUILD_TYPE: Debug
-      ASSET_DST: debug/Rocky9
     image: builder_rocky9
     context: .
     dependencies:
@@ -269,7 +248,7 @@ tasks:
       - export DESTDIR=/build/root
       - mkdir -p ${DESTDIR} /dist
       - >
-        cmake -G Ninja -DCMAKE_BUILD_TYPE=${BUILD_TYPE}
+        cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug
         -DDISABLE_TESTS=ON
         -DIO_URING_ENABLED=OFF
         -DCAIRN_ENABLED=OFF
@@ -282,14 +261,11 @@ tasks:
       - /context/qtm_build/make_rpm_pkg.sh ${VERSION} ${REVISION} $xarch
     assets:
       - from: /dist
-        to: ${ASSET_DST}
+        to: debug/Rocky9
 
   build_release_Rocky9:
     type: run_container
     architecture: [ amd64 ]
-    variables:
-      BUILD_TYPE: Release
-      ASSET_DST: release/Rocky9
     image: builder_rocky9
     context: .
     dependencies:
@@ -301,7 +277,7 @@ tasks:
       - export DESTDIR=/build/root
       - mkdir -p ${DESTDIR} /dist
       - >
-        cmake -G Ninja -DCMAKE_BUILD_TYPE=${BUILD_TYPE}
+        cmake -G Ninja -DCMAKE_BUILD_TYPE=Release
         -DDISABLE_TESTS=ON
         -DIO_URING_ENABLED=OFF
         -DCAIRN_ENABLED=OFF
@@ -314,7 +290,7 @@ tasks:
       - /context/qtm_build/make_rpm_pkg.sh ${VERSION} ${REVISION} $xarch
     assets:
       - from: /dist
-        to: ${ASSET_DST}
+        to: release/Rocky9
 
   # Code check
   # ---------------------------------------
@@ -380,14 +356,12 @@ tasks:
     architecture: [ amd64, arm64 ]
     image: chimera-dev
     context: .
-    variables:
-      BUILD_TYPE: Release
     commands:
       - cd /context
       - export LC_ALL=C
       - >
         scan-build --status-bugs
-        cmake -G Ninja -DCMAKE_BUILD_TYPE=${BUILD_TYPE} -S . -B /build
+        cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -S . -B /build
       - scan-build --status-bugs ninja -C /build
     dependencies:
       builder:
@@ -400,16 +374,13 @@ tasks:
     architecture: [ amd64, arm64 ]
     image: chimera-dev
     context: .
-    variables:
-      BUILD_TYPE: Release
-      ASSET_DST: release/scan-report
     commands:
       - cd /context
       - mkdir -p /scan-report /dist
       - export LC_ALL=C
       - >
         scan-build -o /scan-report
-        cmake -G Ninja -DCMAKE_BUILD_TYPE=${BUILD_TYPE} -S . -B /build
+        cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -S . -B /build
       - >
         scan-build --keep-empty -o /scan-report ninja -C /build 2>&1 |
         tee /dist/scan-build-output.txt
@@ -424,21 +395,19 @@ tasks:
         tag: develop
     assets:
       - from: /dist
-        to: ${ASSET_DST}
+        to: release/scan-report
 
   static_analysis_debug:
     type: run_container
     architecture: [ amd64, arm64 ]
     image: chimera-dev
     context: .
-    variables:
-      BUILD_TYPE: Debug
     commands:
       - cd /context
       - export LC_ALL=C
       - >
         scan-build --status-bugs
-        cmake -G Ninja -DCMAKE_BUILD_TYPE=${BUILD_TYPE} -S . -B /build
+        cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug -S . -B /build
       - scan-build --status-bugs ninja -C /build
     dependencies:
       builder:
@@ -451,16 +420,13 @@ tasks:
     architecture: [ amd64, arm64 ]
     image: chimera-dev
     context: .
-    variables:
-      BUILD_TYPE: Debug
-      ASSET_DST: debug/scan-report
     commands:
       - cd /context
       - mkdir -p /scan-report /dist
       - export LC_ALL=C
       - >
         scan-build -o /scan-report
-        cmake -G Ninja -DCMAKE_BUILD_TYPE=${BUILD_TYPE} -S . -B /build
+        cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug -S . -B /build
       - >
         scan-build --keep-empty -o /scan-report ninja -C /build 2>&1 |
         tee /dist/scan-build-output.txt
@@ -475,7 +441,7 @@ tasks:
         tag: develop
     assets:
       - from: /dist
-        to: ${ASSET_DST}
+        to: debug/scan-report
 
 # Alias section
 aliases:

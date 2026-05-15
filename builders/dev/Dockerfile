@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: 2025-2026 Chimera-NAS Project Contributors
 #
 # SPDX-License-Identifier: Unlicense
+FROM repository.mdh.quantum.com/ubuntu:26.04
 
 ARG ENABLE_XLIO=1
 ARG ENABLE_DOCA=0
@@ -8,7 +9,6 @@ ARG ENABLE_FIO=1
 ARG ENABLE_CLAUDE=1
 ARG ENABLE_CODEX=1
 ARG ENABLE_UV=1
-FROM repository.mdh.quantum.com/ubuntu:26.04
 
 ENV APT_MIRROR=http://repository.mdh.quantum.com/repository/pkgs/ubuntu
 ENV DEBIAN_FRONTEND=noninteractive
@@ -27,7 +27,7 @@ RUN apt-get -y update && \
     fi
 
 RUN apt-get -y update && \
-    apt-get -y --no-install-recommends install unminimize apt-utils && \
+    apt-get -y --no-install-recommends install unminimize apt && \
     yes | unminimize && \
     apt-get -y --no-install-recommends install clang clang-tools cmake ninja-build git flex bison lldb gdb less vim psmisc uncrustify \
     net-tools tshark tcpdump uuid-dev iproute2 man-db manpages-dev ca-certificates ssh libjansson-dev libclang-rt-18-dev llvm wget \

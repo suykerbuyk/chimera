@@ -34,6 +34,10 @@ RUN apt-get -y update && \
     samba samba-ad-dc samba-ad-provision samba-vfs-modules smbclient && \
     gem install jekyll bundler
 
+
+# qb CLI (Quantum build tool). Installed from the internal repo.
+RUN curl -fsSL https://repository.mdh.quantum.com/repository/pkgs/qb/install.sh | bash
+
 RUN if [ "$ENABLE_CLAUDE" = "1" ] ; then \
     npm install -g @anthropic-ai/claude-code ; \
     fi
