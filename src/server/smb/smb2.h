@@ -609,6 +609,33 @@ typedef uint8_t smb2_guid[SMB2_GUID_SIZE];
 #define SMB2_GLOBAL_CAP_DIRECTORY_LEASING           0x00000020 // Supports directory leasing (SMB 3.0+)
 #define SMB2_GLOBAL_CAP_ENCRYPTION                  0x00000040 // Supports encryption (SMB 3.0+)
 
+/* SMB2 3.1.1 negotiate context types (MS-SMB2 §2.2.3.1) */
+#define SMB2_PREAUTH_INTEGRITY_CAPABILITIES         0x0001
+#define SMB2_ENCRYPTION_CAPABILITIES                0x0002
+#define SMB2_COMPRESSION_CAPABILITIES               0x0003
+#define SMB2_NETNAME_NEGOTIATE_CONTEXT_ID           0x0005
+#define SMB2_TRANSPORT_CAPABILITIES                 0x0006
+#define SMB2_RDMA_TRANSFORM_CAPABILITIES            0x0007
+#define SMB2_SIGNING_CAPABILITIES                   0x0008
+
+/* SMB2_PREAUTH_INTEGRITY_CAPABILITIES HashAlgorithm IDs */
+#define SMB2_PREAUTH_HASH_SHA_512                   0x0001
+
+/* SMB2_ENCRYPTION_CAPABILITIES Cipher IDs */
+#define SMB2_ENCRYPTION_AES_128_CCM                 0x0001
+#define SMB2_ENCRYPTION_AES_128_GCM                 0x0002
+#define SMB2_ENCRYPTION_AES_256_CCM                 0x0003
+#define SMB2_ENCRYPTION_AES_256_GCM                 0x0004
+
+/* SMB2_SIGNING_CAPABILITIES Algorithm IDs */
+#define SMB2_SIGNING_HMAC_SHA256                    0x0000
+#define SMB2_SIGNING_AES_CMAC                       0x0001
+#define SMB2_SIGNING_AES_GMAC                       0x0002
+
+/* SMB2_COMPRESSION_CAPABILITIES Flags */
+#define SMB2_COMPRESSION_FLAG_NONE                  0x00000000
+#define SMB2_COMPRESSION_FLAG_CHAINED               0x00000001
+
 #define SMB2_NEGOTIATE_MAX_DIALECTS                 10
 
 #define SMB2_FLAGS_SERVER_TO_REDIR                  0x00000001
@@ -620,6 +647,37 @@ typedef uint8_t smb2_guid[SMB2_GUID_SIZE];
 #define SMB2_FLAGS_REPLAY_OPERATION                 0x20000000
 
 #define SMB2_ERROR_REPLY_SIZE                       9
+
+/* CHANGE_NOTIFY constants */
+#define SMB2_CHANGE_NOTIFY_REQUEST_SIZE             32
+#define SMB2_CHANGE_NOTIFY_REPLY_SIZE               9
+
+#define SMB2_WATCH_TREE                             0x0001
+
+/* CompletionFilter flags */
+#define SMB2_NOTIFY_CHANGE_FILE_NAME                0x00000001
+#define SMB2_NOTIFY_CHANGE_DIR_NAME                 0x00000002
+#define SMB2_NOTIFY_CHANGE_ATTRIBUTES               0x00000004
+#define SMB2_NOTIFY_CHANGE_SIZE                     0x00000008
+#define SMB2_NOTIFY_CHANGE_LAST_WRITE               0x00000010
+#define SMB2_NOTIFY_CHANGE_LAST_ACCESS              0x00000020
+#define SMB2_NOTIFY_CHANGE_CREATION                 0x00000040
+#define SMB2_NOTIFY_CHANGE_EA                       0x00000080
+#define SMB2_NOTIFY_CHANGE_SECURITY                 0x00000100
+#define SMB2_NOTIFY_CHANGE_STREAM_NAME              0x00000200
+#define SMB2_NOTIFY_CHANGE_STREAM_SIZE              0x00000400
+#define SMB2_NOTIFY_CHANGE_STREAM_WRITE             0x00000800
+
+/* FILE_ACTION constants for FILE_NOTIFY_INFORMATION */
+#define FILE_ACTION_ADDED                           0x00000001
+#define FILE_ACTION_REMOVED                         0x00000002
+#define FILE_ACTION_MODIFIED                        0x00000003
+#define FILE_ACTION_RENAMED_OLD_NAME                0x00000004
+#define FILE_ACTION_RENAMED_NEW_NAME                0x00000005
+
+/* Notify-related status */
+#define SMB2_STATUS_NOTIFY_CLEANUP                  0x0000010B
+#define SMB2_STATUS_NOTIFY_ENUM_DIR                 0x0000010C
 
 #define SMB2_NEGOTIATE_REQUEST_SIZE                 36
 #define SMB2_NEGOTIATE_REPLY_SIZE                   65

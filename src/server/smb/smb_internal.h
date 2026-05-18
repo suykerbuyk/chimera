@@ -15,6 +15,7 @@
 #include <gssapi/gssapi_krb5.h>
 #include "evpl/evpl.h"
 #include "common/logging.h"
+#include "common/macros.h"
 #include "common/misc.h"
 #include "smb2.h"
 #include "smb1.h"
@@ -25,6 +26,7 @@
 #include "smb_gssapi.h"
 #include "smb_sharemode.h"
 #include "vfs/vfs_release.h"
+#include "vfs/vfs_notify.h"
 
 #define SMB2_MAX_DIALECTS           16
 #define SMB2_MAX_NEGOTIATE_CONTEXTS 16
@@ -62,6 +64,27 @@
                          __LINE__, \
                          __VA_ARGS__)
 
+/* Little-endian decoders for SMB2 wire fields. Used by the negotiate-context
+ * and CREATE-context parsers; defined here so all SMB protocol code shares one
+ * implementation. The SMB2 wire format is little-endian throughout. */
+static inline uint16_t
+smb_wire_le16(const uint8_t *p)
+{
+    return (uint16_t) p[0] | ((uint16_t) p[1] << 8);
+} /* smb_wire_le16 */
+
+static inline uint32_t
+smb_wire_le32(const uint8_t *p)
+{
+    return (uint32_t) p[0] | ((uint32_t) p[1] << 8) |
+           ((uint32_t) p[2] << 16) | ((uint32_t) p[3] << 24);
+} /* smb_wire_le32 */
+
+static inline uint64_t
+smb_wire_le64(const uint8_t *p)
+{
+    return (uint64_t) smb_wire_le32(p) | ((uint64_t) smb_wire_le32(p + 4) << 32);
+} /* smb_wire_le64 */
 
 struct chimera_smb_nic_info {
     struct sockaddr_storage addr;
@@ -134,6 +157,7 @@ struct chimera_smb_request {
     uint32_t                           status;
     uint16_t                           request_struct_size;
     uint16_t                           flags;
+    uint64_t                           async_id; /* non-zero if async/parked */
     union {
         struct smb1_header smb1_hdr;
         struct smb2_header smb2_hdr;
@@ -162,10 +186,45 @@ struct chimera_smb_request {
             uint64_t r_system_time;
             uint64_t r_server_start_time;
             uint16_t dialects[SMB2_MAX_DIALECTS];
+            /* Typed parse outputs for 3.1.1 negotiate contexts. The ctx_present_mask
+             * is the canonical "client sent this context" record; the typed structs
+             * carry the parsed fields. Phase 0 stores everything; Phase 2/4/5
+             * consumes the chosen algorithms via conn->negotiated.*. */
+            uint32_t ctx_present_mask;
             struct {
-                uint16_t type;
-                uint16_t length;
-            } negotiate_context[SMB2_MAX_NEGOTIATE_CONTEXTS];
+                uint16_t hash_alg_count;
+                uint16_t salt_length;
+                uint16_t hash_algs[8];
+                uint8_t  salt[32];
+            } preauth_in;
+            struct {
+                uint16_t cipher_count;
+                uint16_t ciphers[8];
+            } encryption_in;
+            struct {
+                uint16_t alg_count;
+                uint32_t flags;
+                uint16_t algs[8];
+            } compression_in;
+            struct {
+                uint16_t alg_count;
+                uint16_t algs[4];
+            } signing_in;
+            struct {
+                uint16_t transform_count;
+                uint16_t transforms[4];
+            } rdma_transform_in;
+            struct {
+                uint32_t flags;
+            } transport_in;
+            struct {
+                /* Wire length in bytes (not in UTF-16 code units). May be less
+                 * than the on-wire NetnameNegotiateContextId if it exceeded
+                 * sizeof(utf16le) — the parser truncates silently. Informational
+                 * only in Phase 0; consumed by Phase 4 for virtual hosting. */
+                uint16_t length_bytes;
+                uint8_t  utf16le[256];
+            } netname_in;
         } negotiate;
 
         struct {
@@ -203,8 +262,37 @@ struct chimera_smb_request {
             struct chimera_smb_open_file   *r_open_file;
             struct chimera_smb_attrs        r_attrs;
             struct chimera_vfs_attrs        set_attr;
-            char                            parent_path[SMB_FILENAME_MAX];
-            char                           *name;
+            /* CREATE contexts the client sent (CHIMERA_SMB_CREATE_CTX_* bits).
+             * Phase-0 stubs set the bit and capture a minimum set of fields needed
+             * by the response emit; Phase 1/3 will populate the rest. */
+            uint32_t                        ctx_present_mask;
+            struct {
+                uint64_t persistent;
+                uint64_t volatile_id;
+            } dhnc;
+            struct {
+                uint32_t timeout_ms;
+                uint32_t flags;
+                uint8_t  create_guid[16];
+            } dh2q;
+            struct {
+                uint64_t persistent;
+                uint64_t volatile_id;
+                uint8_t  create_guid[16];
+                uint32_t flags;
+            } dh2c;
+            struct {
+                uint8_t  key[16];
+                uint32_t state;
+                uint32_t flags;
+                uint8_t  parent_key[16];
+                uint16_t epoch;
+                int      is_v2;
+            } rqls;
+            uint64_t alsi_alloc_size;
+            uint64_t twrp_timestamp;
+            char     parent_path[SMB_FILENAME_MAX];
+            char    *name;
         } create;
 
         struct  {
@@ -343,6 +431,18 @@ struct chimera_smb_request {
             uint32_t                     *last_file_offset;
             char                          pattern[SMB_FILENAME_MAX];
         } query_directory;
+
+        struct {
+            uint32_t                        completion_filter;
+            uint16_t                        flags;
+            uint32_t                        output_buffer_length;
+            int                             watch_tree;
+            struct chimera_smb_file_id      file_id;
+            struct chimera_smb_open_file   *open_file;
+            int                             nevents;
+            int                             overflowed;
+            struct chimera_vfs_notify_event events[16];
+        } change_notify;
     };
 };
 
@@ -373,6 +473,19 @@ struct chimera_smb_session_handle {
 #define CHIMERA_SMB_CONN_FLAG_SIGNING_REQUIRED      0x01
 #define CHIMERA_SMB_CONN_FLAG_SMB_DIRECT_NEGOTIATED 0x02
 
+/* Bits identifying which negotiate contexts the client sent (and that we
+ * accepted on the wire). Phase 0 records this so unit tests can assert
+ * dispatch behavior; Phase 2/4/5 will consume conn->negotiated.* values. */
+#define CHIMERA_SMB_NEGOTIATE_CTX_PREAUTH           (1u << 0)
+#define CHIMERA_SMB_NEGOTIATE_CTX_ENCRYPTION        (1u << 1)
+#define CHIMERA_SMB_NEGOTIATE_CTX_COMPRESSION       (1u << 2)
+#define CHIMERA_SMB_NEGOTIATE_CTX_NETNAME           (1u << 3)
+#define CHIMERA_SMB_NEGOTIATE_CTX_TRANSPORT         (1u << 4)
+#define CHIMERA_SMB_NEGOTIATE_CTX_RDMA_TRANSFORM    (1u << 5)
+#define CHIMERA_SMB_NEGOTIATE_CTX_SIGNING           (1u << 6)
+
+struct chimera_smb_notify_request;
+
 struct chimera_smb_conn {
     OM_uint32                          gss_major;
     OM_uint32                          gss_minor;
@@ -392,9 +505,25 @@ struct chimera_smb_conn {
     int                                rdma_max_send;
     int                                rdma_niov;
     int                                rdma_length;
+    /* Algorithms selected at NEGOTIATE time from the client's offer; consumed
+     * by Phase 2 (preauth/encryption/signing), Phase 4 (RDMA transform), and
+     * Phase 5 (RDMA path). Zero means "not selected / not supported". */
+    struct {
+        uint32_t ctx_present_mask;          /* CHIMERA_SMB_NEGOTIATE_CTX_* */
+        uint16_t preauth_hash_alg;          /* 0 or SMB2_PREAUTH_HASH_SHA_512 */
+        uint16_t cipher_id;                 /* 0 or SMB2_ENCRYPTION_* */
+        uint16_t signing_alg;               /* SMB2_SIGNING_* */
+        uint16_t compression_flags;         /* SMB2_COMPRESSION_FLAG_* */
+        uint8_t  preauth_salt[32];          /* server-generated; Phase 2 will hash */
+        uint8_t  compression_alg_count;
+        uint8_t  rdma_transform_count;
+        uint16_t compression_algs[8];
+        uint16_t rdma_transforms[4];
+    } negotiated;
     struct chimera_smb_session_handle *last_session_handle;
     struct chimera_smb_tree           *last_tree;
     struct chimera_smb_session_handle *session_handles;
+    struct chimera_smb_notify_request *parked_notifies;  /* parked CHANGE_NOTIFY requests */
     struct chimera_server_smb_thread  *thread;
     struct evpl_bind                  *bind;
     struct chimera_smb_conn           *prev;
@@ -407,6 +536,7 @@ struct chimera_smb_conn {
 struct chimera_server_smb_shared {
     struct chimera_smb_config   config;
     int                         rdma;
+    enum evpl_protocol_id       tcp_protocol;
     uint8_t                     guid[SMB2_GUID_SIZE];
     gss_name_t                  svc;
     gss_cred_id_t               srv_cred;
@@ -436,6 +566,12 @@ struct chimera_server_smb_thread {
     struct chimera_smb_open_file      *free_open_files;
     struct chimera_smb_signing_ctx    *signing_ctx;
     struct chimera_smb_iconv_ctx       iconv_ctx;
+
+    /* Notify doorbell: VFS callbacks push ready notify requests here,
+     * then ring the doorbell so the SMB thread processes them. */
+    struct evpl_doorbell               notify_doorbell;
+    struct chimera_smb_notify_request *notify_ready;
+    pthread_mutex_t                    notify_ready_lock;
 };
 
 
@@ -445,6 +581,39 @@ chimera_smb_tree_free(
     struct chimera_server_smb_shared *shared,
     struct chimera_smb_tree          *tree);
 
+/*
+ * Open-file lifetime model (current; Phase 3 will change this):
+ *
+ *   - Allocation: thread-local LIFO free list per chimera_server_smb_thread;
+ *     a freshly-popped open_file is NOT zeroed. Every caller (today only
+ *     chimera_smb_create_gen_open_file) is responsible for explicitly setting
+ *     every field that matters for its lifetime — see the explicit init block
+ *     in smb_proc_create.c.
+ *
+ *   - Ownership: an open is owned by exactly one chimera_smb_tree at a time,
+ *     hashed into the tree's open_files[] buckets by file_id (pid+vid). The
+ *     tree's lifetime is bounded by the connection that established it; when
+ *     the connection drops, the tree is torn down and every open it owns is
+ *     freed back to its allocating thread's free list.
+ *
+ *   - Cross-references: the share-mode table and the change-notify state
+ *     hold raw pointers into open_file objects. These are *only* safe while
+ *     the owning tree is alive — there is currently no global open-instance
+ *     registry, no disconnect-survival, and no cross-thread migration.
+ *
+ *   - Reconnect/durable: NOT supported. The ctx_present_mask / lease_* /
+ *     durable_* fields added in Phase 0 are inert state slots; the durable
+ *     handle lifecycle (which lets opens outlive their connection) lands in
+ *     Phase 3 and will almost certainly need to lift these fields out of
+ *     this struct into separate lease/durable objects with their own
+ *     lifetimes.
+ *
+ *   - Phase-3 reviewer's checklist: before merging persistent-handle work,
+ *     confirm (a) file_id no longer collides across tree teardowns, (b) lease
+ *     and durable objects own their own backing store, and (c) the share-mode
+ *     table either takes a strong reference or learns about open-instance
+ *     migration.
+ */
 static inline struct chimera_smb_open_file *
 chimera_smb_open_file_alloc(struct chimera_server_smb_thread *thread)
 {
@@ -478,9 +647,10 @@ chimera_smb_request_alloc(struct chimera_server_smb_thread *thread)
         request = calloc(1, sizeof(*request));
     }
 
-    request->status = SMB2_STATUS_SUCCESS;
-    request->flags  = 0;
-    request->tree   = NULL;
+    request->status   = SMB2_STATUS_SUCCESS;
+    request->flags    = 0;
+    request->async_id = 0;
+    request->tree     = NULL;
 
     return request;
 } /* chimera_smb_request_alloc */
@@ -635,12 +805,25 @@ chimera_smb_conn_alloc(struct chimera_server_smb_thread *thread)
     return conn;
 } /* chimera_smb_conn_alloc */
 
+/* Defined in smb_notify.c */
+void chimera_smb_notify_cancel(
+    struct chimera_smb_notify_request *nr);
+void chimera_smb_notify_drop(
+    struct chimera_smb_notify_request *nr);
+
 static inline void
 chimera_smb_conn_free(
     struct chimera_server_smb_thread *thread,
     struct chimera_smb_conn          *conn)
 {
     struct chimera_smb_session_handle *session_handle, *tmp;
+
+    /* Drop all parked CHANGE_NOTIFY requests silently — the bind is
+     * being torn down so a CANCELLED reply would race the destroy and
+     * the client is already gone. */
+    while (conn->parked_notifies) {
+        chimera_smb_notify_drop(conn->parked_notifies);
+    }
 
     HASH_ITER(hh, conn->session_handles, session_handle, tmp)
     {
@@ -826,9 +1009,6 @@ chimera_smb_open_file_resolve(
 
     pthread_mutex_unlock(&tree->open_files_lock[open_file_bucket]);
 
-    chimera_smb_abort_if(!open_file, "open request for file id %lx.%lx did not match an open file",
-                         file_id->pid, file_id->vid);
-
     return open_file;
 } /* chimera_smb_open_file_resolve */
 
@@ -865,6 +1045,42 @@ chimera_smb_open_file_release(
         chimera_smb_open_file_free(request->compound->thread, open_file_to_free);
     }
 } // chimera_smb_open_file_release
+
+/*
+ * Release an open_file reference without a request context.
+ * Used by parked notify requests which outlive their original request.
+ */
+static inline void
+chimera_smb_open_file_release_nr(
+    struct chimera_server_smb_thread *thread,
+    struct chimera_smb_tree          *tree,
+    struct chimera_smb_open_file     *open_file)
+{
+    struct chimera_smb_open_file *open_file_to_free = NULL;
+    int                           open_file_bucket;
+
+    open_file_bucket = open_file->file_id.vid & CHIMERA_SMB_OPEN_FILE_BUCKET_MASK;
+
+    pthread_mutex_lock(&tree->open_files_lock[open_file_bucket]);
+
+    chimera_smb_abort_if(open_file->refcnt == 0, "open file refcnt is 0 at release");
+
+    open_file->refcnt--;
+
+    if (open_file->refcnt == 0) {
+        if (open_file->handle) {
+            chimera_vfs_release(thread->vfs_thread, open_file->handle);
+        }
+
+        open_file_to_free = open_file;
+    }
+
+    pthread_mutex_unlock(&tree->open_files_lock[open_file_bucket]);
+
+    if (open_file_to_free) {
+        chimera_smb_open_file_free(thread, open_file_to_free);
+    }
+} // chimera_smb_open_file_release_nr
 
 static inline struct chimera_smb_open_file *
 chimera_smb_open_file_close(

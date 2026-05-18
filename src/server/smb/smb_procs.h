@@ -17,6 +17,25 @@ void chimera_smb_negotiate_reply(
     struct evpl_iovec_cursor   *reply_cursor,
     struct chimera_smb_request *request);
 
+/* Phase 0 test hooks. Exposed so tests/phase0_contexts_test.c can drive the
+ * negotiate-context and CREATE-context dispatch paths directly without
+ * standing up a full SMB compound + connection. Not used outside tests. */
+int chimera_smb_parse_one_negotiate_context(
+    struct chimera_smb_request *request,
+    uint16_t                    type,
+    const uint8_t              *data,
+    uint16_t                    data_len);
+
+int chimera_smb_parse_create_contexts(
+    const uint8_t              *buf,
+    uint32_t                    buf_len,
+    struct chimera_smb_request *request);
+
+uint32_t chimera_smb_build_create_response_contexts(
+    struct chimera_smb_request *request,
+    uint8_t                    *ctx_buf,
+    uint32_t                    ctx_buf_size);
+
 int chimera_smb_parse_session_setup(
     struct evpl_iovec_cursor   *request_cursor,
     struct chimera_smb_request *request);
@@ -193,4 +212,22 @@ void chimera_smb_ioctl_set_reparse(
     struct chimera_smb_request *request);
 
 void chimera_smb_ioctl_get_reparse(
+    struct chimera_smb_request *request);
+
+int chimera_smb_parse_change_notify(
+    struct evpl_iovec_cursor   *request_cursor,
+    struct chimera_smb_request *request);
+
+void chimera_smb_change_notify(
+    struct chimera_smb_request *request);
+
+void chimera_smb_change_notify_reply(
+    struct evpl_iovec_cursor   *reply_cursor,
+    struct chimera_smb_request *request);
+
+int chimera_smb_parse_cancel(
+    struct evpl_iovec_cursor   *request_cursor,
+    struct chimera_smb_request *request);
+
+void chimera_smb_cancel(
     struct chimera_smb_request *request);
