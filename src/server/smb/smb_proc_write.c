@@ -5,6 +5,7 @@
 #include "smb_internal.h"
 #include "smb_procs.h"
 #include "vfs/vfs.h"
+#include "vfs/vfs_notify.h"
 
 static void
 chimera_smb_write_callback(
@@ -23,6 +24,16 @@ chimera_smb_write_callback(
      * to avoid cross-thread access to non-atomic refcounts.
      */
     evpl_iovecs_release(thread->evpl, request->write.iov, request->write.niov);
+
+    if (!error_code && request->write.open_file->parent_fh_len > 0) {
+        chimera_vfs_notify_emit(thread->shared->vfs->vfs_notify,
+                                request->write.open_file->parent_fh,
+                                request->write.open_file->parent_fh_len,
+                                CHIMERA_VFS_NOTIFY_FILE_MODIFIED,
+                                request->write.open_file->name,
+                                request->write.open_file->name_len,
+                                NULL, 0);
+    }
 
     chimera_smb_open_file_release(private_data, request->write.open_file);
     chimera_smb_complete_request(private_data, error_code ? SMB2_STATUS_INTERNAL_ERROR : SMB2_STATUS_SUCCESS);
@@ -90,6 +101,11 @@ chimera_smb_write(struct chimera_smb_request *request)
     int                               i, offset = 0;
 
     request->write.open_file = chimera_smb_open_file_resolve(request, &request->write.file_id);
+
+    if (unlikely(!request->write.open_file)) {
+        chimera_smb_complete_request(request, SMB2_STATUS_FILE_CLOSED);
+        return;
+    }
 
     if (request->write.channel == SMB2_CHANNEL_RDMA_V1) {
         /* We need to read in the data we're supposed to be writing first */
