@@ -15,7 +15,7 @@ add_library(chimera_nfs SHARED nfs.c nfs4_session.c nfs_mount.c nfs_portmap.c nf
 
 
             nfs4_proc_getfh.c nfs4_proc_access.c nfs4_proc_putrootfh.c nfs4_proc_putfh.c
-            nfs4_proc_getattr.c nfs4_proc_lookup.c nfs4_proc_compound.c nfs4_proc_null.c
+            nfs4_proc_getattr.c nfs4_proc_lookup.c nfs4_proc_lookupp.c nfs4_proc_compound.c nfs4_proc_null.c
             nfs4_proc_readdir.c nfs4_proc_close.c nfs4_proc_create.c  nfs4_proc_open.c
             nfs4_proc_setclientid.c nfs4_proc_setclientid_confirm.c nfs4_proc_remove.c
             nfs4_proc_read.c nfs4_proc_write.c nfs4_proc_commit.c nfs4_proc_readlink.c
@@ -24,7 +24,9 @@ add_library(chimera_nfs SHARED nfs.c nfs4_session.c nfs_mount.c nfs_portmap.c nf
             nfs4_proc_destroy_clientid.c nfs4_proc_sequence.c nfs4_proc_reclaim_complete.c
             nfs4_proc_secinfo_no_name.c nfs4_proc_test_stateid.c nfs4_root.c
             nfs4_proc_allocate.c nfs4_proc_deallocate.c nfs4_proc_seek.c
-            nfs4_proc_lock.c nfs4_proc_lockt.c nfs4_proc_locku.c)
+            nfs4_proc_lock.c nfs4_proc_lockt.c nfs4_proc_locku.c
+            nfs4_proc_verify.c
+            nfs4_proc_putpubfh.c nfs4_proc_renew.c nfs4_proc_release_lockowner.c)
 
 target_compile_definitions(chimera_nfs PRIVATE XXH_INLINE_ALL)
 target_link_libraries(chimera_nfs chimera_nfs_common chimera_common evpl evpl_rpc2 pthread uuid urcu urcu-common)

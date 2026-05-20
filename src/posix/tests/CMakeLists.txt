@@ -18,10 +18,12 @@ macro(add_posix_testprog name)
 endmacro()
 
 macro(add_posix_test testname prog backend)
-    add_test(NAME chimera/posix/${testname} COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_${prog} -b ${backend})
-    get_target_property(test_file posix_${prog} TEST_FILE)
-    set_tests_properties(chimera/posix/${testname} PROPERTIES
-        ENVIRONMENT "TEST_FILE=${test_file}")
+    if(CHIMERA_NETNS_TESTING)
+        add_test(NAME chimera/posix/${testname} COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_${prog} -b ${backend})
+        get_target_property(test_file posix_${prog} TEST_FILE)
+        set_tests_properties(chimera/posix/${testname} PROPERTIES
+            ENVIRONMENT "TEST_FILE=${test_file}")
+    endif()
 endmacro()
 # List of test programs
 set(POSIX_TEST_PROGRAMS
@@ -68,6 +70,7 @@ set(POSIX_TEST_PROGRAMS
     test_fdatasync
     test_dup
     test_fdopen
+    test_copy_range
 )
 
 # Create test programs
@@ -111,14 +114,16 @@ generate_posix_backend_tests(io_uring CHIMERA_VFS_IO_URING)
 
 # Macro to add a test that runs via NFS3 client (requires network namespace)
 macro(add_posix_nfs3_test testname prog nfs_backend)
-    add_test(NAME chimera/posix/${testname}_nfs3_${nfs_backend}
-        COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_${prog} -b nfs3_${nfs_backend}
-    )
-    get_target_property(test_file posix_${prog} TEST_FILE)
-    set_tests_properties(chimera/posix/${testname}_nfs3_${nfs_backend} PROPERTIES
-        ENVIRONMENT "TEST_FILE=${test_file}"
-        TIMEOUT 60
-    )
+    if(CHIMERA_NETNS_TESTING)
+        add_test(NAME chimera/posix/${testname}_nfs3_${nfs_backend}
+            COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_${prog} -b nfs3_${nfs_backend}
+        )
+        get_target_property(test_file posix_${prog} TEST_FILE)
+        set_tests_properties(chimera/posix/${testname}_nfs3_${nfs_backend} PROPERTIES
+            ENVIRONMENT "TEST_FILE=${test_file}"
+            TIMEOUT 60
+        )
+    endif()
 endmacro()
 
 # Helper macro to generate NFS3 tests for a specific server-side backend
@@ -149,6 +154,52 @@ generate_posix_nfs3_backend_tests(linux "")
 generate_posix_nfs3_backend_tests(io_uring CHIMERA_VFS_IO_URING)
 
 # ============================================================================
+# NFS4 Backend Tests
+# These tests run the POSIX tests through the Chimera NFS4 client,
+# connecting to a Chimera NFS server in the same process.
+# They require a network namespace for loopback networking.
+# ============================================================================
+
+# Macro to add a test that runs via NFS4 client (requires network namespace)
+macro(add_posix_nfs4_test testname prog nfs_backend)
+    add_test(NAME chimera/posix/${testname}_nfs4_${nfs_backend}
+        COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_${prog} -b nfs4_${nfs_backend}
+    )
+    get_target_property(test_file posix_${prog} TEST_FILE)
+    set_tests_properties(chimera/posix/${testname}_nfs4_${nfs_backend} PROPERTIES
+        ENVIRONMENT "TEST_FILE=${test_file}"
+        TIMEOUT 60
+    )
+endmacro()
+
+# Helper macro to generate NFS4 tests for a specific server-side backend
+macro(_generate_posix_nfs4_tests_for_backend nfs_backend)
+    foreach(prog ${POSIX_TEST_PROGRAMS})
+        string(REGEX REPLACE "^test_" "" test_name ${prog})
+        add_posix_nfs4_test(${test_name} ${prog} ${nfs_backend})
+    endforeach()
+endmacro()
+
+# Macro to generate all NFS4 tests for a backend with optional condition
+macro(generate_posix_nfs4_backend_tests backend condition_var)
+    if("${condition_var}" STREQUAL "")
+        _generate_posix_nfs4_tests_for_backend(${backend})
+    elseif(${condition_var})
+        _generate_posix_nfs4_tests_for_backend(${backend})
+    endif()
+endmacro()
+
+# Generate NFS4 tests for each backend
+generate_posix_nfs4_backend_tests(memfs "")
+generate_posix_nfs4_backend_tests(demofs_io_uring IO_URING_ENABLED)
+if(HAVE_LIBAIO)
+    generate_posix_nfs4_backend_tests(demofs_aio "")
+endif()
+generate_posix_nfs4_backend_tests(cairn CAIRN_ENABLED)
+generate_posix_nfs4_backend_tests(linux "")
+generate_posix_nfs4_backend_tests(io_uring CHIMERA_VFS_IO_URING)
+
+# ============================================================================
 # NFS3 over TCP-RDMA Backend Tests
 # These tests run the POSIX tests through the Chimera NFS client using TCP-RDMA,
 # connecting to a Chimera NFS server in the same process.
@@ -157,14 +208,16 @@ generate_posix_nfs3_backend_tests(io_uring CHIMERA_VFS_IO_URING)
 
 # Macro to add a test that runs via NFS3 RDMA client (requires network namespace)
 macro(add_posix_nfs3rdma_test testname prog nfs_backend)
-    add_test(NAME chimera/posix/${testname}_nfs3rdma_${nfs_backend}
-        COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_${prog} -b nfs3rdma_${nfs_backend}
-    )
-    get_target_property(test_file posix_${prog} TEST_FILE)
-    set_tests_properties(chimera/posix/${testname}_nfs3rdma_${nfs_backend} PROPERTIES
-        ENVIRONMENT "TEST_FILE=${test_file}"
-        TIMEOUT 60
-    )
+    if(CHIMERA_NETNS_TESTING)
+        add_test(NAME chimera/posix/${testname}_nfs3rdma_${nfs_backend}
+            COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_${prog} -b nfs3rdma_${nfs_backend}
+        )
+        get_target_property(test_file posix_${prog} TEST_FILE)
+        set_tests_properties(chimera/posix/${testname}_nfs3rdma_${nfs_backend} PROPERTIES
+            ENVIRONMENT "TEST_FILE=${test_file}"
+            TIMEOUT 60
+        )
+    endif()
 endmacro()
 
 # Helper macro to generate NFS3 RDMA tests for a specific server-side backend
@@ -201,14 +254,16 @@ set(FSX_NUM_OPS 10000)
 set(FSX_MAX_LEN 262144)
 
 macro(add_fsx_test backend)
-    add_test(NAME chimera/posix/fsx_${backend}
-        COMMAND ${NETNS_WRAPPER} ${FSX_WRAPPER} -b ${backend} -N ${FSX_NUM_OPS} -l ${FSX_MAX_LEN} -q
-        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
-    )
-    set_tests_properties(chimera/posix/fsx_${backend} PROPERTIES
-        ENVIRONMENT "BUILD_DIR=${CMAKE_BINARY_DIR}"
-        TIMEOUT 300
-    )
+    if(CHIMERA_NETNS_TESTING)
+        add_test(NAME chimera/posix/fsx_${backend}
+            COMMAND ${NETNS_WRAPPER} ${FSX_WRAPPER} -b ${backend} -N ${FSX_NUM_OPS} -l ${FSX_MAX_LEN} -q
+            WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+        )
+        set_tests_properties(chimera/posix/fsx_${backend} PROPERTIES
+            ENVIRONMENT "BUILD_DIR=${CMAKE_BINARY_DIR}"
+            TIMEOUT 300
+        )
+    endif()
 endmacro()
 
 # Add FSX tests for each backend
@@ -261,6 +316,23 @@ if(CHIMERA_VFS_IO_URING)
     add_fsx_test(nfs3rdma_io_uring)
 endif()
 
+# NFS4 FSX tests
+# These tests run FSX through the NFS4 protocol to an in-process server
+add_fsx_test(nfs4_memfs)
+if(IO_URING_ENABLED)
+    add_fsx_test(nfs4_demofs_io_uring)
+endif()
+if(HAVE_LIBAIO)
+    add_fsx_test(nfs4_demofs_aio)
+endif()
+if(CAIRN_ENABLED)
+    add_fsx_test(nfs4_cairn)
+endif()
+add_fsx_test(nfs4_linux)
+if(CHIMERA_VFS_IO_URING)
+    add_fsx_test(nfs4_io_uring)
+endif()
+
 # Cthon common library (shared helpers for all cthon tests)
 add_library(cthon_common STATIC cthon_common.c)
 # Link with chimera_server for NFS backend tests
@@ -277,11 +349,13 @@ endmacro()
 
 # Macro to add a cthon test to ctest
 macro(add_cthon_test testname prog backend)
-    add_test(NAME chimera/posix/cthon/${testname} COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_${prog} -b ${backend})
-    get_target_property(test_file posix_${prog} TEST_FILE)
-    set_tests_properties(chimera/posix/cthon/${testname} PROPERTIES
-        ENVIRONMENT "TEST_FILE=${test_file}"
-        TIMEOUT 300)
+    if(CHIMERA_NETNS_TESTING)
+        add_test(NAME chimera/posix/cthon/${testname} COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_${prog} -b ${backend})
+        get_target_property(test_file posix_${prog} TEST_FILE)
+        set_tests_properties(chimera/posix/cthon/${testname} PROPERTIES
+            ENVIRONMENT "TEST_FILE=${test_file}"
+            TIMEOUT 300)
+    endif()
 endmacro()
 
 # List of cthon basic test programs
@@ -397,14 +471,16 @@ endforeach()
 
 # Macro to add a cthon test that runs via NFS3 client (requires network namespace)
 macro(add_cthon_nfs3_test testname prog nfs_backend)
-    add_test(NAME chimera/posix/cthon/${testname}_nfs3_${nfs_backend}
-        COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_${prog} -b nfs3_${nfs_backend}
-    )
-    get_target_property(test_file posix_${prog} TEST_FILE)
-    set_tests_properties(chimera/posix/cthon/${testname}_nfs3_${nfs_backend} PROPERTIES
-        ENVIRONMENT "TEST_FILE=${test_file}"
-        TIMEOUT 300
-    )
+    if(CHIMERA_NETNS_TESTING)
+        add_test(NAME chimera/posix/cthon/${testname}_nfs3_${nfs_backend}
+            COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_${prog} -b nfs3_${nfs_backend}
+        )
+        get_target_property(test_file posix_${prog} TEST_FILE)
+        set_tests_properties(chimera/posix/cthon/${testname}_nfs3_${nfs_backend} PROPERTIES
+            ENVIRONMENT "TEST_FILE=${test_file}"
+            TIMEOUT 300
+        )
+    endif()
 endmacro()
 
 # Helper macro to generate NFS3 cthon tests for a specific server-side backend
@@ -442,14 +518,16 @@ generate_cthon_nfs3_backend_tests(io_uring CHIMERA_VFS_IO_URING)
 
 # Macro to add a cthon test that runs via NFS3 RDMA client (requires network namespace)
 macro(add_cthon_nfs3rdma_test testname prog nfs_backend)
-    add_test(NAME chimera/posix/cthon/${testname}_nfs3rdma_${nfs_backend}
-        COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_${prog} -b nfs3rdma_${nfs_backend}
-    )
-    get_target_property(test_file posix_${prog} TEST_FILE)
-    set_tests_properties(chimera/posix/cthon/${testname}_nfs3rdma_${nfs_backend} PROPERTIES
-        ENVIRONMENT "TEST_FILE=${test_file}"
-        TIMEOUT 300
-    )
+    if(CHIMERA_NETNS_TESTING)
+        add_test(NAME chimera/posix/cthon/${testname}_nfs3rdma_${nfs_backend}
+            COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_${prog} -b nfs3rdma_${nfs_backend}
+        )
+        get_target_property(test_file posix_${prog} TEST_FILE)
+        set_tests_properties(chimera/posix/cthon/${testname}_nfs3rdma_${nfs_backend} PROPERTIES
+            ENVIRONMENT "TEST_FILE=${test_file}"
+            TIMEOUT 300
+        )
+    endif()
 endmacro()
 
 # Helper macro to generate NFS3 RDMA cthon tests for a specific server-side backend
@@ -477,6 +555,51 @@ endif()
 generate_cthon_nfs3rdma_backend_tests(cairn CAIRN_ENABLED)
 generate_cthon_nfs3rdma_backend_tests(linux "")
 generate_cthon_nfs3rdma_backend_tests(io_uring CHIMERA_VFS_IO_URING)
+
+# ============================================================================
+# NFS4 Cthon Tests
+# These tests run the cthon tests through the Chimera NFS4 client,
+# connecting to a Chimera NFS server in the same process.
+# They require a network namespace for loopback networking.
+# ============================================================================
+
+# Macro to add a cthon test that runs via NFS4 client (requires network namespace)
+macro(add_cthon_nfs4_test testname prog nfs_backend)
+    add_test(NAME chimera/posix/cthon/${testname}_nfs4_${nfs_backend}
+        COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_${prog} -b nfs4_${nfs_backend}
+    )
+    get_target_property(test_file posix_${prog} TEST_FILE)
+    set_tests_properties(chimera/posix/cthon/${testname}_nfs4_${nfs_backend} PROPERTIES
+        ENVIRONMENT "TEST_FILE=${test_file}"
+        TIMEOUT 300
+    )
+endmacro()
+
+# Helper macro to generate NFS4 cthon tests for a specific server-side backend
+macro(_generate_cthon_nfs4_tests_for_backend nfs_backend)
+    foreach(prog ${CTHON_TEST_PROGRAMS})
+        add_cthon_nfs4_test(${prog} ${prog} ${nfs_backend})
+    endforeach()
+endmacro()
+
+# Macro to generate all NFS4 cthon tests for a backend with optional condition
+macro(generate_cthon_nfs4_backend_tests backend condition_var)
+    if("${condition_var}" STREQUAL "")
+        _generate_cthon_nfs4_tests_for_backend(${backend})
+    elseif(${condition_var})
+        _generate_cthon_nfs4_tests_for_backend(${backend})
+    endif()
+endmacro()
+
+# Generate NFS4 cthon tests for each backend
+generate_cthon_nfs4_backend_tests(memfs "")
+generate_cthon_nfs4_backend_tests(demofs_io_uring IO_URING_ENABLED)
+if(HAVE_LIBAIO)
+    generate_cthon_nfs4_backend_tests(demofs_aio "")
+endif()
+generate_cthon_nfs4_backend_tests(cairn CAIRN_ENABLED)
+generate_cthon_nfs4_backend_tests(linux "")
+generate_cthon_nfs4_backend_tests(io_uring CHIMERA_VFS_IO_URING)
 
 # ============================================================================
 # Stress Tests ported from xfstests
@@ -508,35 +631,37 @@ endmacro()
 
 # Helper macro to generate stress tests for a backend
 macro(_generate_stress_tests_for_backend backend)
-    # dirstress: directory operations stress test (reduced params for testing)
-    add_test(NAME chimera/posix/dirstress_${backend}
-        COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_test_dirstress -b ${backend} -p 1 -f 50
-    )
-    set_tests_properties(chimera/posix/dirstress_${backend} PROPERTIES TIMEOUT 120)
+    if(CHIMERA_NETNS_TESTING)
+        # dirstress: directory operations stress test (reduced params for testing)
+        add_test(NAME chimera/posix/dirstress_${backend}
+            COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_test_dirstress -b ${backend} -p 1 -f 50
+        )
+        set_tests_properties(chimera/posix/dirstress_${backend} PROPERTIES TIMEOUT 120)
 
-    # rewinddir: tests rewinddir() POSIX semantics
-    add_test(NAME chimera/posix/rewinddir_${backend}
-        COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_test_rewinddir -b ${backend}
-    )
-    set_tests_properties(chimera/posix/rewinddir_${backend} PROPERTIES TIMEOUT 120)
+        # rewinddir: tests rewinddir() POSIX semantics
+        add_test(NAME chimera/posix/rewinddir_${backend}
+            COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_test_rewinddir -b ${backend}
+        )
+        set_tests_properties(chimera/posix/rewinddir_${backend} PROPERTIES TIMEOUT 120)
 
-    # fstest: data integrity verification test
-    add_test(NAME chimera/posix/fstest_${backend}
-        COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_test_fstest -b ${backend} -n 1 -f 2 -l 5 -s 65536
-    )
-    set_tests_properties(chimera/posix/fstest_${backend} PROPERTIES TIMEOUT 120)
+        # fstest: data integrity verification test
+        add_test(NAME chimera/posix/fstest_${backend}
+            COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_test_fstest -b ${backend} -n 1 -f 2 -l 5 -s 65536
+        )
+        set_tests_properties(chimera/posix/fstest_${backend} PROPERTIES TIMEOUT 120)
 
-    # nametest: namespace stress test
-    add_test(NAME chimera/posix/nametest_${backend}
-        COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_test_nametest -b ${backend} -n 50 -i 1000
-    )
-    set_tests_properties(chimera/posix/nametest_${backend} PROPERTIES TIMEOUT 120)
+        # nametest: namespace stress test
+        add_test(NAME chimera/posix/nametest_${backend}
+            COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_test_nametest -b ${backend} -n 50 -i 1000
+        )
+        set_tests_properties(chimera/posix/nametest_${backend} PROPERTIES TIMEOUT 120)
 
-    # fsstress: comprehensive filesystem stress test
-    add_test(NAME chimera/posix/fsstress_${backend}
-        COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_test_fsstress -b ${backend} -n 500 -p 1
-    )
-    set_tests_properties(chimera/posix/fsstress_${backend} PROPERTIES TIMEOUT 180)
+        # fsstress: comprehensive filesystem stress test
+        add_test(NAME chimera/posix/fsstress_${backend}
+            COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_test_fsstress -b ${backend} -n 500 -p 1
+        )
+        set_tests_properties(chimera/posix/fsstress_${backend} PROPERTIES TIMEOUT 180)
+    endif()
 endmacro()
 
 # Macro to generate stress tests with optional condition
@@ -567,35 +692,37 @@ generate_stress_tests(io_uring CHIMERA_VFS_IO_URING)
 
 # Helper macro to generate NFS3 stress tests for a backend
 macro(_generate_stress_nfs3_tests_for_backend nfs_backend)
-    # dirstress: directory operations stress test (reduced params for testing)
-    add_test(NAME chimera/posix/dirstress_nfs3_${nfs_backend}
-        COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_test_dirstress -b nfs3_${nfs_backend} -p 1 -f 50
-    )
-    set_tests_properties(chimera/posix/dirstress_nfs3_${nfs_backend} PROPERTIES TIMEOUT 120)
+    if(CHIMERA_NETNS_TESTING)
+        # dirstress: directory operations stress test (reduced params for testing)
+        add_test(NAME chimera/posix/dirstress_nfs3_${nfs_backend}
+            COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_test_dirstress -b nfs3_${nfs_backend} -p 1 -f 50
+        )
+        set_tests_properties(chimera/posix/dirstress_nfs3_${nfs_backend} PROPERTIES TIMEOUT 120)
 
-    # rewinddir: tests rewinddir() POSIX semantics
-    add_test(NAME chimera/posix/rewinddir_nfs3_${nfs_backend}
-        COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_test_rewinddir -b nfs3_${nfs_backend}
-    )
-    set_tests_properties(chimera/posix/rewinddir_nfs3_${nfs_backend} PROPERTIES TIMEOUT 120)
+        # rewinddir: tests rewinddir() POSIX semantics
+        add_test(NAME chimera/posix/rewinddir_nfs3_${nfs_backend}
+            COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_test_rewinddir -b nfs3_${nfs_backend}
+        )
+        set_tests_properties(chimera/posix/rewinddir_nfs3_${nfs_backend} PROPERTIES TIMEOUT 120)
 
-    # fstest: data integrity verification test
-    add_test(NAME chimera/posix/fstest_nfs3_${nfs_backend}
-        COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_test_fstest -b nfs3_${nfs_backend} -n 1 -f 2 -l 5 -s 65536
-    )
-    set_tests_properties(chimera/posix/fstest_nfs3_${nfs_backend} PROPERTIES TIMEOUT 120)
+        # fstest: data integrity verification test
+        add_test(NAME chimera/posix/fstest_nfs3_${nfs_backend}
+            COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_test_fstest -b nfs3_${nfs_backend} -n 1 -f 2 -l 5 -s 65536
+        )
+        set_tests_properties(chimera/posix/fstest_nfs3_${nfs_backend} PROPERTIES TIMEOUT 120)
 
-    # nametest: namespace stress test
-    add_test(NAME chimera/posix/nametest_nfs3_${nfs_backend}
-        COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_test_nametest -b nfs3_${nfs_backend} -n 50 -i 1000
-    )
-    set_tests_properties(chimera/posix/nametest_nfs3_${nfs_backend} PROPERTIES TIMEOUT 120)
+        # nametest: namespace stress test
+        add_test(NAME chimera/posix/nametest_nfs3_${nfs_backend}
+            COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_test_nametest -b nfs3_${nfs_backend} -n 50 -i 1000
+        )
+        set_tests_properties(chimera/posix/nametest_nfs3_${nfs_backend} PROPERTIES TIMEOUT 120)
 
-    # fsstress: comprehensive filesystem stress test
-    add_test(NAME chimera/posix/fsstress_nfs3_${nfs_backend}
-        COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_test_fsstress -b nfs3_${nfs_backend} -n 500 -p 1
-    )
-    set_tests_properties(chimera/posix/fsstress_nfs3_${nfs_backend} PROPERTIES TIMEOUT 180)
+        # fsstress: comprehensive filesystem stress test
+        add_test(NAME chimera/posix/fsstress_nfs3_${nfs_backend}
+            COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_test_fsstress -b nfs3_${nfs_backend} -n 500 -p 1
+        )
+        set_tests_properties(chimera/posix/fsstress_nfs3_${nfs_backend} PROPERTIES TIMEOUT 180)
+    endif()
 endmacro()
 
 # Macro to generate NFS3 stress tests with optional condition
@@ -626,35 +753,37 @@ generate_stress_nfs3_tests(io_uring CHIMERA_VFS_IO_URING)
 
 # Helper macro to generate NFS3 RDMA stress tests for a backend
 macro(_generate_stress_nfs3rdma_tests_for_backend nfs_backend)
-    # dirstress: directory operations stress test (reduced params for testing)
-    add_test(NAME chimera/posix/dirstress_nfs3rdma_${nfs_backend}
-        COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_test_dirstress -b nfs3rdma_${nfs_backend} -p 1 -f 50
-    )
-    set_tests_properties(chimera/posix/dirstress_nfs3rdma_${nfs_backend} PROPERTIES TIMEOUT 120)
+    if(CHIMERA_NETNS_TESTING)
+        # dirstress: directory operations stress test (reduced params for testing)
+        add_test(NAME chimera/posix/dirstress_nfs3rdma_${nfs_backend}
+            COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_test_dirstress -b nfs3rdma_${nfs_backend} -p 1 -f 50
+        )
+        set_tests_properties(chimera/posix/dirstress_nfs3rdma_${nfs_backend} PROPERTIES TIMEOUT 120)
 
-    # rewinddir: tests rewinddir() POSIX semantics
-    add_test(NAME chimera/posix/rewinddir_nfs3rdma_${nfs_backend}
-        COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_test_rewinddir -b nfs3rdma_${nfs_backend}
-    )
-    set_tests_properties(chimera/posix/rewinddir_nfs3rdma_${nfs_backend} PROPERTIES TIMEOUT 120)
+        # rewinddir: tests rewinddir() POSIX semantics
+        add_test(NAME chimera/posix/rewinddir_nfs3rdma_${nfs_backend}
+            COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_test_rewinddir -b nfs3rdma_${nfs_backend}
+        )
+        set_tests_properties(chimera/posix/rewinddir_nfs3rdma_${nfs_backend} PROPERTIES TIMEOUT 120)
 
-    # fstest: data integrity verification test
-    add_test(NAME chimera/posix/fstest_nfs3rdma_${nfs_backend}
-        COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_test_fstest -b nfs3rdma_${nfs_backend} -n 1 -f 2 -l 5 -s 65536
-    )
-    set_tests_properties(chimera/posix/fstest_nfs3rdma_${nfs_backend} PROPERTIES TIMEOUT 120)
+        # fstest: data integrity verification test
+        add_test(NAME chimera/posix/fstest_nfs3rdma_${nfs_backend}
+            COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_test_fstest -b nfs3rdma_${nfs_backend} -n 1 -f 2 -l 5 -s 65536
+        )
+        set_tests_properties(chimera/posix/fstest_nfs3rdma_${nfs_backend} PROPERTIES TIMEOUT 120)
 
-    # nametest: namespace stress test
-    add_test(NAME chimera/posix/nametest_nfs3rdma_${nfs_backend}
-        COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_test_nametest -b nfs3rdma_${nfs_backend} -n 50 -i 1000
-    )
-    set_tests_properties(chimera/posix/nametest_nfs3rdma_${nfs_backend} PROPERTIES TIMEOUT 120)
+        # nametest: namespace stress test
+        add_test(NAME chimera/posix/nametest_nfs3rdma_${nfs_backend}
+            COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_test_nametest -b nfs3rdma_${nfs_backend} -n 50 -i 1000
+        )
+        set_tests_properties(chimera/posix/nametest_nfs3rdma_${nfs_backend} PROPERTIES TIMEOUT 120)
 
-    # fsstress: comprehensive filesystem stress test
-    add_test(NAME chimera/posix/fsstress_nfs3rdma_${nfs_backend}
-        COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_test_fsstress -b nfs3rdma_${nfs_backend} -n 500 -p 1
-    )
-    set_tests_properties(chimera/posix/fsstress_nfs3rdma_${nfs_backend} PROPERTIES TIMEOUT 180)
+        # fsstress: comprehensive filesystem stress test
+        add_test(NAME chimera/posix/fsstress_nfs3rdma_${nfs_backend}
+            COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_test_fsstress -b nfs3rdma_${nfs_backend} -n 500 -p 1
+        )
+        set_tests_properties(chimera/posix/fsstress_nfs3rdma_${nfs_backend} PROPERTIES TIMEOUT 180)
+    endif()
 endmacro()
 
 # Macro to generate NFS3 RDMA stress tests with optional condition
@@ -677,6 +806,65 @@ generate_stress_nfs3rdma_tests(linux "")
 generate_stress_nfs3rdma_tests(io_uring CHIMERA_VFS_IO_URING)
 
 # ============================================================================
+# NFS4 Stress Tests
+# These tests run the stress tests through the Chimera NFS4 client,
+# connecting to a Chimera NFS server in the same process.
+# They require a network namespace for loopback networking.
+# ============================================================================
+
+# Helper macro to generate NFS4 stress tests for a backend
+macro(_generate_stress_nfs4_tests_for_backend nfs_backend)
+    # dirstress: directory operations stress test (reduced params for testing)
+    add_test(NAME chimera/posix/dirstress_nfs4_${nfs_backend}
+        COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_test_dirstress -b nfs4_${nfs_backend} -p 1 -f 50
+    )
+    set_tests_properties(chimera/posix/dirstress_nfs4_${nfs_backend} PROPERTIES TIMEOUT 120)
+
+    # rewinddir: tests rewinddir() POSIX semantics
+    add_test(NAME chimera/posix/rewinddir_nfs4_${nfs_backend}
+        COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_test_rewinddir -b nfs4_${nfs_backend}
+    )
+    set_tests_properties(chimera/posix/rewinddir_nfs4_${nfs_backend} PROPERTIES TIMEOUT 120)
+
+    # fstest: data integrity verification test
+    add_test(NAME chimera/posix/fstest_nfs4_${nfs_backend}
+        COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_test_fstest -b nfs4_${nfs_backend} -n 1 -f 2 -l 5 -s 65536
+    )
+    set_tests_properties(chimera/posix/fstest_nfs4_${nfs_backend} PROPERTIES TIMEOUT 120)
+
+    # nametest: namespace stress test
+    add_test(NAME chimera/posix/nametest_nfs4_${nfs_backend}
+        COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_test_nametest -b nfs4_${nfs_backend} -n 50 -i 1000
+    )
+    set_tests_properties(chimera/posix/nametest_nfs4_${nfs_backend} PROPERTIES TIMEOUT 120)
+
+    # fsstress: comprehensive filesystem stress test
+    add_test(NAME chimera/posix/fsstress_nfs4_${nfs_backend}
+        COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_test_fsstress -b nfs4_${nfs_backend} -n 500 -p 1
+    )
+    set_tests_properties(chimera/posix/fsstress_nfs4_${nfs_backend} PROPERTIES TIMEOUT 180)
+endmacro()
+
+# Macro to generate NFS4 stress tests with optional condition
+macro(generate_stress_nfs4_tests backend condition_var)
+    if("${condition_var}" STREQUAL "")
+        _generate_stress_nfs4_tests_for_backend(${backend})
+    elseif(${condition_var})
+        _generate_stress_nfs4_tests_for_backend(${backend})
+    endif()
+endmacro()
+
+# Generate NFS4 stress tests for each backend
+generate_stress_nfs4_tests(memfs "")
+generate_stress_nfs4_tests(demofs_io_uring IO_URING_ENABLED)
+if(HAVE_LIBAIO)
+    generate_stress_nfs4_tests(demofs_aio "")
+endif()
+generate_stress_nfs4_tests(cairn CAIRN_ENABLED)
+generate_stress_nfs4_tests(linux "")
+generate_stress_nfs4_tests(io_uring CHIMERA_VFS_IO_URING)
+
+# ============================================================================
 # Non-root user tests
 # Run all POSIX tests as 'myuser' against the linux, nfs3_linux, and
 # nfs3rdma_linux backends to catch permission errors that only surface for
@@ -684,35 +872,41 @@ generate_stress_nfs3rdma_tests(io_uring CHIMERA_VFS_IO_URING)
 # ============================================================================
 
 macro(add_posix_test_myuser testname prog backend)
-    add_test(NAME chimera/posix/${testname}_myuser COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_${prog} -b ${backend} -U myuser)
-    get_target_property(test_file posix_${prog} TEST_FILE)
-    set_tests_properties(chimera/posix/${testname}_myuser PROPERTIES
-        ENVIRONMENT "TEST_FILE=${test_file}"
-        SKIP_RETURN_CODE 77)
+    if(CHIMERA_NETNS_TESTING)
+        add_test(NAME chimera/posix/${testname}_myuser COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_${prog} -b ${backend} -U myuser)
+        get_target_property(test_file posix_${prog} TEST_FILE)
+        set_tests_properties(chimera/posix/${testname}_myuser PROPERTIES
+            ENVIRONMENT "TEST_FILE=${test_file}"
+            SKIP_RETURN_CODE 77)
+    endif()
 endmacro()
 
 macro(add_posix_nfs3_test_myuser testname prog nfs_backend)
-    add_test(NAME chimera/posix/${testname}_nfs3_${nfs_backend}_myuser
-        COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_${prog} -b nfs3_${nfs_backend} -U myuser
-    )
-    get_target_property(test_file posix_${prog} TEST_FILE)
-    set_tests_properties(chimera/posix/${testname}_nfs3_${nfs_backend}_myuser PROPERTIES
-        ENVIRONMENT "TEST_FILE=${test_file}"
-        TIMEOUT 60
-        SKIP_RETURN_CODE 77
-    )
+    if(CHIMERA_NETNS_TESTING)
+        add_test(NAME chimera/posix/${testname}_nfs3_${nfs_backend}_myuser
+            COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_${prog} -b nfs3_${nfs_backend} -U myuser
+        )
+        get_target_property(test_file posix_${prog} TEST_FILE)
+        set_tests_properties(chimera/posix/${testname}_nfs3_${nfs_backend}_myuser PROPERTIES
+            ENVIRONMENT "TEST_FILE=${test_file}"
+            TIMEOUT 60
+            SKIP_RETURN_CODE 77
+        )
+    endif()
 endmacro()
 
 macro(add_posix_nfs3rdma_test_myuser testname prog nfs_backend)
-    add_test(NAME chimera/posix/${testname}_nfs3rdma_${nfs_backend}_myuser
-        COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_${prog} -b nfs3rdma_${nfs_backend} -U myuser
-    )
-    get_target_property(test_file posix_${prog} TEST_FILE)
-    set_tests_properties(chimera/posix/${testname}_nfs3rdma_${nfs_backend}_myuser PROPERTIES
-        ENVIRONMENT "TEST_FILE=${test_file}"
-        TIMEOUT 60
-        SKIP_RETURN_CODE 77
-    )
+    if(CHIMERA_NETNS_TESTING)
+        add_test(NAME chimera/posix/${testname}_nfs3rdma_${nfs_backend}_myuser
+            COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_${prog} -b nfs3rdma_${nfs_backend} -U myuser
+        )
+        get_target_property(test_file posix_${prog} TEST_FILE)
+        set_tests_properties(chimera/posix/${testname}_nfs3rdma_${nfs_backend}_myuser PROPERTIES
+            ENVIRONMENT "TEST_FILE=${test_file}"
+            TIMEOUT 60
+            SKIP_RETURN_CODE 77
+        )
+    endif()
 endmacro()
 
 foreach(prog ${POSIX_TEST_PROGRAMS})

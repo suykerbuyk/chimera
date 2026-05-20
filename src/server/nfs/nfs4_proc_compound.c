@@ -72,6 +72,9 @@ chimera_nfs4_compound_process(
             case OP_LOOKUP:
                 chimera_nfs4_lookup(thread, req, argop, resop);
                 break;
+            case OP_LOOKUPP:
+                chimera_nfs4_lookupp(thread, req, argop, resop);
+                break;
             case OP_PUTFH:
                 chimera_nfs4_putfh(thread, req, argop, resop);
                 break;
@@ -159,6 +162,21 @@ chimera_nfs4_compound_process(
             case OP_LOCKU:
                 chimera_nfs4_locku(thread, req, argop, resop);
                 break;
+            case OP_VERIFY:
+                chimera_nfs4_verify(thread, req, argop, resop);
+                break;
+            case OP_NVERIFY:
+                chimera_nfs4_nverify(thread, req, argop, resop);
+                break;
+            case OP_PUTPUBFH:
+                chimera_nfs4_putpubfh(thread, req, argop, resop);
+                break;
+            case OP_RENEW:
+                chimera_nfs4_renew(thread, req, argop, resop);
+                break;
+            case OP_RELEASE_LOCKOWNER:
+                chimera_nfs4_release_lockowner(thread, req, argop, resop);
+                break;
             default:
                 chimera_nfs_error("Unsupported operation: %d", argop->argop);
                 if (argop->argop >= OP_ACCESS && argop->argop <= OP_CLONE) {
@@ -210,12 +228,33 @@ chimera_nfs4_compound(
 
         req->session = nfs4_session_is_live(cached) ? cached : NULL;
     }
-    req->args_compound        = args;
-    req->res_compound.status  = NFS4_OK;
-    req->res_compound.tag.len = 0;
-    req->fhlen                = 0;
-    req->saved_fhlen          = 0;
+    req->args_compound       = args;
+    req->res_compound.status = NFS4_OK;
+    /* RFC 7530 §16.2.4: the server MUST echo the request tag back to the
+     * client unchanged. xdr_opaque .data is owned by the request msg buffer
+     * which lives until the response is sent. */
+    req->res_compound.tag = args->tag;
+    req->fhlen            = 0;
+    req->saved_fhlen      = 0;
 
+    /* Chimera implements NFS v4.0, v4.1 and v4.2 (minorversions 0–2).
+     * Reject unknown minor versions with NFS4ERR_MINOR_VERS_MISMATCH per
+     * RFC 7530 §16.2.4 / RFC 5661 §15.1.5.4. */
+    if (args->minorversion > 2) {
+        req->res_compound.status       = NFS4ERR_MINOR_VERS_MISMATCH;
+        req->res_compound.num_resarray = 0;
+        req->res_compound.resarray     = NULL;
+
+        rc = thread->shared->nfs_v4.send_reply_NFSPROC4_COMPOUND(
+            thread->evpl,
+            NULL,
+            &req->res_compound,
+            req->encoding);
+        chimera_nfs_abort_if(rc, "Failed to send RPC2 reply");
+
+        nfs_request_free(thread, req);
+        return;
+    }
 
     rc = xdr_dbuf_alloc_array(&req->res_compound, resarray, args->num_argarray, req->encoding->dbuf);
 

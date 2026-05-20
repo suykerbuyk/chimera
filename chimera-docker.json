@@ -1,0 +1,31 @@
+{
+    "server": {
+        "threads": 4,
+        "sync_delegation_threads": 8,
+        "async_delegation": false,
+        "async_delegation_threads": 8,
+        "rest_http_port": 8080
+    },
+    "mounts": {
+        "export": {
+            "module": "linux",
+            "path": "/export"
+        },
+        "memfs": {
+            "module": "memfs",
+            "path": "/"
+        }
+    },
+    "exports": {
+        "/export": { "path": "/export" },
+        "/memfs":  { "path": "/memfs"  }
+    },
+    "shares": {
+        "export": { "path": "/export" },
+        "memfs":  { "path": "/memfs"  }
+    },
+    "buckets": {
+        "export": { "path": "/export" },
+        "memfs":  { "path": "/memfs"  }
+    }
+}

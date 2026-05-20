@@ -61,7 +61,17 @@ chimera_server_config_set_core_threads(
     int                           threads);
 
 void
-chimera_server_config_set_delegation_threads(
+chimera_server_config_set_sync_delegation_threads(
+    struct chimera_server_config *config,
+    int                           threads);
+
+void
+chimera_server_config_set_async_delegation(
+    struct chimera_server_config *config,
+    int                           enable);
+
+void
+chimera_server_config_set_async_delegation_threads(
     struct chimera_server_config *config,
     int                           threads);
 
@@ -96,6 +106,27 @@ void
 chimera_server_config_set_external_portmap(
     struct chimera_server_config *config,
     int                           enable);
+
+void
+chimera_server_config_set_portmap_hostname(
+    struct chimera_server_config *config,
+    const char                   *hostname);
+
+const char *
+chimera_server_config_get_portmap_hostname(
+    const struct chimera_server_config *config);
+
+/*
+ * Resolve a hostname or IPv4 dotted-quad string to an IPv4 dotted-quad string.
+ * Writes the result (NUL-terminated) into out_buf. out_size must be at least
+ * INET_ADDRSTRLEN (16). Aborts startup with a clear error on resolution
+ * failure.
+ */
+void
+chimera_server_resolve_ipv4(
+    const char *hostname,
+    char       *out_buf,
+    size_t      out_size);
 
 uint32_t
 chimera_server_config_get_soft_fail_bad_req(
@@ -260,7 +291,8 @@ chimera_server_mount(
     struct chimera_server *server,
     const char            *mount_path,
     const char            *module_name,
-    const char            *module_path);
+    const char            *module_path,
+    const char            *options);
 
 int
 chimera_server_create_bucket(

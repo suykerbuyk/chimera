@@ -273,6 +273,21 @@ main(
                                             flavor == CHIMERA_TCP_FLAVOR_XLIO);
     }
 
+    if (server_params) {
+        json_t *prealloc_slabs_value   = json_object_get(server_params, "preallocate_slabs");
+        json_t *prealloc_threads_value = json_object_get(server_params, "preallocate_threads");
+
+        if (prealloc_slabs_value && json_is_integer(prealloc_slabs_value)) {
+            evpl_global_config_set_preallocate_slabs(evpl_global_config,
+                                                     json_integer_value(prealloc_slabs_value));
+        }
+
+        if (prealloc_threads_value && json_is_integer(prealloc_threads_value)) {
+            evpl_global_config_set_preallocate_threads(evpl_global_config,
+                                                       json_integer_value(prealloc_threads_value));
+        }
+    }
+
     /* Configure TLS if HTTPS is enabled */
     if (rest_https_port != 0) {
         if (rest_ssl_cert && rest_ssl_key) {
@@ -322,16 +337,34 @@ main(
         chimera_server_config_set_max_open_files(server_config, int_value);
     }
 
-    json_value = json_object_get(server_params, "delegation_threads");
+    json_value = json_object_get(server_params, "sync_delegation_threads");
     if (json_is_integer(json_value)) {
         int_value = json_integer_value(json_value);
-        chimera_server_config_set_delegation_threads(server_config, int_value);
+        chimera_server_config_set_sync_delegation_threads(server_config, int_value);
+    }
+
+    json_value = json_object_get(server_params, "async_delegation");
+    if (json_is_boolean(json_value)) {
+        chimera_server_config_set_async_delegation(server_config, json_is_true(json_value));
+    }
+
+    json_value = json_object_get(server_params, "async_delegation_threads");
+    if (json_is_integer(json_value)) {
+        int_value = json_integer_value(json_value);
+        chimera_server_config_set_async_delegation_threads(server_config, int_value);
     }
 
     json_value = json_object_get(server_params, "external_portmap");
     if (json_is_true(json_value)) {
         chimera_server_info("Enabling external portmap/rpcbind support");
         chimera_server_config_set_external_portmap(server_config, 1);
+    }
+
+    json_value = json_object_get(server_params, "portmap_hostname");
+    if (json_is_string(json_value)) {
+        str_value = json_string_value(json_value);
+        chimera_server_info("Setting portmap hostname to %s", str_value);
+        chimera_server_config_set_portmap_hostname(server_config, str_value);
     }
 
     json_value = json_object_get(server_params, "kv_module");
@@ -549,12 +582,17 @@ main(
     if (mounts) {
         json_object_foreach(mounts, name, mount)
         {
-            module = json_string_value(json_object_get(mount, "module"));
-            path   = json_string_value(json_object_get(mount, "path"));
+            const char *mount_options;
 
-            chimera_server_info("Mounting %s://%s to /%s...",
-                                module, path, name);
-            chimera_server_mount(server, name, module, path);
+            module        = json_string_value(json_object_get(mount, "module"));
+            path          = json_string_value(json_object_get(mount, "path"));
+            mount_options = json_string_value(json_object_get(mount, "options"));
+
+            chimera_server_info("Mounting %s://%s to /%s%s%s...",
+                                module, path, name,
+                                mount_options ? " options=" : "",
+                                mount_options ? mount_options : "");
+            chimera_server_mount(server, name, module, path, mount_options);
         }
     }
 

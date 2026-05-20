@@ -8,6 +8,12 @@ on:
   pull_request:        # always build for PRs but don't publish
   workflow_dispatch:   # allow manual runs
 
+# The full cross-OS, cross-arch test and static-analysis matrix runs nightly
+# from .github/workflows/nightly.yml. On PRs we run a reduced matrix:
+#   - all OS images built for amd64 (devcontainer also for arm64)
+#   - tests on all OS images amd64; arm64 only on devcontainer
+#   - static analysis only on devcontainer
+
 env:
   DEV_IMAGE_TAG_PREFIX: repository.mdh.quantum.com:5004/cache/chimera-dev
   U26_IMAGE_TAG_PREFIX: repository.mdh.quantum.com:5004/cache/chimera-ubuntu26
@@ -15,6 +21,7 @@ env:
   U22_IMAGE_TAG_PREFIX: repository.mdh.quantum.com:5004/cache/chimera-ubuntu22
   R9_IMAGE_TAG_PREFIX: repository.mdh.quantum.com:5004/cache/chimera-rocky9
   R10_IMAGE_TAG_PREFIX: repository.mdh.quantum.com:5004/cache/chimera-rocky10
+  KVM_IMAGE_CACHE_REGISTRY: repository.mdh.quantum.com:5004/cache
   APT_MIRROR: http://repository.mdh.quantum.com/repository/pkgs/ubuntu
   DOCKER_MIRROR: repository.mdh.quantum.com/
 
@@ -37,12 +44,12 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           submodules: recursive
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
         with:
           driver: docker-container
           buildkitd-config-inline: |
@@ -50,7 +57,7 @@ jobs:
               mirrors = ["repository.mdh.quantum.com:5001"]
 
       - name: Build and push the dev container image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .devcontainer
           file: .devcontainer/Dockerfile
@@ -75,18 +82,15 @@ jobs:
           - platform: linux/amd64
             runner: arc-amd64
             arch: amd64
-          - platform: linux/arm64
-            runner: arc-arm64
-            arch: arm64
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           submodules: recursive
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
         with:
           driver: docker-container
           buildkitd-config-inline: |
@@ -94,7 +98,7 @@ jobs:
               mirrors = ["repository.mdh.quantum.com:5001"]
 
       - name: Build and push the ubuntu26 CI image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile.ubuntu26.04
@@ -119,18 +123,15 @@ jobs:
           - platform: linux/amd64
             runner: arc-amd64
             arch: amd64
-          - platform: linux/arm64
-            runner: arc-arm64
-            arch: arm64
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           submodules: recursive
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
         with:
           driver: docker-container
           buildkitd-config-inline: |
@@ -138,7 +139,7 @@ jobs:
               mirrors = ["repository.mdh.quantum.com:5001"]
 
       - name: Build and push the ubuntu24 CI image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile.ubuntu24.04
@@ -163,18 +164,15 @@ jobs:
           - platform: linux/amd64
             runner: arc-amd64
             arch: amd64
-          - platform: linux/arm64
-            runner: arc-arm64
-            arch: arm64
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           submodules: recursive
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
         with:
           driver: docker-container
           buildkitd-config-inline: |
@@ -182,7 +180,7 @@ jobs:
               mirrors = ["repository.mdh.quantum.com:5001"]
 
       - name: Build and push the ubuntu22 CI image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile.ubuntu22.04
@@ -207,18 +205,15 @@ jobs:
           - platform: linux/amd64
             runner: arc-amd64
             arch: amd64
-          - platform: linux/arm64
-            runner: arc-arm64
-            arch: arm64
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           submodules: recursive
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
         with:
           driver: docker-container
           buildkitd-config-inline: |
@@ -226,7 +221,7 @@ jobs:
               mirrors = ["repository.mdh.quantum.com:5001"]
 
       - name: Build and push the rocky9 CI image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile.rocky9
@@ -250,18 +245,15 @@ jobs:
           - platform: linux/amd64
             runner: arc-amd64
             arch: amd64
-          - platform: linux/arm64
-            runner: arc-arm64
-            arch: arm64
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           submodules: recursive
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
         with:
           driver: docker-container
           buildkitd-config-inline: |
@@ -269,7 +261,7 @@ jobs:
               mirrors = ["repository.mdh.quantum.com:5001"]
 
       - name: Build and push the rocky10 CI image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile.rocky10
@@ -291,7 +283,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # devcontainer
+          # devcontainer (amd64 + arm64)
           - platform: linux/amd64
             runner: arc-amd64
             arch: amd64
@@ -320,7 +312,7 @@ jobs:
             image_tag_prefix: repository.mdh.quantum.com:5004/cache/chimera-dev
             image_name: devcontainer
             cmake_extra: ""
-          # ubuntu 26
+          # ubuntu 26 (amd64 only on PR; arm64 runs in nightly)
           - platform: linux/amd64
             runner: arc-amd64
             arch: amd64
@@ -335,21 +327,7 @@ jobs:
             image_tag_prefix: repository.mdh.quantum.com:5004/cache/chimera-ubuntu26
             image_name: ubuntu26
             cmake_extra: ""
-          - platform: linux/arm64
-            runner: arc-arm64
-            arch: arm64
-            build_type: Release
-            image_tag_prefix: repository.mdh.quantum.com:5004/cache/chimera-ubuntu26
-            image_name: ubuntu26
-            cmake_extra: ""
-          - platform: linux/arm64
-            runner: arc-arm64
-            arch: arm64
-            build_type: Debug
-            image_tag_prefix: repository.mdh.quantum.com:5004/cache/chimera-ubuntu26
-            image_name: ubuntu26
-            cmake_extra: ""
-          # ubuntu 24
+          # ubuntu 24 (amd64 only on PR; arm64 runs in nightly)
           - platform: linux/amd64
             runner: arc-amd64
             arch: amd64
@@ -364,21 +342,7 @@ jobs:
             image_tag_prefix: repository.mdh.quantum.com:5004/cache/chimera-ubuntu24
             image_name: ubuntu24
             cmake_extra: ""
-          - platform: linux/arm64
-            runner: arc-arm64
-            arch: arm64
-            build_type: Release
-            image_tag_prefix: repository.mdh.quantum.com:5004/cache/chimera-ubuntu24
-            image_name: ubuntu24
-            cmake_extra: ""
-          - platform: linux/arm64
-            runner: arc-arm64
-            arch: arm64
-            build_type: Debug
-            image_tag_prefix: repository.mdh.quantum.com:5004/cache/chimera-ubuntu24
-            image_name: ubuntu24
-            cmake_extra: ""
-          # ubuntu 22
+          # ubuntu 22 (amd64 only on PR; arm64 runs in nightly)
           - platform: linux/amd64
             runner: arc-amd64
             arch: amd64
@@ -389,20 +353,6 @@ jobs:
           - platform: linux/amd64
             runner: arc-amd64
             arch: amd64
-            build_type: Debug
-            image_tag_prefix: repository.mdh.quantum.com:5004/cache/chimera-ubuntu22
-            image_name: ubuntu22
-            cmake_extra: "-DIO_URING_ENABLED=OFF"
-          - platform: linux/arm64
-            runner: arc-arm64
-            arch: arm64
-            build_type: Release
-            image_tag_prefix: repository.mdh.quantum.com:5004/cache/chimera-ubuntu22
-            image_name: ubuntu22
-            cmake_extra: "-DIO_URING_ENABLED=OFF"
-          - platform: linux/arm64
-            runner: arc-arm64
-            arch: arm64
             build_type: Debug
             image_tag_prefix: repository.mdh.quantum.com:5004/cache/chimera-ubuntu22
             image_name: ubuntu22
@@ -422,21 +372,7 @@ jobs:
             image_tag_prefix: repository.mdh.quantum.com:5004/cache/chimera-rocky9
             image_name: rocky9
             cmake_extra: "-DIO_URING_ENABLED=OFF"
-          - platform: linux/arm64
-            runner: arc-arm64
-            arch: arm64
-            build_type: Release
-            image_tag_prefix: repository.mdh.quantum.com:5004/cache/chimera-rocky9
-            image_name: rocky9
-            cmake_extra: "-DIO_URING_ENABLED=OFF"
-          - platform: linux/arm64
-            runner: arc-arm64
-            arch: arm64
-            build_type: Debug
-            image_tag_prefix: repository.mdh.quantum.com:5004/cache/chimera-rocky9
-            image_name: rocky9
-            cmake_extra: "-DIO_URING_ENABLED=OFF"
-          # rocky 10
+          # rocky 10 (amd64 only on PR; arm64 runs in nightly)
           - platform: linux/amd64
             runner: arc-amd64
             arch: amd64
@@ -447,20 +383,6 @@ jobs:
           - platform: linux/amd64
             runner: arc-amd64
             arch: amd64
-            build_type: Debug
-            image_tag_prefix: repository.mdh.quantum.com:5004/cache/chimera-rocky10
-            image_name: rocky10
-            cmake_extra: ""
-          - platform: linux/arm64
-            runner: arc-arm64
-            arch: arm64
-            build_type: Release
-            image_tag_prefix: repository.mdh.quantum.com:5004/cache/chimera-rocky10
-            image_name: rocky10
-            cmake_extra: ""
-          - platform: linux/arm64
-            runner: arc-arm64
-            arch: arm64
             build_type: Debug
             image_tag_prefix: repository.mdh.quantum.com:5004/cache/chimera-rocky10
             image_name: rocky10
@@ -468,7 +390,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           submodules: recursive
 
@@ -484,14 +406,14 @@ jobs:
             bash -euxc '\
               dockerd --storage-driver=vfs --registry-mirror=https://repository.mdh.quantum.com:5001 &>/dev/null &
               sleep 2 && \
-              cmake -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} ${{ matrix.cmake_extra }} /workspace && \
+              cmake -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DREQUIRE_NETNS_TESTS=ON -DKVM_IMAGE_CACHE_REGISTRY=${{ env.KVM_IMAGE_CACHE_REGISTRY }} ${{ matrix.cmake_extra }} /workspace && \
               ninja && \
               /workspace/scripts/cap_ctest_output.sh \
               ctest --output-on-failure --test-output-size-failed 65536 --timeout 300 -j 32'
 
   static-analysis:
     name: Static Analysis ${{ matrix.image_name }} ${{ matrix.platform }} ${{ matrix.build_type }}
-    needs: [build-devcontainer, build-ubuntu26, build-ubuntu24, build-ubuntu22, build-rocky9, build-rocky10]
+    needs: [build-devcontainer]
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -499,7 +421,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # devcontainer
+          # devcontainer only on PR; full matrix runs in nightly
           - platform: linux/amd64
             runner: arc-amd64
             arch: amd64
@@ -527,156 +449,11 @@ jobs:
             build_type: Debug
             image_tag_prefix: repository.mdh.quantum.com:5004/cache/chimera-dev
             image_name: devcontainer
-            cmake_extra: ""
-          # ubuntu 26
-          - platform: linux/amd64
-            runner: arc-amd64
-            arch: amd64
-            build_type: Release
-            image_tag_prefix: repository.mdh.quantum.com:5004/cache/chimera-ubuntu26
-            image_name: ubuntu26
-            cmake_extra: ""
-          - platform: linux/amd64
-            runner: arc-amd64
-            arch: amd64
-            build_type: Debug
-            image_tag_prefix: repository.mdh.quantum.com:5004/cache/chimera-ubuntu26
-            image_name: ubuntu26
-            cmake_extra: ""
-          - platform: linux/arm64
-            runner: arc-arm64
-            arch: arm64
-            build_type: Release
-            image_tag_prefix: repository.mdh.quantum.com:5004/cache/chimera-ubuntu26
-            image_name: ubuntu26
-            cmake_extra: ""
-          - platform: linux/arm64
-            runner: arc-arm64
-            arch: arm64
-            build_type: Debug
-            image_tag_prefix: repository.mdh.quantum.com:5004/cache/chimera-ubuntu26
-            image_name: ubuntu26
-            cmake_extra: ""
-          # ubuntu 24
-          - platform: linux/amd64
-            runner: arc-amd64
-            arch: amd64
-            build_type: Release
-            image_tag_prefix: repository.mdh.quantum.com:5004/cache/chimera-ubuntu24
-            image_name: ubuntu24
-            cmake_extra: ""
-          - platform: linux/amd64
-            runner: arc-amd64
-            arch: amd64
-            build_type: Debug
-            image_tag_prefix: repository.mdh.quantum.com:5004/cache/chimera-ubuntu24
-            image_name: ubuntu24
-            cmake_extra: ""
-          - platform: linux/arm64
-            runner: arc-arm64
-            arch: arm64
-            build_type: Release
-            image_tag_prefix: repository.mdh.quantum.com:5004/cache/chimera-ubuntu24
-            image_name: ubuntu24
-            cmake_extra: ""
-          - platform: linux/arm64
-            runner: arc-arm64
-            arch: arm64
-            build_type: Debug
-            image_tag_prefix: repository.mdh.quantum.com:5004/cache/chimera-ubuntu24
-            image_name: ubuntu24
-            cmake_extra: ""
-          # ubuntu 22
-          - platform: linux/amd64
-            runner: arc-amd64
-            arch: amd64
-            build_type: Release
-            image_tag_prefix: repository.mdh.quantum.com:5004/cache/chimera-ubuntu22
-            image_name: ubuntu22
-            cmake_extra: "-DIO_URING_ENABLED=OFF"
-          - platform: linux/amd64
-            runner: arc-amd64
-            arch: amd64
-            build_type: Debug
-            image_tag_prefix: repository.mdh.quantum.com:5004/cache/chimera-ubuntu22
-            image_name: ubuntu22
-            cmake_extra: "-DIO_URING_ENABLED=OFF"
-          - platform: linux/arm64
-            runner: arc-arm64
-            arch: arm64
-            build_type: Release
-            image_tag_prefix: repository.mdh.quantum.com:5004/cache/chimera-ubuntu22
-            image_name: ubuntu22
-            cmake_extra: "-DIO_URING_ENABLED=OFF"
-          - platform: linux/arm64
-            runner: arc-arm64
-            arch: arm64
-            build_type: Debug
-            image_tag_prefix: repository.mdh.quantum.com:5004/cache/chimera-ubuntu22
-            image_name: ubuntu22
-            cmake_extra: "-DIO_URING_ENABLED=OFF"
-          # rocky 9 (io_uring disabled: kernel 5.14 + ASAN causes timeouts, see #197)
-          - platform: linux/amd64
-            runner: arc-amd64
-            arch: amd64
-            build_type: Release
-            image_tag_prefix: repository.mdh.quantum.com:5004/cache/chimera-rocky9
-            image_name: rocky9
-            cmake_extra: "-DIO_URING_ENABLED=OFF"
-          - platform: linux/amd64
-            runner: arc-amd64
-            arch: amd64
-            build_type: Debug
-            image_tag_prefix: repository.mdh.quantum.com:5004/cache/chimera-rocky9
-            image_name: rocky9
-            cmake_extra: "-DIO_URING_ENABLED=OFF"
-          - platform: linux/arm64
-            runner: arc-arm64
-            arch: arm64
-            build_type: Release
-            image_tag_prefix: repository.mdh.quantum.com:5004/cache/chimera-rocky9
-            image_name: rocky9
-            cmake_extra: "-DIO_URING_ENABLED=OFF"
-          - platform: linux/arm64
-            runner: arc-arm64
-            arch: arm64
-            build_type: Debug
-            image_tag_prefix: repository.mdh.quantum.com:5004/cache/chimera-rocky9
-            image_name: rocky9
-            cmake_extra: "-DIO_URING_ENABLED=OFF"
-          # rocky 10
-          - platform: linux/amd64
-            runner: arc-amd64
-            arch: amd64
-            build_type: Release
-            image_tag_prefix: repository.mdh.quantum.com:5004/cache/chimera-rocky10
-            image_name: rocky10
-            cmake_extra: ""
-          - platform: linux/amd64
-            runner: arc-amd64
-            arch: amd64
-            build_type: Debug
-            image_tag_prefix: repository.mdh.quantum.com:5004/cache/chimera-rocky10
-            image_name: rocky10
-            cmake_extra: ""
-          - platform: linux/arm64
-            runner: arc-arm64
-            arch: arm64
-            build_type: Release
-            image_tag_prefix: repository.mdh.quantum.com:5004/cache/chimera-rocky10
-            image_name: rocky10
-            cmake_extra: ""
-          - platform: linux/arm64
-            runner: arc-arm64
-            arch: arm64
-            build_type: Debug
-            image_tag_prefix: repository.mdh.quantum.com:5004/cache/chimera-rocky10
-            image_name: rocky10
             cmake_extra: ""
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           submodules: recursive
 
@@ -700,7 +477,7 @@ jobs:
 
       - name: Upload static analysis report
         if: ${{ failure() && steps.static-analysis.outcome == 'failure' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: scan-report-${{ matrix.image_name }}-${{ matrix.arch }}-${{ matrix.build_type }}
           path: scan-report/
