@@ -356,12 +356,14 @@ tasks:
     architecture: [ amd64, arm64 ]
     image: chimera-dev
     context: .
+    empty_dir:
+      - /build
     commands:
       - cd /context
       - export LC_ALL=C
       - >
         scan-build --status-bugs
-        cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -S . -B /build
+        cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -D IO_URING_NVME_ENABLED=OFF -S . -B /build
       - scan-build --status-bugs ninja -C /build
     dependencies:
       builder:
@@ -374,13 +376,15 @@ tasks:
     architecture: [ amd64, arm64 ]
     image: chimera-dev
     context: .
+    empty_dir:
+      - /build
     commands:
       - cd /context
       - mkdir -p /scan-report /dist
       - export LC_ALL=C
       - >
         scan-build -o /scan-report
-        cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -S . -B /build
+        cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -D IO_URING_NVME_ENABLED=OFF -S . -B /build
       - >
         scan-build --keep-empty -o /scan-report ninja -C /build 2>&1 |
         tee /dist/scan-build-output.txt
@@ -402,12 +406,14 @@ tasks:
     architecture: [ amd64, arm64 ]
     image: chimera-dev
     context: .
+    empty_dir:
+      - /build
     commands:
       - cd /context
       - export LC_ALL=C
       - >
         scan-build --status-bugs
-        cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug -S . -B /build
+        cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug -D IO_URING_NVME_ENABLED=OFF -S . -B /build
       - scan-build --status-bugs ninja -C /build
     dependencies:
       builder:
@@ -420,13 +426,15 @@ tasks:
     architecture: [ amd64, arm64 ]
     image: chimera-dev
     context: .
+    empty_dir:
+      - /build
     commands:
       - cd /context
       - mkdir -p /scan-report /dist
       - export LC_ALL=C
       - >
         scan-build -o /scan-report
-        cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug -S . -B /build
+        cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug -D IO_URING_NVME_ENABLED=OFF -S . -B /build
       - >
         scan-build --keep-empty -o /scan-report ninja -C /build 2>&1 |
         tee /dist/scan-build-output.txt
