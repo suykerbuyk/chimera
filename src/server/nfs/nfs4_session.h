@@ -8,31 +8,98 @@
 #include <stdbool.h>
 #include <uthash.h>
 
-#include "nfs3_xdr.h"
 #include "nfs4_xdr.h"
 #include "nfs_internal.h"
-#include "vfs/vfs.h"
 
 struct evpl_rpc2_conn;
+struct chimera_vfs_thread;
+struct nfs_client;
+struct nfs_state_table;
+struct nfs_request;
 
-#define NFS4_SESSION_MAX_STATE 1024
+/* RPC slot table caps (NFS4.1 SEQUENCE replay cache).  These are *server*
+ * ceilings on what a client can negotiate at CREATE_SESSION; the negotiated
+ * value is min(client_request, server_cap). */
+#define NFS4_MAX_REPLY_CACHE_SLOTS    64u
+#define NFS4_MAX_CACHED_RESPONSE_SIZE (64u * 1024u)
+#define NFS4_MAX_REPLY_CACHE_BYTES    (4u * 1024u * 1024u)
 
-#define NFS4_STATE_TYPE_OPEN   0
-#define NFS4_STATE_TYPE_LOCK   1
+enum nfs4_slot_state {
+    NFS4_SLOT_UNUSED      = 0,
+    NFS4_SLOT_IN_PROGRESS = 1,
+    NFS4_SLOT_CACHED      = 2, /* completed; cachethis=true; bytes held */
+    NFS4_SLOT_COMPLETED   = 3, /* completed; cachethis=false; no bytes */
+};
+
+/* Set on req->replay_action by the SEQUENCE handler so the compound
+ * dispatcher knows whether to execute the compound normally or to
+ * short-circuit and replay a cached reply. */
+#define NFS4_REPLAY_ACTION_NONE       0
+#define NFS4_REPLAY_ACTION_NEW        1
+#define NFS4_REPLAY_ACTION_FROM_CACHE 2
+
+/*
+ * Per-slot state lives in a single atomic word so the SEQUENCE hot path needs
+ * no per-session lock: bits [1:0] hold enum nfs4_slot_state, bits [33:2] hold
+ * the 32-bit seqid (the in-flight seqid while IN_PROGRESS, otherwise the last
+ * completed seqid).  calloc() zero-init == (seqid 0, NFS4_SLOT_UNUSED).
+ *
+ * Distinct slots are independent (RFC 5661: a client has at most one
+ * outstanding request per slot id), so concurrent SEQUENCEs touch different
+ * words and never contend.  The only same-slot race is a retransmit arriving on
+ * another connection/thread; it is arbitrated by the CAS in
+ * nfs4_replay_slot_acquire.  cached_buf/cached_len are written by the (rare)
+ * cachethis capture path on the owning thread and published via the release
+ * store in nfs4_replay_slot_finalize.
+ */
+struct nfs4_replay_slot {
+    _Atomic uint64_t state_word;       /* (seqid << NFS4_SLOT_SEQID_SHIFT) | state */
+    uint32_t         cached_len;       /* bytes in cached_buf (CACHED only) */
+    void            *cached_buf;       /* RPC reply (header+body); malloc'd */
+};
+
+#define NFS4_SLOT_STATE_MASK  0x3u
+#define NFS4_SLOT_SEQID_SHIFT 2
+
+static inline uint64_t
+nfs4_slot_word(
+    uint32_t             seqid,
+    enum nfs4_slot_state state)
+{
+    return ((uint64_t) seqid << NFS4_SLOT_SEQID_SHIFT) | (uint64_t) state;
+} /* nfs4_slot_word */
+
+static inline enum nfs4_slot_state
+nfs4_slot_state(struct nfs4_replay_slot *slot)
+{
+    return (enum nfs4_slot_state) (atomic_load_explicit(&slot->state_word,
+                                                        memory_order_acquire) &
+                                   NFS4_SLOT_STATE_MASK);
+} /* nfs4_slot_state */
+
+static inline uint32_t
+nfs4_slot_seqid(struct nfs4_replay_slot *slot)
+{
+    return (uint32_t) (atomic_load_explicit(&slot->state_word,
+                                            memory_order_acquire) >>
+                       NFS4_SLOT_SEQID_SHIFT);
+} /* nfs4_slot_seqid */
 
 /* Magic stored in nfs4_session.magic so that a connection's private_data
  * (which may hold either an nlm_client* or an nfs4_session*) can be safely
  * type-checked in the disconnect handler.  Must match the layout of
  * nlm_client (uint32_t magic at offset 0). */
-#define NFS4_SESSION_MAGIC     0x4E465353U /* "NFSS" */
+#define NFS4_SESSION_MAGIC 0x4E465353U /* "NFSS" */
 
-struct nfs4_state {
-    struct stateid4                 nfs4_state_id;
-    uint16_t                        nfs4_state_type;
-    uint16_t                        nfs4_state_active;
-    uint32_t                        nfs4_state_refcnt;
-    struct chimera_vfs_open_handle *nfs4_state_handle;
-    uint32_t                        nfs4_state_parent_slot; /* open slot index for LOCK states */
+/* Identity of the RPC principal that established a client record, captured at
+ * EXCHANGE_ID time.  Used for the RFC 8881 §18.35.4 record-matching cases,
+ * which distinguish callers by principal as well as by boot verifier. */
+struct nfs4_client_principal {
+    uint32_t    flavor;
+    uint32_t    uid;
+    uint32_t    gid;
+    const char *machinename;
+    uint32_t    machinename_len;
 };
 
 struct nfs4_client {
@@ -46,26 +113,104 @@ struct nfs4_client {
     uint8_t               nfs4_client_owner[NFS4_OPAQUE_LIMIT];
     char                  nfs4_client_domain[NFS4_OPAQUE_LIMIT];
     char                  nfs4_client_name[NFS4_OPAQUE_LIMIT];
+    /* RFC 8881 §18.35: a record is "unconfirmed" until the client proves
+     * possession of the clientid via a successful CREATE_SESSION; only then
+     * is it "confirmed". */
+    uint8_t               nfs4_client_confirmed;
+    /* Principal that created the record (see nfs4_client_principal). */
+    uint32_t              nfs4_client_princ_flavor;
+    uint32_t              nfs4_client_princ_uid;
+    uint32_t              nfs4_client_princ_gid;
+    uint32_t              nfs4_client_princ_mach_len;
+    char                  nfs4_client_princ_mach[NFS4_OPAQUE_LIMIT];
+    /* Client-reboot (RFC 8881 §18.35.4 case 5): when a confirmed record is
+     * replaced by a new EXCHANGE_ID from the same principal with a new boot
+     * verifier, the new (unconfirmed) record records the old clientid here.
+     * The old record stays live until this new one is confirmed at
+     * CREATE_SESSION, at which point the old record and its sessions are torn
+     * down.  0 means "supersedes nothing". */
+    uint64_t              nfs4_client_supersedes_id;
+    /* CREATE_SESSION sequencing + single-entry reply cache (RFC 8881
+     * §18.36.4).  cs_seqid is the last csa_sequence processed, initialised to
+     * eir_sequenceid - 1 (= 0).  When cs_have_reply is set, the cached fields
+     * below reproduce the reply for a retransmit of cs_seqid. */
+    uint32_t              nfs4_client_cs_seqid;
+    uint8_t               nfs4_client_cs_have_reply;
+    nfsstat4              nfs4_client_cs_reply_status;
+    uint8_t               nfs4_client_cs_reply_sessionid[NFS4_SESSIONID_SIZE];
+    uint32_t              nfs4_client_cs_reply_sequence;
+    uint32_t              nfs4_client_cs_reply_flags;
+    /* Negotiated channel attrs.  Stored with ca_rdma_ird cleared (the pointer
+     * would otherwise dangle once the session is freed); the RDMA ird is not
+     * preserved across a CREATE_SESSION retransmit, which no client relies on. */
+    struct channel_attrs4 nfs4_client_cs_reply_fore;
+    struct channel_attrs4 nfs4_client_cs_reply_back;
+    /* Set once the client has issued RECLAIM_COMPLETE; a second one is
+     * NFS4ERR_COMPLETE_ALREADY (RFC 8881 §18.51.4). */
+    uint8_t               nfs4_client_reclaim_complete;
+    /* NFSv4.0 SETCLIENTID/SETCLIENTID_CONFIRM handshake (RFC 7530 §16.33/16.34).
+     * When a SETCLIENTID leaves a confirm pending on this record, the 8-byte
+     * verifier the client must echo back is stored here and scid_confirm_valid
+     * is set.  For a *confirmed* record, scid_pending_id names a separate
+     * superseding unconfirmed record (a reboot with a new verifier created a
+     * new clientid); 0 = none. */
+    uint8_t               nfs4_client_scid_confirm[NFS4_VERIFIER_SIZE];
+    uint8_t               nfs4_client_scid_confirm_valid;
+    uint64_t              nfs4_client_scid_pending_id;
+    /* Unified state hierarchy.  Created when this nfs4_client is first
+     * registered; freed when the nfs4_client is unregistered or the table
+     * is torn down.  See nfs4_state.h. */
+    struct nfs_client    *unified;
+};
+
+/* Outcome of the EXCHANGE_ID record-matching state machine.  The handler acts
+ * on `status`; on NFS4_OK it returns `clientid`/`confirmed` to the client.
+ * `destroy_unified`, if non-NULL, is a superseded client's state hierarchy the
+ * caller must tear down with nfs_client_destroy AFTER dropping the table lock
+ * (nfs4_client_exchange_id only unhashes/frees the bookkeeping struct). */
+struct nfs4_exchange_id_result {
+    nfsstat4           status;
+    uint64_t           clientid;
+    uint32_t           confirmed;
+    struct nfs_client *destroy_unified;
 };
 
 struct nfs4_session {
     /* magic MUST be the first member -- see NFS4_SESSION_MAGIC comment. */
-    uint32_t              magic;
-    _Atomic uint32_t      refcount;
-    _Atomic bool          destroyed;
-    uint8_t               nfs4_session_id[NFS4_SESSIONID_SIZE];
-    uint64_t              nfs4_session_clientid;
-    pthread_mutex_t       nfs4_session_lock;
-    uint32_t              num_free_slots;
-    struct nfs4_state     nfs4_session_state[NFS4_SESSION_MAX_STATE];
-    uint16_t              free_slot[NFS4_SESSION_MAX_STATE];
-    uint32_t              nfs4_session_implicit;
-    struct nfs4_client   *nfs4_session_client;
-    struct channel_attrs4 nfs4_session_fore_attrs;
-    struct channel_attrs4 nfs4_session_back_attrs;
-    uint32_t              nfs4_session_fore_attrs_rdma_ird;
-    uint32_t              nfs4_session_back_attrs_rdma_ird;
-    struct UT_hash_handle nfs4_session_hh;
+    uint32_t                 magic;
+    /* Cached pointer to the owning client's unified state hierarchy.  Set
+     * at session creation; cleared at table teardown (when the unified
+     * client is destroyed).  Borrowed reference: lifetime matches the
+     * nfs4_client this session belongs to. */
+    struct nfs_client       *client_unified;
+    _Atomic uint32_t         refcount;
+    _Atomic bool             destroyed;
+    uint8_t                  nfs4_session_id[NFS4_SESSIONID_SIZE];
+    uint64_t                 nfs4_session_clientid;
+    uint32_t                 nfs4_session_implicit;
+    struct nfs4_client      *nfs4_session_client;
+    struct channel_attrs4    nfs4_session_fore_attrs;
+    struct channel_attrs4    nfs4_session_back_attrs;
+    uint32_t                 nfs4_session_fore_attrs_rdma_ird;
+    uint32_t                 nfs4_session_back_attrs_rdma_ird;
+    /* NFS4.1 SEQUENCE replay cache (per-session slot table).  Distinct
+     * mechanism from the 4.0 per-owner replay in nfs_open_owner.replay /
+     * nfs_lock_owner.replay -- the two coexist by minor version.  Implicit
+     * sessions (4.0 SETCLIENTID path) leave replay_max_slots = 0. */
+    uint32_t                 replay_max_slots;
+    uint32_t                 replay_maxresp_cached;
+    _Atomic size_t           replay_bytes_in_use;
+    struct nfs4_replay_slot *replay_slots;
+    /* NFSv4.1 backchannel for delegation recalls (RFC 8881 §2.10.3.1).
+     * Set at CREATE_SESSION when CREATE_SESSION4_FLAG_CONN_BACK_CHAN is
+     * requested: cb_program is the client's callback program number and
+     * backchannel_conn is the fore connection the session was created on,
+     * which doubles as the server->client callback transport.  The conn is
+     * a borrowed pointer kept live by the session<->conn binding; it is
+     * cleared by nfs4_session_unbind_conn on disconnect. */
+    uint32_t                 nfs4_session_cb_program;
+    struct evpl_rpc2_conn   *nfs4_session_backchannel_conn;
+    struct UT_hash_handle    nfs4_session_hh;
 };
 
 struct nfs4_client_table {
@@ -73,6 +218,9 @@ struct nfs4_client_table {
     struct nfs4_client  *nfs4_ct_clients_by_id;
     struct nfs4_session *nfs4_ct_sessions;
     uint64_t             nfs4_ct_next_client_id;
+    /* Monotonic source for SETCLIENTID setclientid_confirm verifiers; every
+     * value handed out is unique for the life of the table. */
+    uint64_t             nfs4_ct_next_confirm;
     pthread_mutex_t      nfs4_ct_lock;
 };
 
@@ -84,9 +232,14 @@ void
 nfs4_client_table_free(
     struct nfs4_client_table *table);
 
+/* Walk all clients in the table and tear down each one's `unified` state
+ * hierarchy via nfs_client_destroy.  Must be called while the VFS thread is
+ * still live (handles get released through it).  After this returns, every
+ * client->unified pointer is NULL and the state slot table is empty. */
 void
-nfs4_client_table_release_handles(
+nfs4_client_table_destroy_unified(
     struct nfs4_client_table  *table,
+    struct nfs_state_table    *state_table,
     struct chimera_vfs_thread *vfs_thread);
 
 uint64_t
@@ -99,18 +252,215 @@ nfs4_client_register(
     const char               *nii_domain,
     const char               *nii_name);
 
+/* Outcome of the NFSv4.0 SETCLIENTID record-matching state machine
+ * (RFC 7530 §16.33.5).  On NFS4_OK the handler returns `clientid` and the
+ * `confirm` verifier the client must echo in SETCLIENTID_CONFIRM. */
+struct nfs4_setclientid_result {
+    nfsstat4           status;
+    uint64_t           clientid;
+    uint8_t            confirm[NFS4_VERIFIER_SIZE];
+    /* A replaced unconfirmed record's state hierarchy, to be torn down with
+     * nfs_client_destroy after the table lock is dropped (NULL if none). */
+    struct nfs_client *destroy_unified;
+};
+
+/* RFC 7530 §16.33.5 SETCLIENTID record matching.  Records (or updates) an
+ * unconfirmed record for the client owner and fills *out.  May return
+ * NFS4ERR_CLID_INUSE when a confirmed record owned by a different principal
+ * still holds open/lock state. */
 void
-nfs4_client_unregister(
+nfs4_client_setclientid(
+    struct nfs4_client_table           *table,
+    const void                         *owner,
+    int                                 owner_len,
+    uint64_t                            verifier,
+    const struct nfs4_client_principal *principal,
+    uint8_t                             minorversion,
+    struct nfs4_setclientid_result     *out);
+
+/* RFC 7530 §16.34 SETCLIENTID_CONFIRM.  Confirms the (unconfirmed) record
+ * named by `clientid`/`confirm`.  On a client reboot this promotes the
+ * superseding record and tears the old one down, returning its unified state
+ * hierarchy via *destroy_unified for teardown outside the table lock.
+ * Returns NFS4ERR_STALE_CLIENTID (no such clientid) or NFS4ERR_CLID_INUSE
+ * (confirm verifier mismatch) on failure. */
+nfsstat4
+nfs4_client_setclientid_confirm(
+    struct nfs4_client_table *table,
+    uint64_t                  clientid,
+    const uint8_t            *confirm,
+    struct nfs_client       **destroy_unified);
+
+/* RFC 8881 §18.35.4 EXCHANGE_ID client-record matching state machine.  Runs
+ * entirely under the table lock and fills *out (see nfs4_exchange_id_result).
+ * `update` reflects EXCHGID4_FLAG_UPD_CONFIRMED_REC_A. */
+void
+nfs4_client_exchange_id(
+    struct nfs4_client_table           *table,
+    const void                         *owner,
+    int                                 owner_len,
+    uint64_t                            verifier,
+    const struct nfs4_client_principal *principal,
+    bool                                update,
+    uint8_t                             minorversion,
+    struct nfs4_exchange_id_result     *out);
+
+/* CREATE_SESSION sequencing decision (RFC 8881 §18.36.4). */
+enum nfs4_cs_action {
+    NFS4_CS_NEW,    /* fresh request -- caller creates the session */
+    NFS4_CS_REPLAY, /* retransmit -- caller replays the cached reply */
+    NFS4_CS_ERROR,  /* sequencing error -- caller returns `status` (uncached) */
+};
+
+struct nfs4_cs_classify {
+    enum nfs4_cs_action   action;
+    nfsstat4              status;   /* ERROR status, or REPLAY cached status */
+    uint32_t              confirmed; /* record confirmed? (NEW only) */
+    uint32_t              principal_ok; /* current principal matches record? (NEW only) */
+    /* REPLAY cached reply fields. */
+    uint8_t               sessionid[NFS4_SESSIONID_SIZE];
+    uint32_t              sequence;
+    uint32_t              flags;
+    struct channel_attrs4 fore;
+    struct channel_attrs4 back;
+};
+
+/* Classify an incoming CREATE_SESSION against the client's sequence state and
+ * reply cache.  Looks up `client_id`; on NFS4_CS_NEW it also reports whether
+ * the record is confirmed and whether `principal` matches the record's
+ * principal so the caller can apply the RFC 8881 §18.36.4 principal rule. */
+void
+nfs4_client_create_session_classify(
+    struct nfs4_client_table           *table,
+    uint64_t                            client_id,
+    uint32_t                            csa_sequence,
+    const struct nfs4_client_principal *principal,
+    struct nfs4_cs_classify            *out);
+
+/* Record the reply for the just-processed CREATE_SESSION (advances cs_seqid
+ * and populates the reply cache).  `status` is the op result; the resok fields
+ * are ignored when status != NFS4_OK. */
+void
+nfs4_client_create_session_cache(
+    struct nfs4_client_table    *table,
+    uint64_t                     client_id,
+    uint32_t                     csa_sequence,
+    nfsstat4                     status,
+    const uint8_t               *sessionid,
+    uint32_t                     sequence,
+    uint32_t                     flags,
+    const struct channel_attrs4 *fore,
+    const struct channel_attrs4 *back);
+
+/* Mark a client's RECLAIM_COMPLETE.  Returns true if the client had already
+ * completed reclaim (caller returns NFS4ERR_COMPLETE_ALREADY), false on the
+ * first call (now recorded). */
+bool
+nfs4_client_mark_reclaim_complete(
     struct nfs4_client_table *table,
     uint64_t                  client_id);
+
+bool
+nfs4_client_reclaim_complete(
+    struct nfs4_client_table *table,
+    uint64_t                  client_id);
+
+/* DESTROY_CLIENTID (RFC 8881 §18.50): returns NFS4ERR_STALE_CLIENTID if no
+ * such client, NFS4ERR_CLIENTID_BUSY if it still owns sessions, else removes
+ * the record (tearing down its unified state hierarchy) and returns NFS4_OK. */
+nfsstat4
+nfs4_client_destroy_clientid(
+    struct nfs4_client_table  *table,
+    struct nfs_state_table    *state_table,
+    struct chimera_vfs_thread *vfs_thread,
+    uint64_t                   client_id);
+
+/* Mark a client record confirmed (first successful CREATE_SESSION).  If the
+ * record supersedes an older one (client reboot), the older record and its
+ * sessions are torn down and its state hierarchy is returned via
+ * *destroy_unified for teardown outside the table lock.  Returns false when no
+ * such client exists (caller maps to NFS4ERR_STALE_CLIENTID). */
+bool
+nfs4_client_confirm(
+    struct nfs4_client_table *table,
+    uint64_t                  client_id,
+    struct nfs_client       **destroy_unified);
+
+/* Unregister a client and tear down its unified state hierarchy.
+ *
+ * `state_table` and `vfs_thread` may be NULL only when the caller has
+ * already invoked nfs4_client_table_destroy_unified (e.g. at shutdown);
+ * otherwise both must be valid so that any state slots / dup'd VFS
+ * handles still rooted under client->unified are released. */
+void
+nfs4_client_unregister(
+    struct nfs4_client_table  *table,
+    struct nfs_state_table    *state_table,
+    struct chimera_vfs_thread *vfs_thread,
+    uint64_t                   client_id);
 
 struct nfs4_session *
 nfs4_create_session(
     struct nfs4_client_table    *table,
     uint64_t                     client_id,
     uint32_t                     implicit,
+    uint32_t                     replay_max_slots,
+    uint32_t                     replay_maxresp_cached,
     const struct channel_attrs4 *fore_attrs,
     const struct channel_attrs4 *back_attrs);
+
+/* SEQUENCE replay slot state machine.  See plan in
+ * /root/.claude/plans/lets-plan-out-the-steady-steele.md for the full
+ * state diagram.  Returns NFS4_OK on success (NEW request or REPLAY hit),
+ * otherwise an NFS4ERR_* code (BADSLOT / SEQ_MISORDERED / RETRY_UNCACHED_REP).
+ * On NFS4_OK with *out_is_replay=true the caller must short-circuit the
+ * compound and replay slot->cached_buf.
+ *
+ * On NFS4_OK the slot pointer and slot id are stashed on req for the
+ * compound dispatcher to consume at finalize time.  cachethis is recorded
+ * for the in-flight request and consulted only at finalize. */
+nfsstat4 nfs4_replay_slot_acquire(
+    struct nfs4_session *session,
+    uint32_t             slotid,
+    uint32_t             seqid,
+    bool                 cachethis,
+    struct nfs_request  *req,
+    bool                *out_is_replay);
+
+/* Called by the compound dispatcher just before sending the reply.  In
+ * Phase 1 this advances IN_PROGRESS -> COMPLETED.  Phase 2 will optionally
+ * capture the encoded reply bytes and transition to CACHED. */
+void nfs4_replay_slot_finalize(
+    struct nfs_request *req);
+
+/* Record the delegation callback path on a client's unified state record.
+ * 4.0 supplies a full cb_client4 (program + netid/addr); 4.1 supplies only
+ * the program (netid/addr empty -- the backchannel rides the fore conn).
+ * Resets the CB_NULL probe state so the path is re-validated before the next
+ * delegation grant. */
+void
+nfs4_client_set_cb_path(
+    struct nfs4_client_table *table,
+    uint64_t                  client_id,
+    uint32_t                  cb_program,
+    uint32_t                  cb_ident,
+    uint8_t                   minorversion,
+    const char               *netid,
+    int                       netid_len,
+    const char               *addr,
+    int                       addr_len);
+
+/* Record the callback-channel RPC auth (CREATE_SESSION csa_sec_parms /
+ * BACKCHANNEL_CTL).  flavor is an ONC RPC flavor (AUTH_NONE=0, AUTH_SYS=1);
+ * uid/gid apply to AUTH_SYS.  cb_program, if non-zero, updates the program. */
+void
+nfs4_client_set_cb_sec(
+    struct nfs4_client_table *table,
+    uint64_t                  client_id,
+    uint32_t                  cb_program,
+    uint32_t                  flavor,
+    uint32_t                  uid,
+    uint32_t                  gid);
 
 struct nfs4_session *
 nfs4_session_lookup(
@@ -162,231 +512,3 @@ nfs4_session_is_live(struct nfs4_session *session)
            session->magic == NFS4_SESSION_MAGIC &&
            !atomic_load_explicit(&session->destroyed, memory_order_acquire);
 } // nfs4_session_is_live
-
-static inline struct nfs4_state *
-nfs4_session_alloc_slot(struct nfs4_session *session)
-{
-    uint32_t           slot;
-    struct nfs4_state *state;
-
-    pthread_mutex_lock(&session->nfs4_session_lock);
-
-    chimera_nfs_abort_if(session->num_free_slots == 0, "no free session slots");
-
-    slot  = session->free_slot[--session->num_free_slots];
-    state = &session->nfs4_session_state[slot];
-
-    state->nfs4_state_id.seqid = 1;
-
-    *(uint32_t *) state->nfs4_state_id.other       = slot;
-    *(uint64_t *) (state->nfs4_state_id.other + 4) = session->nfs4_session_clientid;
-
-    state->nfs4_state_type        = NFS4_STATE_TYPE_OPEN;
-    state->nfs4_state_active      = 1;
-    state->nfs4_state_refcnt      = 0;
-    state->nfs4_state_handle      = NULL;
-    state->nfs4_state_parent_slot = NFS4_SESSION_MAX_STATE;
-
-    pthread_mutex_unlock(&session->nfs4_session_lock);
-
-    return state;
-} /* nfs4_session_alloc_slot */
-
-static inline int
-nfs4_session_free_slot(
-    struct nfs4_session             *session,
-    struct nfs4_state               *state,
-    struct chimera_vfs_open_handle **out_handle)
-{
-    uint32_t slot = *(uint32_t *) state->nfs4_state_id.other;
-
-    *out_handle = NULL;
-
-    pthread_mutex_lock(&session->nfs4_session_lock);
-
-    if (!state->nfs4_state_active) {
-        pthread_mutex_unlock(&session->nfs4_session_lock);
-        return -1;
-    }
-
-    state->nfs4_state_active = 0;
-
-    if (state->nfs4_state_refcnt == 0) {
-        if (state->nfs4_state_type != NFS4_STATE_TYPE_LOCK) {
-            *out_handle = state->nfs4_state_handle;
-        }
-        state->nfs4_state_handle                      = NULL;
-        session->free_slot[session->num_free_slots++] = slot;
-        pthread_mutex_unlock(&session->nfs4_session_lock);
-        return 0;
-    }
-
-    /* refcnt > 0: deferred cleanup by last release_state */
-    pthread_mutex_unlock(&session->nfs4_session_lock);
-    return 1;
-} /* nfs4_session_free_slot */
-
-static inline void
-nfs4_session_free_lock_states(
-    struct nfs4_session *session,
-    uint32_t             open_slot)
-{
-    struct chimera_vfs_open_handle *unused;
-    uint32_t                        i;
-
-    for (i = 0; i < NFS4_SESSION_MAX_STATE; i++) {
-        struct nfs4_state *s = &session->nfs4_session_state[i];
-
-        if (s->nfs4_state_type        == NFS4_STATE_TYPE_LOCK &&
-            s->nfs4_state_active      == 1 &&
-            s->nfs4_state_parent_slot == open_slot) {
-            s->nfs4_state_handle = NULL;
-            nfs4_session_free_slot(session, s, &unused);
-        }
-    }
-} /* nfs4_session_free_lock_states */
-
-static inline struct nfs4_state *
-nfs4_session_get_state(
-    struct nfs4_session   *session,
-    const struct stateid4 *stateid)
-{
-    uint32_t slot = *(uint32_t *) stateid->other;
-
-    return &session->nfs4_session_state[slot];
-} /* nfs4_session_get_state */
-
-static inline nfsstat4
-nfs4_session_acquire_state(
-    struct nfs4_session             *session,
-    const struct stateid4           *stateid,
-    struct nfs4_state              **out_state,
-    struct chimera_vfs_open_handle **out_handle)
-{
-    uint32_t           slot     = *(uint32_t *) stateid->other;
-    uint64_t           clientid = *(uint64_t *) (stateid->other + 4);
-    struct nfs4_state *state;
-
-    *out_state  = NULL;
-    *out_handle = NULL;
-
-    if (slot >= NFS4_SESSION_MAX_STATE) {
-        return NFS4ERR_BAD_STATEID;
-    }
-
-    if (clientid != session->nfs4_session_clientid) {
-        return NFS4ERR_BAD_STATEID;
-    }
-
-    state = &session->nfs4_session_state[slot];
-
-    pthread_mutex_lock(&session->nfs4_session_lock);
-
-    if (!state->nfs4_state_active || !state->nfs4_state_handle) {
-        pthread_mutex_unlock(&session->nfs4_session_lock);
-        return NFS4ERR_BAD_STATEID;
-    }
-
-    state->nfs4_state_refcnt++;
-    *out_state  = state;
-    *out_handle = state->nfs4_state_handle;
-
-    pthread_mutex_unlock(&session->nfs4_session_lock);
-    return NFS4_OK;
-} /* nfs4_session_acquire_state */
-
-static inline struct chimera_vfs_open_handle *
-nfs4_session_release_state(
-    struct nfs4_session *session,
-    struct nfs4_state   *state)
-{
-    struct chimera_vfs_open_handle *handle = NULL;
-
-    pthread_mutex_lock(&session->nfs4_session_lock);
-
-    state->nfs4_state_refcnt--;
-
-    if (state->nfs4_state_refcnt == 0 && !state->nfs4_state_active) {
-        /* CLOSE already ran; we are the last user - do deferred cleanup */
-        if (state->nfs4_state_type != NFS4_STATE_TYPE_LOCK) {
-            handle = state->nfs4_state_handle;
-        }
-        state->nfs4_state_handle = NULL;
-        uint32_t slot = *(uint32_t *) state->nfs4_state_id.other;
-        session->free_slot[session->num_free_slots++] = slot;
-    }
-
-    pthread_mutex_unlock(&session->nfs4_session_lock);
-    return handle;
-} /* nfs4_session_release_state */
-
-static inline nfsstat4
-nfs4_session_validate_stateid(
-    struct nfs4_session   *session,
-    const struct stateid4 *stateid)
-{
-    uint32_t           slot     = *(uint32_t *) stateid->other;
-    uint64_t           clientid = *(uint64_t *) (stateid->other + 4);
-    struct nfs4_state *state;
-    nfsstat4           status;
-
-    if (slot >= NFS4_SESSION_MAX_STATE) {
-        return NFS4ERR_BAD_STATEID;
-    }
-
-    if (clientid != session->nfs4_session_clientid) {
-        return NFS4ERR_BAD_STATEID;
-    }
-
-    state = &session->nfs4_session_state[slot];
-
-    pthread_mutex_lock(&session->nfs4_session_lock);
-
-    if (!state->nfs4_state_active) {
-        status = NFS4ERR_BAD_STATEID;
-    } else {
-        status = NFS4_OK;
-    }
-
-    pthread_mutex_unlock(&session->nfs4_session_lock);
-
-    return status;
-} /* nfs4_session_validate_stateid */
-
-/*
- * Resolve the session for the current request.
- *
- * If `session` is non-NULL it is already borrowed via the conn's bind
- * (compound entry transitively holds a ref through evpl_rpc2_conn private_data)
- * and is returned as-is.
- *
- * Otherwise look up the session by the clientid embedded in `stateid`.  If
- * found, bind it to `conn` (taking a ref on the conn's behalf) and drop the
- * lookup's ref; the returned pointer is then borrowed via that conn ref.
- *
- * Returns NULL if no session exists for this client.
- */
-static inline struct nfs4_session *
-nfs4_resolve_session(
-    struct nfs4_session      *session,
-    struct evpl_rpc2_conn    *conn,
-    struct nfs4_client_table *table,
-    const struct stateid4    *stateid)
-{
-    uint64_t             client_id;
-    struct nfs4_session *found;
-
-    if (session) {
-        return session;
-    }
-
-    client_id = *(uint64_t *) (stateid->other + 4);
-    found     = nfs4_session_find_by_clientid(table, client_id);
-
-    if (found) {
-        nfs4_session_bind_conn(conn, found);
-        nfs4_session_put(found);
-    }
-
-    return found;
-} /* nfs4_resolve_session */

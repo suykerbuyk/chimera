@@ -6,6 +6,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <sys/stat.h>
 #include "nfs_common.h"
 #include "nfs_internal.h"
 
@@ -43,6 +44,53 @@ nfs4_root_get_fh(
     memcpy(fh, nfs4_root_fh, nfs4_root_fh_len);
     *fh_len = nfs4_root_fh_len;
 } /* nfs4_root_get_fh */
+
+static inline int
+chimera_nfs4_cred_has_mode_access(
+    const struct chimera_vfs_attrs *attr,
+    const struct chimera_vfs_cred  *cred,
+    int                             need_read,
+    int                             need_write,
+    int                             need_exec)
+{
+    uint32_t mode = attr->va_mode;
+    int      r, w, x;
+
+    if (cred->uid == 0) {
+        r = 1;
+        w = 1;
+        x = !!(mode & (S_IXUSR | S_IXGRP | S_IXOTH));
+    } else if ((uint64_t) cred->uid == attr->va_uid) {
+        r = !!(mode & S_IRUSR);
+        w = !!(mode & S_IWUSR);
+        x = !!(mode & S_IXUSR);
+    } else {
+        int in_group = ((uint64_t) cred->gid == attr->va_gid);
+
+        if (!in_group) {
+            for (uint32_t i = 0; i < cred->ngids; i++) {
+                if ((uint64_t) cred->gids[i] == attr->va_gid) {
+                    in_group = 1;
+                    break;
+                }
+            }
+        }
+
+        if (in_group) {
+            r = !!(mode & S_IRGRP);
+            w = !!(mode & S_IWGRP);
+            x = !!(mode & S_IXGRP);
+        } else {
+            r = !!(mode & S_IROTH);
+            w = !!(mode & S_IWOTH);
+            x = !!(mode & S_IXOTH);
+        }
+    }
+
+    return (!need_read || r) &&
+           (!need_write || w) &&
+           (!need_exec || x);
+} /* chimera_nfs4_cred_has_mode_access */
 
 /**
  * Populate attributes for the NFSv4 pseudo-root directory.
@@ -208,6 +256,13 @@ chimera_nfs4_write(
     struct nfs_resop4                *resop);
 
 void
+chimera_nfs4_copy(
+    struct chimera_server_nfs_thread *thread,
+    struct nfs_request               *req,
+    struct nfs_argop4                *argop,
+    struct nfs_resop4                *resop);
+
+void
 chimera_nfs4_commit(
     struct chimera_server_nfs_thread *thread,
     struct nfs_request               *req,
@@ -257,7 +312,49 @@ chimera_nfs4_close(
     struct nfs_resop4                *resop);
 
 void
+chimera_nfs4_delegreturn(
+    struct chimera_server_nfs_thread *thread,
+    struct nfs_request               *req,
+    struct nfs_argop4                *argop,
+    struct nfs_resop4                *resop);
+
+void
+chimera_nfs4_delegpurge(
+    struct chimera_server_nfs_thread *thread,
+    struct nfs_request               *req,
+    struct nfs_argop4                *argop,
+    struct nfs_resop4                *resop);
+
+void
 chimera_nfs4_setclientid(
+    struct chimera_server_nfs_thread *thread,
+    struct nfs_request               *req,
+    struct nfs_argop4                *argop,
+    struct nfs_resop4                *resop);
+
+void
+chimera_nfs4_renew(
+    struct chimera_server_nfs_thread *thread,
+    struct nfs_request               *req,
+    struct nfs_argop4                *argop,
+    struct nfs_resop4                *resop);
+
+void
+chimera_nfs4_open_confirm(
+    struct chimera_server_nfs_thread *thread,
+    struct nfs_request               *req,
+    struct nfs_argop4                *argop,
+    struct nfs_resop4                *resop);
+
+void
+chimera_nfs4_open_downgrade(
+    struct chimera_server_nfs_thread *thread,
+    struct nfs_request               *req,
+    struct nfs_argop4                *argop,
+    struct nfs_resop4                *resop);
+
+void
+chimera_nfs4_release_lockowner(
     struct chimera_server_nfs_thread *thread,
     struct nfs_request               *req,
     struct nfs_argop4                *argop,
@@ -320,6 +417,27 @@ chimera_nfs4_test_stateid(
     struct nfs_resop4                *resop);
 
 void
+chimera_nfs4_free_stateid(
+    struct chimera_server_nfs_thread *thread,
+    struct nfs_request               *req,
+    struct nfs_argop4                *argop,
+    struct nfs_resop4                *resop);
+
+void
+chimera_nfs4_backchannel_ctl(
+    struct chimera_server_nfs_thread *thread,
+    struct nfs_request               *req,
+    struct nfs_argop4                *argop,
+    struct nfs_resop4                *resop);
+
+void
+chimera_nfs4_secinfo(
+    struct chimera_server_nfs_thread *thread,
+    struct nfs_request               *req,
+    struct nfs_argop4                *argop,
+    struct nfs_resop4                *resop);
+
+void
 chimera_nfs4_secinfo_no_name(
     struct chimera_server_nfs_thread *thread,
     struct nfs_request               *req,
@@ -342,6 +460,77 @@ chimera_nfs4_deallocate(
 
 void
 chimera_nfs4_seek(
+    struct chimera_server_nfs_thread *thread,
+    struct nfs_request               *req,
+    struct nfs_argop4                *argop,
+    struct nfs_resop4                *resop);
+
+/* pNFS (NFSv4.1 file layout) operations — see nfs4_pnfs.c */
+void
+chimera_nfs4_getdeviceinfo(
+    struct chimera_server_nfs_thread *thread,
+    struct nfs_request               *req,
+    struct nfs_argop4                *argop,
+    struct nfs_resop4                *resop);
+
+void
+chimera_nfs4_getdevicelist(
+    struct chimera_server_nfs_thread *thread,
+    struct nfs_request               *req,
+    struct nfs_argop4                *argop,
+    struct nfs_resop4                *resop);
+
+void
+chimera_nfs4_layoutget(
+    struct chimera_server_nfs_thread *thread,
+    struct nfs_request               *req,
+    struct nfs_argop4                *argop,
+    struct nfs_resop4                *resop);
+
+void
+chimera_nfs4_layoutreturn(
+    struct chimera_server_nfs_thread *thread,
+    struct nfs_request               *req,
+    struct nfs_argop4                *argop,
+    struct nfs_resop4                *resop);
+
+void
+chimera_nfs4_layoutcommit(
+    struct chimera_server_nfs_thread *thread,
+    struct nfs_request               *req,
+    struct nfs_argop4                *argop,
+    struct nfs_resop4                *resop);
+
+void
+chimera_nfs4_layoutstats(
+    struct chimera_server_nfs_thread *thread,
+    struct nfs_request               *req,
+    struct nfs_argop4                *argop,
+    struct nfs_resop4                *resop);
+
+void
+chimera_nfs4_getxattr(
+    struct chimera_server_nfs_thread *thread,
+    struct nfs_request               *req,
+    struct nfs_argop4                *argop,
+    struct nfs_resop4                *resop);
+
+void
+chimera_nfs4_setxattr(
+    struct chimera_server_nfs_thread *thread,
+    struct nfs_request               *req,
+    struct nfs_argop4                *argop,
+    struct nfs_resop4                *resop);
+
+void
+chimera_nfs4_listxattrs(
+    struct chimera_server_nfs_thread *thread,
+    struct nfs_request               *req,
+    struct nfs_argop4                *argop,
+    struct nfs_resop4                *resop);
+
+void
+chimera_nfs4_removexattr(
     struct chimera_server_nfs_thread *thread,
     struct nfs_request               *req,
     struct nfs_argop4                *argop,
@@ -373,10 +562,136 @@ chimera_nfs4_compound_process(
     struct nfs_request *req,
     nfsstat4            status);
 
+/* Validate that [p, p+len) is well-formed UTF-8 (RFC 3629): rejects stray
+ * continuation bytes, overlong encodings, UTF-16 surrogates, the U+FFFE/FFFF
+ * non-characters, and anything above U+10FFFF. Returns true if well-formed. */
+/*
+ * NFS4.1 "current stateid" (RFC 8881 §16.2.3.1.2).  The special value
+ * { seqid = 1, other = all zeros } means "use the COMPOUND's current stateid",
+ * which stateid-returning operations (OPEN, LOCK, OPEN_DOWNGRADE, ...) set.
+ */
+static inline bool
+chimera_nfs4_stateid_is_current(const struct stateid4 *sid)
+{
+    static const uint8_t zero[NFS4_OTHER_SIZE] = { 0 };
+
+    return sid->seqid == 1 &&
+           memcmp(sid->other, zero, NFS4_OTHER_SIZE) == 0;
+} /* chimera_nfs4_stateid_is_current */
+
+/* Record the current stateid produced by a stateid-returning op (4.1+). */
+static inline void
+chimera_nfs4_set_current_stateid(
+    struct nfs_request    *req,
+    const struct stateid4 *sid)
+{
+    if (req->minorversion >= 1) {
+        req->current_stateid       = *sid;
+        req->current_stateid_valid = true;
+    }
+} /* chimera_nfs4_set_current_stateid */
+
+/* Clear the COMPOUND's current stateid -- done by ops that change the current
+ * filehandle (RFC 8881 §16.2.3.1.2). */
+static inline void
+chimera_nfs4_clear_current_stateid(struct nfs_request *req)
+{
+    req->current_stateid_valid = false;
+} /* chimera_nfs4_clear_current_stateid */
+
+/* If `sid` is the special current-stateid value, replace it in place with the
+ * COMPOUND's current stateid (4.1+).  No-op otherwise. */
+static inline void
+chimera_nfs4_resolve_current_stateid(
+    struct nfs_request *req,
+    struct stateid4    *sid)
+{
+    if (req->minorversion >= 1 &&
+        req->current_stateid_valid &&
+        chimera_nfs4_stateid_is_current(sid)) {
+        *sid = req->current_stateid;
+    }
+} /* chimera_nfs4_resolve_current_stateid */
+
+static inline bool
+chimera_nfs4_utf8_valid(
+    const char *data,
+    uint32_t    len)
+{
+    const unsigned char *p = (const unsigned char *) data;
+    uint32_t             i;
+
+    for (i = 0; i < len; ) {
+        unsigned char c     = p[i];
+        uint32_t      extra = 0;
+
+        if (c < 0x80) {
+            i++;
+            continue;
+        } else if (c < 0xC2) {
+            /* 0x80-0xBF: stray continuation byte; 0xC0-0xC1: overlong encoding */
+            return false;
+        } else if (c < 0xE0) {
+            extra = 1;
+        } else if (c < 0xF0) {
+            unsigned char c2;
+            /* 3-byte sequence: need at least one more byte to range-check */
+            if (i + 1 >= len || (p[i + 1] & 0xC0) != 0x80) {
+                return false;
+            }
+            c2    = p[i + 1];
+            extra = 2;
+            /* 0xE0 0x80-0x9F: overlong (encodes U+0000-U+07FF in 3 bytes) */
+            if (c == 0xE0 && c2 < 0xA0) {
+                return false;
+            }
+            /* 0xED 0xA0-0xBF: surrogate (U+D800-U+DFFF) */
+            if (c == 0xED && c2 >= 0xA0) {
+                return false;
+            }
+            /* 0xEF 0xBF 0xBE/0xBF: U+FFFE and U+FFFF are non-characters */
+            if (c == 0xEF && c2 == 0xBF && i + 2 < len) {
+                unsigned char c3 = p[i + 2];
+                if (c3 == 0xBE || c3 == 0xBF) {
+                    return false;
+                }
+            }
+        } else if (c <= 0xF4) {
+            unsigned char c2;
+            /* 4-byte sequence: need at least one more byte to range-check */
+            if (i + 1 >= len || (p[i + 1] & 0xC0) != 0x80) {
+                return false;
+            }
+            c2    = p[i + 1];
+            extra = 3;
+            /* 0xF0 0x80-0x8F: overlong (encodes U+0000-U+FFFF in 4 bytes) */
+            if (c == 0xF0 && c2 < 0x90) {
+                return false;
+            }
+            /* 0xF4 0x90-0xBF: above U+10FFFF */
+            if (c == 0xF4 && c2 > 0x8F) {
+                return false;
+            }
+        } else {
+            return false;
+        }
+
+        i++;
+        while (extra--) {
+            if (i >= len || (p[i] & 0xC0) != 0x80) {
+                return false;
+            }
+            i++;
+        }
+    }
+
+    return true;
+} /* chimera_nfs4_utf8_valid */
+
 static inline nfsstat4
 chimera_nfs4_validate_name(const xdr_opaque *name)
 {
-    const char *p;
+    const char *p = (const char *) name->data;
     uint32_t    i;
 
     if (name->len == 0) {
@@ -387,80 +702,20 @@ chimera_nfs4_validate_name(const xdr_opaque *name)
         return NFS4ERR_NAMETOOLONG;
     }
 
-    if ((name->len == 1 && ((const char *) name->data)[0] == '.') ||
-        (name->len == 2 && ((const char *) name->data)[0] == '.' &&
-         ((const char *) name->data)[1] == '.')) {
+    if ((name->len == 1 && p[0] == '.') ||
+        (name->len == 2 && p[0] == '.' && p[1] == '.')) {
         return NFS4ERR_BADNAME;
     }
 
-    p = (const char *) name->data;
-
-    for (i = 0; i < name->len; ) {
-        unsigned char c     = (unsigned char) p[i];
-        uint32_t      extra = 0;
-
-        if (c == '/' || c == '\0') {
+    /* A component name may not contain a path separator or NUL. */
+    for (i = 0; i < name->len; i++) {
+        if (p[i] == '/' || p[i] == '\0') {
             return NFS4ERR_BADCHAR;
         }
+    }
 
-        if (c < 0x80) {
-            i++;
-            continue;
-        } else if (c < 0xC2) {
-            /* 0x80-0xBF: stray continuation byte; 0xC0-0xC1: overlong encoding */
-            return NFS4ERR_INVAL;
-        } else if (c < 0xE0) {
-            extra = 1;
-        } else if (c < 0xF0) {
-            unsigned char c2;
-            /* 3-byte sequence: need at least one more byte to range-check */
-            if (i + 1 >= name->len || ((unsigned char) p[i + 1] & 0xC0) != 0x80) {
-                return NFS4ERR_INVAL;
-            }
-            c2    = (unsigned char) p[i + 1];
-            extra = 2;
-            /* 0xE0 0x80-0x9F: overlong (encodes U+0000-U+07FF in 3 bytes) */
-            if (c == 0xE0 && c2 < 0xA0) {
-                return NFS4ERR_INVAL;
-            }
-            /* 0xED 0xA0-0xBF: surrogate (U+D800-U+DFFF) */
-            if (c == 0xED && c2 >= 0xA0) {
-                return NFS4ERR_INVAL;
-            }
-            /* 0xEF 0xBF 0xBE/0xBF: U+FFFE and U+FFFF are non-characters */
-            if (c == 0xEF && c2 == 0xBF && i + 2 < name->len) {
-                unsigned char c3 = (unsigned char) p[i + 2];
-                if (c3 == 0xBE || c3 == 0xBF) {
-                    return NFS4ERR_INVAL;
-                }
-            }
-        } else if (c <= 0xF4) {
-            unsigned char c2;
-            /* 4-byte sequence: need at least one more byte to range-check */
-            if (i + 1 >= name->len || ((unsigned char) p[i + 1] & 0xC0) != 0x80) {
-                return NFS4ERR_INVAL;
-            }
-            c2    = (unsigned char) p[i + 1];
-            extra = 3;
-            /* 0xF0 0x80-0x8F: overlong (encodes U+0000-U+FFFF in 4 bytes) */
-            if (c == 0xF0 && c2 < 0x90) {
-                return NFS4ERR_INVAL;
-            }
-            /* 0xF4 0x90-0xBF: above U+10FFFF */
-            if (c == 0xF4 && c2 > 0x8F) {
-                return NFS4ERR_INVAL;
-            }
-        } else {
-            return NFS4ERR_INVAL;
-        }
-
-        i++;
-        while (extra--) {
-            if (i >= name->len || ((unsigned char) p[i] & 0xC0) != 0x80) {
-                return NFS4ERR_INVAL;
-            }
-            i++;
-        }
+    if (!chimera_nfs4_utf8_valid(p, name->len)) {
+        return NFS4ERR_INVAL;
     }
 
     return NFS4_OK;
@@ -478,6 +733,23 @@ chimera_nfs4_compound_complete(
 
         /* Set the status for the failed operation */
         req->res_compound.resarray[req->index].opillegal.status = status;
+
+        /* XDR unmarshall of any WRITE4args in the compound clones the data
+         * iovecs (via xdr_iovec_copy_private / evpl_iovec_clone), taking a
+         * +1 refcount that is normally dropped by chimera_nfs4_write_complete.
+         * When a prior op fails and the compound is truncated, those
+         * WRITE ops never dispatch and their clones would leak.  Release
+         * the unmarshalled iovecs of every WRITE past the failed op. */
+        for (uint32_t i = req->index + 1; i < req->args_compound->num_argarray;
+             i++) {
+            struct nfs_argop4 *ap = &req->args_compound->argarray[i];
+            if (ap->argop == OP_WRITE && ap->opwrite.data.niov) {
+                evpl_iovecs_release(thread->evpl,
+                                    ap->opwrite.data.iov,
+                                    ap->opwrite.data.niov);
+                ap->opwrite.data.niov = 0;
+            }
+        }
 
         /* Per RFC 7530 section 15.2, the response must only include
          * operations up to and including the one that failed. Truncate

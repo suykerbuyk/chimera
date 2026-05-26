@@ -22,10 +22,10 @@ EXTRA_ARGS=""
 usage() {
     echo "Usage: $0 -b <backend> [options]"
     echo ""
-    echo "Direct backends:    memfs, demofs_io_uring, demofs_aio, cairn, linux, io_uring"
-    echo "NFS3 backends:      nfs3_memfs, nfs3_demofs_io_uring, nfs3_demofs_aio, nfs3_cairn, nfs3_linux, nfs3_io_uring"
-    echo "NFS3 RDMA backends: nfs3rdma_memfs, nfs3rdma_demofs_io_uring, nfs3rdma_demofs_aio, nfs3rdma_cairn, nfs3rdma_linux, nfs3rdma_io_uring"
-    echo "NFS4 backends:      nfs4_memfs, nfs4_demofs_io_uring, nfs4_demofs_aio, nfs4_cairn, nfs4_linux, nfs4_io_uring"
+    echo "Direct backends:    memfs, diskfs_io_uring, diskfs_aio, cairn, linux, io_uring"
+    echo "NFS3 backends:      nfs3_memfs, nfs3_diskfs_io_uring, nfs3_diskfs_aio, nfs3_cairn, nfs3_linux, nfs3_io_uring"
+    echo "NFS3 RDMA backends: nfs3rdma_memfs, nfs3rdma_diskfs_io_uring, nfs3rdma_diskfs_aio, nfs3rdma_cairn, nfs3rdma_linux, nfs3rdma_io_uring"
+    echo "NFS4 backends:      nfs4_memfs, nfs4_diskfs_io_uring, nfs4_diskfs_aio, nfs4_cairn, nfs4_linux, nfs4_io_uring"
     echo ""
     echo "Options:"
     echo "  -b <backend>   VFS backend to use (required)"
@@ -58,10 +58,10 @@ EXTRA_ARGS="$@"
 # Validate backend and check if NFS
 IS_NFS=0
 case "$BACKEND" in
-    memfs|demofs_io_uring|demofs_aio|cairn|linux|io_uring) ;;
-    nfs3_memfs|nfs3_demofs_io_uring|nfs3_demofs_aio|nfs3_cairn|nfs3_linux|nfs3_io_uring) IS_NFS=1 ;;
-    nfs3rdma_memfs|nfs3rdma_demofs_io_uring|nfs3rdma_demofs_aio|nfs3rdma_cairn|nfs3rdma_linux|nfs3rdma_io_uring) IS_NFS=1 ;;
-    nfs4_memfs|nfs4_demofs_io_uring|nfs4_demofs_aio|nfs4_cairn|nfs4_linux|nfs4_io_uring) IS_NFS=1 ;;
+    memfs|diskfs_io_uring|diskfs_aio|cairn|linux|io_uring) ;;
+    nfs3_memfs|nfs3_diskfs_io_uring|nfs3_diskfs_aio|nfs3_cairn|nfs3_linux|nfs3_io_uring) IS_NFS=1 ;;
+    nfs3rdma_memfs|nfs3rdma_diskfs_io_uring|nfs3rdma_diskfs_aio|nfs3rdma_cairn|nfs3rdma_linux|nfs3rdma_io_uring) IS_NFS=1 ;;
+    nfs4_memfs|nfs4_diskfs_io_uring|nfs4_diskfs_aio|nfs4_cairn|nfs4_linux|nfs4_io_uring) IS_NFS=1 ;;
     *) echo "Error: Unknown backend '$BACKEND'"; usage ;;
 esac
 
@@ -93,9 +93,9 @@ generate_config() {
             # memfs uses "/" as mount path, no special config needed
             mount_path="/"
             ;;
-        demofs_io_uring|demofs_aio)
-            # Create demofs devices and build inline config
-            if [ "$BACKEND" = "demofs_aio" ]; then
+        diskfs_io_uring|diskfs_aio)
+            # Create diskfs devices and build inline config
+            if [ "$BACKEND" = "diskfs_aio" ]; then
                 DEVICE_TYPE="libaio"
             else
                 DEVICE_TYPE="io_uring"
@@ -103,7 +103,7 @@ generate_config() {
             DEVICES_JSON=""
             for i in $(seq 0 9); do
                 DEVICE_PATH="${SESSION_DIR}/device-${i}.img"
-                truncate -s 256G "$DEVICE_PATH"
+                truncate -s 1G "$DEVICE_PATH"
                 if [ $i -gt 0 ]; then
                     DEVICES_JSON="${DEVICES_JSON},"
                 fi
@@ -111,12 +111,12 @@ generate_config() {
             done
             mount_path="/"
             modules_section="\"modules\": {
-        \"demofs\": {
-            \"path\": \"/build/test/demofs\",
-            \"config\": {\"devices\":[$DEVICES_JSON]}
+        \"diskfs\": {
+            \"path\": \"/build/test/diskfs\",
+            \"config\": {\"initialize\":true,\"devices\":[$DEVICES_JSON],\"unsafe_async\":true}
         }
     },"
-            BACKEND="demofs"
+            BACKEND="diskfs"
             ;;
         cairn)
             mount_path="/"

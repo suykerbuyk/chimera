@@ -72,7 +72,8 @@ chimera_smb_server_init(
     shared->config.port      = 445;
     shared->config.rdma_port = 445;
 
-    shared->config.capabilities = SMB2_GLOBAL_CAP_LARGE_MTU | SMB2_GLOBAL_CAP_MULTI_CHANNEL;
+    shared->config.capabilities = SMB2_GLOBAL_CAP_LARGE_MTU | SMB2_GLOBAL_CAP_MULTI_CHANNEL |
+        SMB2_GLOBAL_CAP_LEASING;
 
     shared->config.num_dialects = chimera_server_config_get_smb_num_dialects(config);
 
@@ -143,7 +144,12 @@ chimera_smb_server_init(
                          shared->config.auth.kerberos_keytab[0] ? shared->config.auth.kerberos_keytab : "(default)");
     }
 
-    shared->config.soft_fail_bad_req = chimera_server_config_get_soft_fail_bad_req(config);
+    shared->config.soft_fail_bad_req  = chimera_server_config_get_soft_fail_bad_req(config);
+    shared->config.persistent_handles = chimera_server_config_get_smb_persistent_handles(config);
+
+    if (shared->config.persistent_handles) {
+        chimera_smb_info("SMB3 durable/persistent handles enabled (in-memory state)");
+    }
 
     shared->vfs     = vfs;
     shared->metrics = metrics;
@@ -174,6 +180,13 @@ chimera_smb_server_init(
     pthread_mutex_init(&shared->shares_lock, NULL);
     pthread_mutex_init(&shared->trees_lock, NULL);
 
+    /* Seed the persistent-id allocator with a random, nonzero base so ids do
+     * not restart from a fixed value across daemon restarts (a courtesy to the
+     * future on-disk persistence layer; 0 is reserved for "no file id"). */
+    atomic_init(&shared->next_persistent_id, (chimera_rand64() | 1));
+
+    chimera_smb_durable_table_init(&shared->durable);
+
     return shared;
 } /* smb_server_init */
 
@@ -195,6 +208,8 @@ chimera_smb_server_destroy(void *data)
 
 
     chimera_smb_abort_if(shared->sessions, "active sessions exist at server shutdown")
+
+    chimera_smb_durable_table_destroy(&shared->durable);
 
     while (shared->free_sessions) {
         session = shared->free_sessions;
@@ -256,8 +271,9 @@ chimera_smb_compound_reply(struct chimera_smb_compound *compound)
     struct smb2_header               *reply_hdr;
     struct smb_direct_hdr            *direct_hdr = NULL;
     struct chimera_smb_request       *request;
-    uint32_t                         *prev_command = NULL;
-    uint16_t                          prev_hdr     = 0;
+    uint32_t                         *prev_command     = NULL;
+    uint16_t                          prev_hdr         = 0;
+    uint32_t                          preauth_fold_len = 0;
     struct evpl_iovec                 chunk_iov[3];
     int                               i, rc, chunk_niov;
     int                               reply_hdr_len, reply_payload_length, left, chunk;
@@ -292,6 +308,18 @@ chimera_smb_compound_reply(struct chimera_smb_compound *compound)
 
         if ((conn->flags & CHIMERA_SMB_CONN_FLAG_SIGNING_REQUIRED) &&
             request->session_handle) {
+            request->flags |= CHIMERA_SMB_REQUEST_FLAG_SIGN;
+        }
+
+        /* The final SESSION_SETUP response that establishes an authenticated
+         * session MUST be signed once a signing key exists, even when signing
+         * is only enabled (not required). SMB 3.x clients verify this response
+         * to confirm the server holds the session key; for SMB 3.1.1 it also
+         * binds the preauth-integrity hash. */
+        if (request->smb2_hdr.command == SMB2_SESSION_SETUP &&
+            request->status == SMB2_STATUS_SUCCESS &&
+            request->session_handle &&
+            (request->session_handle->session->flags & CHIMERA_SMB_SESSION_AUTHORIZED)) {
             request->flags |= CHIMERA_SMB_REQUEST_FLAG_SIGN;
         }
 
@@ -389,13 +417,31 @@ chimera_smb_compound_reply(struct chimera_smb_compound *compound)
                 case SMB2_CHANGE_NOTIFY:
                     chimera_smb_change_notify_reply(&reply_cursor, request);
                     break;
+                case SMB2_LOCK:
+                    chimera_smb_lock_reply(&reply_cursor, request);
+                    break;
+                case SMB2_OPLOCK_BREAK:
+                    chimera_smb_oplock_break_reply(&reply_cursor, request);
+                    break;
                     /* SMB2_CANCEL never reaches this switch: chimera_smb_cancel
                      * always completes with STATUS_PENDING so the slot is
                      * skipped above. */
             } /* switch */
         }
 
-        evpl_iovec_cursor_zero(&reply_cursor, (8 - (evpl_iovec_cursor_consumed(&reply_cursor) & 7)) & 7);
+        /* Length of this response with no trailing alignment padding, captured
+         * before padding for the SMB 3.1.1 preauth-integrity fold below. */
+        preauth_fold_len = evpl_iovec_cursor_consumed(&reply_cursor);
+
+        /* Pad each response to an 8-byte boundary so the next compounded
+         * response's header is aligned. NEGOTIATE and SESSION_SETUP are never
+         * compounded and feed the SMB 3.1.1 preauth-integrity hash, which the
+         * client computes over the message *as received* (no trailing pad):
+         * emit them in canonical form so our hash matches the client's. */
+        if (request->smb2_hdr.command != SMB2_NEGOTIATE &&
+            request->smb2_hdr.command != SMB2_SESSION_SETUP) {
+            evpl_iovec_cursor_zero(&reply_cursor, (8 - (evpl_iovec_cursor_consumed(&reply_cursor) & 7)) & 7);
+        }
 
     }
 
@@ -425,7 +471,25 @@ chimera_smb_compound_reply(struct chimera_smb_compound *compound)
         return;
     }
 
+    /* SMB 3.1.1 preauth integrity: fold the NEGOTIATE / SESSION_SETUP response
+    * into the running hash. The hash covers the canonical (unpadded) message,
+    * so use preauth_fold_len rather than the padded payload length — Windows
+    * and WPTS hash the message without trailing alignment padding. These
+    * responses are not compounded and carry no injected payload, so the whole
+    * SMB2 message is contiguous in reply_iov[0] after the transport header. */
+    if (compound->num_requests > 0 &&
+        (compound->requests[0]->smb2_hdr.command == SMB2_NEGOTIATE ||
+         compound->requests[0]->smb2_hdr.command == SMB2_SESSION_SETUP)) {
+        chimera_smb_preauth_extend(conn->preauth_hash,
+                                   (uint8_t *) evpl_iovec_data(&reply_iov[0]) + reply_hdr_len,
+                                   preauth_fold_len);
+    }
+
     if (conn->protocol == EVPL_DATAGRAM_RDMACM_RC) {
+
+        /* direct_hdr was set above under this same protocol check; assert the
+         * invariant so it is not a bare conditional dereference. */
+        chimera_smb_abort_if(direct_hdr == NULL, "RDMA reply without SMB-Direct header");
 
         left = reply_payload_length;
 
@@ -638,6 +702,12 @@ chimera_smb_compound_advance(struct chimera_smb_compound *compound)
         case SMB2_CANCEL:
             chimera_smb_cancel(request);
             break;
+        case SMB2_LOCK:
+            chimera_smb_lock(request);
+            break;
+        case SMB2_OPLOCK_BREAK:
+            chimera_smb_oplock_break(request);
+            break;
         default:
             chimera_smb_complete_request(request, SMB2_STATUS_NOT_IMPLEMENTED);
             break;
@@ -708,6 +778,9 @@ chimera_smb_server_handle_smb2(
     struct chimera_smb_session_handle *session_handle;
     struct chimera_smb_session        *session;
     struct evpl_iovec_cursor           signature_cursor;
+    /* Snapshot of the cursor at the SMB2 message start, for the 3.1.1
+     * preauth-integrity hash (covers the whole received message). */
+    struct evpl_iovec_cursor           preauth_cursor = *request_cursor;
     int                                more_requests, rc, left = length, payload_length;
 
     compound = chimera_smb_compound_alloc(thread);
@@ -916,6 +989,12 @@ chimera_smb_server_handle_smb2(
             case SMB2_CANCEL:
                 rc = chimera_smb_parse_cancel(request_cursor, request);
                 break;
+            case SMB2_LOCK:
+                rc = chimera_smb_parse_lock(request_cursor, request);
+                break;
+            case SMB2_OPLOCK_BREAK:
+                rc = chimera_smb_parse_oplock_break(request_cursor, request);
+                break;
             default:
                 chimera_smb_error("Received SMB2 message with unimplemented command %u",
                                   request->smb2_hdr.command);
@@ -956,6 +1035,21 @@ chimera_smb_server_handle_smb2(
     }
 
     smb_dump_compound_request(compound);
+
+    /* SMB 3.1.1 preauth integrity: fold the raw NEGOTIATE / SESSION_SETUP
+     * request into the running hash before dispatch, so the SESSION_SETUP
+     * handler derives the signing key over a hash that includes this request.
+     * Maintained unconditionally for these commands; only consumed at 3.1.1. */
+    if (compound->num_requests > 0 &&
+        (compound->requests[0]->smb2_hdr.command == SMB2_NEGOTIATE ||
+         compound->requests[0]->smb2_hdr.command == SMB2_SESSION_SETUP)) {
+        uint8_t *msg = malloc(length);
+        if (msg) {
+            evpl_iovec_cursor_copy(&preauth_cursor, msg, length);
+            chimera_smb_preauth_extend(conn->preauth_hash, msg, length);
+            free(msg);
+        }
+    }
 
     chimera_smb_compound_advance(compound);
 
@@ -1303,6 +1397,8 @@ chimera_smb_server_accept(
     conn->ntlm_output_len   = 0;
     smb_ntlm_ctx_init(&conn->ntlm_ctx);
     memset(&conn->gssapi_ctx, 0, sizeof(conn->gssapi_ctx));
+    /* SMB 3.1.1 preauth-integrity hash starts at zero for each connection. */
+    memset(conn->preauth_hash, 0, sizeof(conn->preauth_hash));
     conn->rdma_niov   = 0;
     conn->rdma_length = 0;
 
@@ -1315,6 +1411,20 @@ chimera_smb_server_accept(
 
 } /* smb_server_accept */
 
+
+/* Interval between durable-handle reconnect-grace sweeps. */
+#define CHIMERA_SMB_DURABLE_SWEEP_INTERVAL_US (1 * 1000 * 1000)
+
+static void
+chimera_smb_durable_sweeper_fire(
+    struct evpl       *evpl,
+    struct evpl_timer *timer)
+{
+    struct chimera_server_smb_thread *thread =
+        container_of(timer, struct chimera_server_smb_thread, durable_sweeper);
+
+    chimera_smb_durable_sweep(thread);
+} /* chimera_smb_durable_sweeper_fire */
 
 static void *
 chimera_smb_server_thread_init(
@@ -1336,6 +1446,13 @@ chimera_smb_server_thread_init(
 
     chimera_smb_iconv_init(&thread->iconv_ctx);
     chimera_smb_notify_thread_init(thread);
+    chimera_smb_lease_break_thread_init(thread);
+
+    if (shared->config.persistent_handles) {
+        evpl_add_timer(evpl, &thread->durable_sweeper,
+                       chimera_smb_durable_sweeper_fire,
+                       CHIMERA_SMB_DURABLE_SWEEP_INTERVAL_US);
+    }
 
     thread->binding = evpl_listener_attach(
         evpl,
@@ -1386,8 +1503,13 @@ chimera_smb_server_thread_destroy(void *data)
         free(session_handle);
     }
 
+    if (thread->shared->config.persistent_handles) {
+        evpl_remove_timer(thread->evpl, &thread->durable_sweeper);
+    }
+
     evpl_listener_detach(thread->evpl, thread->binding);
     chimera_smb_notify_thread_destroy(thread);
+    chimera_smb_lease_break_thread_destroy(thread);
 
     chimera_smb_iconv_destroy(&thread->iconv_ctx);
     chimera_smb_signing_ctx_destroy(thread->signing_ctx);
@@ -1400,7 +1522,8 @@ SYMBOL_EXPORT void
 chimera_smb_add_share(
     void       *smb_shared,
     const char *name,
-    const char *path)
+    const char *path,
+    int         continuous_availability)
 {
     struct chimera_server_smb_shared *shared = smb_shared;
     struct chimera_smb_share         *share  = calloc(1, sizeof(*share));
@@ -1408,6 +1531,11 @@ chimera_smb_add_share(
     snprintf(share->name, sizeof(share->name), "%s", name);
     snprintf(share->path, sizeof(share->path), "%s", path);
     chimera_smb_sharemode_init(&share->sharemode);
+
+    /* A share is continuously available (and thus eligible to grant persistent
+     * handles) only when the feature is enabled AND the share opts in. */
+    share->continuous_availability = shared->config.persistent_handles &&
+        continuous_availability;
 
     pthread_mutex_lock(&shared->shares_lock);
     LL_PREPEND(shared->shares, share);

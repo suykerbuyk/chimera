@@ -8,6 +8,16 @@
 
 struct evpl_iovec;
 
+/* Synchronous, no-I/O check that a file handle is structurally valid and
+ * resolves to a currently-mounted VFS module. Returns 1 if the handle could
+ * name an object on this server, 0 if it is malformed or names an unknown
+ * mount (the caller should map 0 to NFS4ERR_BADHANDLE / NFS3ERR_BADHANDLE).
+ * It does NOT verify that the target object still exists. */
+int
+chimera_vfs_fh_is_plausible(
+    struct chimera_vfs_thread *thread,
+    const void                *fh,
+    int                        fhlen);
 
 typedef void (*chimera_vfs_mount_callback_t)(
     struct chimera_vfs_thread *thread,
@@ -254,6 +264,20 @@ chimera_vfs_open_fh(
     chimera_vfs_open_fh_callback_t callback,
     void                          *private_data);
 
+/* Variant that persists an opaque handle-state record atomically with the
+ * open (backends advertising CHIMERA_VFS_CAP_ATOMIC_HANDLE_STATE); handle_state
+ * may be NULL, in which case it behaves exactly like chimera_vfs_open_fh. */
+void
+chimera_vfs_open_fh_hs(
+    struct chimera_vfs_thread       *thread,
+    const struct chimera_vfs_cred   *cred,
+    const void                      *fh,
+    int                              fhlen,
+    unsigned int                     flags,
+    struct chimera_vfs_handle_state *handle_state,
+    chimera_vfs_open_fh_callback_t   callback,
+    void                            *private_data);
+
 typedef void (*chimera_vfs_open_at_callback_t)(
     enum chimera_vfs_error          error_code,
     struct chimera_vfs_open_handle *oh,
@@ -277,6 +301,25 @@ chimera_vfs_open_at(
     uint64_t                        post_attr_mask,
     chimera_vfs_open_at_callback_t  callback,
     void                           *private_data);
+
+/* Variant that persists an opaque handle-state record atomically with the
+ * open (backends advertising CHIMERA_VFS_CAP_ATOMIC_HANDLE_STATE); handle_state
+ * may be NULL, in which case it behaves exactly like chimera_vfs_open_at. */
+void
+chimera_vfs_open_at_hs(
+    struct chimera_vfs_thread       *thread,
+    const struct chimera_vfs_cred   *cred,
+    struct chimera_vfs_open_handle  *handle,
+    const char                      *name,
+    int                              namelen,
+    unsigned int                     flags,
+    struct chimera_vfs_attrs        *attr,
+    uint64_t                         attr_mask,
+    uint64_t                         pre_attr_mask,
+    uint64_t                         post_attr_mask,
+    struct chimera_vfs_handle_state *handle_state,
+    chimera_vfs_open_at_callback_t   callback,
+    void                            *private_data);
 
 
 typedef void (*chimera_vfs_create_unlinked_callback_t)(
@@ -396,6 +439,24 @@ chimera_vfs_read(
     chimera_vfs_read_callback_t     callback,
     void                           *private_data);
 
+/* As chimera_vfs_read(), but attributes the I/O to `io_owner` (a lease-
+ * holding client's owner) so its own delegation/oplock is not recalled by
+ * its own read.  Pass NULL to have chimera hold an implicit lease on behalf
+ * of a leaseless actor (equivalent to chimera_vfs_read()). */
+void
+chimera_vfs_read_owned(
+    struct chimera_vfs_thread            *thread,
+    const struct chimera_vfs_cred        *cred,
+    struct chimera_vfs_open_handle       *handle,
+    uint64_t                              offset,
+    uint32_t                              count,
+    struct evpl_iovec                    *iov,
+    int                                   niov,
+    uint64_t                              attrmask,
+    const struct chimera_vfs_lease_owner *io_owner,
+    chimera_vfs_read_callback_t           callback,
+    void                                 *private_data);
+
 typedef void (*chimera_vfs_write_callback_t)(
     enum chimera_vfs_error    error_code,
     uint32_t                  length,
@@ -419,6 +480,27 @@ chimera_vfs_write(
     chimera_vfs_write_callback_t    callback,
     void                           *private_data);
 
+/* As chimera_vfs_write(), but attributes the I/O to `io_owner` (a lease-
+ * holding client's owner) so its own write delegation/oplock is not recalled
+ * by its own write, while other holders' read caches are still invalidated.
+ * Pass NULL to have chimera hold an implicit lease on behalf of a leaseless
+ * actor (equivalent to chimera_vfs_write()). */
+void
+chimera_vfs_write_owned(
+    struct chimera_vfs_thread            *thread,
+    const struct chimera_vfs_cred        *cred,
+    struct chimera_vfs_open_handle       *handle,
+    uint64_t                              offset,
+    uint32_t                              count,
+    uint32_t                              sync,
+    uint64_t                              pre_attr_mask,
+    uint64_t                              post_attr_mask,
+    struct evpl_iovec                    *iov,
+    int                                   niov,
+    const struct chimera_vfs_lease_owner *io_owner,
+    chimera_vfs_write_callback_t          callback,
+    void                                 *private_data);
+
 typedef void (*chimera_vfs_commit_callback_t)(
     enum chimera_vfs_error    error_code,
     struct chimera_vfs_attrs *pre_attr,
@@ -436,6 +518,36 @@ chimera_vfs_commit(
     uint64_t                        post_attr_mask,
     chimera_vfs_commit_callback_t   callback,
     void                           *private_data);
+
+/* pNFS: ask a layout-sourcing backend (CHIMERA_VFS_CAP_LAYOUT_SOURCE) where a
+ * file's data lives.  segments/devices are valid only while the callback runs. */
+typedef void (*chimera_vfs_get_layout_callback_t)(
+    enum chimera_vfs_error                   error_code,
+    uint32_t                                 layout_class,
+    uint32_t                                 num_segments,
+    const struct chimera_vfs_layout_segment *segments,
+    uint32_t                                 num_devices,
+    const struct chimera_vfs_layout_device  *devices,
+    void                                    *private_data);
+
+uint64_t
+chimera_vfs_module_capabilities(
+    struct chimera_vfs_thread *thread,
+    const void                *fh,
+    int                        fhlen);
+
+void
+chimera_vfs_get_layout(
+    struct chimera_vfs_thread        *thread,
+    const struct chimera_vfs_cred    *cred,
+    struct chimera_vfs_open_handle   *handle,
+    uint64_t                          offset,
+    uint64_t                          length,
+    uint32_t                          iomode,
+    uint32_t                          layout_class,
+    uint32_t                          max_segments,
+    chimera_vfs_get_layout_callback_t callback,
+    void                             *private_data);
 
 typedef void (*chimera_vfs_symlink_at_callback_t)(
     enum chimera_vfs_error    error_code,
@@ -556,9 +668,36 @@ chimera_vfs_delete_key(
     chimera_vfs_delete_key_callback_t callback,
     void                             *private_data);
 
+/* fh-routed variants: operate on the backend serving `fh` rather than the
+ * global kv_module (used for per-share handle-state records). */
+void
+chimera_vfs_delete_key_at(
+    struct chimera_vfs_thread        *thread,
+    const struct chimera_vfs_cred    *cred,
+    const void                       *fh,
+    int                               fhlen,
+    const void                       *key,
+    uint32_t                          key_len,
+    chimera_vfs_delete_key_callback_t callback,
+    void                             *private_data);
+
 void
 chimera_vfs_search_keys(
     struct chimera_vfs_thread         *thread,
+    const void                        *start_key,
+    uint32_t                           start_key_len,
+    const void                        *end_key,
+    uint32_t                           end_key_len,
+    chimera_vfs_search_keys_callback_t callback,
+    chimera_vfs_search_keys_complete_t complete,
+    void                              *private_data);
+
+void
+chimera_vfs_search_keys_at(
+    struct chimera_vfs_thread         *thread,
+    const struct chimera_vfs_cred     *cred,
+    const void                        *fh,
+    int                                fhlen,
     const void                        *start_key,
     uint32_t                           start_key_len,
     const void                        *end_key,
@@ -702,3 +841,79 @@ chimera_vfs_getparent(
     int                              fhlen,
     chimera_vfs_getparent_callback_t callback,
     void                            *private_data);
+
+/*
+ * RFC 8276 extended attribute operations.
+ */
+
+typedef void (*chimera_vfs_get_xattr_callback_t)(
+    enum chimera_vfs_error error_code,
+    uint32_t               value_len,
+    void                  *private_data);
+
+void
+chimera_vfs_get_xattr(
+    struct chimera_vfs_thread       *thread,
+    const struct chimera_vfs_cred   *cred,
+    struct chimera_vfs_open_handle  *handle,
+    const char                      *name,
+    uint32_t                         namelen,
+    void                            *value,
+    uint32_t                         value_maxlen,
+    chimera_vfs_get_xattr_callback_t callback,
+    void                            *private_data);
+
+typedef void (*chimera_vfs_set_xattr_callback_t)(
+    enum chimera_vfs_error          error_code,
+    const struct chimera_vfs_attrs *pre_attr,
+    const struct chimera_vfs_attrs *post_attr,
+    void                           *private_data);
+
+void
+chimera_vfs_set_xattr(
+    struct chimera_vfs_thread       *thread,
+    const struct chimera_vfs_cred   *cred,
+    struct chimera_vfs_open_handle  *handle,
+    uint32_t                         option,
+    const char                      *name,
+    uint32_t                         namelen,
+    const void                      *value,
+    uint32_t                         value_len,
+    chimera_vfs_set_xattr_callback_t callback,
+    void                            *private_data);
+
+typedef void (*chimera_vfs_list_xattrs_callback_t)(
+    enum chimera_vfs_error error_code,
+    const char            *names,    /* back-to-back NUL-terminated names */
+    uint32_t               names_len,
+    uint32_t               count,
+    uint32_t               eof,
+    uint64_t               cookie,
+    void                  *private_data);
+
+void
+chimera_vfs_list_xattrs(
+    struct chimera_vfs_thread         *thread,
+    const struct chimera_vfs_cred     *cred,
+    struct chimera_vfs_open_handle    *handle,
+    uint64_t                           cookie,
+    void                              *buffer,
+    uint32_t                           max_bytes,
+    chimera_vfs_list_xattrs_callback_t callback,
+    void                              *private_data);
+
+typedef void (*chimera_vfs_remove_xattr_callback_t)(
+    enum chimera_vfs_error          error_code,
+    const struct chimera_vfs_attrs *pre_attr,
+    const struct chimera_vfs_attrs *post_attr,
+    void                           *private_data);
+
+void
+chimera_vfs_remove_xattr(
+    struct chimera_vfs_thread          *thread,
+    const struct chimera_vfs_cred      *cred,
+    struct chimera_vfs_open_handle     *handle,
+    const char                         *name,
+    uint32_t                            namelen,
+    chimera_vfs_remove_xattr_callback_t callback,
+    void                               *private_data);

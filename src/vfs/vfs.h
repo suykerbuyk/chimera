@@ -10,6 +10,8 @@
 #include "vfs_dump.h"
 #include "vfs_error.h"
 #include "vfs_cred.h"
+#include "vfs_pnfs.h"
+#include "vfs_lease_types.h"
 #include "evpl/evpl.h"
 
 #define CHIMERA_VFS_PATH_MAX 4096
@@ -75,7 +77,12 @@ struct chimera_vfs_mount_options {
 #define CHIMERA_VFS_OP_COPY_RANGE       29
 #define CHIMERA_VFS_OP_CLONE_RANGE      30
 #define CHIMERA_VFS_OP_MOVE_RANGE       31
-#define CHIMERA_VFS_OP_NUM              32
+#define CHIMERA_VFS_OP_GET_XATTR        32
+#define CHIMERA_VFS_OP_SET_XATTR        33
+#define CHIMERA_VFS_OP_LIST_XATTRS      34
+#define CHIMERA_VFS_OP_REMOVE_XATTR     35
+#define CHIMERA_VFS_OP_GET_LAYOUT       36
+#define CHIMERA_VFS_OP_NUM              37
 
 #define CHIMERA_VFS_OPEN_CREATE         (1U << 0)
 #define CHIMERA_VFS_OPEN_PATH           (1U << 1)
@@ -84,6 +91,10 @@ struct chimera_vfs_mount_options {
 #define CHIMERA_VFS_OPEN_READ_ONLY      (1U << 4)
 #define CHIMERA_VFS_OPEN_EXCLUSIVE      (1U << 5)
 #define CHIMERA_VFS_OPEN_NOFOLLOW       (1U << 6)
+/* Replace an existing file's contents on open: truncate to zero and apply
+ * set_attr (used for the SMB OVERWRITE / OVERWRITE_IF / SUPERSEDE
+ * dispositions).  Backends that do not honor it simply open the file. */
+#define CHIMERA_VFS_OPEN_TRUNCATE       (1U << 7)
 
 /* Allocate flags */
 #define CHIMERA_VFS_ALLOCATE_DEALLOCATE 0x01
@@ -129,6 +140,10 @@ struct chimera_vfs_open_handle {
     uint8_t                         cache_id;
     uint8_t                         flags;
     uint8_t                         access_mode;
+    /* Whether the most recent open via this handle created the file (vs opened
+     * an existing one).  Refreshed on every open completion and read by the SMB
+     * create path immediately afterwards to report OPENED vs CREATED. */
+    uint8_t                         r_created;
     uint32_t                        opencnt;
     struct chimera_vfs_request     *blocked_requests;
     uint64_t                        vfs_private;
@@ -289,41 +304,59 @@ struct chimera_vfs_request_handle {
 #define CHIMERA_VFS_REQUEST_MAX_HANDLES 3
 
 struct chimera_vfs_request {
-    struct chimera_vfs_thread        *thread;
-    const struct chimera_vfs_cred    *cred;
-    uint32_t                          opcode;
-    enum chimera_vfs_error            status;
-    chimera_vfs_complete_callback_t   complete;
-    chimera_vfs_complete_callback_t   complete_delegate;
-    struct timespec                   start_time;
-    uint64_t                          elapsed_ns;
+    struct chimera_vfs_thread         *thread;
+    const struct chimera_vfs_cred     *cred;
+    uint32_t                           opcode;
+    enum chimera_vfs_error             status;
+    chimera_vfs_complete_callback_t    complete;
+    chimera_vfs_complete_callback_t    complete_delegate;
+    struct timespec                    start_time;
+    uint64_t                           elapsed_ns;
 
     /* Points to one page of memory that the plugin may use as desired */
-    void                             *plugin_data;
+    void                              *plugin_data;
 
     /* For use by the plugin if desired, see io_uring for example */
-    struct chimera_vfs_request_handle handle[CHIMERA_VFS_REQUEST_MAX_HANDLES];
-    uint8_t                           token_count;
+    struct chimera_vfs_request_handle  handle[CHIMERA_VFS_REQUEST_MAX_HANDLES];
+    uint8_t                            token_count;
 
-    struct chimera_vfs_module        *module;
-    void                             *proto_callback;
-    void                             *proto_private_data;
+    struct chimera_vfs_module         *module;
+    void                              *proto_callback;
+    void                              *proto_private_data;
 
     /* VFS plugins may use these while processing the request */
-    struct chimera_vfs_request       *prev;
-    struct chimera_vfs_request       *next;
+    struct chimera_vfs_request        *prev;
+    struct chimera_vfs_request        *next;
 
     /* For use by vfs core only */
-    struct chimera_vfs_request       *active_prev;
-    struct chimera_vfs_request       *active_next;
+    struct chimera_vfs_request        *active_prev;
+    struct chimera_vfs_request        *active_next;
 
-    uint8_t                           fh[CHIMERA_VFS_FH_SIZE];
-    uint32_t                          fh_len;
-    uint64_t                          fh_hash;
+    uint8_t                            fh[CHIMERA_VFS_FH_SIZE];
+    uint32_t                           fh_len;
+    uint64_t                           fh_hash;
 
-    struct chimera_vfs_open_handle   *pending_handle;
+    /* Implicit I/O lease mediation (chimera_vfs_io_lease_acquire).  For a
+     * lease-holding client (NFSv4 delegation, SMB oplock) the protocol fills
+     * io_owner + io_owner_valid so the I/O coalesces with the client's own
+     * lease instead of recalling it.  io_next is the continuation invoked
+     * once the lease is held (normally chimera_vfs_dispatch); io_lease_file
+     * is the per-file state whose implicit lease this request has pinned
+     * (NULL on the fast path where nothing was pinned). */
+    struct chimera_vfs_lease_owner     io_owner;
+    uint8_t                            io_owner_valid;
+    /* Set by chimera_vfs_io_recall(): this request is a namespace/metadata
+     * mutation that must recall every caching lease on a target file (regardless
+     * of owner) rather than hold an implicit lease. */
+    uint8_t                            io_recall_all;
+    void                               ( *io_next )(
+        struct chimera_vfs_request *request);
+    struct chimera_vfs_file_state     *io_lease_file;
+    struct chimera_vfs_pending_acquire io_lease_ticket;
 
-    void                              ( *unblock_callback )(
+    struct chimera_vfs_open_handle    *pending_handle;
+
+    void                               ( *unblock_callback )(
         struct chimera_vfs_request     *request,
         struct chimera_vfs_open_handle *handle);
 
@@ -564,21 +597,31 @@ struct chimera_vfs_request {
         } mknod_at;
 
         struct {
-            uint32_t flags;
-            uint64_t r_vfs_private;
+            uint32_t                         flags;
+            /* Optional: opaque record to persist atomically with the open,
+             * honored only by modules advertising CAP_ATOMIC_HANDLE_STATE. */
+            struct chimera_vfs_handle_state *handle_state;
+            uint64_t                         r_vfs_private;
         } open_fh;
 
         struct {
-            struct chimera_vfs_open_handle *handle;
-            const char                     *name;
-            uint64_t                        name_hash;
-            int                             namelen;
-            uint32_t                        flags;
-            struct chimera_vfs_attrs       *set_attr;
-            struct chimera_vfs_attrs        r_attr;
-            struct chimera_vfs_attrs        r_dir_pre_attr;
-            struct chimera_vfs_attrs        r_dir_post_attr;
-            uint64_t                        r_vfs_private;
+            struct chimera_vfs_open_handle  *handle;
+            const char                      *name;
+            uint64_t                         name_hash;
+            int                              namelen;
+            uint32_t                         flags;
+            struct chimera_vfs_attrs        *set_attr;
+            /* Optional: opaque record to persist atomically with the open,
+             * honored only by modules advertising CAP_ATOMIC_HANDLE_STATE. */
+            struct chimera_vfs_handle_state *handle_state;
+            struct chimera_vfs_attrs         r_attr;
+            struct chimera_vfs_attrs         r_dir_pre_attr;
+            struct chimera_vfs_attrs         r_dir_post_attr;
+            uint64_t                         r_vfs_private;
+            /* Set by the module when the open created a new file (vs opened an
+             * existing one); lets the SMB server report OPENED vs CREATED.
+             * Modules that don't set it leave it 0 (treated as "opened"). */
+            uint8_t                          r_created;
         } open_at;
 
         struct {
@@ -787,6 +830,64 @@ struct chimera_vfs_request {
             char     r_name[CHIMERA_VFS_NAME_MAX];
             uint16_t r_name_len;
         } getparent;
+
+        struct {
+            struct chimera_vfs_open_handle *handle;
+            const char                     *name;
+            uint32_t                        namelen;
+            void                           *value;        /* caller-provided buffer */
+            uint32_t                        value_maxlen;
+            uint32_t                        r_value_len;   /* bytes written to value */
+        } get_xattr;
+
+        struct {
+            struct chimera_vfs_open_handle *handle;
+            uint32_t                        option;       /* setxattr_option4 */
+            const char                     *name;
+            uint32_t                        namelen;
+            const void                     *value;
+            uint32_t                        value_len;
+            struct chimera_vfs_attrs        r_pre_attr;
+            struct chimera_vfs_attrs        r_post_attr;
+        } set_xattr;
+
+        struct {
+            struct chimera_vfs_open_handle *handle;
+            uint64_t                        cookie;
+            void                           *buffer;        /* caller-provided buffer */
+            uint32_t                        max_bytes;
+            /* buffer is filled with NUL-terminated names, back to back */
+            uint32_t                        r_len;         /* bytes written to buffer */
+            uint32_t                        r_count;       /* number of names written */
+            uint32_t                        r_eof;
+            uint64_t                        r_cookie;
+        } list_xattrs;
+
+        struct {
+            struct chimera_vfs_open_handle *handle;
+            const char                     *name;
+            uint32_t                        namelen;
+            struct chimera_vfs_attrs        r_pre_attr;
+            struct chimera_vfs_attrs        r_post_attr;
+        } remove_xattr;
+
+        /* pNFS: a layout-sourcing backend (CHIMERA_VFS_CAP_LAYOUT_SOURCE)
+         * describes where the file's data physically lives.  The NFS server
+         * encodes the returned segments/devices into a flex-files or block
+         * layout; the descriptors are protocol-neutral. */
+        struct {
+            struct chimera_vfs_open_handle   *handle;
+            uint64_t                          offset;
+            uint64_t                          length;
+            uint32_t                          iomode;        /* LAYOUTIOMODE4_*           */
+            uint32_t                          layout_class;  /* requested CHIMERA_VFS_LAYOUT_CLASS_* */
+            uint32_t                          max_segments;
+            uint32_t                          r_layout_class;/* class actually produced   */
+            uint32_t                          r_num_segments;
+            uint32_t                          r_num_devices;
+            struct chimera_vfs_layout_segment r_segments[CHIMERA_VFS_LAYOUT_MAX_SEGMENTS];
+            struct chimera_vfs_layout_device  r_devices[CHIMERA_VFS_LAYOUT_MAX_DEVICES];
+        } get_layout;
     };
 };
 
@@ -810,7 +911,7 @@ enum CHIMERA_FS_FH_MAGIC {
     CHIMERA_VFS_FH_MAGIC_LINUX    = 2,
     CHIMERA_VFS_FH_MAGIC_IO_URING = 3,
     CHIMERA_VFS_FH_MAGIC_CAIRN    = 4,
-    CHIMERA_VFS_FH_MAGIC_DEMOFS   = 5,
+    CHIMERA_VFS_FH_MAGIC_DISKFS   = 5,
     CHIMERA_VFS_FH_MAGIC_NFS      = 6,
     // Extra value for QuantumFS
     CHIMERA_VFS_FH_MAGIC_MYRIAD   = 100,
@@ -829,7 +930,7 @@ enum CHIMERA_FS_FH_MAGIC {
  * to the module for stateless operation (ie NFS3).
  */
 
-#define CHIMERA_VFS_CAP_OPEN_PATH_REQUIRED (1U << 0)
+#define CHIMERA_VFS_CAP_OPEN_PATH_REQUIRED  (1U << 0)
 
 
 /* If set, module requires open handles for file operations
@@ -839,7 +940,7 @@ enum CHIMERA_FS_FH_MAGIC {
  * only contain the file handle w/o an explicit open callout
  * to the module for stateless operation (ie NFS3).
  */
-#define CHIMERA_VFS_CAP_OPEN_FILE_REQUIRED (1U << 1)
+#define CHIMERA_VFS_CAP_OPEN_FILE_REQUIRED  (1U << 1)
 
 /* If set, dispatch function is synchronous/blocking
  * and chimera will delegate VFS requests to a separate
@@ -850,60 +951,110 @@ enum CHIMERA_FS_FH_MAGIC {
  * main threadpool and the dispatch function is expected
  * to return quickly.
  */
-#define CHIMERA_VFS_CAP_BLOCKING           (1U << 2)
+#define CHIMERA_VFS_CAP_BLOCKING            (1U << 2)
 
 /* If set, module supports chimera_vfs_create_unlinked()
  * Used primarily for S3 PUT.
  */
 
-#define CHIMERA_VFS_CAP_CREATE_UNLINKED    (1U << 3)
+#define CHIMERA_VFS_CAP_CREATE_UNLINKED     (1U << 3)
 
 /* If set, module supports filesystem operations (directories, files, etc.)
  * All current backends should declare this capability.
  */
-#define CHIMERA_VFS_CAP_FS                 (1U << 4)
+#define CHIMERA_VFS_CAP_FS                  (1U << 4)
 
 /* If set, module supports key-value operations
  * (put_key, get_key, delete_key, search_keys)
  */
-#define CHIMERA_VFS_CAP_KV                 (1U << 5)
+#define CHIMERA_VFS_CAP_KV                  (1U << 5)
 
 /* If set, module supports FH-relative operations (lookup_at, mkdir_at, etc.)
  * All current backends support this.
  */
-#define CHIMERA_VFS_CAP_FS_RELATIVE_OP     (1U << 6)
+#define CHIMERA_VFS_CAP_FS_RELATIVE_OP      (1U << 6)
 
 /* If set, module supports path-based operations (open, mkdir, etc.)
  * Path-based operations take a full path relative to the mount point.
  * If a module does not support path ops, the VFS core will resolve
  * path components one at a time using FH-relative operations.
  */
-#define CHIMERA_VFS_CAP_FS_PATH_OP         (1U << 7)
+#define CHIMERA_VFS_CAP_FS_PATH_OP          (1U << 7)
 
 /* If set, module supports byte-range file locking via chimera_vfs_lock(). */
-#define CHIMERA_VFS_CAP_FS_LOCK            (1U << 8)
+#define CHIMERA_VFS_CAP_FS_LOCK             (1U << 8)
 
 /* If set, module supports reverse path lookup: given a directory FH,
  * resolve (parent_fh, name_in_parent).  Enables precise subtree
  * change notifications via CHIMERA_VFS_OP_GETPARENT. */
-#define CHIMERA_VFS_CAP_RPL                (1U << 9)
+#define CHIMERA_VFS_CAP_RPL                 (1U << 9)
 
 /* If set, module supports server-side byte-range copy between two
  * open handles served by the same module (chimera_vfs_copy_range). */
-#define CHIMERA_VFS_CAP_COPY_RANGE         (1U << 10)
+#define CHIMERA_VFS_CAP_COPY_RANGE          (1U << 10)
 
 /* If set, module supports reflink/COW share of a byte range between
  * two open handles served by the same module (chimera_vfs_clone_range).
  * Modules backed by filesystems without reflink support should leave
  * this unset; the VFS layer will surface ENOTSUP. */
-#define CHIMERA_VFS_CAP_CLONE_RANGE        (1U << 11)
+#define CHIMERA_VFS_CAP_CLONE_RANGE         (1U << 11)
 
 /* If set, module supports zero-copy move of a byte range between two
  * open handles served by the same module (chimera_vfs_move_range): block
  * references are transferred from source to destination and the source
  * range becomes a hole. Not exposed over NFS; intended for server-internal
  * use (e.g. S3 multipart-upload completion). */
-#define CHIMERA_VFS_CAP_MOVE_RANGE         (1U << 12)
+#define CHIMERA_VFS_CAP_MOVE_RANGE          (1U << 12)
+
+/* If set, the module can persist an opaque "handle-state" record atomically
+ * with an open/create (see struct chimera_vfs_handle_state below): the record
+ * is committed in the same transaction as the open, so a crash cannot leave
+ * the file created without its record (or vice versa).  Used by the SMB server
+ * to persist SMB3 persistent-handle records.  Backends without this cap ignore
+ * any handle_state passed on an open. */
+#define CHIMERA_VFS_CAP_ATOMIC_HANDLE_STATE (1U << 13)
+
+/* Opaque key/value record the caller asks the backend to persist atomically
+ * as part of an open/create.  The VFS layer never interprets the bytes; for
+ * the SMB server the key is "smbdh\0"+CreateGuid and the value is a serialized
+ * persistent-handle record.  Stored in the backend's KV namespace, so it can
+ * later be enumerated with chimera_vfs_search_keys and removed with
+ * chimera_vfs_delete_key (clear-on-close / reap need not be atomic). */
+struct chimera_vfs_handle_state {
+    const void *key;
+    uint32_t    key_len;
+    const void *value;
+    uint32_t    value_len;
+};
+
+/* If set, module supports extended attributes via
+ * chimera_vfs_get_xattr / set_xattr / list_xattrs / remove_xattr.
+ * Surfaced over NFSv4.2 (RFC 8276). Modules that leave this unset
+ * cause the VFS layer to return ENOTSUP. */
+#define CHIMERA_VFS_CAP_XATTR              (1U << 18)
+
+/* setxattr_option4 values (RFC 8276 §8) passed to chimera_vfs_set_xattr().
+ * Kept numerically identical to the on-the-wire NFSv4.2 enum. */
+#define CHIMERA_VFS_XATTR_EITHER           0  /* create or replace */
+#define CHIMERA_VFS_XATTR_CREATE           1  /* must not already exist */
+#define CHIMERA_VFS_XATTR_REPLACE          2  /* must already exist */
+
+/* Module persists the opaque CHIMERA_VFS_ATTR_PNFS_LAYOUT attribute, so the NFS
+ * server can store per-file pNFS layout state on it and hand out pNFS layouts.
+ * This is the "orchestrated" model: the module is a passive vessel and the NFS
+ * server produces the layout (creating data-server backing files itself). */
+#define CHIMERA_VFS_CAP_LAYOUT             (1U << 14)
+
+/* Module SOURCES the layout itself: it already knows where a file's data
+ * physically lives and synthesizes a protocol-neutral layout via
+ * CHIMERA_VFS_OP_GET_LAYOUT.  The NFS server is the consumer (it only encodes
+ * what the module returns) and does NO orchestration.  Mutually exclusive in
+ * effect with CHIMERA_VFS_CAP_LAYOUT for a given file.  Exactly one of the
+ * class bits below should accompany it. */
+#define CHIMERA_VFS_CAP_LAYOUT_SOURCE      (1U << 15)
+#define CHIMERA_VFS_CAP_LAYOUT_CLASS_FLEX  (1U << 16) /* produces flex-files (RFC 8435)  */
+#define CHIMERA_VFS_CAP_LAYOUT_CLASS_BLOCK (1U << 17) /* produces block volume (RFC 5663)*/
+#define CHIMERA_VFS_CAP_LAYOUT_CLASS_SCSI  (1U << 19) /* produces SCSI volume (RFC 8154) */
 
 struct chimera_vfs_module {
     /* Required
@@ -1047,6 +1198,8 @@ struct chimera_vfs_close_thread {
 struct chimera_vfs_mount_table;
 
 struct chimera_vfs_notify;
+struct chimera_vfs_state;
+struct chimera_vfs_pnfs;
 
 struct chimera_vfs {
     struct chimera_vfs_module            *modules[CHIMERA_VFS_FH_MAGIC_MAX];
@@ -1058,7 +1211,9 @@ struct chimera_vfs {
     struct chimera_vfs_attr_cache        *vfs_attr_cache;
     struct chimera_vfs_user_cache        *vfs_user_cache;
     struct chimera_vfs_notify            *vfs_notify;
+    struct chimera_vfs_state             *vfs_state;
     struct chimera_vfs_mount_table       *mount_table;
+    struct chimera_vfs_pnfs              *pnfs;
     int                                   num_sync_delegation_threads;
     struct chimera_vfs_delegation_thread *sync_delegation_threads;
     int                                   num_async_delegation_threads;
@@ -1081,6 +1236,10 @@ struct chimera_vfs_thread {
 
     struct chimera_vfs_request       *pending_complete_requests;
     struct chimera_vfs_request       *unblocked_requests;
+    /* Parked I/O requests being resumed on their owning thread (the lease
+     * pump runs on whatever thread released/broke a lease, but a request's
+     * dispatch+reply must run on the thread that owns its connection iovecs). */
+    struct chimera_vfs_request       *pending_io_resume;
     struct evpl_doorbell              doorbell;
     pthread_mutex_t                   lock;
     uint64_t                          anon_fh_key;

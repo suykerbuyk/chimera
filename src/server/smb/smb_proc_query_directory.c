@@ -10,6 +10,20 @@
 #include "vfs/vfs_procs.h"
 #include "xxhash.h"
 
+static unsigned int
+chimera_smb_query_directory_status(enum chimera_vfs_error error_code)
+{
+    switch (error_code) {
+        case CHIMERA_VFS_OK:      return SMB2_STATUS_SUCCESS;
+        /* QUERY_DIRECTORY against a non-directory open: per MS-SMB2 3.3.5.18
+         * the server fails the request with STATUS_INVALID_PARAMETER. */
+        case CHIMERA_VFS_ENOTDIR: return SMB2_STATUS_INVALID_PARAMETER;
+        case CHIMERA_VFS_EACCES:
+        case CHIMERA_VFS_EPERM:   return SMB2_STATUS_ACCESS_DENIED;
+        default:                  return SMB2_STATUS_INTERNAL_ERROR;
+    } /* switch */
+} /* chimera_smb_query_directory_status */
+
 void
 chimera_smb_query_directory_readdir_complete(
     enum chimera_vfs_error          error_code,
@@ -29,7 +43,12 @@ chimera_smb_query_directory_readdir_complete(
     chimera_smb_open_file_release(request, request->query_directory.open_file);
 
     if (error_code != CHIMERA_VFS_OK) {
-        chimera_smb_complete_request(request, SMB2_STATUS_INTERNAL_ERROR);
+        /* Must return here: falling through would complete the request a
+         * second time, overrunning the compound's completion counter and
+         * tripping the compound_advance abort (smb.c). */
+        evpl_iovec_release(request->compound->thread->evpl, &request->query_directory.iov);
+        chimera_smb_complete_request(request, chimera_smb_query_directory_status(error_code));
+        return;
     }
 
     if (request->query_directory.output_length) {
@@ -39,7 +58,7 @@ chimera_smb_query_directory_readdir_complete(
         chimera_smb_complete_request(request, SMB2_STATUS_NO_MORE_FILES);
     }
 
-} /* chimera_smb_query_directory_readdir_complete */ /* chimera_smb_query_directory_readdir_complete */
+} /* chimera_smb_query_directory_readdir_complete */
 
 int
 chimera_smb_query_directory_readdir_callback(
@@ -139,7 +158,7 @@ chimera_smb_query_directory_readdir_callback(
     switch (request->query_directory.info_class) {
         case SMB2_FILE_DIRECTORY_INFORMATION:
             evpl_iovec_cursor_append_uint32(&entry_cursor, file_index);
-            evpl_iovec_cursor_append_uint64(&entry_cursor, 0);
+            evpl_iovec_cursor_append_uint64(&entry_cursor, smb_attrs.smb_crttime);
             evpl_iovec_cursor_append_uint64(&entry_cursor, smb_attrs.smb_atime);
             evpl_iovec_cursor_append_uint64(&entry_cursor, smb_attrs.smb_mtime);
             evpl_iovec_cursor_append_uint64(&entry_cursor, smb_attrs.smb_ctime);
@@ -158,7 +177,7 @@ chimera_smb_query_directory_readdir_callback(
             break;
         case SMB2_FILE_BOTH_DIRECTORY_INFORMATION:
             evpl_iovec_cursor_append_uint32(&entry_cursor, file_index);
-            evpl_iovec_cursor_append_uint64(&entry_cursor, 0);
+            evpl_iovec_cursor_append_uint64(&entry_cursor, smb_attrs.smb_crttime);
             evpl_iovec_cursor_append_uint64(&entry_cursor, smb_attrs.smb_atime);
             evpl_iovec_cursor_append_uint64(&entry_cursor, smb_attrs.smb_mtime);
             evpl_iovec_cursor_append_uint64(&entry_cursor, smb_attrs.smb_ctime);
@@ -190,7 +209,7 @@ chimera_smb_query_directory_readdir_callback(
             break;
         case SMB2_FILE_FULL_DIRECTORY_INFORMATION:
             evpl_iovec_cursor_append_uint32(&entry_cursor, file_index);
-            evpl_iovec_cursor_append_uint64(&entry_cursor, 0);
+            evpl_iovec_cursor_append_uint64(&entry_cursor, smb_attrs.smb_crttime);
             evpl_iovec_cursor_append_uint64(&entry_cursor, smb_attrs.smb_atime);
             evpl_iovec_cursor_append_uint64(&entry_cursor, smb_attrs.smb_mtime);
             evpl_iovec_cursor_append_uint64(&entry_cursor, smb_attrs.smb_ctime);
@@ -211,7 +230,7 @@ chimera_smb_query_directory_readdir_callback(
 
         case SMB2_FILE_ID_BOTH_DIRECTORY_INFORMATION:
             evpl_iovec_cursor_append_uint32(&entry_cursor, file_index);
-            evpl_iovec_cursor_append_uint64(&entry_cursor, 0);
+            evpl_iovec_cursor_append_uint64(&entry_cursor, smb_attrs.smb_crttime);
             evpl_iovec_cursor_append_uint64(&entry_cursor, smb_attrs.smb_atime);
             evpl_iovec_cursor_append_uint64(&entry_cursor, smb_attrs.smb_mtime);
             evpl_iovec_cursor_append_uint64(&entry_cursor, smb_attrs.smb_ctime);
@@ -233,7 +252,7 @@ chimera_smb_query_directory_readdir_callback(
             break;
         case SMB2_FILE_ID_FULL_DIRECTORY_INFORMATION:
             evpl_iovec_cursor_append_uint32(&entry_cursor, file_index);
-            evpl_iovec_cursor_append_uint64(&entry_cursor, 0);
+            evpl_iovec_cursor_append_uint64(&entry_cursor, smb_attrs.smb_crttime);
             evpl_iovec_cursor_append_uint64(&entry_cursor, smb_attrs.smb_atime);
             evpl_iovec_cursor_append_uint64(&entry_cursor, smb_attrs.smb_mtime);
             evpl_iovec_cursor_append_uint64(&entry_cursor, smb_attrs.smb_ctime);
@@ -293,7 +312,7 @@ chimera_smb_query_directory(struct chimera_smb_request *request)
         thread->vfs_thread,
         &request->session_handle->session->cred,
         request->query_directory.open_file->handle,
-        CHIMERA_VFS_ATTR_MASK_STAT,
+        CHIMERA_VFS_ATTR_MASK_STAT | CHIMERA_VFS_ATTR_BTIME,
         0, /* dir_attr_mask */
         request->query_directory.open_file->position,
         0, /* verifier */

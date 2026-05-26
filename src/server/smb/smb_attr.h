@@ -29,6 +29,20 @@
 #define SMB_ATTR_DISPOSITION        (1ULL << 13)
 #define SMB_ATTR_POSITION           (1ULL << 14)
 
+/* DOS attribute bits a client may set/clear via SET_INFO FileBasicInformation
+ * and that the VFS persists.  DIRECTORY/REPARSE/etc. are derived from the
+ * inode type, not stored, so they are excluded here. */
+#define SMB_DOS_ATTR_SETTABLE       (SMB2_FILE_ATTRIBUTE_READONLY | \
+                                     SMB2_FILE_ATTRIBUTE_HIDDEN |   \
+                                     SMB2_FILE_ATTRIBUTE_SYSTEM |   \
+                                     SMB2_FILE_ATTRIBUTE_ARCHIVE)
+
+/* Persisted DOS bits reported back to clients.  SPARSE is reportable but is
+ * excluded from SMB_DOS_ATTR_SETTABLE because it is managed via
+ * FSCTL_SET_SPARSE, not FileBasicInformation. */
+#define SMB_DOS_ATTR_REPORTABLE     (SMB_DOS_ATTR_SETTABLE | \
+                                     SMB2_FILE_ATTRIBUTE_SPARSE_FILE)
+
 /* Masks for each information class */
 #define SMB_ATTR_MASK_BASIC         ( \
             SMB_ATTR_CRTTIME | SMB_ATTR_ATIME | SMB_ATTR_MTIME | \
@@ -99,8 +113,10 @@ chimera_smb_marshal_basic_attrs(
     const struct chimera_vfs_attrs *attr,
     struct chimera_smb_attrs       *smb_attr)
 {
-    /* Time attributes */
-    smb_attr->smb_crttime    = 0; /* Creation time not tracked in VFS */
+    /* Time attributes.  Creation/birth time is optional in the VFS (no POSIX
+     * equivalent); use it when the backend tracked it, else report 0. */
+    smb_attr->smb_crttime = (attr->va_set_mask & CHIMERA_VFS_ATTR_BTIME)
+                               ? chimera_nt_time(&attr->va_btime) : 0;
     smb_attr->smb_attr_mask |= SMB_ATTR_CRTTIME;
 
     smb_attr->smb_atime      = chimera_nt_time(&attr->va_atime);
@@ -114,6 +130,14 @@ chimera_smb_marshal_basic_attrs(
 
     /* File attributes */
     smb_attr->smb_attributes = 0;
+
+    /* DOS attribute bits persisted by the VFS (READONLY, HIDDEN, SYSTEM,
+     * ARCHIVE, SPARSE).  Only honored when the backend reports it actually
+     * stores them; otherwise we fall back to synthesizing from the mode. */
+    if (attr->va_set_mask & CHIMERA_VFS_ATTR_DOS_ATTRIBUTES) {
+        smb_attr->smb_attributes |= attr->va_dos_attributes & SMB_DOS_ATTR_REPORTABLE;
+    }
+
     if ((attr->va_mode & S_IFMT) == S_IFDIR) {
         smb_attr->smb_attributes |= 0x10; /* FILE_ATTRIBUTE_DIRECTORY */
     }
@@ -130,9 +154,12 @@ chimera_smb_marshal_basic_attrs(
             break;
     } // switch
 
-    /* Set default for normal file if no attributes are set */
-    if (smb_attr->smb_attributes == 0 && (attr->va_mode & S_IFMT) == S_IFREG) {
-        smb_attr->smb_attributes = SMB2_FILE_ATTRIBUTE_ARCHIVE;
+    /* A regular file always reports at least ARCHIVE when it carries none of
+     * the settable attribute bits (so e.g. a sparse-but-otherwise-plain file
+     * still shows ARCHIVE, matching Windows). */
+    if ((smb_attr->smb_attributes & SMB_DOS_ATTR_SETTABLE) == 0 &&
+        (attr->va_mode & S_IFMT) == S_IFREG) {
+        smb_attr->smb_attributes |= SMB2_FILE_ATTRIBUTE_ARCHIVE;
     }
     smb_attr->smb_attr_mask |= SMB_ATTR_ATTRIBUTES;
 } /* chimera_smb_marshal_basic_attrs */
@@ -347,6 +374,24 @@ chimera_smb_unmarshal_basic_info(
 
     attr->va_req_mask |= CHIMERA_VFS_ATTR_ATIME | CHIMERA_VFS_ATTR_MTIME | CHIMERA_VFS_ATTR_CTIME;
     attr->va_set_mask |= CHIMERA_VFS_ATTR_ATIME | CHIMERA_VFS_ATTR_MTIME | CHIMERA_VFS_ATTR_CTIME;
+
+    /* Creation/birth time: 0 means "no change" and -1 (0xFFFF...) means
+     * "do not change, and freeze against system updates" (MS-FSCC 2.4.7).
+     * In both cases leave the stored value alone. */
+    if (smb_attrs->smb_crttime != 0 &&
+        smb_attrs->smb_crttime != UINT64_MAX) {
+        chimera_nt_to_epoch(smb_attrs->smb_crttime, &attr->va_btime);
+        attr->va_req_mask |= CHIMERA_VFS_ATTR_BTIME;
+        attr->va_set_mask |= CHIMERA_VFS_ATTR_BTIME;
+    }
+
+    /* A FileAttributes value of 0 means "no change" (MS-FSCC 2.4.7); any
+     * non-zero value replaces the persisted DOS attribute set. */
+    if (smb_attrs->smb_attributes != 0) {
+        attr->va_dos_attributes = smb_attrs->smb_attributes & SMB_DOS_ATTR_SETTABLE;
+        attr->va_req_mask      |= CHIMERA_VFS_ATTR_DOS_ATTRIBUTES;
+        attr->va_set_mask      |= CHIMERA_VFS_ATTR_DOS_ATTRIBUTES;
+    }
 } // chimera_smb_unmarshal_basic_info
 
 static inline void

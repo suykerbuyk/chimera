@@ -187,10 +187,13 @@ s3_server_notify(
     struct chimera_server_s3_thread *thread     = private_data;
     int                              is_upload_part;
     int                              is_complete_mpu;
+    int                              is_delete_objects;
 
     is_upload_part  = s3_request->has_upload_id && s3_request->has_part_number;
     is_complete_mpu = (request_type == EVPL_HTTP_REQUEST_TYPE_POST &&
                        s3_request->has_upload_id);
+    is_delete_objects = (request_type == EVPL_HTTP_REQUEST_TYPE_POST &&
+                         s3_request->has_delete);
 
     switch (notify_type) {
         case EVPL_HTTP_NOTIFY_RECEIVE_DATA:
@@ -204,6 +207,9 @@ s3_server_notify(
             } else if (is_complete_mpu) {
                 /* Accumulate the client's part manifest. */
                 chimera_s3_complete_multipart_upload_recv(evpl, s3_request);
+            } else if (is_delete_objects) {
+                /* Accumulate the <Delete> document. */
+                chimera_s3_delete_objects_recv(evpl, s3_request);
             } else if (request_type == EVPL_HTTP_REQUEST_TYPE_POST) {
                 /* CreateMultipartUpload: body is empty in practice. */
                 s3_server_drain_body(evpl, s3_request);
@@ -224,6 +230,10 @@ s3_server_notify(
                 chimera_s3_complete_multipart_upload_recv(evpl, s3_request);
                 /* Body fully in hand: parse + validate + assemble. */
                 chimera_s3_complete_multipart_upload_body_done(evpl, s3_request);
+            } else if (is_delete_objects) {
+                chimera_s3_delete_objects_recv(evpl, s3_request);
+                /* Body fully in hand: parse keys + remove them. */
+                chimera_s3_delete_objects_body_done(evpl, s3_request);
             } else if (request_type == EVPL_HTTP_REQUEST_TYPE_POST) {
                 s3_server_drain_body(evpl, s3_request);
             }
@@ -294,17 +304,35 @@ chimera_s3_dispatch_callback(
             }
             break;
         case EVPL_HTTP_REQUEST_TYPE_PUT:
+        {
+            const char *copy_source = evpl_http_request_header(
+                s3_request->http_request, "x-amz-copy-source");
+
             if (s3_request->has_upload_id && s3_request->has_part_number) {
-                chimera_s3_upload_part(evpl, thread, s3_request);
+                if (copy_source) {
+                    /* UploadPartCopy (copying a byte range of an existing
+                     * object into an in-progress multipart upload) is not
+                     * implemented yet. Reject explicitly rather than treating
+                     * the (empty) body as the part contents. */
+                    s3_request->status    = CHIMERA_S3_STATUS_NOT_IMPLEMENTED;
+                    s3_request->vfs_state = CHIMERA_S3_VFS_STATE_COMPLETE;
+                } else {
+                    chimera_s3_upload_part(evpl, thread, s3_request);
+                }
+            } else if (copy_source) {
+                chimera_s3_copy(evpl, thread, s3_request);
             } else {
                 chimera_s3_put(evpl, thread, s3_request);
             }
             break;
+        }
         case EVPL_HTTP_REQUEST_TYPE_POST:
             if (s3_request->has_uploads) {
                 chimera_s3_create_multipart_upload(evpl, thread, s3_request);
             } else if (s3_request->has_upload_id) {
                 chimera_s3_complete_multipart_upload(evpl, thread, s3_request);
+            } else if (s3_request->has_delete) {
+                chimera_s3_delete_objects(evpl, thread, s3_request);
             } else {
                 s3_request->status    = CHIMERA_S3_STATUS_NOT_IMPLEMENTED;
                 s3_request->vfs_state = CHIMERA_S3_VFS_STATE_COMPLETE;
@@ -354,7 +382,9 @@ s3_server_dispatch(
     s3_request->is_list            = 0;
     s3_request->has_uploads        = 0;
     s3_request->has_upload_id      = 0;
+    s3_request->has_delete         = 0;
     s3_request->has_part_number    = 0;
+    s3_request->chunked            = 0;
     s3_request->query_upload_idlen = 0;
     s3_request->query_part_number  = 0;
     s3_request->http_request       = request;
@@ -387,6 +417,19 @@ s3_server_dispatch(
             s3_request->vfs_state = CHIMERA_S3_VFS_STATE_COMPLETE;
             return;
     } /* switch */
+
+    /* SigV4 streaming uploads (aws-chunked) carry the object body wrapped in
+     * chunk framing rather than as raw bytes. The sentinel lives in
+     * x-amz-content-sha256; flag the request so the PUT / UploadPart body
+     * handlers de-chunk before writing to the VFS. */
+    {
+        const char *content_sha256 = evpl_http_request_header(request, "x-amz-content-sha256");
+
+        if (content_sha256 && strncmp(content_sha256, "STREAMING-", 10) == 0) {
+            s3_request->chunked = 1;
+            s3_chunk_decoder_init(&s3_request->chunk);
+        }
+    }
 
     host_header = evpl_http_request_header(request, "Host");
 
@@ -497,6 +540,8 @@ s3_server_dispatch(
 
                 if (key_len == 7 && memcmp(key_start, "uploads", 7) == 0) {
                     s3_request->has_uploads = 1;
+                } else if (key_len == 6 && memcmp(key_start, "delete", 6) == 0) {
+                    s3_request->has_delete = 1;
                 } else if (key_len == 8 && memcmp(key_start, "uploadId", 8) == 0) {
                     int copy = value_len;
                     if (copy > CHIMERA_S3_UPLOAD_ID_LEN) {
@@ -548,6 +593,23 @@ s3_server_dispatch(
                     s3_request->multipart.part_number =
                         s3_request->query_part_number;
                 }
+            } else if (s3_request->has_delete) {
+                /* POST /bucket?delete: the keys to remove arrive in the
+                 * request body, so there is no object key in the path.
+                 * Initialize the body/response accumulators here, before any
+                 * RECEIVE_DATA notification can fire. */
+                s3_request->path         = "";
+                s3_request->path_len     = 0;
+                s3_request->del.body_buf = NULL;
+                s3_request->del.body_len = 0;
+                s3_request->del.body_cap = 0;
+                s3_request->del.resp_buf = NULL;
+                s3_request->del.resp_len = 0;
+                s3_request->del.resp_cap = 0;
+                s3_request->del.entries  = NULL;
+                s3_request->del.n_keys   = 0;
+                s3_request->del.cur      = 0;
+                s3_request->del.quiet    = 0;
             } else if (qmark == s3_request->path) {
                 /* Path starts with '?': bucket-level LIST query. */
                 s3_request->is_list         = 1;

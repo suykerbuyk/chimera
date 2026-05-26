@@ -17,10 +17,13 @@
 #include "server_internal.h"
 #include "protocol.h"
 #include "nfs/nfs.h"
+#include "nfs/nfs4_lease.h"
 #include "s3/s3.h"
 #include "smb/smb.h"
 #include "vfs/vfs.h"
 #include "vfs/vfs_procs.h"
+#include "vfs/vfs_pnfs.h"
+#include "vfs/vfs_mount_table.h"
 #include "common/macros.h"
 #include "server/server.h"
 #include "smb/smb2.h"
@@ -41,21 +44,29 @@ struct chimera_server_config {
     int                                   nfs_rdma_port;
     int                                   nfs_tcp_rdma_port;
     int                                   nfs_lockmgr_port;
+    int                                   nfs_port;
+    int                                   nfs_data_server;
     int                                   external_portmap;
     char                                  portmap_hostname[256];
     int                                   soft_fail_bad_req;
     rlim_t                                max_open_files;
     int                                   core_threads;
+    int                                   sync_delegation;
     int                                   sync_delegation_threads;
     int                                   async_delegation;
     int                                   async_delegation_threads;
     int                                   cache_ttl;
+    int                                   nfs4_session_slots;
+    int                                   nfs4_delegations;
+    uint32_t                              nfs4_lease_time_s;
+    uint32_t                              nfs4_grace_time_s;
     int                                   num_modules;
     int                                   metrics_port;
     int                                   rest_http_port;
     int                                   rest_https_port;
     int                                   smb_num_dialects;
     uint32_t                              smb_dialects[16];
+    int                                   smb_persistent_handles;
     int                                   smb_num_nic_info;
     uint32_t                              anonuid;
     uint32_t                              anongid;
@@ -68,6 +79,13 @@ struct chimera_server_config {
     struct chimera_vfs_module_cfg         modules[CHIMERA_SERVER_MAX_MODULES];
     struct chimera_server_config_smb_nic  smb_nic_info[16];
     struct chimera_server_config_smb_auth smb_auth;
+    int                                   pnfs_enabled;
+    int                                   pnfs_num_ds;
+    struct chimera_server_config_pnfs_ds {
+        char netid[8];
+        char uaddr[64];
+        char backing_path[CHIMERA_PNFS_BACKING_MAX];
+    }                                     pnfs_ds[CHIMERA_PNFS_MAX_DS];
 };
 
 struct chimera_server {
@@ -103,6 +121,7 @@ chimera_server_config_init(void)
 
     config->core_threads             = 8;
     config->max_open_files           = 65535;
+    config->sync_delegation          = 1;
     config->sync_delegation_threads  = 8;
     config->async_delegation         = 0;
     config->async_delegation_threads = 8;
@@ -112,11 +131,17 @@ chimera_server_config_init(void)
     config->soft_fail_bad_req        = 0;
     config->tcp_flavor               = CHIMERA_TCP_FLAVOR_PLAIN;
 
-    config->smb_num_dialects = 2;
+    config->smb_num_dialects = 4;
     config->smb_dialects[0]  = SMB2_DIALECT_2_1;
     config->smb_dialects[1]  = SMB2_DIALECT_3_0;
+    config->smb_dialects[2]  = SMB2_DIALECT_3_0_2;
+    config->smb_dialects[3]  = SMB2_DIALECT_3_1_1;
 
     config->smb_num_nic_info = 0;
+
+    /* SMB3 durable/persistent handles are off by default; they are an
+     * opt-in feature gated by the "smb_persistent_handles" config flag. */
+    config->smb_persistent_handles = 0;
 
     // SMB auth config defaults - local NTLM only
     config->smb_auth.winbind_enabled    = 0;
@@ -128,7 +153,29 @@ chimera_server_config_init(void)
     config->anonuid = 65534;
     config->anongid = 65534;
 
+    /* pNFS layouts are disabled by default. */
+    config->pnfs_enabled = 0;
+    config->pnfs_num_ds  = 0;
+
+    /* NFS service port (default 2049); data-server mode binds only the NFSv4
+     * service so a pNFS data server can coexist with an MDS on one host. */
+    config->nfs_port        = 2049;
+    config->nfs_data_server = 0;
+
     config->cache_ttl = 60;
+
+    /* Default NFSv4.1 fore-channel session slots (server cap on the number
+     * of concurrent SEQUENCE requests a client may have outstanding per
+     * session).  Mirrors NFS4_MAX_REPLY_CACHE_SLOTS in the NFS server. */
+    config->nfs4_session_slots = 64;
+
+    /* NFSv4 protocol delegations (OPEN_DELEGATE_READ/WRITE) are disabled by
+     * default.  When off, every OPEN returns OPEN_DELEGATE_NONE and the
+     * callback channel is never established.  Distinct from the VFS
+     * sync_delegation/async_delegation thread-pool knobs above. */
+    config->nfs4_delegations  = 0;
+    config->nfs4_lease_time_s = NFS4_LEASE_TIME_DEFAULT_S;
+    config->nfs4_grace_time_s = NFS4_GRACE_TIME_DEFAULT_S;
 
     strncpy(config->nfs_rdma_hostname, "0.0.0.0", sizeof(config->nfs_rdma_hostname));
     config->nfs_rdma_port    = 20049;
@@ -174,6 +221,14 @@ chimera_server_config_set_core_threads(
 } /* chimera_server_config_set_core_threads */
 
 SYMBOL_EXPORT void
+chimera_server_config_set_sync_delegation(
+    struct chimera_server_config *config,
+    int                           enable)
+{
+    config->sync_delegation = enable;
+} /* chimera_server_config_set_sync_delegation */
+
+SYMBOL_EXPORT void
 chimera_server_config_set_sync_delegation_threads(
     struct chimera_server_config *config,
     int                           threads)
@@ -196,6 +251,20 @@ chimera_server_config_set_async_delegation_threads(
 {
     config->async_delegation_threads = threads;
 } /* chimera_server_config_set_async_delegation_threads */
+
+SYMBOL_EXPORT void
+chimera_server_config_set_smb_persistent_handles(
+    struct chimera_server_config *config,
+    int                           enable)
+{
+    config->smb_persistent_handles = enable;
+} /* chimera_server_config_set_smb_persistent_handles */
+
+SYMBOL_EXPORT int
+chimera_server_config_get_smb_persistent_handles(const struct chimera_server_config *config)
+{
+    return config->smb_persistent_handles;
+} /* chimera_server_config_get_smb_persistent_handles */
 
 SYMBOL_EXPORT void
 chimera_server_config_set_max_open_files(
@@ -245,6 +314,62 @@ chimera_server_config_get_cache_ttl(const struct chimera_server_config *config)
 } /* chimera_server_config_get_cache_ttl */
 
 SYMBOL_EXPORT void
+chimera_server_config_set_nfs4_session_slots(
+    struct chimera_server_config *config,
+    int                           slots)
+{
+    config->nfs4_session_slots = slots;
+} /* chimera_server_config_set_nfs4_session_slots */
+
+SYMBOL_EXPORT int
+chimera_server_config_get_nfs4_session_slots(const struct chimera_server_config *config)
+{
+    return config->nfs4_session_slots;
+} /* chimera_server_config_get_nfs4_session_slots */
+
+SYMBOL_EXPORT void
+chimera_server_config_set_nfs4_delegations(
+    struct chimera_server_config *config,
+    int                           enable)
+{
+    config->nfs4_delegations = enable;
+} /* chimera_server_config_set_nfs4_delegations */
+
+SYMBOL_EXPORT int
+chimera_server_config_get_nfs4_delegations(const struct chimera_server_config *config)
+{
+    return config->nfs4_delegations;
+} /* chimera_server_config_get_nfs4_delegations */
+
+SYMBOL_EXPORT void
+chimera_server_config_set_nfs4_lease_time(
+    struct chimera_server_config *config,
+    uint32_t                      seconds)
+{
+    config->nfs4_lease_time_s = seconds;
+} /* chimera_server_config_set_nfs4_lease_time */
+
+SYMBOL_EXPORT uint32_t
+chimera_server_config_get_nfs4_lease_time(const struct chimera_server_config *config)
+{
+    return config->nfs4_lease_time_s;
+} /* chimera_server_config_get_nfs4_lease_time */
+
+SYMBOL_EXPORT void
+chimera_server_config_set_nfs4_grace_time(
+    struct chimera_server_config *config,
+    uint32_t                      seconds)
+{
+    config->nfs4_grace_time_s = seconds;
+} /* chimera_server_config_set_nfs4_grace_time */
+
+SYMBOL_EXPORT uint32_t
+chimera_server_config_get_nfs4_grace_time(const struct chimera_server_config *config)
+{
+    return config->nfs4_grace_time_s;
+} /* chimera_server_config_get_nfs4_grace_time */
+
+SYMBOL_EXPORT void
 chimera_server_config_set_kv_module(
     struct chimera_server_config *config,
     const char                   *kv_module)
@@ -264,6 +389,72 @@ chimera_server_config_get_nfs_rdma(const struct chimera_server_config *config)
 {
     return config->nfs_rdma;
 } /* chimera_server_config_get_nfs_rdma */
+
+SYMBOL_EXPORT void
+chimera_server_config_set_pnfs_enabled(
+    struct chimera_server_config *config,
+    int                           enable)
+{
+    config->pnfs_enabled = enable;
+} /* chimera_server_config_set_pnfs_enabled */
+
+SYMBOL_EXPORT int
+chimera_server_config_get_pnfs_enabled(const struct chimera_server_config *config)
+{
+    return config->pnfs_enabled;
+} /* chimera_server_config_get_pnfs_enabled */
+
+SYMBOL_EXPORT int
+chimera_server_config_add_pnfs_ds(
+    struct chimera_server_config *config,
+    const char                   *netid,
+    const char                   *uaddr,
+    const char                   *backing_path)
+{
+    struct chimera_server_config_pnfs_ds *ds;
+    int                                   idx;
+
+    if (config->pnfs_num_ds >= CHIMERA_PNFS_MAX_DS) {
+        return -1;
+    }
+
+    idx = config->pnfs_num_ds++;
+    ds  = &config->pnfs_ds[idx];
+
+    snprintf(ds->netid, sizeof(ds->netid), "%s", netid ? netid : "tcp");
+    snprintf(ds->uaddr, sizeof(ds->uaddr), "%s", uaddr ? uaddr : "");
+    snprintf(ds->backing_path, sizeof(ds->backing_path), "%s", backing_path ? backing_path : "");
+
+    return idx;
+} /* chimera_server_config_add_pnfs_ds */
+
+SYMBOL_EXPORT void
+chimera_server_config_set_nfs_port(
+    struct chimera_server_config *config,
+    int                           port)
+{
+    config->nfs_port = port;
+} /* chimera_server_config_set_nfs_port */
+
+SYMBOL_EXPORT int
+chimera_server_config_get_nfs_port(const struct chimera_server_config *config)
+{
+    return config->nfs_port;
+} /* chimera_server_config_get_nfs_port */
+
+SYMBOL_EXPORT void
+chimera_server_config_set_nfs_data_server(
+    struct chimera_server_config *config,
+    int                           enable)
+{
+    config->nfs_data_server = enable;
+} /* chimera_server_config_set_nfs_data_server */
+
+SYMBOL_EXPORT int
+chimera_server_config_get_nfs_data_server(const struct chimera_server_config *config)
+{
+    return config->nfs_data_server;
+} /* chimera_server_config_get_nfs_data_server */
 
 SYMBOL_EXPORT void
 chimera_server_config_set_nfs_rdma_hostname(
@@ -390,20 +581,33 @@ chimera_server_config_add_module(
     const char                   *module_path,
     const char                   *config_data)
 {
-    struct chimera_vfs_module_cfg *module_cfg;
+    struct chimera_vfs_module_cfg *module_cfg = NULL;
+    int                            i;
 
-    module_cfg = &config->modules[config->num_modules];
+    /* A module name maps to a single backend (one fh_magic), so configuring a
+     * built-in module (e.g. memfs with ds_mode/block_size) must override its
+     * default entry rather than register a duplicate -- a double registration
+     * leaks the first instance's private state. */
+    for (i = 0; i < config->num_modules; i++) {
+        if (strcmp(config->modules[i].module_name, module_name) == 0) {
+            module_cfg = &config->modules[i];
+            break;
+        }
+    }
 
-    strncpy(module_cfg->module_name, module_name, sizeof(module_cfg->module_name));
-    strncpy(module_cfg->config_data, config_data, sizeof(module_cfg->config_data));
+    if (!module_cfg) {
+        module_cfg = &config->modules[config->num_modules++];
+    }
+
+    snprintf(module_cfg->module_name, sizeof(module_cfg->module_name), "%s", module_name);
+    snprintf(module_cfg->config_data, sizeof(module_cfg->config_data), "%s", config_data);
     if (module_path) {
-        strncpy(module_cfg->module_path, module_path, sizeof(module_cfg->module_path));
+        snprintf(module_cfg->module_path, sizeof(module_cfg->module_path), "%s", module_path);
     } else {
-        /* We don't specify a path for preloaded modules like demofs */
+        /* We don't specify a path for preloaded modules like diskfs */
         module_cfg->module_path[0] = '\0';
     }
-    config->num_modules++;
-} /* chimera_server_config_add_module */ /* chimera_server_config_add_module */
+} /* chimera_server_config_add_module */
 
 SYMBOL_EXPORT void
 chimera_server_config_set_metrics_port(
@@ -672,6 +876,46 @@ chimera_server_mount(
 } /* chimera_server_create_share */
 
 SYMBOL_EXPORT int
+chimera_server_pnfs_resolve(struct chimera_server *server)
+{
+    struct chimera_vfs *vfs = server->vfs;
+    int                 n   = chimera_vfs_pnfs_num_devices(vfs);
+    int                 i, resolved = 0;
+
+    for (i = 0; i < n; i++) {
+        struct chimera_vfs_ds    *ds = chimera_vfs_pnfs_get_device(vfs, i);
+        struct chimera_vfs_mount *m;
+        const char               *bpath = ds->backing_path;
+
+        /* Mounts are registered with leading slashes stripped (see
+         * chimera_vfs_mount), so normalize the configured backing path the same
+         * way -- otherwise "/ds0" only prefix-matches the empty-path root. */
+        while (*bpath == '/') {
+            bpath++;
+        }
+
+        m = chimera_vfs_mount_table_find_by_path(vfs->mount_table,
+                                                 bpath,
+                                                 strlen(bpath));
+        if (!m) {
+            chimera_server_error(
+                "pNFS data server %d: backing mount '%s' not found (mount it via the nfs module)",
+                i, ds->backing_path);
+            continue;
+        }
+
+        chimera_vfs_pnfs_set_device_root(vfs, i, m->root_fh, m->root_fh_len);
+        chimera_server_info("pNFS data server %d backing root resolved via '%s' (module=%s path=%s root_fh_len=%d)",
+                            i, ds->backing_path,
+                            m->module ? m->module->name : "?",
+                            m->path ? m->path : "?", m->root_fh_len);
+        resolved++;
+    }
+
+    return (resolved == n) ? 0 : -1;
+} /* chimera_server_pnfs_resolve */
+
+SYMBOL_EXPORT int
 chimera_server_create_bucket(
     struct chimera_server *server,
     const char            *bucket_name,
@@ -690,13 +934,15 @@ SYMBOL_EXPORT int
 chimera_server_create_share(
     struct chimera_server *server,
     const char            *share_name,
-    const char            *share_path)
+    const char            *share_path,
+    int                    continuous_availability)
 {
     if (!server->smb_shared) {
         return -1;
     }
 
-    chimera_smb_add_share(server->smb_shared, share_name, share_path);
+    chimera_smb_add_share(server->smb_shared, share_name, share_path,
+                          continuous_availability);
 
     return 0;
 } /* chimera_server_create_share */
@@ -785,7 +1031,7 @@ chimera_server_init(
     pthread_cond_init(&server->all_threads_online, NULL);
 
     chimera_server_info("Initializing VFS...");
-    server->vfs = chimera_vfs_init(config->sync_delegation_threads,
+    server->vfs = chimera_vfs_init(config->sync_delegation ? config->sync_delegation_threads : 0,
                                    config->async_delegation ? config->async_delegation_threads : 0,
                                    config->modules,
                                    config->num_modules,
@@ -793,18 +1039,40 @@ chimera_server_init(
                                    config->cache_ttl,
                                    metrics);
 
+    /* Enable the pNFS feature whenever configured.  Orchestrated flex-files
+     * needs a data-server table (below); a layout-sourcing backend (e.g. diskfs
+     * block mode) produces its own layouts and needs no data servers, so the
+     * feature is enabled with an empty table. */
+    if (config->pnfs_enabled) {
+        chimera_vfs_pnfs_set_enabled(server->vfs, 1);
+        for (i = 0; i < config->pnfs_num_ds; i++) {
+            chimera_vfs_pnfs_add_device(server->vfs,
+                                        config->pnfs_ds[i].netid,
+                                        config->pnfs_ds[i].uaddr,
+                                        config->pnfs_ds[i].backing_path);
+        }
+        chimera_server_info("pNFS enabled with %d data server(s)", config->pnfs_num_ds);
+    }
+
     chimera_server_info("Initializing protocols...");
     server->protocols[server->num_protocols++] = &nfs_protocol;
-    server->protocols[server->num_protocols++] = &smb_protocol;
-    server->protocols[server->num_protocols++] = &s3_protocol;
+
+    /* A pNFS data server speaks only NFS; skipping SMB/S3 also frees their
+     * fixed listen ports so it can share a host with the metadata server. */
+    if (!config->nfs_data_server) {
+        server->protocols[server->num_protocols++] = &smb_protocol;
+        server->protocols[server->num_protocols++] = &s3_protocol;
+    }
 
     for (i = 0; i < server->num_protocols; i++) {
         server->protocol_private[i] = server->protocols[i]->init(config, server->vfs, metrics);
     }
 
-    server->s3_shared  = server->protocol_private[2];
-    server->smb_shared = server->protocol_private[1];
     server->nfs_shared = server->protocol_private[0];
+    if (!config->nfs_data_server) {
+        server->smb_shared = server->protocol_private[1];
+        server->s3_shared  = server->protocol_private[2];
+    }
 
     chimera_server_info("Initializing REST API...");
     server->rest = chimera_rest_init(config, server, server->vfs, metrics);

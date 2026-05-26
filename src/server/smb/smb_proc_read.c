@@ -5,7 +5,9 @@
 #include "common/evpl_iovec_cursor.h"
 #include "smb_internal.h"
 #include "smb_procs.h"
+#include "smb_session.h"
 #include "vfs/vfs.h"
+#include "vfs/vfs_state.h"
 
 static void
 chimera_smb_read_callback(
@@ -125,7 +127,30 @@ chimera_smb_read(struct chimera_smb_request *request)
         return;
     }
 
-    chimera_vfs_read(
+    struct chimera_vfs_lease_owner io_owner = {
+        .protocol   = CHIMERA_VFS_LEASE_PROTO_SMB2,
+        .client_key = request->session_handle->session->session_id,
+        .owner_lo   = request->read.open_file->file_id.pid,
+        .owner_hi   = request->read.open_file->file_id.vid,
+    };
+
+    /* Mandatory byte-range lock enforcement: an exclusive lock held by a
+     * different open denies reads of the locked range. */
+    if (chimera_vfs_state_range_io_conflict(
+            thread->vfs_thread->vfs->vfs_state,
+            request->read.open_file->handle->fh,
+            request->read.open_file->handle->fh_len,
+            request->read.open_file->handle->fh_hash,
+            request->read.offset, request->read.length,
+            false, &io_owner)) {
+        chimera_smb_open_file_release(request, request->read.open_file);
+        chimera_smb_complete_request(request, SMB2_STATUS_FILE_LOCK_CONFLICT);
+        return;
+    }
+
+    /* Attribute the read to this open's owner so it is mediated against
+     * other holders without recalling the client's own oplock/lease. */
+    chimera_vfs_read_owned(
         thread->vfs_thread,
         &request->session_handle->session->cred,
         request->read.open_file->handle,
@@ -134,6 +159,7 @@ chimera_smb_read(struct chimera_smb_request *request)
         request->read.iov,
         request->read.niov,
         0,
+        &io_owner,
         chimera_smb_read_callback,
         request);
 } /* chimera_smb_read */

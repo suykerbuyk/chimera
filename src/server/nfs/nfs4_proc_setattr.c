@@ -5,6 +5,10 @@
 #include "nfs4_procs.h"
 #include "nfs4_status.h"
 #include "nfs4_attr.h"
+#include "nfs4_state.h"
+#include "nfs4_stateid.h"
+#include "nfs4_session.h"
+#include "nfs4_cb.h"
 #include "vfs/vfs_procs.h"
 #include "vfs/vfs_release.h"
 
@@ -70,8 +74,8 @@ chimera_nfs4_setattr_open_callback(
                                        args->obj_attributes.attr_vals.data,
                                        args->obj_attributes.attr_vals.len);
 
-    if (rc != 0) {
-        res->status = NFS4ERR_BADXDR;
+    if (rc != NFS4_OK) {
+        res->status = rc;
         chimera_vfs_release(req->thread->vfs_thread, handle);
         chimera_nfs4_compound_complete(req, res->status);
         return;
@@ -86,6 +90,22 @@ chimera_nfs4_setattr_open_callback(
                         chimera_nfs4_setattr_complete,
                         req);
 } /* chimera_nfs4_setattr_open_callback */
+
+/* Open the target and apply the attributes.  Invoked directly, or as the
+ * resume continuation once a conflicting layout has been recalled. */
+static void
+nfs4_setattr_proceed(void *arg)
+{
+    struct nfs_request *req = arg;
+
+    chimera_vfs_open_fh(req->thread->vfs_thread,
+                        &req->cred,
+                        req->fh,
+                        req->fhlen,
+                        CHIMERA_VFS_OPEN_INFERRED | CHIMERA_VFS_OPEN_PATH,
+                        chimera_nfs4_setattr_open_callback,
+                        req);
+} /* nfs4_setattr_proceed */
 
 void
 chimera_nfs4_setattr(
@@ -121,11 +141,79 @@ chimera_nfs4_setattr(
         return;
     }
 
-    chimera_vfs_open_fh(thread->vfs_thread,
-                        &req->cred,
-                        req->fh,
-                        req->fhlen,
-                        CHIMERA_VFS_OPEN_INFERRED | CHIMERA_VFS_OPEN_PATH,
-                        chimera_nfs4_setattr_open_callback,
-                        req);
+    /* NFS4.1 current-stateid substitution (RFC 8881 §16.2.3.1.2). */
+    chimera_nfs4_resolve_current_stateid(req, &args->stateid);
+
+    /* RFC 7530 §16.32.3: when SETATTR carries FATTR4_SIZE the supplied
+     * stateid must identify an open with write access.  Special stateids
+     * (all-zero / all-ones) are exempt -- treated as anonymous, like the
+     * pre-Phase-2 behavior. */
+    if (args->obj_attributes.num_attrmask >= 1 &&
+        (args->obj_attributes.attrmask[0] & (1 << FATTR4_SIZE)) &&
+        !nfs4_stateid_is_special(&args->stateid)) {
+        struct nfs_state_table *table = &thread->shared->nfs4_state_table;
+        void                   *state_void;
+        uint8_t                 state_type;
+        nfsstat4                status;
+
+        status = nfs_state_table_acquire(table, &args->stateid,
+                                         NFS4_SLOT_TYPE_OPEN,
+                                         &state_void, &state_type);
+        if (status != NFS4_OK) {
+            res->status = status;
+            chimera_nfs4_compound_complete(req, res->status);
+            return;
+        }
+
+        status = nfs_state_check_client(
+            state_void, state_type,
+            req->session ? req->session->client_unified : NULL);
+        if (status != NFS4_OK) {
+            nfs_state_table_release(table, state_void, state_type,
+                                    thread->vfs_thread);
+            res->status = status;
+            chimera_nfs4_compound_complete(req, res->status);
+            return;
+        }
+
+        struct nfs_open_state *open_state = state_void;
+
+        /* RFC 7530 §9.1.4.3: the stateid must name an open of the object that
+         * is the current filehandle, not some other open file. */
+        if (open_state->fh_len != req->fhlen ||
+            memcmp(open_state->fh, req->fh, req->fhlen) != 0) {
+            nfs_state_table_release(table, open_state, NFS4_SLOT_TYPE_OPEN,
+                                    thread->vfs_thread);
+            res->status = NFS4ERR_BAD_STATEID;
+            chimera_nfs4_compound_complete(req, res->status);
+            return;
+        }
+
+        bool has_write = (open_state->share_access &
+                          OPEN4_SHARE_ACCESS_WRITE) != 0;
+
+        nfs_state_table_release(table, open_state, NFS4_SLOT_TYPE_OPEN,
+                                thread->vfs_thread);
+
+        if (!has_write) {
+            res->status = NFS4ERR_OPENMODE;
+            chimera_nfs4_compound_complete(req, res->status);
+            return;
+        }
+    }
+
+    /* A size change conflicts with any outstanding writable layout for the
+     * file -- held by this client or any other.  Recall it from every holder
+     * and defer the truncate until they have flushed to the data server and
+     * returned their layouts (two-stage recall); if none is held,
+     * nfs4_setattr_proceed runs immediately. */
+    if (args->obj_attributes.num_attrmask >= 1 &&
+        (args->obj_attributes.attrmask[0] & (1 << FATTR4_SIZE)) &&
+        chimera_vfs_pnfs_feature_enabled(thread->shared->vfs)) {
+        chimera_nfs4_cb_recall_and_wait(thread, req->fh, req->fhlen,
+                                        nfs4_setattr_proceed, req);
+        return;
+    }
+
+    nfs4_setattr_proceed(req);
 } /* chimera_nfs4_setattr */

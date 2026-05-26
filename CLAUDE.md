@@ -94,7 +94,7 @@ All of these checks are verified by CI, so running `make check` locally ensures 
 1. **VFS Modules** (`src/vfs/`):
    - `memfs`: In-memory filesystem
    - `linux`: Linux filesystem passthrough
-   - `demofs`: Demo/test filesystem
+   - `diskfs`: Demo/test filesystem
    - `cairn`: Custom persistent filesystem
    - `io_uring`: io_uring-based async filesystem
 
@@ -128,6 +128,7 @@ Chimera uses JSON configuration files. Example:
         }
     },
     "core_threads": 4,
+    "sync_delegation": true,
     "sync_delegation_threads": 16,
     "async_delegation": false,
     "async_delegation_threads": 8,

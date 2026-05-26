@@ -6,6 +6,33 @@
 #include "nfs4_status.h"
 #include "vfs/vfs_procs.h"
 #include "vfs/vfs_release.h"
+#include "vfs/vfs_mount_table.h"
+
+static bool
+chimera_nfs4_fh_is_vfs_mount_root(
+    struct chimera_vfs *vfs,
+    const uint8_t      *fh,
+    uint32_t            fhlen)
+{
+    struct chimera_vfs_mount *mount;
+    bool                      is_root = false;
+
+    if (fhlen < CHIMERA_VFS_MOUNT_ID_SIZE) {
+        return false;
+    }
+
+    urcu_memb_read_lock();
+    mount = chimera_vfs_mount_table_lookup(vfs->mount_table, fh);
+    if (mount &&
+        mount->pathlen > 0 &&
+        mount->root_fh_len == (int) fhlen &&
+        memcmp(mount->root_fh, fh, fhlen) == 0) {
+        is_root = true;
+    }
+    urcu_memb_read_unlock();
+
+    return is_root;
+} /* chimera_nfs4_fh_is_vfs_mount_root */
 
 static void
 chimera_nfs4_lookupp_complete(
@@ -47,7 +74,7 @@ chimera_nfs4_lookupp_open_callback(
 
         /*
          * Resolve parent via lookup_at(handle, "..").  Backends that
-         * understand directory structure (memfs, cairn, demofs) handle
+         * understand directory structure (memfs, cairn, diskfs) handle
          * ".." natively; pass-through backends (linux, io_uring) get
          * parent attrs from fstatat(parent_fd, "..").
          */
@@ -81,12 +108,27 @@ chimera_nfs4_lookupp(
     }
 
     /*
-     * LOOKUPP at the namespace root returns the root again (RFC 7530
-     * 14.2.16).  No need to descend into VFS for the synthetic NFS4 root.
+     * RFC 7530 §16.10.5: LOOKUPP with the current filehandle at the root of
+     * the namespace has no parent to return, so it fails with NFS4ERR_NOENT.
      */
     if (fh_is_nfs4_root(req->fh, req->fhlen)) {
+        res->status = NFS4ERR_NOENT;
+        chimera_nfs4_compound_complete(req, res->status);
+        return;
+    }
+
+    /*
+     * Export roots are mounted as entries in the NFSv4 pseudo-root.  A LOOKUPP
+     * from such a filehandle must return the pseudo-root FH, not the backend's
+     * physical parent/root handle.
+     */
+    if (chimera_nfs4_fh_is_vfs_mount_root(thread->vfs, req->fh, req->fhlen)) {
+        uint32_t fhlen;
+
+        nfs4_root_get_fh(req->fh, &fhlen);
+        req->fhlen  = fhlen;
         res->status = NFS4_OK;
-        chimera_nfs4_compound_complete(req, NFS4_OK);
+        chimera_nfs4_compound_complete(req, res->status);
         return;
     }
 

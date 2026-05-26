@@ -32,6 +32,23 @@
 #define CHIMERA_VFS_ATTR_ATOMIC         (1UL << 19)
 #define CHIMERA_VFS_ATTR_FSID           (1UL << 20)
 
+/* Windows/SMB DOS attribute bits (FILE_ATTRIBUTE_*).  Optional: a backend
+ * sets this bit in va_set_mask only if it actually persists the value. */
+#define CHIMERA_VFS_ATTR_DOS_ATTRIBUTES (1UL << 21)
+
+/* Birth/creation time (SMB create time, statx btime).  POSIX has no such
+ * concept, so this is optional: a backend sets this bit in va_set_mask only
+ * if it actually tracks the value. */
+#define CHIMERA_VFS_ATTR_BTIME          (1UL << 22)
+
+/* Opaque per-file pNFS layout state (va_pnfs/va_pnfs_len).  The contents are
+ * defined and interpreted solely by the NFS server (it packs the data-server
+ * deviceid + backing file handle); a backend just persists and returns the
+ * blob verbatim, which is all it takes to become a pNFS metadata-server
+ * backend.  A backend advertises CHIMERA_VFS_CAP_LAYOUT iff it persists it. */
+#define CHIMERA_VFS_ATTR_PNFS_LAYOUT    (1UL << 23)
+#define CHIMERA_VFS_PNFS_LAYOUT_MAX     96
+
 #define CHIMERA_VFS_ATTR_MASK_STAT      ( \
             CHIMERA_VFS_ATTR_DEV | \
             CHIMERA_VFS_ATTR_INUM | \
@@ -55,8 +72,14 @@
             CHIMERA_VFS_ATTR_FILES_AVAIL | \
             CHIMERA_VFS_ATTR_FSID)
 
+/* Birth time is cacheable and is requested alongside the stat set, but it is
+ * deliberately NOT part of MASK_STAT: MASK_STAT is the set every backend is
+ * required to supply, and the attr cache's "complete entry" gate and the
+ * remove_at hardlink-invalidation both rely on that.  Backends that don't
+ * track btime (linux/io_uring/cairn) must still satisfy MASK_STAT. */
 #define CHIMERA_VFS_ATTR_MASK_CACHEABLE ( \
-            CHIMERA_VFS_ATTR_MASK_STAT)
+            CHIMERA_VFS_ATTR_MASK_STAT | \
+            CHIMERA_VFS_ATTR_BTIME)
 
 #define CHIMERA_VFS_TIME_NOW            ((1l << 30) - 3l)
 
@@ -76,6 +99,7 @@ struct chimera_vfs_attrs {
     struct timespec va_atime;
     struct timespec va_mtime;
     struct timespec va_ctime;
+    struct timespec va_btime;
 
     uint64_t        va_fs_space_avail;
     uint64_t        va_fs_space_free;
@@ -85,6 +109,13 @@ struct chimera_vfs_attrs {
     uint64_t        va_fs_files_free;
     uint64_t        va_fs_files_avail;
     uint64_t        va_fsid;
+
+    uint32_t        va_dos_attributes;
+
+    /* Opaque pNFS layout state, owned by the NFS server (see
+     * CHIMERA_VFS_ATTR_PNFS_LAYOUT). */
+    uint32_t        va_pnfs_len;
+    uint8_t         va_pnfs[CHIMERA_VFS_PNFS_LAYOUT_MAX];
 
     uint32_t        va_fh_len;
     uint64_t        va_fh_hash;

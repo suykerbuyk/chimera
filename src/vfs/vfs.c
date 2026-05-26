@@ -22,6 +22,8 @@
 #include "vfs/vfs_attr_cache.h"
 #include "vfs/vfs_user_cache.h"
 #include "vfs/vfs_notify.h"
+#include "vfs/vfs_state.h"
+#include "vfs/vfs_pnfs.h"
 #include "vfs/vfs_mount_table.h"
 #include "vfs/memfs/memfs.h"
 #include "vfs/linux/linux.h"
@@ -34,7 +36,7 @@
 #include "vfs/cairn/cairn.h"
 #endif /* ifdef HAVE_CAIRN */
 
-#include "vfs/demofs/demofs.h"
+#include "vfs/diskfs/diskfs.h"
 #include "common/misc.h"
 #include "common/macros.h"
 #include "prometheus-c.h"
@@ -220,6 +222,13 @@ chimera_vfs_close_thread_wake_timer(
     chimera_vfs_close_thread_sweep(evpl, close_thread, close_thread->vfs->vfs_open_file_cache, min_age);
 
     pthread_mutex_unlock(&close_thread->lock);
+
+    /* Drop implicit I/O leases that have gone idle, bounding resident
+     * per-file state for write-once / read-once workloads. */
+    if (close_thread->vfs->vfs_state) {
+        chimera_vfs_state_reap_idle(close_thread->vfs->vfs_state,
+                                    close_thread->vfs->vfs_state->implicit_idle_ms);
+    }
 
 } /* chimera_vfs_close_thread_wake */
 
@@ -415,6 +424,8 @@ chimera_vfs_init(
     vfs->vfs_user_cache = chimera_vfs_user_cache_create(8192, 600);
 
     vfs->vfs_notify = chimera_vfs_notify_init(vfs);
+    vfs->vfs_state  = chimera_vfs_state_init();
+    vfs->pnfs       = chimera_vfs_pnfs_create();
 
     /* Register the root pseudo-filesystem module */
     chimera_vfs_register(vfs, &vfs_root, NULL);
@@ -499,6 +510,29 @@ chimera_vfs_init(
     return vfs;
 } /* chimera_vfs_init */
 
+SYMBOL_EXPORT int
+chimera_vfs_fh_is_plausible(
+    struct chimera_vfs_thread *thread,
+    const void                *fh,
+    int                        fhlen)
+{
+    return chimera_vfs_get_module(thread, fh, fhlen) != NULL;
+} /* chimera_vfs_fh_is_plausible */
+
+/* Capabilities of the backend module owning fh, or 0 if no mount matches.
+ * Lets callers without an open handle (e.g. the NFS attribute marshaller)
+ * learn a file's backend pNFS capabilities. */
+SYMBOL_EXPORT uint64_t
+chimera_vfs_module_capabilities(
+    struct chimera_vfs_thread *thread,
+    const void                *fh,
+    int                        fhlen)
+{
+    struct chimera_vfs_module *module = chimera_vfs_get_module(thread, fh, fhlen);
+
+    return module ? module->capabilities : 0;
+} /* chimera_vfs_module_capabilities */
+
 SYMBOL_EXPORT void
 chimera_vfs_destroy(struct chimera_vfs *vfs)
 {
@@ -533,6 +567,8 @@ chimera_vfs_destroy(struct chimera_vfs *vfs)
 
     chimera_vfs_mount_table_destroy(vfs->mount_table);
 
+    chimera_vfs_pnfs_destroy(vfs->pnfs);
+
     for (i = 0; i < CHIMERA_VFS_FH_MAGIC_MAX; i++) {
         module = vfs->modules[i];
 
@@ -549,6 +585,10 @@ chimera_vfs_destroy(struct chimera_vfs *vfs)
 
     if (vfs->vfs_notify) {
         chimera_vfs_notify_destroy(vfs->vfs_notify);
+    }
+
+    if (vfs->vfs_state) {
+        chimera_vfs_state_destroy(vfs->vfs_state);
     }
 
     if (vfs->vfs_user_cache) {
@@ -583,13 +623,15 @@ chimera_vfs_process_completion(
     struct evpl_doorbell *doorbell)
 {
     struct chimera_vfs_thread  *thread = container_of(doorbell, struct chimera_vfs_thread, doorbell);
-    struct chimera_vfs_request *complete_requests, *unblocked_requests, *request;
+    struct chimera_vfs_request *complete_requests, *unblocked_requests, *io_resume_requests, *request;
 
     pthread_mutex_lock(&thread->lock);
     complete_requests                 = thread->pending_complete_requests;
     unblocked_requests                = thread->unblocked_requests;
+    io_resume_requests                = thread->pending_io_resume;
     thread->pending_complete_requests = NULL;
     thread->unblocked_requests        = NULL;
+    thread->pending_io_resume         = NULL;
     pthread_mutex_unlock(&thread->lock);
 
     while (complete_requests) {
@@ -602,6 +644,13 @@ chimera_vfs_process_completion(
         request = unblocked_requests;
         LL_DELETE(unblocked_requests, request);
         request->unblock_callback(request, request->pending_handle);
+    }
+
+    /* Resume parked I/O/metadata requests on this (their owning) thread. */
+    while (io_resume_requests) {
+        request = io_resume_requests;
+        DL_DELETE(io_resume_requests, request);
+        chimera_vfs_state_io_resume(request);
     }
 
 } /* chimera_vfs_process_completion */

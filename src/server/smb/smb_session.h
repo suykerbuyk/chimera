@@ -5,14 +5,17 @@
 #pragma once
 
 #include <stdint.h>
+#include <stdbool.h>
 #include <pthread.h>
 #include <uthash.h>
 
 #include "vfs/vfs.h"
 #include "vfs/vfs_cred.h"
+#include "vfs/vfs_state.h"
 #include "smb2.h"
 
 struct chimera_smb_share;
+struct chimera_smb_conn;
 
 struct chimera_smb_file_id {
     uint64_t pid;
@@ -22,6 +25,15 @@ struct chimera_smb_file_id {
 #define CHIMERA_SMB_OPEN_FILE_FLAG_DIRECTORY       0x00000001
 #define CHIMERA_SMB_OPEN_FILE_FLAG_DELETE_ON_CLOSE 0x00000002
 #define CHIMERA_SMB_OPEN_FILE_CLOSED               0x00000004
+/* Open survived its owning connection's teardown and is parked in the shared
+ * durable-handle table awaiting reconnect or expiry.  While set, the open is
+ * not present in any tree's open_files[] hash and is owned solely by the
+ * durable table (refcnt == 1). Cleared when a reconnect re-homes it. */
+#define CHIMERA_SMB_OPEN_FILE_PARKED               0x00000008
+/* A persistent-handle record for this open was written to the share's backend
+ * (atomically with the open).  On final close the record must be deleted from
+ * that backend so a restart doesn't resurrect a closed handle. */
+#define CHIMERA_SMB_OPEN_FILE_PERSISTED            0x00000010
 
 /* Bits identifying which CREATE contexts a client supplied on the open. Mirrored
  * from request->create.ctx_present_mask into the open file so later phases
@@ -66,6 +78,7 @@ typedef int (*chimera_smb_pipe_transceive_t)(
     struct evpl_iovec          *output_iov);
 
 struct chimera_smb_notify_state;
+struct chimera_smb_lock_entry;
 
 struct chimera_smb_open_file {
     enum chimera_smb_open_file_type  type;
@@ -94,6 +107,24 @@ struct chimera_smb_open_file {
     uint8_t                          create_guid[16];
     struct chimera_smb_open_file    *next;
     struct chimera_smb_notify_state *notify_state;
+    /* Byte-range locks (SMB2_LOCK) held against this open.  Allocated
+     * and linked on each granted lock op; freed on UNLOCK or on close. */
+    struct chimera_smb_lock_entry   *lock_entries;
+    /* SHARE lease (whole-file deny mode reservation) held by this open
+     * once CREATE succeeds.  Released at close. */
+    struct chimera_vfs_lease         share_lease;
+    struct chimera_vfs_file_state   *share_file_state;
+    bool                             share_lease_inserted;
+    /* CACHING lease (SMB2 lease / oplock) held by this open.  Released
+     * at close or on OPLOCK_BREAK ack with mode=0. */
+    struct chimera_vfs_lease         caching_lease;
+    struct chimera_vfs_file_state   *caching_file_state;
+    bool                             caching_lease_inserted;
+    /* Conn on which this open was created — used by the break path to
+     * send unsolicited OPLOCK_BREAK Notifications.  Cleared by the
+     * disconnect handler before the conn is freed; if NULL when a
+     * break is needed, the lease is forcibly revoked instead. */
+    struct chimera_smb_conn         *create_conn;
     uint8_t                          parent_fh[CHIMERA_VFS_FH_SIZE];
     char                             name[SMB_FILENAME_MAX];
     uint16_t                         pattern[SMB_FILENAME_MAX];

@@ -97,9 +97,9 @@ endmacro()
 
 # Generate tests for each backend
 generate_posix_backend_tests(memfs "")
-generate_posix_backend_tests(demofs_io_uring IO_URING_ENABLED)
+generate_posix_backend_tests(diskfs_io_uring IO_URING_ENABLED)
 if(HAVE_LIBAIO)
-    generate_posix_backend_tests(demofs_aio "")
+    generate_posix_backend_tests(diskfs_aio "")
 endif()
 generate_posix_backend_tests(cairn CAIRN_ENABLED)
 generate_posix_backend_tests(linux "")
@@ -115,13 +115,17 @@ generate_posix_backend_tests(io_uring CHIMERA_VFS_IO_URING)
 # Macro to add a test that runs via NFS3 client (requires network namespace)
 macro(add_posix_nfs3_test testname prog nfs_backend)
     if(CHIMERA_NETNS_TESTING)
+        set(test_timeout 60)
+        if("${testname}" STREQUAL "io_serialize" AND "${nfs_backend}" MATCHES "^diskfs_")
+            set(test_timeout 120)
+        endif()
         add_test(NAME chimera/posix/${testname}_nfs3_${nfs_backend}
             COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_${prog} -b nfs3_${nfs_backend}
         )
         get_target_property(test_file posix_${prog} TEST_FILE)
         set_tests_properties(chimera/posix/${testname}_nfs3_${nfs_backend} PROPERTIES
             ENVIRONMENT "TEST_FILE=${test_file}"
-            TIMEOUT 60
+            TIMEOUT ${test_timeout}
         )
     endif()
 endmacro()
@@ -145,9 +149,9 @@ endmacro()
 
 # Generate NFS3 tests for each backend
 generate_posix_nfs3_backend_tests(memfs "")
-generate_posix_nfs3_backend_tests(demofs_io_uring IO_URING_ENABLED)
+generate_posix_nfs3_backend_tests(diskfs_io_uring IO_URING_ENABLED)
 if(HAVE_LIBAIO)
-    generate_posix_nfs3_backend_tests(demofs_aio "")
+    generate_posix_nfs3_backend_tests(diskfs_aio "")
 endif()
 generate_posix_nfs3_backend_tests(cairn CAIRN_ENABLED)
 generate_posix_nfs3_backend_tests(linux "")
@@ -162,14 +166,20 @@ generate_posix_nfs3_backend_tests(io_uring CHIMERA_VFS_IO_URING)
 
 # Macro to add a test that runs via NFS4 client (requires network namespace)
 macro(add_posix_nfs4_test testname prog nfs_backend)
-    add_test(NAME chimera/posix/${testname}_nfs4_${nfs_backend}
-        COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_${prog} -b nfs4_${nfs_backend}
-    )
-    get_target_property(test_file posix_${prog} TEST_FILE)
-    set_tests_properties(chimera/posix/${testname}_nfs4_${nfs_backend} PROPERTIES
-        ENVIRONMENT "TEST_FILE=${test_file}"
-        TIMEOUT 60
-    )
+    if(CHIMERA_NETNS_TESTING)
+        set(test_timeout 60)
+        if("${testname}" STREQUAL "io_serialize" AND "${nfs_backend}" MATCHES "^diskfs_")
+            set(test_timeout 120)
+        endif()
+        add_test(NAME chimera/posix/${testname}_nfs4_${nfs_backend}
+            COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_${prog} -b nfs4_${nfs_backend}
+        )
+        get_target_property(test_file posix_${prog} TEST_FILE)
+        set_tests_properties(chimera/posix/${testname}_nfs4_${nfs_backend} PROPERTIES
+            ENVIRONMENT "TEST_FILE=${test_file}"
+            TIMEOUT ${test_timeout}
+        )
+    endif()
 endmacro()
 
 # Helper macro to generate NFS4 tests for a specific server-side backend
@@ -191,9 +201,9 @@ endmacro()
 
 # Generate NFS4 tests for each backend
 generate_posix_nfs4_backend_tests(memfs "")
-generate_posix_nfs4_backend_tests(demofs_io_uring IO_URING_ENABLED)
+generate_posix_nfs4_backend_tests(diskfs_io_uring IO_URING_ENABLED)
 if(HAVE_LIBAIO)
-    generate_posix_nfs4_backend_tests(demofs_aio "")
+    generate_posix_nfs4_backend_tests(diskfs_aio "")
 endif()
 generate_posix_nfs4_backend_tests(cairn CAIRN_ENABLED)
 generate_posix_nfs4_backend_tests(linux "")
@@ -209,13 +219,17 @@ generate_posix_nfs4_backend_tests(io_uring CHIMERA_VFS_IO_URING)
 # Macro to add a test that runs via NFS3 RDMA client (requires network namespace)
 macro(add_posix_nfs3rdma_test testname prog nfs_backend)
     if(CHIMERA_NETNS_TESTING)
+        set(test_timeout 60)
+        if("${testname}" STREQUAL "io_serialize" AND "${nfs_backend}" MATCHES "^diskfs_")
+            set(test_timeout 120)
+        endif()
         add_test(NAME chimera/posix/${testname}_nfs3rdma_${nfs_backend}
             COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_${prog} -b nfs3rdma_${nfs_backend}
         )
         get_target_property(test_file posix_${prog} TEST_FILE)
         set_tests_properties(chimera/posix/${testname}_nfs3rdma_${nfs_backend} PROPERTIES
             ENVIRONMENT "TEST_FILE=${test_file}"
-            TIMEOUT 60
+            TIMEOUT ${test_timeout}
         )
     endif()
 endmacro()
@@ -239,9 +253,9 @@ endmacro()
 
 # Generate NFS3 RDMA tests for each backend
 generate_posix_nfs3rdma_backend_tests(memfs "")
-generate_posix_nfs3rdma_backend_tests(demofs_io_uring IO_URING_ENABLED)
+generate_posix_nfs3rdma_backend_tests(diskfs_io_uring IO_URING_ENABLED)
 if(HAVE_LIBAIO)
-    generate_posix_nfs3rdma_backend_tests(demofs_aio "")
+    generate_posix_nfs3rdma_backend_tests(diskfs_aio "")
 endif()
 generate_posix_nfs3rdma_backend_tests(cairn CAIRN_ENABLED)
 generate_posix_nfs3rdma_backend_tests(linux "")
@@ -269,10 +283,10 @@ endmacro()
 # Add FSX tests for each backend
 add_fsx_test(memfs)
 if(IO_URING_ENABLED)
-    add_fsx_test(demofs_io_uring)
+    add_fsx_test(diskfs_io_uring)
 endif()
 if(HAVE_LIBAIO)
-    add_fsx_test(demofs_aio)
+    add_fsx_test(diskfs_aio)
 endif()
 if(CAIRN_ENABLED)
     add_fsx_test(cairn)
@@ -286,10 +300,10 @@ endif()
 # These tests run FSX through the NFS3 protocol to an in-process server
 add_fsx_test(nfs3_memfs)
 if(IO_URING_ENABLED)
-    add_fsx_test(nfs3_demofs_io_uring)
+    add_fsx_test(nfs3_diskfs_io_uring)
 endif()
 if(HAVE_LIBAIO)
-    add_fsx_test(nfs3_demofs_aio)
+    add_fsx_test(nfs3_diskfs_aio)
 endif()
 if(CAIRN_ENABLED)
     add_fsx_test(nfs3_cairn)
@@ -303,10 +317,10 @@ endif()
 # These tests run FSX through the NFS3 protocol using TCP-RDMA to an in-process server
 add_fsx_test(nfs3rdma_memfs)
 if(IO_URING_ENABLED)
-    add_fsx_test(nfs3rdma_demofs_io_uring)
+    add_fsx_test(nfs3rdma_diskfs_io_uring)
 endif()
 if(HAVE_LIBAIO)
-    add_fsx_test(nfs3rdma_demofs_aio)
+    add_fsx_test(nfs3rdma_diskfs_aio)
 endif()
 if(CAIRN_ENABLED)
     add_fsx_test(nfs3rdma_cairn)
@@ -320,10 +334,10 @@ endif()
 # These tests run FSX through the NFS4 protocol to an in-process server
 add_fsx_test(nfs4_memfs)
 if(IO_URING_ENABLED)
-    add_fsx_test(nfs4_demofs_io_uring)
+    add_fsx_test(nfs4_diskfs_io_uring)
 endif()
 if(HAVE_LIBAIO)
-    add_fsx_test(nfs4_demofs_aio)
+    add_fsx_test(nfs4_diskfs_aio)
 endif()
 if(CAIRN_ENABLED)
     add_fsx_test(nfs4_cairn)
@@ -429,9 +443,9 @@ endmacro()
 
 # Generate cthon tests for each backend
 generate_cthon_backend_tests(memfs "")
-generate_cthon_backend_tests(demofs_io_uring IO_URING_ENABLED)
+generate_cthon_backend_tests(diskfs_io_uring IO_URING_ENABLED)
 if(HAVE_LIBAIO)
-    generate_cthon_backend_tests(demofs_aio "")
+    generate_cthon_backend_tests(diskfs_aio "")
 endif()
 generate_cthon_backend_tests(cairn CAIRN_ENABLED)
 generate_cthon_backend_tests(linux "")
@@ -501,9 +515,9 @@ endmacro()
 
 # Generate NFS3 cthon tests for each backend
 generate_cthon_nfs3_backend_tests(memfs "")
-generate_cthon_nfs3_backend_tests(demofs_io_uring IO_URING_ENABLED)
+generate_cthon_nfs3_backend_tests(diskfs_io_uring IO_URING_ENABLED)
 if(HAVE_LIBAIO)
-    generate_cthon_nfs3_backend_tests(demofs_aio "")
+    generate_cthon_nfs3_backend_tests(diskfs_aio "")
 endif()
 generate_cthon_nfs3_backend_tests(cairn CAIRN_ENABLED)
 generate_cthon_nfs3_backend_tests(linux "")
@@ -548,9 +562,9 @@ endmacro()
 
 # Generate NFS3 RDMA cthon tests for each backend
 generate_cthon_nfs3rdma_backend_tests(memfs "")
-generate_cthon_nfs3rdma_backend_tests(demofs_io_uring IO_URING_ENABLED)
+generate_cthon_nfs3rdma_backend_tests(diskfs_io_uring IO_URING_ENABLED)
 if(HAVE_LIBAIO)
-    generate_cthon_nfs3rdma_backend_tests(demofs_aio "")
+    generate_cthon_nfs3rdma_backend_tests(diskfs_aio "")
 endif()
 generate_cthon_nfs3rdma_backend_tests(cairn CAIRN_ENABLED)
 generate_cthon_nfs3rdma_backend_tests(linux "")
@@ -565,14 +579,16 @@ generate_cthon_nfs3rdma_backend_tests(io_uring CHIMERA_VFS_IO_URING)
 
 # Macro to add a cthon test that runs via NFS4 client (requires network namespace)
 macro(add_cthon_nfs4_test testname prog nfs_backend)
-    add_test(NAME chimera/posix/cthon/${testname}_nfs4_${nfs_backend}
-        COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_${prog} -b nfs4_${nfs_backend}
-    )
-    get_target_property(test_file posix_${prog} TEST_FILE)
-    set_tests_properties(chimera/posix/cthon/${testname}_nfs4_${nfs_backend} PROPERTIES
-        ENVIRONMENT "TEST_FILE=${test_file}"
-        TIMEOUT 300
-    )
+    if(CHIMERA_NETNS_TESTING)
+        add_test(NAME chimera/posix/cthon/${testname}_nfs4_${nfs_backend}
+            COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_${prog} -b nfs4_${nfs_backend}
+        )
+        get_target_property(test_file posix_${prog} TEST_FILE)
+        set_tests_properties(chimera/posix/cthon/${testname}_nfs4_${nfs_backend} PROPERTIES
+            ENVIRONMENT "TEST_FILE=${test_file}"
+            TIMEOUT 300
+        )
+    endif()
 endmacro()
 
 # Helper macro to generate NFS4 cthon tests for a specific server-side backend
@@ -593,9 +609,9 @@ endmacro()
 
 # Generate NFS4 cthon tests for each backend
 generate_cthon_nfs4_backend_tests(memfs "")
-generate_cthon_nfs4_backend_tests(demofs_io_uring IO_URING_ENABLED)
+generate_cthon_nfs4_backend_tests(diskfs_io_uring IO_URING_ENABLED)
 if(HAVE_LIBAIO)
-    generate_cthon_nfs4_backend_tests(demofs_aio "")
+    generate_cthon_nfs4_backend_tests(diskfs_aio "")
 endif()
 generate_cthon_nfs4_backend_tests(cairn CAIRN_ENABLED)
 generate_cthon_nfs4_backend_tests(linux "")
@@ -675,9 +691,9 @@ endmacro()
 
 # Generate stress tests for each backend
 generate_stress_tests(memfs "")
-generate_stress_tests(demofs_io_uring IO_URING_ENABLED)
+generate_stress_tests(diskfs_io_uring IO_URING_ENABLED)
 if(HAVE_LIBAIO)
-    generate_stress_tests(demofs_aio "")
+    generate_stress_tests(diskfs_aio "")
 endif()
 generate_stress_tests(cairn CAIRN_ENABLED)
 generate_stress_tests(linux "")
@@ -736,9 +752,9 @@ endmacro()
 
 # Generate NFS3 stress tests for each backend
 generate_stress_nfs3_tests(memfs "")
-generate_stress_nfs3_tests(demofs_io_uring IO_URING_ENABLED)
+generate_stress_nfs3_tests(diskfs_io_uring IO_URING_ENABLED)
 if(HAVE_LIBAIO)
-    generate_stress_nfs3_tests(demofs_aio "")
+    generate_stress_nfs3_tests(diskfs_aio "")
 endif()
 generate_stress_nfs3_tests(cairn CAIRN_ENABLED)
 generate_stress_nfs3_tests(linux "")
@@ -797,9 +813,9 @@ endmacro()
 
 # Generate NFS3 RDMA stress tests for each backend
 generate_stress_nfs3rdma_tests(memfs "")
-generate_stress_nfs3rdma_tests(demofs_io_uring IO_URING_ENABLED)
+generate_stress_nfs3rdma_tests(diskfs_io_uring IO_URING_ENABLED)
 if(HAVE_LIBAIO)
-    generate_stress_nfs3rdma_tests(demofs_aio "")
+    generate_stress_nfs3rdma_tests(diskfs_aio "")
 endif()
 generate_stress_nfs3rdma_tests(cairn CAIRN_ENABLED)
 generate_stress_nfs3rdma_tests(linux "")
@@ -814,35 +830,37 @@ generate_stress_nfs3rdma_tests(io_uring CHIMERA_VFS_IO_URING)
 
 # Helper macro to generate NFS4 stress tests for a backend
 macro(_generate_stress_nfs4_tests_for_backend nfs_backend)
-    # dirstress: directory operations stress test (reduced params for testing)
-    add_test(NAME chimera/posix/dirstress_nfs4_${nfs_backend}
-        COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_test_dirstress -b nfs4_${nfs_backend} -p 1 -f 50
-    )
-    set_tests_properties(chimera/posix/dirstress_nfs4_${nfs_backend} PROPERTIES TIMEOUT 120)
+    if(CHIMERA_NETNS_TESTING)
+        # dirstress: directory operations stress test (reduced params for testing)
+        add_test(NAME chimera/posix/dirstress_nfs4_${nfs_backend}
+            COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_test_dirstress -b nfs4_${nfs_backend} -p 1 -f 50
+        )
+        set_tests_properties(chimera/posix/dirstress_nfs4_${nfs_backend} PROPERTIES TIMEOUT 120)
 
-    # rewinddir: tests rewinddir() POSIX semantics
-    add_test(NAME chimera/posix/rewinddir_nfs4_${nfs_backend}
-        COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_test_rewinddir -b nfs4_${nfs_backend}
-    )
-    set_tests_properties(chimera/posix/rewinddir_nfs4_${nfs_backend} PROPERTIES TIMEOUT 120)
+        # rewinddir: tests rewinddir() POSIX semantics
+        add_test(NAME chimera/posix/rewinddir_nfs4_${nfs_backend}
+            COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_test_rewinddir -b nfs4_${nfs_backend}
+        )
+        set_tests_properties(chimera/posix/rewinddir_nfs4_${nfs_backend} PROPERTIES TIMEOUT 120)
 
-    # fstest: data integrity verification test
-    add_test(NAME chimera/posix/fstest_nfs4_${nfs_backend}
-        COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_test_fstest -b nfs4_${nfs_backend} -n 1 -f 2 -l 5 -s 65536
-    )
-    set_tests_properties(chimera/posix/fstest_nfs4_${nfs_backend} PROPERTIES TIMEOUT 120)
+        # fstest: data integrity verification test
+        add_test(NAME chimera/posix/fstest_nfs4_${nfs_backend}
+            COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_test_fstest -b nfs4_${nfs_backend} -n 1 -f 2 -l 5 -s 65536
+        )
+        set_tests_properties(chimera/posix/fstest_nfs4_${nfs_backend} PROPERTIES TIMEOUT 120)
 
-    # nametest: namespace stress test
-    add_test(NAME chimera/posix/nametest_nfs4_${nfs_backend}
-        COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_test_nametest -b nfs4_${nfs_backend} -n 50 -i 1000
-    )
-    set_tests_properties(chimera/posix/nametest_nfs4_${nfs_backend} PROPERTIES TIMEOUT 120)
+        # nametest: namespace stress test
+        add_test(NAME chimera/posix/nametest_nfs4_${nfs_backend}
+            COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_test_nametest -b nfs4_${nfs_backend} -n 50 -i 1000
+        )
+        set_tests_properties(chimera/posix/nametest_nfs4_${nfs_backend} PROPERTIES TIMEOUT 120)
 
-    # fsstress: comprehensive filesystem stress test
-    add_test(NAME chimera/posix/fsstress_nfs4_${nfs_backend}
-        COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_test_fsstress -b nfs4_${nfs_backend} -n 500 -p 1
-    )
-    set_tests_properties(chimera/posix/fsstress_nfs4_${nfs_backend} PROPERTIES TIMEOUT 180)
+        # fsstress: comprehensive filesystem stress test
+        add_test(NAME chimera/posix/fsstress_nfs4_${nfs_backend}
+            COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_test_fsstress -b nfs4_${nfs_backend} -n 500 -p 1
+        )
+        set_tests_properties(chimera/posix/fsstress_nfs4_${nfs_backend} PROPERTIES TIMEOUT 180)
+    endif()
 endmacro()
 
 # Macro to generate NFS4 stress tests with optional condition
@@ -856,9 +874,9 @@ endmacro()
 
 # Generate NFS4 stress tests for each backend
 generate_stress_nfs4_tests(memfs "")
-generate_stress_nfs4_tests(demofs_io_uring IO_URING_ENABLED)
+generate_stress_nfs4_tests(diskfs_io_uring IO_URING_ENABLED)
 if(HAVE_LIBAIO)
-    generate_stress_nfs4_tests(demofs_aio "")
+    generate_stress_nfs4_tests(diskfs_aio "")
 endif()
 generate_stress_nfs4_tests(cairn CAIRN_ENABLED)
 generate_stress_nfs4_tests(linux "")

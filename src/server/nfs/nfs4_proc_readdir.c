@@ -5,6 +5,7 @@
 #include "nfs4_procs.h"
 #include "nfs4_attr.h"
 #include "nfs4_status.h"
+#include "server/server.h"
 #include "vfs/vfs_procs.h"
 #include "vfs/vfs_release.h"
 
@@ -63,7 +64,15 @@ chimera_nfs4_readdir_callback(
                                 entry->attrs.attrmask,
                                 3,
                                 entry->attrs.attr_vals.data,
-                                &entry->attrs.attr_vals.len);
+                                &entry->attrs.attr_vals.len,
+                                req->minorversion,
+                                /* entries share the directory's backend/fs */
+                                chimera_nfs4_pnfs_layout_type(req->thread->vfs_thread,
+                                                              req->thread->shared->vfs,
+                                                              req->fh, req->fhlen),
+                                chimera_server_config_get_nfs4_delegations(
+                                    req->thread->shared->config),
+                                req->thread->shared->nfs_lease_time_s);
 
     dbuf_cur = req->encoding->dbuf->used - dbuf_before;
 
@@ -102,7 +111,20 @@ chimera_nfs4_readdir_complete(
     struct nfs_nfs4_readdir_cursor *cursor = &req->readdir4_cursor;
     uint64_t                        cv;
 
+    /* RFC 7530 §16.24.4: if not even one entry fit in maxcount and we are
+     * not at end-of-directory, the buffer is too small. Returning an empty,
+     * non-eof page would stall a paging client. */
+    if (status == NFS4_OK && !eof && cursor->entries == NULL) {
+        status = NFS4ERR_TOOSMALL;
+    }
+
     res->status = status;
+
+    if (status != NFS4_OK) {
+        chimera_vfs_release(req->thread->vfs_thread, req->handle);
+        chimera_nfs4_compound_complete(req, status);
+        return;
+    }
 
     cv = verifier ? verifier : cookie;
     memcpy(res->resok4.cookieverf, &cv, sizeof(res->resok4.cookieverf));
@@ -157,11 +179,29 @@ chimera_nfs4_readdir(
     struct nfs_argop4                *argop,
     struct nfs_resop4                *resop)
 {
-    struct READDIR4res             *res = &req->res_compound.resarray[req->index].opreaddir;
+    struct READDIR4args            *args = &argop->opreaddir;
+    struct READDIR4res             *res  = &req->res_compound.resarray[req->index].opreaddir;
     struct nfs_nfs4_readdir_cursor *cursor;
 
     if (req->fhlen == 0) {
         res->status = NFS4ERR_NOFILEHANDLE;
+        chimera_nfs4_compound_complete(req, res->status);
+        return;
+    }
+
+    /* maxcount bounds the entire READDIR4resok. If it cannot even hold the
+     * cookie verifier and the empty-directory reply (8 + 4 + 4 bytes), the
+     * server returns NFS4ERR_TOOSMALL. */
+    if (args->maxcount < 16) {
+        res->status = NFS4ERR_TOOSMALL;
+        chimera_nfs4_compound_complete(req, res->status);
+        return;
+    }
+
+    /* Write-only attributes (time_*_set) cannot be read back per entry. */
+    res->status = chimera_nfs4_validate_getattr_request(args->num_attr_request,
+                                                        args->attr_request);
+    if (res->status != NFS4_OK) {
         chimera_nfs4_compound_complete(req, res->status);
         return;
     }
@@ -171,10 +211,24 @@ chimera_nfs4_readdir(
         return;
     }
 
+    /* RFC 7530 §16.24: cookie values 1 and 2 are reserved and must never be
+     * sent by a client (0 means "start of directory"). The VFS backends emit
+     * only cookie 0 or values >= 3 for regular directories, so a reserved
+     * cookie here is a client error. The pseudo-root, handled above, uses its
+     * own export-index cookie space and is intentionally exempt. */
+    if (args->cookie == 1 || args->cookie == 2) {
+        res->status = NFS4ERR_BAD_COOKIE;
+        chimera_nfs4_compound_complete(req, res->status);
+        return;
+    }
 
     cursor = &req->readdir4_cursor;
 
-    cursor->count   = 256;
+    /* Fixed READDIR4resok overhead counted against maxcount: cookieverf (8)
+     * + the dirlist4 "entry present" and "eof" booleans (4 each). Keeping
+     * this tight ensures a small maxcount on a continuation still admits at
+     * least one entry rather than returning an empty, non-eof page. */
+    cursor->count   = 16;
     cursor->entries = NULL;
     cursor->last    = NULL;
 

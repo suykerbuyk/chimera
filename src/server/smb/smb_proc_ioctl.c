@@ -8,6 +8,57 @@
 #include "smb2.h"
 #include "common/misc.h"
 
+/* MS-SMB2 3.3.5.15.12: validate an FSCTL_VALIDATE_NEGOTIATE_INFO request
+ * against the connection's negotiated state.  Returns true if it matches and
+ * a response should be sent; false if the connection MUST be terminated. */
+static bool
+chimera_smb_validate_negotiate_info_ok(
+    const struct chimera_smb_conn          *conn,
+    const struct chimera_server_smb_shared *shared,
+    const struct chimera_smb_request       *request)
+{
+    uint16_t gcd = 0;
+    int      i, j;
+
+    /* The response is 24 bytes; an output buffer too small to hold it is a
+     * protocol violation. */
+    if (request->ioctl.max_output_response < 24) {
+        return false;
+    }
+
+    /* VALIDATE_NEGOTIATE_INFO is not used on SMB 3.1.1 (preauth integrity
+     * supersedes it); receiving it there terminates the connection. */
+    if (conn->dialect == SMB2_DIALECT_3_1_1) {
+        return false;
+    }
+
+    if (memcmp(request->ioctl.vni_guid, conn->client_guid, 16) != 0) {
+        return false;
+    }
+    if (request->ioctl.vni_security_mode != conn->client_security_mode) {
+        return false;
+    }
+    if (request->ioctl.vni_capabilities != conn->client_capabilities) {
+        return false;
+    }
+
+    /* The greatest dialect common to the request's list and the server's
+     * supported set must equal the dialect negotiated on this connection. */
+    for (i = 0; i < request->ioctl.vni_dialect_count; i++) {
+        uint16_t cand = request->ioctl.vni_dialects[i];
+        for (j = 0; j < shared->config.num_dialects; j++) {
+            if (shared->config.dialects[j] == cand && cand > gcd) {
+                gcd = cand;
+            }
+        }
+    }
+    if (gcd != conn->dialect) {
+        return false;
+    }
+
+    return true;
+} /* chimera_smb_validate_negotiate_info_ok */
+
 void
 chimera_smb_ioctl(struct chimera_smb_request *request)
 {
@@ -24,6 +75,18 @@ chimera_smb_ioctl(struct chimera_smb_request *request)
             break;
 
         case SMB2_FSCTL_VALIDATE_NEGOTIATE_INFO:
+            if (!chimera_smb_validate_negotiate_info_ok(conn, shared, request)) {
+                /* MS-SMB2 3.3.5.15.12: a mismatch (or a 3.1.1 connection)
+                 * MUST terminate the transport connection with no reply.
+                 * Mirror the signing-failure teardown: drop the compound and
+                 * close the bind. */
+                struct chimera_smb_compound *compound = request->compound;
+
+                chimera_smb_compound_free(thread, compound);
+                evpl_close(thread->evpl, conn->bind);
+                return;
+            }
+
             request->ioctl.r_capabilities = conn->capabilities;
             memcpy(request->ioctl.r_guid, shared->guid, 16);
             request->ioctl.r_security_mode = SMB2_SIGNING_ENABLED;
@@ -79,6 +142,27 @@ chimera_smb_ioctl(struct chimera_smb_request *request)
             chimera_smb_ioctl_get_reparse(request);
             break;
 
+        case SMB2_FSCTL_SET_SPARSE:
+            chimera_smb_ioctl_set_sparse(request);
+            break;
+
+        case SMB2_FSCTL_SET_ZERO_DATA:
+            chimera_smb_ioctl_set_zero_data(request);
+            break;
+
+        case SMB2_FSCTL_QUERY_ALLOCATED_RANGES:
+            chimera_smb_ioctl_query_allocated_ranges(request);
+            break;
+
+        case SMB2_FSCTL_SRV_REQUEST_RESUME_KEY:
+            chimera_smb_ioctl_request_resume_key(request);
+            break;
+
+        case SMB2_FSCTL_SRV_COPYCHUNK:
+        case SMB2_FSCTL_SRV_COPYCHUNK_WRITE:
+            chimera_smb_ioctl_copychunk(request);
+            break;
+
         default:
             chimera_smb_complete_request(request, SMB2_STATUS_NOT_IMPLEMENTED);
             break;
@@ -111,6 +195,16 @@ chimera_smb_ioctl_reply(
             break;
         case SMB2_FSCTL_GET_REPARSE_POINT:
             output_length = request->ioctl.rp_response_len;
+            break;
+        case SMB2_FSCTL_QUERY_ALLOCATED_RANGES:
+            output_length = request->ioctl.sp_qar_count * 16;
+            break;
+        case SMB2_FSCTL_SRV_REQUEST_RESUME_KEY:
+            output_length = 32; /* ResumeKey(24) + ContextLength(4) + Context(pad 4) */
+            break;
+        case SMB2_FSCTL_SRV_COPYCHUNK:
+        case SMB2_FSCTL_SRV_COPYCHUNK_WRITE:
+            output_length = 12; /* ChunksWritten + ChunkBytesWritten + TotalBytesWritten */
             break;
     } /* switch */
 
@@ -179,6 +273,27 @@ chimera_smb_ioctl_reply(
                                           request->ioctl.rp_response,
                                           request->ioctl.rp_response_len);
             break;
+        case SMB2_FSCTL_QUERY_ALLOCATED_RANGES:
+            for (uint32_t qi = 0; qi < request->ioctl.sp_qar_count; qi++) {
+                evpl_iovec_cursor_append_uint64(reply_cursor, request->ioctl.sp_qar_ranges[qi].offset);
+                evpl_iovec_cursor_append_uint64(reply_cursor, request->ioctl.sp_qar_ranges[qi].length);
+            }
+            break;
+        case SMB2_FSCTL_SRV_REQUEST_RESUME_KEY:
+            /* ResumeKey (24): encode the source open's FileId; the client
+             * treats it opaquely and echoes it back in COPYCHUNK. */
+            evpl_iovec_cursor_append_uint64(reply_cursor, request->ioctl.file_id.pid);
+            evpl_iovec_cursor_append_uint64(reply_cursor, request->ioctl.file_id.vid);
+            evpl_iovec_cursor_append_uint64(reply_cursor, 0);
+            evpl_iovec_cursor_append_uint32(reply_cursor, 0); /* ContextLength */
+            evpl_iovec_cursor_append_uint32(reply_cursor, 0); /* Context (pad) */
+            break;
+        case SMB2_FSCTL_SRV_COPYCHUNK:
+        case SMB2_FSCTL_SRV_COPYCHUNK_WRITE:
+            evpl_iovec_cursor_append_uint32(reply_cursor, request->ioctl.cc_chunks_written);
+            evpl_iovec_cursor_append_uint32(reply_cursor, 0); /* ChunkBytesWritten */
+            evpl_iovec_cursor_append_uint32(reply_cursor, (uint32_t) request->ioctl.cc_total_written);
+            break;
         default:
             break;
     } /* switch */
@@ -211,6 +326,9 @@ chimera_smb_parse_ioctl(
     evpl_iovec_cursor_get_uint32(request_cursor, &request->ioctl.output_count);
     evpl_iovec_cursor_get_uint32(request_cursor, &request->ioctl.max_output_response);
     evpl_iovec_cursor_get_uint32(request_cursor, &request->ioctl.flags);
+
+    /* SET_SPARSE with no input buffer means SetSparse = TRUE. */
+    request->ioctl.sp_set_sparse = 1;
 
     /* Parse IOCTL-specific input data if present */
     if (request->ioctl.input_count > 0) {
@@ -424,6 +542,65 @@ chimera_smb_parse_ioctl(
                                      request->ioctl.rp_reparse_tag);
                     /* Mark tag as 0 so handler knows to skip */
                     request->ioctl.rp_reparse_tag = 0;
+                }
+                break;
+            }
+            case SMB2_FSCTL_SET_SPARSE:
+                /* FILE_SET_SPARSE_BUFFER: optional single SetSparse byte. */
+                evpl_iovec_cursor_get_uint8(request_cursor, &request->ioctl.sp_set_sparse);
+                break;
+            case SMB2_FSCTL_SET_ZERO_DATA:
+                /* FILE_ZERO_DATA_INFORMATION: int64 FileOffset, int64 BeyondFinalZero. */
+                if (request->ioctl.input_count < 16) {
+                    chimera_smb_error("SET_ZERO_DATA input too small (%u < 16)",
+                                      request->ioctl.input_count);
+                    request->status = SMB2_STATUS_INVALID_PARAMETER;
+                    return -1;
+                }
+                evpl_iovec_cursor_get_uint64(request_cursor, &request->ioctl.sp_zero_offset);
+                evpl_iovec_cursor_get_uint64(request_cursor, &request->ioctl.sp_zero_beyond);
+                break;
+            case SMB2_FSCTL_QUERY_ALLOCATED_RANGES:
+                /* FILE_ALLOCATED_RANGE_BUFFER: int64 FileOffset, int64 Length. */
+                if (request->ioctl.input_count < 16) {
+                    chimera_smb_error("QUERY_ALLOCATED_RANGES input too small (%u < 16)",
+                                      request->ioctl.input_count);
+                    request->status = SMB2_STATUS_INVALID_PARAMETER;
+                    return -1;
+                }
+                evpl_iovec_cursor_get_uint64(request_cursor, &request->ioctl.sp_qar_offset);
+                evpl_iovec_cursor_get_uint64(request_cursor, &request->ioctl.sp_qar_length);
+                break;
+            case SMB2_FSCTL_SRV_COPYCHUNK:
+            case SMB2_FSCTL_SRV_COPYCHUNK_WRITE: {
+                /* SRV_COPYCHUNK_COPY: SourceKey(24) + ChunkCount(4) +
+                 * Reserved(4) + ChunkCount * SRV_COPYCHUNK{ SourceOffset(8),
+                 * TargetOffset(8), Length(4), Reserved(4) }. */
+                uint32_t reserved, cc, i;
+
+                if (request->ioctl.input_count < 32) {
+                    request->status = SMB2_STATUS_INVALID_PARAMETER;
+                    return -1;
+                }
+                /* The 24-byte SourceKey encodes the source open's FileId. */
+                evpl_iovec_cursor_get_uint64(request_cursor, &request->ioctl.cc_src_file_id.pid);
+                evpl_iovec_cursor_get_uint64(request_cursor, &request->ioctl.cc_src_file_id.vid);
+                evpl_iovec_cursor_skip(request_cursor, 8); /* remainder of resume key */
+                evpl_iovec_cursor_get_uint32(request_cursor, &cc);
+                evpl_iovec_cursor_get_uint32(request_cursor, &reserved);
+
+                if (cc > CHIMERA_SMB_COPYCHUNK_MAX ||
+                    request->ioctl.input_count < 32 + (uint64_t) cc * 24) {
+                    request->status = SMB2_STATUS_INVALID_PARAMETER;
+                    return -1;
+                }
+
+                request->ioctl.cc_chunk_count = cc;
+                for (i = 0; i < cc; i++) {
+                    evpl_iovec_cursor_get_uint64(request_cursor, &request->ioctl.cc_chunks[i].src_offset);
+                    evpl_iovec_cursor_get_uint64(request_cursor, &request->ioctl.cc_chunks[i].dst_offset);
+                    evpl_iovec_cursor_get_uint32(request_cursor, &request->ioctl.cc_chunks[i].length);
+                    evpl_iovec_cursor_get_uint32(request_cursor, &reserved);
                 }
                 break;
             }

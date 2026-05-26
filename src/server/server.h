@@ -61,6 +61,11 @@ chimera_server_config_set_core_threads(
     int                           threads);
 
 void
+chimera_server_config_set_sync_delegation(
+    struct chimera_server_config *config,
+    int                           enable);
+
+void
 chimera_server_config_set_sync_delegation_threads(
     struct chimera_server_config *config,
     int                           threads);
@@ -76,12 +81,57 @@ chimera_server_config_set_async_delegation_threads(
     int                           threads);
 
 void
+chimera_server_config_set_smb_persistent_handles(
+    struct chimera_server_config *config,
+    int                           enable);
+
+int
+chimera_server_config_get_smb_persistent_handles(
+    const struct chimera_server_config *config);
+
+void
 chimera_server_config_set_cache_ttl(
     struct chimera_server_config *config,
     int                           ttl);
 
 int
 chimera_server_config_get_cache_ttl(
+    const struct chimera_server_config *config);
+
+void
+chimera_server_config_set_nfs4_session_slots(
+    struct chimera_server_config *config,
+    int                           slots);
+
+int
+chimera_server_config_get_nfs4_session_slots(
+    const struct chimera_server_config *config);
+
+void
+chimera_server_config_set_nfs4_delegations(
+    struct chimera_server_config *config,
+    int                           enable);
+
+int
+chimera_server_config_get_nfs4_delegations(
+    const struct chimera_server_config *config);
+
+void
+chimera_server_config_set_nfs4_lease_time(
+    struct chimera_server_config *config,
+    uint32_t                      seconds);
+
+uint32_t
+chimera_server_config_get_nfs4_lease_time(
+    const struct chimera_server_config *config);
+
+void
+chimera_server_config_set_nfs4_grace_time(
+    struct chimera_server_config *config,
+    uint32_t                      seconds);
+
+uint32_t
+chimera_server_config_get_nfs4_grace_time(
     const struct chimera_server_config *config);
 
 void
@@ -144,6 +194,47 @@ chimera_server_config_set_nfs_rdma(
 
 int
 chimera_server_config_get_nfs_rdma(
+    const struct chimera_server_config *config);
+
+void
+chimera_server_config_set_pnfs_enabled(
+    struct chimera_server_config *config,
+    int                           enable);
+
+int
+chimera_server_config_get_pnfs_enabled(
+    const struct chimera_server_config *config);
+
+int
+chimera_server_config_add_pnfs_ds(
+    struct chimera_server_config *config,
+    const char                   *netid,
+    const char                   *uaddr,
+    const char                   *backing_path);
+
+/* After mounts are established, resolve each pNFS data server's backing root
+ * (its nfs-mounted export directory) into the device table so the MDS can
+ * create backing files there.  Returns 0 on success. */
+int
+chimera_server_pnfs_resolve(
+    struct chimera_server *server);
+
+void
+chimera_server_config_set_nfs_port(
+    struct chimera_server_config *config,
+    int                           port);
+
+int
+chimera_server_config_get_nfs_port(
+    const struct chimera_server_config *config);
+
+void
+chimera_server_config_set_nfs_data_server(
+    struct chimera_server_config *config,
+    int                           enable);
+
+int
+chimera_server_config_get_nfs_data_server(
     const struct chimera_server_config *config);
 
 void
@@ -304,7 +395,8 @@ int
 chimera_server_create_share(
     struct chimera_server *server,
     const char            *share_name,
-    const char            *share_path);
+    const char            *share_path,
+    int                    continuous_availability);
 
 int
 chimera_server_create_export(

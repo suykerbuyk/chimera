@@ -2,39 +2,15 @@
 //
 // SPDX-License-Identifier: LGPL-2.1-only
 
+#include <stdlib.h>
+
 #include "nfs4_procs.h"
 #include "nfs4_status.h"
 #include "nfs4_session.h"
+#include "nfs4_state.h"
 #include "vfs/vfs_procs.h"
 #include "vfs/vfs_release.h"
-
-static void
-chimera_nfs4_locku_complete(
-    enum chimera_vfs_error error_code,
-    uint32_t               conflict_type,
-    uint64_t               conflict_offset,
-    uint64_t               conflict_length,
-    pid_t                  conflict_pid,
-    void                  *private_data)
-{
-    struct nfs_request *req        = private_data;
-    struct LOCKU4res   *res        = &req->res_compound.resarray[req->index].oplocku;
-    struct nfs4_state  *lock_state = req->nfs4_state;
-
-    if (error_code != CHIMERA_VFS_OK) {
-        nfs4_session_release_state(req->session, lock_state);
-        res->status = chimera_nfs4_errno_to_nfsstat4(error_code);
-        chimera_nfs4_compound_complete(req, res->status);
-        return;
-    }
-
-    lock_state->nfs4_state_id.seqid++;
-    res->status       = NFS4_OK;
-    res->lock_stateid = lock_state->nfs4_state_id;
-    nfs4_session_release_state(req->session, lock_state);
-
-    chimera_nfs4_compound_complete(req, NFS4_OK);
-} /* chimera_nfs4_locku_complete */
+#include "vfs/vfs_state.h"
 
 void
 chimera_nfs4_locku(
@@ -43,70 +19,206 @@ chimera_nfs4_locku(
     struct nfs_argop4                *argop,
     struct nfs_resop4                *resop)
 {
-    struct LOCKU4args              *args = &argop->oplocku;
-    struct LOCKU4res               *res  = &resop->oplocku;
-    struct nfs4_session            *session;
-    struct nfs4_state              *lock_state;
-    struct chimera_vfs_open_handle *handle;
-    uint64_t                        vfs_length;
+    struct LOCKU4args        *args      = &argop->oplocku;
+    struct LOCKU4res         *res       = &resop->oplocku;
+    struct nfs_state_table   *table     = &thread->shared->nfs4_state_table;
+    struct chimera_vfs_state *vfs_state = thread->vfs->vfs_state;
+    bool                      is_v40    = (req->minorversion == 0);
+    void                     *state_void;
+    uint8_t                   state_type;
+    struct nfs_lock_state    *lock_state;
+    struct nfs_lock_owner    *lock_owner;
+    struct nfs4_range_lease  *rl, *match;
+    uint64_t                  vfs_length;
+    nfsstat4                  status;
 
-    /* RFC 7530 Section 16.12.3: current filehandle must be set */
+    /* RFC 7530 §16.12.3: current filehandle must be set */
     if (req->fhlen == 0) {
         res->status = NFS4ERR_NOFILEHANDLE;
         chimera_nfs4_compound_complete(req, res->status);
         return;
     }
 
-    session = nfs4_resolve_session(
-        req->session, req->conn,
-        &thread->shared->nfs4_shared_clients,
-        &args->lock_stateid);
+    /* NFS4.1 current-stateid substitution (RFC 8881 §16.2.3.1.2). */
+    chimera_nfs4_resolve_current_stateid(req, &args->lock_stateid);
 
-    if (!session) {
-        res->status = NFS4ERR_BAD_STATEID;
+    status = nfs_state_table_acquire(table, &args->lock_stateid,
+                                     NFS4_SLOT_TYPE_LOCK,
+                                     &state_void, &state_type);
+    if (status != NFS4_OK) {
+        res->status = status;
         chimera_nfs4_compound_complete(req, res->status);
         return;
     }
 
-    req->session = session;
+    lock_state          = state_void;
+    lock_owner          = lock_state->lock_owner;
+    req->nfs_state_ref  = lock_state;
+    req->nfs_state_type = NFS4_SLOT_TYPE_LOCK;
 
-    if (nfs4_session_acquire_state(session,
-                                   &args->lock_stateid,
-                                   &lock_state,
-                                   &handle) != NFS4_OK) {
-        res->status = NFS4ERR_BAD_STATEID;
-        chimera_nfs4_compound_complete(req, res->status);
-        return;
+    /* A LOCK stateid's lock_state always carries a lock_owner (set at
+     * nfs_lock_state_create); the deref below relies on it. */
+    chimera_nfs_abort_if(!lock_owner, "lock_state without lock_owner");
+
+    if (is_v40 && lock_owner) {
+        pthread_mutex_lock(&lock_owner->lock);
+        int seqid_class = nfs4_owner_seqid_classify(lock_owner->seqid,
+                                                    &lock_owner->replay,
+                                                    args->seqid);
+        if (seqid_class == NFS4_SEQID_REPLAY) {
+            res->status       = lock_owner->replay.status;
+            res->lock_stateid = lock_owner->replay.stateid;
+            pthread_mutex_unlock(&lock_owner->lock);
+            nfs_state_table_release(table, lock_state, NFS4_SLOT_TYPE_LOCK,
+                                    thread->vfs_thread);
+            req->nfs_state_ref = NULL;
+            chimera_nfs4_compound_complete(req, res->status);
+            return;
+        }
+        if (seqid_class != NFS4_SEQID_NEW) {
+            pthread_mutex_unlock(&lock_owner->lock);
+            nfs_state_table_release(table, lock_state, NFS4_SLOT_TYPE_LOCK,
+                                    thread->vfs_thread);
+            req->nfs_state_ref = NULL;
+            res->status        = NFS4ERR_BAD_SEQID;
+            chimera_nfs4_compound_complete(req, res->status);
+            return;
+        }
+        pthread_mutex_unlock(&lock_owner->lock);
     }
 
-    if (lock_state->nfs4_state_type != NFS4_STATE_TYPE_LOCK) {
-        nfs4_session_release_state(session, lock_state);
-        res->status = NFS4ERR_BAD_STATEID;
-        chimera_nfs4_compound_complete(req, res->status);
-        return;
+    /* RFC 7530 §9.1.4.2: a stale lock-stateid seqid is NFS4ERR_OLD_STATEID
+     * (and a never-issued one NFS4ERR_BAD_STATEID); this takes precedence over
+     * the byte-range check below.  Gated on 4.0 (4.1+ drops seqid coupling). */
+    if (is_v40) {
+        status = nfs4_stateid_check_seqid(lock_state->seqid,
+                                          args->lock_stateid.seqid);
+        if (status != NFS4_OK) {
+            nfs_state_table_release(table, lock_state, NFS4_SLOT_TYPE_LOCK,
+                                    thread->vfs_thread);
+            req->nfs_state_ref = NULL;
+            res->status        = status;
+            chimera_nfs4_compound_complete(req, res->status);
+            return;
+        }
     }
 
-    req->nfs4_state = lock_state;
-
-    /* RFC 7530 Section 16.12.4: same length rules as LOCK */
+    /* RFC 7530 §16.12.4: same length rules as LOCK */
     if (args->length == 0 ||
         (args->length != UINT64_MAX && args->offset > UINT64_MAX - args->length)) {
-        nfs4_session_release_state(session, lock_state);
-        res->status = NFS4ERR_INVAL;
+        nfs_state_table_release(table, lock_state, NFS4_SLOT_TYPE_LOCK,
+                                thread->vfs_thread);
+        req->nfs_state_ref = NULL;
+        res->status        = NFS4ERR_INVAL;
         chimera_nfs4_compound_complete(req, res->status);
         return;
     }
 
-    /* NFS uses UINT64_MAX to mean "to end of file"; POSIX fcntl uses 0. */
+    /* NFS uses UINT64_MAX to mean "to end of file"; vfs_state uses 0. */
     vfs_length = args->length == UINT64_MAX ? 0 : args->length;
 
-    chimera_vfs_lock(thread->vfs_thread, &req->cred,
-                     handle,
-                     SEEK_SET,
-                     args->offset,
-                     vfs_length,
-                     CHIMERA_VFS_LOCK_UNLOCK,
-                     0,
-                     chimera_nfs4_locku_complete,
-                     req);
+    /* RFC 7530 §16.12.4 / POSIX: remove the unlocked region [u_start, u_end)
+     * from every interval of this lock-owner that it overlaps, splitting an
+     * interval into its left and/or right remainders as needed.  Unlocking a
+     * region that holds no lock is a successful no-op (LOCKU always succeeds). */
+    {
+        uint64_t                  u_start = args->offset;
+        uint64_t                  u_end   = vfs_length ?
+            args->offset + vfs_length : UINT64_MAX;
+        struct nfs4_range_lease  *hits = NULL;
+        struct nfs4_range_lease **pp   = &lock_state->range_leases;
+
+        /* Detach all intervals overlapping the unlock range. */
+        while (*pp) {
+            rl = *pp;
+            uint64_t e_start = rl->lease.offset;
+            uint64_t e_end   = rl->lease.length ?
+                rl->lease.offset + rl->lease.length : UINT64_MAX;
+
+            if (e_end <= u_start || u_end <= e_start) {
+                pp = &rl->next;
+                continue;
+            }
+            *pp      = rl->next;
+            rl->next = hits;
+            hits     = rl;
+        }
+
+        /* Re-insert the non-unlocked remainder(s) of each detached interval. */
+        while (hits) {
+            uint64_t                       e_start = hits->lease.offset;
+            uint64_t                       e_end   = hits->lease.length ?
+                hits->lease.offset + hits->lease.length : UINT64_MAX;
+            uint8_t                        mode   = hits->lease.mode.granted;
+            struct chimera_vfs_lease_owner owner  = hits->lease.owner;
+            struct chimera_vfs_file_state *fs     = hits->file_state;
+            bool                           reused = false;
+
+            match = hits;
+            hits  = hits->next;
+
+            chimera_vfs_lease_release(vfs_state, fs, &match->lease);
+
+            if (e_start < u_start) {
+                /* Left remainder [e_start, u_start): reuse this entry. */
+                match->lease.offset = e_start;
+                match->lease.length = u_start - e_start;
+                chimera_vfs_state_try_insert(vfs_state, fs, &match->lease, NULL);
+                match->next              = lock_state->range_leases;
+                lock_state->range_leases = match;
+                reused                   = true;
+            }
+            if (e_end > u_end) {
+                if (!reused) {
+                    /* Right remainder [u_end, e_end): reuse this entry. */
+                    match->lease.offset = u_end;
+                    match->lease.length = (e_end == UINT64_MAX) ? 0 :
+                        e_end - u_end;
+                    chimera_vfs_state_try_insert(vfs_state, fs, &match->lease,
+                                                 NULL);
+                    match->next              = lock_state->range_leases;
+                    lock_state->range_leases = match;
+                    reused                   = true;
+                } else {
+                    /* Both remainders: the right one needs its own entry and a
+                     * fresh file_state reference. */
+                    struct chimera_vfs_file_state *fs2 =
+                        chimera_vfs_state_get(vfs_state, fs->fh, fs->fh_len,
+                                              fs->fh_hash, true);
+                    if (fs2) {
+                        nfs4_range_lease_insert(vfs_state, lock_state, fs2,
+                                                &owner, mode, u_end, e_end);
+                    }
+                }
+            }
+            if (!reused) {
+                /* Interval fully covered by the unlock: drop it. */
+                chimera_vfs_state_put(vfs_state, fs);
+                free(match);
+            }
+        }
+    }
+
+    lock_state->seqid += 1;
+    nfs4_stateid_encode(&res->lock_stateid, lock_state->seqid,
+                        NFS4_STATEID_TYPE_LOCK,
+                        lock_state->shard, lock_state->slot_idx,
+                        lock_state->generation, table->epoch);
+    res->status = NFS4_OK;
+    chimera_nfs4_set_current_stateid(req, &res->lock_stateid);
+
+    /* RFC 7530 §9.1.7: record cached reply for the lock_owner. */
+    if (is_v40 && lock_owner) {
+        pthread_mutex_lock(&lock_owner->lock);
+        lock_owner->seqid = args->seqid;
+        nfs4_replay_record(&lock_owner->replay, args->seqid, OP_LOCKU,
+                           NFS4_OK, &res->lock_stateid);
+        pthread_mutex_unlock(&lock_owner->lock);
+    }
+
+    nfs_state_table_release(table, lock_state, NFS4_SLOT_TYPE_LOCK,
+                            thread->vfs_thread);
+    req->nfs_state_ref = NULL;
+
+    chimera_nfs4_compound_complete(req, NFS4_OK);
 } /* chimera_nfs4_locku */

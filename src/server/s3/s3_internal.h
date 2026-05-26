@@ -13,6 +13,7 @@
 #include "vfs/vfs.h"
 #include "vfs/vfs_cred.h"
 #include "s3_cred_cache.h"
+#include "s3_chunk.h"
 
 enum chimera_s3_vfs_state {
     CHIMERA_S3_VFS_STATE_INIT,
@@ -37,6 +38,16 @@ enum chimera_s3_http_state {
 struct chimera_server_s3_thread;
 struct chimera_s3_multipart_table;
 struct chimera_s3_multipart_upload;
+
+/* One <Object> entry from a DeleteObjects (POST /bucket?delete) request.
+ * key points into the accumulated request body (unescaped in place). */
+struct chimera_s3_delete_entry {
+    char       *key;
+    int         key_len;
+    int         deleted;     /* 1 once the key is resolved as removed/absent */
+    const char *err_code;    /* NULL on success, else S3 error code string   */
+    const char *err_msg;
+};
 
 struct chimera_s3_config {
     int      port;
@@ -63,7 +74,9 @@ struct chimera_s3_request {
     int                              is_list;
     int                              has_uploads;
     int                              has_upload_id;
+    int                              has_delete;
     int                              has_part_number;
+    int                              chunked;
     int                              query_upload_idlen;
     int                              query_part_number;
     char                             query_upload_id[CHIMERA_S3_UPLOAD_ID_LEN + 1];
@@ -85,6 +98,7 @@ struct chimera_s3_request {
     struct chimera_s3_request       *prev;
     struct chimera_s3_request       *next;
     struct chimera_vfs_attrs         set_attr;
+    struct s3_chunk_decoder          chunk;
     uint8_t                          bucket_fh[CHIMERA_VFS_FH_SIZE];
 
     union {
@@ -122,6 +136,28 @@ struct chimera_s3_request {
             char                                tmp_name[64];
             char                                path_buf[1024];
         } multipart;
+
+        struct {
+            /* Request body (the <Delete> document) accumulator. */
+            char                           *body_buf;
+            int                             body_len;
+            int                             body_cap;
+            int                             quiet;
+            /* Parsed object keys and the sequential delete cursor. */
+            struct chimera_s3_delete_entry *entries;
+            int                             n_keys;
+            int                             cur;
+            /* Trampoline flags so inline VFS completions don't recurse. */
+            int                             pending;
+            int                             synchronous;
+            /* Working state for the key currently being removed. */
+            const char                     *cur_name;
+            int                             cur_name_len;
+            /* Response (<DeleteResult>) builder. */
+            char                           *resp_buf;
+            int                             resp_len;
+            int                             resp_cap;
+        } del;
     };
 };
 
@@ -191,6 +227,28 @@ chimera_s3_format_date(
     return ret;
 
 } /* chimera_s3_format_date */
+
+/*
+ * Attach an HTTP Last-Modified header from an object's mtime. The AWS CLI
+ * (unlike boto3) requires this header on GET/HEAD responses; without it
+ * `aws s3 cp s3://...` aborts with a KeyError on 'LastModified'.
+ */
+static inline void
+chimera_s3_attach_last_modified(
+    struct evpl_http_request       *request,
+    const struct chimera_vfs_attrs *attr)
+{
+    char      buf[64];
+    struct tm tm;
+
+    if (!(attr->va_set_mask & CHIMERA_VFS_ATTR_MTIME)) {
+        return;
+    }
+
+    gmtime_r(&attr->va_mtime.tv_sec, &tm);
+    strftime(buf, sizeof(buf), "%a, %d %b %Y %H:%M:%S GMT", &tm);
+    evpl_http_request_add_header(request, "Last-Modified", buf);
+} /* chimera_s3_attach_last_modified */
 
 void
 s3_server_respond(

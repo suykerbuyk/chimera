@@ -4,8 +4,10 @@
 
 #include "smb_internal.h"
 #include "smb_procs.h"
+#include "smb_session.h"
 #include "vfs/vfs.h"
 #include "vfs/vfs_notify.h"
+#include "vfs/vfs_state.h"
 
 static void
 chimera_smb_write_callback(
@@ -73,7 +75,14 @@ chimera_smb_rdma_read_callback(
             return;
         }
 
-        chimera_vfs_write(
+        struct chimera_vfs_lease_owner io_owner = {
+            .protocol   = CHIMERA_VFS_LEASE_PROTO_SMB2,
+            .client_key = request->session_handle->session->session_id,
+            .owner_lo   = request->write.open_file->file_id.pid,
+            .owner_hi   = request->write.open_file->file_id.vid,
+        };
+
+        chimera_vfs_write_owned(
             thread->vfs_thread,
             &request->session_handle->session->cred,
             request->write.open_file->handle,
@@ -84,6 +93,7 @@ chimera_smb_rdma_read_callback(
             0,
             request->write.iov,
             request->write.niov,
+            &io_owner,
             chimera_smb_write_callback,
             request);
     }
@@ -104,6 +114,32 @@ chimera_smb_write(struct chimera_smb_request *request)
 
     if (unlikely(!request->write.open_file)) {
         chimera_smb_complete_request(request, SMB2_STATUS_FILE_CLOSED);
+        return;
+    }
+
+    struct chimera_vfs_lease_owner io_owner = {
+        .protocol   = CHIMERA_VFS_LEASE_PROTO_SMB2,
+        .client_key = request->session_handle->session->session_id,
+        .owner_lo   = request->write.open_file->file_id.pid,
+        .owner_hi   = request->write.open_file->file_id.vid,
+    };
+
+    /* Mandatory byte-range lock enforcement: a shared lock denies writes from
+     * everyone, an exclusive lock denies writes from other opens.  (The
+     * read-cache invalidation that used to follow here is now driven by the
+     * VFS write path via chimera_vfs_write_owned().) */
+    if (chimera_vfs_state_range_io_conflict(
+            thread->vfs_thread->vfs->vfs_state,
+            request->write.open_file->handle->fh,
+            request->write.open_file->handle->fh_len,
+            request->write.open_file->handle->fh_hash,
+            request->write.offset, request->write.length,
+            true, &io_owner)) {
+        /* Release the write payload iovecs here: the normal path frees
+        * them in chimera_smb_write_callback, which we are skipping. */
+        evpl_iovecs_release(evpl, request->write.iov, request->write.niov);
+        chimera_smb_open_file_release(request, request->write.open_file);
+        chimera_smb_complete_request(request, SMB2_STATUS_FILE_LOCK_CONFLICT);
         return;
     }
 
@@ -131,7 +167,7 @@ chimera_smb_write(struct chimera_smb_request *request)
             chunk_iov++;
         }
     } else {
-        chimera_vfs_write(
+        chimera_vfs_write_owned(
             thread->vfs_thread,
             &request->session_handle->session->cred,
             request->write.open_file->handle,
@@ -142,6 +178,7 @@ chimera_smb_write(struct chimera_smb_request *request)
             0,
             request->write.iov,
             request->write.niov,
+            &io_owner,
             chimera_smb_write_callback,
             request);
     }

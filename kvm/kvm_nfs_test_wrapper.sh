@@ -100,25 +100,25 @@ generate_config() {
         memfs)
             mount_path="/"
             ;;
-        demofs_io_uring|demofs_aio)
+        diskfs_io_uring|diskfs_aio)
             local device_type="io_uring"
-            if [ "$BACKEND" = "demofs_aio" ]; then
+            if [ "$BACKEND" = "diskfs_aio" ]; then
                 device_type="libaio"
             fi
             local devices_json=""
             for i in $(seq 0 9); do
                 local device_path="${SESSION_DIR}/device-${i}.img"
-                truncate -s 256G "$device_path"
+                truncate -s 1G "$device_path"
                 if [ $i -gt 0 ]; then
                     devices_json="${devices_json},"
                 fi
                 devices_json="${devices_json}{\"type\":\"$device_type\",\"size\":1,\"path\":\"$device_path\"}"
             done
             mount_path="/"
-            BACKEND="demofs"
+            BACKEND="diskfs"
             vfs_section="\"vfs\": {
-                \"demofs\": {
-                    \"config\": {\"devices\":[$devices_json]}
+                \"diskfs\": {
+                    \"config\": {\"initialize\":true,\"devices\":[$devices_json],\"unsafe_async\":true}
                 }
             },"
             ;;

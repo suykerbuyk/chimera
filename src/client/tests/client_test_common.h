@@ -111,15 +111,15 @@ client_test_init(
     if (env->use_nfs) {
         server_config = chimera_server_config_init();
 
-        if (strcmp(backend, "demofs_io_uring") == 0 ||
-            strcmp(backend, "demofs_aio") == 0) {
-            char        demofs_cfg[4096];
+        if (strcmp(backend, "diskfs_io_uring") == 0 ||
+            strcmp(backend, "diskfs_aio") == 0) {
+            char        diskfs_cfg[4096];
             char        device_path[300];
             char       *json_str;
             json_t     *cfg, *devices, *device;
             const char *device_type;
 
-            device_type = strcmp(backend, "demofs_aio") == 0
+            device_type = strcmp(backend, "diskfs_aio") == 0
                           ? "libaio" : "io_uring";
 
             cfg     = json_object();
@@ -149,13 +149,15 @@ client_test_init(
                 close(fd);
             }
 
+            json_object_set_new(cfg, "initialize", json_true());
             json_object_set_new(cfg, "devices", devices);
+            json_object_set_new(cfg, "unsafe_async", json_true());
             json_str = json_dumps(cfg, JSON_COMPACT);
-            snprintf(demofs_cfg, sizeof(demofs_cfg), "%s", json_str);
+            snprintf(diskfs_cfg, sizeof(diskfs_cfg), "%s", json_str);
             free(json_str);
             json_decref(cfg);
 
-            chimera_server_config_add_module(server_config, "demofs", "/build/test/demofs", demofs_cfg);
+            chimera_server_config_add_module(server_config, "diskfs", "/build/test/diskfs", diskfs_cfg);
         } else if (strcmp(backend, "cairn") == 0) {
             char    cairn_cfg[4096];
             char   *json_str;
@@ -183,9 +185,9 @@ client_test_init(
         } else if (strcmp(backend, "memfs") == 0) {
             chimera_server_mount(env->server, "share", "memfs", "/", NULL);
 
-        } else if (strcmp(backend, "demofs_io_uring") == 0 ||
-                   strcmp(backend, "demofs_aio") == 0) {
-            chimera_server_mount(env->server, "share", "demofs", "/", NULL);
+        } else if (strcmp(backend, "diskfs_io_uring") == 0 ||
+                   strcmp(backend, "diskfs_aio") == 0) {
+            chimera_server_mount(env->server, "share", "diskfs", "/", NULL);
 
         } else if (strcmp(backend, "cairn") == 0) {
             chimera_server_mount(env->server, "share", "cairn", "/", NULL);
@@ -216,15 +218,15 @@ client_test_init(
         client_json_config = json_object();
 
         if (!env->use_nfs) {
-            if (strcmp(backend, "demofs_io_uring") == 0 ||
-                strcmp(backend, "demofs_aio") == 0) {
-                char        demofs_cfg[4096];
+            if (strcmp(backend, "diskfs_io_uring") == 0 ||
+                strcmp(backend, "diskfs_aio") == 0) {
+                char        diskfs_cfg[4096];
                 char        device_path[300];
                 char       *json_str;
                 json_t     *cfg, *devices, *device, *vfs, *vfs_entry;
                 const char *device_type;
 
-                device_type = strcmp(backend, "demofs_aio") == 0
+                device_type = strcmp(backend, "diskfs_aio") == 0
                               ? "libaio" : "io_uring";
 
                 cfg     = json_object();
@@ -254,17 +256,19 @@ client_test_init(
                     close(fd);
                 }
 
+                json_object_set_new(cfg, "initialize", json_true());
                 json_object_set_new(cfg, "devices", devices);
+                json_object_set_new(cfg, "unsafe_async", json_true());
                 json_str = json_dumps(cfg, JSON_COMPACT);
-                snprintf(demofs_cfg, sizeof(demofs_cfg), "%s", json_str);
+                snprintf(diskfs_cfg, sizeof(diskfs_cfg), "%s", json_str);
                 free(json_str);
                 json_decref(cfg);
 
                 vfs       = json_object();
                 vfs_entry = json_object();
-                json_object_set_new(vfs_entry, "path", json_string("/build/test/demofs"));
-                json_object_set_new(vfs_entry, "config", json_string(demofs_cfg));
-                json_object_set_new(vfs, "demofs", vfs_entry);
+                json_object_set_new(vfs_entry, "path", json_string("/build/test/diskfs"));
+                json_object_set_new(vfs_entry, "config", json_string(diskfs_cfg));
+                json_object_set_new(vfs, "diskfs", vfs_entry);
                 json_object_set_new(client_json_config, "vfs", vfs);
             } else if (strcmp(backend, "cairn") == 0) {
                 char    cairn_cfg[4096];
@@ -363,11 +367,10 @@ client_test_mount(
         if (strcmp(env->backend, "linux") == 0 || strcmp(env->backend, "io_uring") == 0) {
             module_path = env->session_dir;
         }
-        if (strcmp(env->backend, "demofs_io_uring") == 0 ||
-            strcmp(env->backend, "demofs_aio") == 0) {
-            module_name = "demofs";
+        if (strcmp(env->backend, "diskfs_io_uring") == 0 ||
+            strcmp(env->backend, "diskfs_aio") == 0) {
+            module_name = "diskfs";
         }
         chimera_mount(env->client_thread, mount_path, module_name, module_path, NULL, callback, private_data);
     }
 } /* client_test_mount */
-

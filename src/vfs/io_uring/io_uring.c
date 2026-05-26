@@ -18,6 +18,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <sys/ioctl.h>
+#include <sys/xattr.h>
 #include <linux/fs.h>
 #include <liburing.h>
 #include <uthash.h>
@@ -88,6 +89,7 @@ struct chimera_io_uring_shared {
 struct chimera_io_uring_thread {
     struct evpl                     *evpl;
     struct evpl_doorbell             doorbell;
+    struct evpl_poll                *poll;
     struct evpl_deferral             deferral;
     struct io_uring                  ring;
     uint64_t                         inflight;
@@ -172,11 +174,10 @@ chimera_io_uring_get_sqe(
 } /* chimera_io_uring_get_sqe */
 
 static void
-chimera_io_uring_complete(
-    struct evpl          *evpl,
-    struct evpl_doorbell *doorbell)
+chimera_io_uring_reap(
+    struct evpl                    *evpl,
+    struct chimera_io_uring_thread *thread)
 {
-    struct chimera_io_uring_thread    *thread;
     struct io_uring_cqe               *cqe;
     int                                parent_fd;
     struct chimera_vfs_request        *request;
@@ -185,8 +186,6 @@ chimera_io_uring_complete(
     const char                        *name;
     struct io_uring_sqe               *sqe;
     void                              *scratch;
-
-    thread = container_of(doorbell, struct chimera_io_uring_thread, doorbell);
 
     while (io_uring_peek_cqe(&thread->ring, &cqe) == 0) {
 
@@ -408,14 +407,66 @@ chimera_io_uring_complete(
 
         io_uring_cqe_seen(&thread->ring, cqe);
 
-    } /* chimera_io_uring_complete */
+    } /* while peek_cqe */
 
     while (thread->pending_requests && thread->inflight < thread->max_inflight) {
         request = thread->pending_requests;
         DL_DELETE(thread->pending_requests, request);
         chimera_io_uring_dispatch(request, thread);
     }
-} /* chimera_io_uring_complete */ /* chimera_io_uring_complete */ /* chimera_io_uring_complete */
+} /* chimera_io_uring_reap */
+
+/*
+ * Doorbell callback: used while the evpl loop is sleeping in epoll.  The ring's
+ * eventfd is registered in that state, so a completion wakes the loop here.
+ */
+static void
+chimera_io_uring_complete(
+    struct evpl          *evpl,
+    struct evpl_doorbell *doorbell)
+{
+    struct chimera_io_uring_thread *thread =
+        container_of(doorbell, struct chimera_io_uring_thread, doorbell);
+
+    chimera_io_uring_reap(evpl, thread);
+} /* chimera_io_uring_complete */
+
+/*
+ * Poll callbacks: while the evpl loop is in busy-poll (spin) mode it calls
+ * chimera_io_uring_poll every iteration to drain the CQ with no syscall.  The
+ * enter/exit callbacks unregister/re-register the ring eventfd so the kernel
+ * does not bother signaling it during the spin phase (mirrors libevpl's own
+ * io_uring framework in ext/libevpl/src/core/io_uring/io_uring.c).
+ */
+static void
+chimera_io_uring_poll(
+    struct evpl *evpl,
+    void        *private_data)
+{
+    chimera_io_uring_reap(evpl, private_data);
+} /* chimera_io_uring_poll */
+
+static void
+chimera_io_uring_poll_enter(
+    struct evpl *evpl,
+    void        *private_data)
+{
+    struct chimera_io_uring_thread *thread = private_data;
+
+    io_uring_unregister_eventfd(&thread->ring);
+    chimera_io_uring_reap(evpl, thread);
+} /* chimera_io_uring_poll_enter */
+
+static void
+chimera_io_uring_poll_exit(
+    struct evpl *evpl,
+    void        *private_data)
+{
+    struct chimera_io_uring_thread *thread = private_data;
+
+    io_uring_register_eventfd(&thread->ring, evpl_doorbell_fd(&thread->doorbell));
+    chimera_io_uring_reap(evpl, thread);
+} /* chimera_io_uring_poll_exit */
 
 static void
 chimera_io_uring_flush(
@@ -469,6 +520,12 @@ chimera_io_uring_thread_init(
                        chimera_io_uring_flush,
                        thread);
 
+    thread->poll = evpl_add_poll(evpl,
+                                 chimera_io_uring_poll_enter,
+                                 chimera_io_uring_poll_exit,
+                                 chimera_io_uring_poll,
+                                 thread);
+
     return thread;
 } /* io_uring_thread_init */ /* io_uring_thread_init */
 
@@ -479,6 +536,7 @@ chimera_io_uring_thread_destroy(void *private_data)
 
     linux_mount_table_destroy(&thread->mount_table);
 
+    evpl_remove_poll(thread->evpl, thread->poll);
     io_uring_queue_exit(&thread->ring);
     evpl_remove_doorbell(thread->evpl, &thread->doorbell);
 
@@ -1207,9 +1265,15 @@ chimera_io_uring_read(
         request->read.r_niov   = 0;
         request->read.r_length = 0;
         request->read.r_eof    = 1;
-        sqe                    = chimera_io_uring_get_sqe(thread, request, 1, 0);
-        io_uring_prep_statx(sqe, fd, "", AT_EMPTY_PATH, AT_STATX_SYNC_AS_STAT, stx);
-        evpl_defer(thread->evpl, &thread->deferral);
+        if (request->read.r_attr.va_req_mask & CHIMERA_VFS_ATTR_MASK_STAT) {
+            sqe = chimera_io_uring_get_sqe(thread, request, 1, 0);
+            io_uring_prep_statx(sqe, fd, "", AT_EMPTY_PATH, AT_STATX_SYNC_AS_STAT, stx);
+            evpl_defer(thread->evpl, &thread->deferral);
+        } else {
+            /* No attrs requested and no readv to submit: complete inline. */
+            --thread->inflight;
+            request->complete(request);
+        }
         return;
     }
 
@@ -1242,9 +1306,10 @@ chimera_io_uring_read(
 
     io_uring_prep_readv(sqe, fd, iov, request->read.r_niov, request->read.offset);
 
-    sqe = chimera_io_uring_get_sqe(thread, request, 1, 0);
-
-    io_uring_prep_statx(sqe, fd, "", AT_EMPTY_PATH, AT_STATX_SYNC_AS_STAT, stx);
+    if (request->read.r_attr.va_req_mask & CHIMERA_VFS_ATTR_MASK_STAT) {
+        sqe = chimera_io_uring_get_sqe(thread, request, 1, 0);
+        io_uring_prep_statx(sqe, fd, "", AT_EMPTY_PATH, AT_STATX_SYNC_AS_STAT, stx);
+    }
 
     evpl_defer(thread->evpl, &thread->deferral);
 } /* chimera_io_uring_read */
@@ -1785,6 +1850,162 @@ chimera_io_uring_lock(
 } /* chimera_io_uring_lock */
 
 static void
+chimera_io_uring_get_xattr(
+    struct chimera_vfs_request *request,
+    void                       *private_data)
+{
+    struct chimera_io_uring_thread *thread = private_data;
+    int                             fd     = (int) request->get_xattr.handle->vfs_private;
+    char                           *name;
+    ssize_t                         rc;
+
+    --thread->inflight;
+
+    name = malloc(request->get_xattr.namelen + 1);
+    memcpy(name, request->get_xattr.name, request->get_xattr.namelen);
+    name[request->get_xattr.namelen] = '\0';
+
+    rc = fgetxattr(fd, name, request->get_xattr.value,
+                   request->get_xattr.value_maxlen);
+    free(name);
+
+    if (rc < 0) {
+        request->status = chimera_linux_errno_to_status(errno);
+    } else {
+        request->get_xattr.r_value_len = rc;
+        request->status                = CHIMERA_VFS_OK;
+    }
+
+    request->complete(request);
+} /* chimera_io_uring_get_xattr */
+
+static void
+chimera_io_uring_set_xattr(
+    struct chimera_vfs_request *request,
+    void                       *private_data)
+{
+    struct chimera_io_uring_thread *thread = private_data;
+    int                             fd     = (int) request->set_xattr.handle->vfs_private;
+    char                           *name;
+    int                             flags = 0;
+    int                             rc;
+    struct stat                     st;
+
+    --thread->inflight;
+
+    if (request->set_xattr.option == CHIMERA_VFS_XATTR_CREATE) {
+        flags = XATTR_CREATE;
+    } else if (request->set_xattr.option == CHIMERA_VFS_XATTR_REPLACE) {
+        flags = XATTR_REPLACE;
+    }
+
+    if (fstat(fd, &st) < 0) {
+        request->status = chimera_linux_errno_to_status(errno);
+        request->complete(request);
+        return;
+    }
+    chimera_linux_stat_to_attr(&request->set_xattr.r_pre_attr, &st);
+
+    name = malloc(request->set_xattr.namelen + 1);
+    memcpy(name, request->set_xattr.name, request->set_xattr.namelen);
+    name[request->set_xattr.namelen] = '\0';
+
+    rc = fsetxattr(fd, name, request->set_xattr.value,
+                   request->set_xattr.value_len, flags);
+    free(name);
+
+    if (rc < 0) {
+        request->status = chimera_linux_errno_to_status(errno);
+    } else if (fstat(fd, &st) < 0) {
+        request->status = chimera_linux_errno_to_status(errno);
+    } else {
+        chimera_linux_stat_to_attr(&request->set_xattr.r_post_attr, &st);
+        request->status = CHIMERA_VFS_OK;
+    }
+
+    request->complete(request);
+} /* chimera_io_uring_set_xattr */
+
+static void
+chimera_io_uring_list_xattrs(
+    struct chimera_vfs_request *request,
+    void                       *private_data)
+{
+    struct chimera_io_uring_thread *thread = private_data;
+    int                             fd     = (int) request->list_xattrs.handle->vfs_private;
+    ssize_t                         rc;
+    char                           *p, *end;
+
+    --thread->inflight;
+
+    rc = flistxattr(fd, request->list_xattrs.buffer,
+                    request->list_xattrs.max_bytes);
+    if (rc < 0) {
+        request->status = chimera_linux_errno_to_status(errno);
+        request->complete(request);
+        return;
+    }
+    if (rc > request->list_xattrs.max_bytes) {
+        request->status = CHIMERA_VFS_ERANGE;
+        request->complete(request);
+        return;
+    }
+
+    request->list_xattrs.r_len    = rc;
+    request->list_xattrs.r_eof    = 1;
+    request->list_xattrs.r_cookie = 0;
+
+    p   = request->list_xattrs.buffer;
+    end = p + rc;
+    while (p < end) {
+        request->list_xattrs.r_count++;
+        p += strlen(p) + 1;
+    }
+
+    request->status = CHIMERA_VFS_OK;
+    request->complete(request);
+} /* chimera_io_uring_list_xattrs */
+
+static void
+chimera_io_uring_remove_xattr(
+    struct chimera_vfs_request *request,
+    void                       *private_data)
+{
+    struct chimera_io_uring_thread *thread = private_data;
+    int                             fd     = (int) request->remove_xattr.handle->vfs_private;
+    char                           *name;
+    int                             rc;
+    struct stat                     st;
+
+    --thread->inflight;
+
+    if (fstat(fd, &st) < 0) {
+        request->status = chimera_linux_errno_to_status(errno);
+        request->complete(request);
+        return;
+    }
+    chimera_linux_stat_to_attr(&request->remove_xattr.r_pre_attr, &st);
+
+    name = malloc(request->remove_xattr.namelen + 1);
+    memcpy(name, request->remove_xattr.name, request->remove_xattr.namelen);
+    name[request->remove_xattr.namelen] = '\0';
+
+    rc = fremovexattr(fd, name);
+    free(name);
+
+    if (rc < 0) {
+        request->status = chimera_linux_errno_to_status(errno);
+    } else if (fstat(fd, &st) < 0) {
+        request->status = chimera_linux_errno_to_status(errno);
+    } else {
+        chimera_linux_stat_to_attr(&request->remove_xattr.r_post_attr, &st);
+        request->status = CHIMERA_VFS_OK;
+    }
+
+    request->complete(request);
+} /* chimera_io_uring_remove_xattr */
+
+static void
 chimera_io_uring_dispatch(
     struct chimera_vfs_request *request,
     void                       *private_data)
@@ -1872,6 +2093,18 @@ chimera_io_uring_dispatch(
         case CHIMERA_VFS_OP_LOCK:
             chimera_io_uring_lock(request, private_data);
             break;
+        case CHIMERA_VFS_OP_GET_XATTR:
+            chimera_io_uring_get_xattr(request, private_data);
+            break;
+        case CHIMERA_VFS_OP_SET_XATTR:
+            chimera_io_uring_set_xattr(request, private_data);
+            break;
+        case CHIMERA_VFS_OP_LIST_XATTRS:
+            chimera_io_uring_list_xattrs(request, private_data);
+            break;
+        case CHIMERA_VFS_OP_REMOVE_XATTR:
+            chimera_io_uring_remove_xattr(request, private_data);
+            break;
         default:
             chimera_io_uring_error("io_uring_dispatch: unknown operation %d",
                                    request->opcode);
@@ -1887,7 +2120,8 @@ SYMBOL_EXPORT struct chimera_vfs_module vfs_io_uring = {
     .fh_magic     = CHIMERA_VFS_FH_MAGIC_IO_URING,
     .capabilities = CHIMERA_VFS_CAP_OPEN_PATH_REQUIRED | CHIMERA_VFS_CAP_OPEN_FILE_REQUIRED | CHIMERA_VFS_CAP_FS |
         CHIMERA_VFS_CAP_FS_PATH_OP | CHIMERA_VFS_CAP_FS_LOCK |
-        CHIMERA_VFS_CAP_COPY_RANGE | CHIMERA_VFS_CAP_CLONE_RANGE,
+        CHIMERA_VFS_CAP_COPY_RANGE | CHIMERA_VFS_CAP_CLONE_RANGE |
+        CHIMERA_VFS_CAP_XATTR,
     .init           = chimera_io_uring_init,
     .destroy        = chimera_io_uring_destroy,
     .thread_init    = chimera_io_uring_thread_init,

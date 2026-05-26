@@ -541,6 +541,7 @@
 #define SMB2_STATUS_VOLUME_DISMOUNTED                 0xC000026E
 #define SMB2_STATUS_NOT_A_REPARSE_POINT               0xC0000275
 #define SMB2_STATUS_SERVER_UNAVAILABLE                0xC0000466
+#define SMB2_STATUS_FILE_NOT_AVAILABLE                0xC0000467
 
 /* Warning codes */
 #define SMB2_STATUS_BUFFER_OVERFLOW                   0x80000005
@@ -609,6 +610,16 @@ typedef uint8_t smb2_guid[SMB2_GUID_SIZE];
 #define SMB2_GLOBAL_CAP_DIRECTORY_LEASING           0x00000020 // Supports directory leasing (SMB 3.0+)
 #define SMB2_GLOBAL_CAP_ENCRYPTION                  0x00000040 // Supports encryption (SMB 3.0+)
 
+// SMB2 TREE_CONNECT response share capabilities (MS-SMB2 §2.2.10)
+#define SMB2_SHARE_CAP_DFS                          0x00000008
+#define SMB2_SHARE_CAP_CONTINUOUS_AVAILABILITY      0x00000010 // CA share (persistent handles)
+#define SMB2_SHARE_CAP_SCALEOUT                     0x00000020
+#define SMB2_SHARE_CAP_CLUSTER                      0x00000040
+#define SMB2_SHARE_CAP_ASYMMETRIC                   0x00000080
+
+// SMB2 CREATE durable-handle-request-v2 (DH2Q) / response flags (MS-SMB2 §2.2.13.2.11)
+#define SMB2_DHANDLE_FLAG_PERSISTENT                0x00000002
+
 /* SMB2 3.1.1 negotiate context types (MS-SMB2 §2.2.3.1) */
 #define SMB2_PREAUTH_INTEGRITY_CAPABILITIES         0x0001
 #define SMB2_ENCRYPTION_CAPABILITIES                0x0002
@@ -620,6 +631,9 @@ typedef uint8_t smb2_guid[SMB2_GUID_SIZE];
 
 /* SMB2_PREAUTH_INTEGRITY_CAPABILITIES HashAlgorithm IDs */
 #define SMB2_PREAUTH_HASH_SHA_512                   0x0001
+
+/* SHA-512 produces a 64-byte preauth-integrity hash value. */
+#define SMB2_PREAUTH_HASH_SIZE                      64
 
 /* SMB2_ENCRYPTION_CAPABILITIES Cipher IDs */
 #define SMB2_ENCRYPTION_AES_128_CCM                 0x0001
@@ -710,7 +724,20 @@ typedef uint8_t smb2_guid[SMB2_GUID_SIZE];
 #define SMB2_OPLOCK_LEVEL_BATCH                     0x09
 #define SMB2_OPLOCK_LEVEL_LEASE                     0xff
 
+/* SMB2 lease state bits (MS-SMB2 §2.2.13.2.8/2.2.13.2.10).  Note the
+ * bit positions differ from the internal vfs_state RWH masks — the
+ * smb_proc_create lease helpers do the translation. */
+#define SMB2_LEASE_NONE                             0x00
+#define SMB2_LEASE_READ_CACHING                     0x01
+#define SMB2_LEASE_HANDLE_CACHING                   0x02
+#define SMB2_LEASE_WRITE_CACHING                    0x04
+
 #define SMB2_CREATE_REQUEST_LEASE_SIZE              32
+#define SMB2_CREATE_REQUEST_LEASE_V2_SIZE           52
+#define SMB2_OPLOCK_BREAK_NOTIFY_LEASE_SIZE         44
+#define SMB2_OPLOCK_BREAK_NOTIFY_LEGACY_SIZE        24
+#define SMB2_OPLOCK_BREAK_ACK_LEASE_SIZE            36
+#define SMB2_OPLOCK_BREAK_ACK_LEGACY_SIZE           24
 
 #define SMB2_IMPERSONATION_ANONYMOUS                0x00000000
 #define SMB2_IMPERSONATION_IDENTIFICATION           0x00000001
@@ -856,6 +883,12 @@ typedef uint8_t smb2_guid[SMB2_GUID_SIZE];
 #define SMB2_FSCTL_VALIDATE_NEGOTIATE_INFO          0x00140204
 #define SMB2_FSCTL_TRANSCEIVE_PIPE                  0x0011C017
 #define SMB2_FSCTL_QUERY_NETWORK_INTERFACE_INFO     0x001401FC
+#define SMB2_FSCTL_SET_SPARSE                       0x000900C4
+#define SMB2_FSCTL_SET_ZERO_DATA                    0x000980C8
+#define SMB2_FSCTL_QUERY_ALLOCATED_RANGES           0x000940CF
+#define SMB2_FSCTL_SRV_REQUEST_RESUME_KEY           0x00140078
+#define SMB2_FSCTL_SRV_COPYCHUNK                    0x001440F2
+#define SMB2_FSCTL_SRV_COPYCHUNK_WRITE              0x001480F2
 
 #define SMB2_IO_REPARSE_TAG_NFS                     0x80000014
 #define SMB2_IO_REPARSE_TAG_SYMLINK                 0xA000000C

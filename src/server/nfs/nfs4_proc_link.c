@@ -2,10 +2,14 @@
 //
 // SPDX-License-Identifier: LGPL-2.1-only
 
+#include <xxhash.h>
+
 #include "nfs4_procs.h"
 #include "nfs4_attr.h"
+#include "server/server.h"
 #include "vfs/vfs_procs.h"
 #include "vfs/vfs_release.h"
+#include "vfs/vfs_state.h"
 #include "nfs4_status.h"
 
 static void
@@ -102,6 +106,9 @@ chimera_nfs4_link(
         return;
     }
 
+    /* RFC 7530 §10.4.5 (hard link to a delegated file must recall the
+     * delegation) is now enforced centrally by chimera_vfs_link_at(), which
+     * recalls any caching lease on the SAVEFH source before linking. */
     chimera_vfs_open_fh(thread->vfs_thread,
                         &req->cred,
                         req->fh,

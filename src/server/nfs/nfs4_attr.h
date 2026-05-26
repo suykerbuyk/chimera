@@ -8,8 +8,62 @@
 
 /* XXX */
 #include <sys/stat.h>
+#include <string.h>
 
 #include "vfs/vfs.h"
+#include "vfs/vfs_procs.h"
+#include "vfs/vfs_pnfs.h"
+#include "nfs4_lease.h"
+
+/* RFC 8275 OPEN-arguments attribute and its enumerations.  Not present in our
+ * generated nfs4.x (which stops at FATTR4_SEC_LABEL), so define what we need to
+ * advertise the attribute. */
+#ifndef FATTR4_OPEN_ARGUMENTS
+#define FATTR4_OPEN_ARGUMENTS                        86
+#endif // ifndef FATTR4_OPEN_ARGUMENTS
+#define OPEN_ARGS_SHARE_ACCESS_READ                  1
+#define OPEN_ARGS_SHARE_ACCESS_WRITE                 2
+#define OPEN_ARGS_SHARE_ACCESS_BOTH                  3
+#define OPEN_ARGS_SHARE_ACCESS_WANT_ANY_DELEG        3
+#define OPEN_ARGS_SHARE_ACCESS_WANT_NO_DELEG         4
+#define OPEN_ARGS_SHARE_ACCESS_WANT_DELEG_TIMESTAMPS 20
+#define OPEN_ARGS_OPEN_CLAIM_NULL                    0
+#define OPEN_ARGS_OPEN_CLAIM_PREVIOUS                1
+#define OPEN_ARGS_OPEN_CLAIM_DELEGATE_CUR            2
+#define OPEN_ARGS_OPEN_CLAIM_FH                      4
+/*
+ * The single pNFS layouttype4 this file's backend supports, for FATTR4
+ * advertisement: LAYOUT4_FLEX_FILES (0x4) for an orchestrated backend
+ * (CHIMERA_VFS_CAP_LAYOUT) or a flex-sourcing backend, LAYOUT4_BLOCK_VOLUME
+ * (0x3) for a block-sourcing backend, LAYOUT4_SCSI (0x5) for a SCSI-sourcing
+ * backend, or 0 when pNFS is off/unsupported.
+ */
+static inline uint32_t
+chimera_nfs4_pnfs_layout_type(
+    struct chimera_vfs_thread *vfs_thread,
+    struct chimera_vfs        *vfs,
+    const void                *fh,
+    int                        fhlen)
+{
+    uint64_t caps;
+
+    if (!chimera_vfs_pnfs_feature_enabled(vfs)) {
+        return 0;
+    }
+
+    caps = chimera_vfs_module_capabilities(vfs_thread, fh, fhlen);
+
+    if (caps & CHIMERA_VFS_CAP_LAYOUT_SOURCE) {
+        if (caps & CHIMERA_VFS_CAP_LAYOUT_CLASS_SCSI) {
+            return 0x5;
+        }
+        return (caps & CHIMERA_VFS_CAP_LAYOUT_CLASS_BLOCK) ? 0x3 : 0x4;
+    }
+    if (caps & CHIMERA_VFS_CAP_LAYOUT) {
+        return 0x4;  /* orchestrated flex-files */
+    }
+    return 0;
+} /* chimera_nfs4_pnfs_layout_type */
 
 static inline uint64_t
 chimera_nfs4_attr2mask(
@@ -98,6 +152,25 @@ chimera_nfs4_attr2mask(
 
     return attr_mask;
 } /* chimera_nfs4_getattr2mask */
+
+static inline void
+chimera_nfs4_attrs_fill_filehandle(
+    struct chimera_vfs_attrs *attr,
+    uint32_t                  num_req_mask,
+    const uint32_t           *req_mask,
+    const void               *fh,
+    int                       fhlen)
+{
+    if (num_req_mask < 1 ||
+        !(req_mask[0] & (1 << FATTR4_FILEHANDLE)) ||
+        (attr->va_set_mask & CHIMERA_VFS_ATTR_FH)) {
+        return;
+    }
+
+    attr->va_set_mask |= CHIMERA_VFS_ATTR_FH;
+    attr->va_fh_len    = fhlen;
+    memcpy(attr->va_fh, fh, fhlen);
+} /* chimera_nfs4_attrs_fill_filehandle */
 
 static inline int
 chimera_nfs4_mask2attr(
@@ -201,8 +274,15 @@ chimera_nfs4_marshall_attrs(
     uint32_t                       *rsp_mask,
     uint32_t                        max_rsp_mask,
     void                           *attrs,
-    uint32_t                       *attrvals_len)
+    uint32_t                       *attrvals_len,
+    uint8_t                         minorversion,
+    uint32_t                        pnfs_layout_type,
+    int                             nfs4_delegations,
+    uint32_t                        lease_time_s)
 {
+    /* pnfs_layout_type is the single layouttype4 this file's backend supports
+     * (LAYOUT4_FLEX_FILES 0x4 or LAYOUT4_BLOCK_VOLUME 0x3), or 0 when pNFS is
+     * off / unsupported for this file. */
     void    *attrbase = attrs;
     uint64_t v64;
 
@@ -215,7 +295,10 @@ chimera_nfs4_marshall_attrs(
             rsp_mask[0]  |= (1 << FATTR4_SUPPORTED_ATTRS);
             *num_rsp_mask = 1;
 
-            chimera_nfs4_attr_append_uint32(&attrs, 3);
+            /* The supported_attrs value is itself a bitmap4. FATTR4_SUPPATTR_
+             * EXCLCREAT lives in word 2 and is only defined for NFSv4.1+, so a
+             * v4.0 reply advertises just the two 4.0 words. */
+            chimera_nfs4_attr_append_uint32(&attrs, minorversion >= 1 ? 3 : 2);
             chimera_nfs4_attr_append_uint32(&attrs,
                                             (1 << FATTR4_SUPPORTED_ATTRS) |
                                             (1 << FATTR4_TYPE) |
@@ -263,10 +346,36 @@ chimera_nfs4_marshall_attrs(
                                             (1UL << (FATTR4_TIME_METADATA - 32)) |
                                             (1UL << (FATTR4_SPACE_AVAIL - 32)) |
                                             (1UL << (FATTR4_SPACE_FREE - 32)) |
-                                            (1UL << (FATTR4_SPACE_TOTAL - 32)));
+                                            (1UL << (FATTR4_SPACE_TOTAL - 32)) |
+                                            (pnfs_layout_type ? (1UL << (FATTR4_FS_LAYOUT_TYPES - 32)) : 0));
 
-            chimera_nfs4_attr_append_uint32(&attrs,
-                                            (1 << (FATTR4_SUPPATTR_EXCLCREAT - 64)));
+            if (minorversion >= 1) {
+                uint32_t word2 = (1 << (FATTR4_SUPPATTR_EXCLCREAT - 64));
+
+                if (nfs4_delegations) {
+                    word2 |= (1 << (FATTR4_OPEN_ARGUMENTS - 64));
+                }
+
+                /* Extended attributes (RFC 8276) are an NFSv4.2 feature. */
+                if (minorversion >= 2) {
+                    word2 |= (1 << (FATTR4_XATTR_SUPPORT - 64));
+                }
+
+                /* Layout types (attr 64) advertised when pNFS is enabled. */
+                if (pnfs_layout_type) {
+                    word2 |= (1 << (FATTR4_LAYOUT_TYPES - 64));
+                }
+
+                /* The block (RFC 5663) and SCSI (RFC 8154) layouts require the
+                 * server to advertise the layout block size + alignment, or the
+                 * client's layout driver refuses to initialize. */
+                if (pnfs_layout_type == 0x3 || pnfs_layout_type == 0x5) {
+                    word2 |= (1 << (FATTR4_LAYOUT_BLKSIZE - 64)) |
+                        (1 << (FATTR4_LAYOUT_ALIGNMENT - 64));
+                }
+
+                chimera_nfs4_attr_append_uint32(&attrs, word2);
+            }
         }
 
         if (req_mask[0] & (1 << FATTR4_TYPE) &&
@@ -358,7 +467,7 @@ chimera_nfs4_marshall_attrs(
             rsp_mask[0]  |= (1 << FATTR4_LEASE_TIME);
             *num_rsp_mask = 1;
 
-            chimera_nfs4_attr_append_uint32(&attrs, 600);
+            chimera_nfs4_attr_append_uint32(&attrs, lease_time_s);
         }
 
         if (req_mask[0] & (1 << FATTR4_ACLSUPPORT)) {
@@ -564,9 +673,58 @@ chimera_nfs4_marshall_attrs(
             chimera_nfs4_attr_append_uint64(&attrs, attr->va_mtime.tv_sec);
             chimera_nfs4_attr_append_uint32(&attrs, attr->va_mtime.tv_nsec);
         }
+
+        /* fs_layout_types is server-static (no backing VFS attribute); emit it
+         * only when pNFS is enabled so it stays consistent with supported_attrs
+         * and EXCHANGE_ID's USE_PNFS_MDS flag. */
+        if (pnfs_layout_type &&
+            (req_mask[1] & (1UL << (FATTR4_FS_LAYOUT_TYPES - 32)))) {
+            rsp_mask[1]  |= (1UL << (FATTR4_FS_LAYOUT_TYPES - 32));
+            *num_rsp_mask = 2;
+
+            chimera_nfs4_attr_append_uint32(&attrs, 1); /* layouttype4<> count */
+            chimera_nfs4_attr_append_uint32(&attrs, pnfs_layout_type); /* per-backend */
+        }
     }
 
     if (num_req_mask >= 3) {
+        /* layout_types (attr 64, word2 bit 0) is the lowest word2 attr in
+         * ascending bitmap order, so it is emitted first. */
+        if (pnfs_layout_type &&
+            (req_mask[2] & (1 << (FATTR4_LAYOUT_TYPES - 64)))) {
+            rsp_mask[2]  |= (1 << (FATTR4_LAYOUT_TYPES - 64));
+            *num_rsp_mask = 3;
+
+            chimera_nfs4_attr_append_uint32(&attrs, 1); /* layouttype4<> count */
+            chimera_nfs4_attr_append_uint32(&attrs, pnfs_layout_type); /* per-backend */
+        }
+
+        /* Block (RFC 5663) and SCSI (RFC 8154) layout block size + alignment
+         * (attrs 65, 66).  The client's layout driver requires a non-zero
+         * blksize <= PAGE_SIZE to initialize.  We allocate and align extents to
+         * 4 KiB. */
+        if ((pnfs_layout_type == 0x3 || pnfs_layout_type == 0x5) &&
+            (req_mask[2] & (1 << (FATTR4_LAYOUT_BLKSIZE - 64)))) {
+            rsp_mask[2]  |= (1 << (FATTR4_LAYOUT_BLKSIZE - 64));
+            *num_rsp_mask = 3;
+            chimera_nfs4_attr_append_uint32(&attrs, 4096);
+        }
+        if ((pnfs_layout_type == 0x3 || pnfs_layout_type == 0x5) &&
+            (req_mask[2] & (1 << (FATTR4_LAYOUT_ALIGNMENT - 64)))) {
+            rsp_mask[2]  |= (1 << (FATTR4_LAYOUT_ALIGNMENT - 64));
+            *num_rsp_mask = 3;
+            chimera_nfs4_attr_append_uint32(&attrs, 4096);
+        }
+
+        if ((req_mask[2] & (1 << (FATTR4_XATTR_SUPPORT - 64))) &&
+            minorversion >= 2) {
+            rsp_mask[2]  |= (1 << (FATTR4_XATTR_SUPPORT - 64));
+            *num_rsp_mask = 3;
+
+            /* memfs and the other validated backends support xattrs. */
+            chimera_nfs4_attr_append_uint32(&attrs, 1);
+        }
+
         if (req_mask[2] & (1 << (FATTR4_SUPPATTR_EXCLCREAT - 64))) {
             rsp_mask[2]  |= (1 << (FATTR4_SUPPATTR_EXCLCREAT - 64));
             *num_rsp_mask = 3;
@@ -582,6 +740,41 @@ chimera_nfs4_marshall_attrs(
                                             (1UL << (FATTR4_OWNER - 32)) |
                                             (1UL << (FATTR4_OWNER_GROUP - 32)));
         }
+
+        if (nfs4_delegations &&
+            (req_mask[2] & (1 << (FATTR4_OPEN_ARGUMENTS - 64)))) {
+            rsp_mask[2]  |= (1 << (FATTR4_OPEN_ARGUMENTS - 64));
+            *num_rsp_mask = 3;
+
+            /* open_arguments4 (RFC 8275): five bitmap4s describing what the
+             * server's OPEN supports.  Each is encoded as { count=1, word }.
+             * Deliberately omit WANT_DELEG_TIMESTAMPS from oa_share_access_want
+             * (we do not implement delegated timestamps). */
+            /* oa_share_access: READ(1) | WRITE(2) | BOTH(3) */
+            chimera_nfs4_attr_append_uint32(&attrs, 1);
+            chimera_nfs4_attr_append_uint32(&attrs,
+                                            (1 << OPEN_ARGS_SHARE_ACCESS_READ) |
+                                            (1 << OPEN_ARGS_SHARE_ACCESS_WRITE) |
+                                            (1 << OPEN_ARGS_SHARE_ACCESS_BOTH));
+            /* oa_share_deny: NONE(0) | READ(1) | WRITE(2) | BOTH(3) */
+            chimera_nfs4_attr_append_uint32(&attrs, 1);
+            chimera_nfs4_attr_append_uint32(&attrs, 0xF);
+            /* oa_share_access_want: ANY_DELEG(3) | NO_DELEG(4) */
+            chimera_nfs4_attr_append_uint32(&attrs, 1);
+            chimera_nfs4_attr_append_uint32(&attrs,
+                                            (1 << OPEN_ARGS_SHARE_ACCESS_WANT_ANY_DELEG) |
+                                            (1 << OPEN_ARGS_SHARE_ACCESS_WANT_NO_DELEG));
+            /* oa_open_claim: NULL(0) | PREVIOUS(1) | DELEGATE_CUR(2) | FH(4) */
+            chimera_nfs4_attr_append_uint32(&attrs, 1);
+            chimera_nfs4_attr_append_uint32(&attrs,
+                                            (1 << OPEN_ARGS_OPEN_CLAIM_NULL) |
+                                            (1 << OPEN_ARGS_OPEN_CLAIM_PREVIOUS) |
+                                            (1 << OPEN_ARGS_OPEN_CLAIM_DELEGATE_CUR) |
+                                            (1 << OPEN_ARGS_OPEN_CLAIM_FH));
+            /* oa_create_mode: UNCHECKED(0) | GUARDED(1) | EXCLUSIVE(2) | EXCL4_1(3) */
+            chimera_nfs4_attr_append_uint32(&attrs, 1);
+            chimera_nfs4_attr_append_uint32(&attrs, 0xF);
+        }
     }
 
     *attrvals_len = attrs - attrbase;
@@ -589,7 +782,7 @@ chimera_nfs4_marshall_attrs(
     return 0;
 } /* chimera_nfs4_marshall_attrs */
 
-static int
+static nfsstat4
 chimera_nfs4_unmarshall_attrs(
     struct chimera_vfs_attrs *attr,
     uint32_t                  num_req_mask,
@@ -606,7 +799,7 @@ chimera_nfs4_unmarshall_attrs(
         if (req_mask[0] & (1 << FATTR4_SIZE)) {
 
             if (unlikely(attrs + sizeof(uint64_t) > attrsend)) {
-                return -1;
+                return NFS4ERR_BADXDR;
             }
 
             attr->va_size      = chimera_nfs_ntoh64(*(uint64_t *) attrs);
@@ -619,7 +812,7 @@ chimera_nfs4_unmarshall_attrs(
         if (req_mask[1] & (1 << (FATTR4_MODE - 32))) {
 
             if (unlikely(attrs + sizeof(uint32_t) > attrsend)) {
-                return -1;
+                return NFS4ERR_BADXDR;
             }
 
             attr->va_mode      = chimera_nfs_ntoh32(*(uint32_t *) attrs);
@@ -632,7 +825,7 @@ chimera_nfs4_unmarshall_attrs(
             uint32_t owner_padded_len;
 
             if (unlikely(attrs + sizeof(uint32_t) > attrsend)) {
-                return -1;
+                return NFS4ERR_BADXDR;
             }
 
             owner_len        = chimera_nfs_ntoh32(*(uint32_t *) attrs);
@@ -640,7 +833,12 @@ chimera_nfs4_unmarshall_attrs(
             owner_padded_len = (owner_len + 3) & ~3;
 
             if (unlikely(attrs + owner_padded_len > attrsend)) {
-                return -1;
+                return NFS4ERR_BADXDR;
+            }
+
+            /* RFC 7530 §5.9: owner is a non-empty utf8str_mixed. */
+            if (unlikely(owner_len == 0)) {
+                return NFS4ERR_INVAL;
             }
 
             /* Convert string to numeric uid */
@@ -654,7 +852,7 @@ chimera_nfs4_unmarshall_attrs(
             uint32_t group_padded_len;
 
             if (unlikely(attrs + sizeof(uint32_t) > attrsend)) {
-                return -1;
+                return NFS4ERR_BADXDR;
             }
 
             group_len        = chimera_nfs_ntoh32(*(uint32_t *) attrs);
@@ -662,7 +860,12 @@ chimera_nfs4_unmarshall_attrs(
             group_padded_len = (group_len + 3) & ~3;
 
             if (unlikely(attrs + group_padded_len > attrsend)) {
-                return -1;
+                return NFS4ERR_BADXDR;
+            }
+
+            /* RFC 7530 §5.9: owner_group is a non-empty utf8str_mixed. */
+            if (unlikely(group_len == 0)) {
+                return NFS4ERR_INVAL;
             }
 
             /* Convert string to numeric gid */
@@ -674,7 +877,7 @@ chimera_nfs4_unmarshall_attrs(
         if (req_mask[1] & (1 << (FATTR4_TIME_ACCESS_SET - 32))) {
 
             if (unlikely(attrs + sizeof(uint32_t) > attrsend)) {
-                return -1;
+                return NFS4ERR_BADXDR;
             }
 
             set_it = chimera_nfs_ntoh32(*(uint32_t *) attrs);
@@ -683,13 +886,18 @@ chimera_nfs4_unmarshall_attrs(
             if (set_it) {
 
                 if (unlikely(attrs + sizeof(uint64_t) + sizeof(uint32_t) > attrsend)) {
-                    return -1;
+                    return NFS4ERR_BADXDR;
                 }
 
                 attr->va_atime.tv_sec  = chimera_nfs_ntoh64(*(uint64_t *) attrs);
                 attrs                 += sizeof(uint64_t);
                 attr->va_atime.tv_nsec = chimera_nfs_ntoh32(*(uint32_t *) attrs);
                 attrs                 += sizeof(uint32_t);
+
+                /* RFC 7530 §5.7: nseconds must be < 1,000,000,000. */
+                if (unlikely(attr->va_atime.tv_nsec >= 1000000000)) {
+                    return NFS4ERR_INVAL;
+                }
             } else {
                 attr->va_atime.tv_sec  = 0;
                 attr->va_atime.tv_nsec = CHIMERA_VFS_TIME_NOW;
@@ -701,7 +909,7 @@ chimera_nfs4_unmarshall_attrs(
         if (req_mask[1] & (1 << (FATTR4_TIME_MODIFY_SET - 32))) {
 
             if (unlikely(attrs + sizeof(uint32_t) > attrsend)) {
-                return -1;
+                return NFS4ERR_BADXDR;
             }
 
             set_it = chimera_nfs_ntoh32(*(uint32_t *) attrs);
@@ -710,13 +918,18 @@ chimera_nfs4_unmarshall_attrs(
             if (set_it) {
 
                 if (unlikely(attrs + sizeof(uint64_t) + sizeof(uint32_t) > attrsend)) {
-                    return -1;
+                    return NFS4ERR_BADXDR;
                 }
 
                 attr->va_mtime.tv_sec  = chimera_nfs_ntoh64(*(uint64_t *) attrs);
                 attrs                 += sizeof(uint64_t);
                 attr->va_mtime.tv_nsec = chimera_nfs_ntoh32(*(uint32_t *) attrs);
                 attrs                 += sizeof(uint32_t);
+
+                /* RFC 7530 §5.7: nseconds must be < 1,000,000,000. */
+                if (unlikely(attr->va_mtime.tv_nsec >= 1000000000)) {
+                    return NFS4ERR_INVAL;
+                }
             } else {
                 attr->va_mtime.tv_sec  = 0;
                 attr->va_mtime.tv_nsec = CHIMERA_VFS_TIME_NOW;
@@ -728,7 +941,9 @@ chimera_nfs4_unmarshall_attrs(
 
     }
 
-    return (attrs <= attrsend) ? 0 : -1;
+    /* RFC 7530 §5: the attr_vals opaque must be consumed exactly. Leftover
+     * bytes (or an overrun) are a malformed fattr4 -> NFS4ERR_BADXDR. */
+    return (attrs == attrsend) ? NFS4_OK : NFS4ERR_BADXDR;
 } /* chimera_nfs4_unmarshall_attrs */
 
 static inline nfsstat4
