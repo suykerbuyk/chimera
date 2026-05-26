@@ -9,6 +9,10 @@ ARG ENABLE_FIO=1
 ARG ENABLE_CLAUDE=1
 ARG ENABLE_CODEX=1
 ARG ENABLE_UV=1
+ARG ENABLE_WPTS=1
+ARG PYNFS_REF=chimera-fast-ci
+# Pinned Microsoft Windows Protocol Test Suites (WPTS) FileServer release.
+ARG WPTS_VERSION=4.26.3.0
 
 ENV APT_MIRROR=http://repository.mdh.quantum.com/repository/pkgs/ubuntu
 ENV DEBIAN_FRONTEND=noninteractive
@@ -16,26 +20,20 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN echo "deb $APT_MIRROR resolute main universe" > /etc/apt/sources.list.d/local-mirror.list && \
     echo "deb $APT_MIRROR resolute-updates main universe" >> /etc/apt/sources.list.d/local-mirror.list && \
     echo "deb $APT_MIRROR resolute-security main universe" >> /etc/apt/sources.list.d/local-mirror.list && \
-    rm -f /etc/apt/sources.list.d/ubuntu.sources && \
-    ls -l /etc/apt/sources.list.d/
+    rm -f /etc/apt/sources.list.d/ubuntu.sources
 
-# Upgrade but make sure we keep mirror image
+
 RUN apt-get -y update && \
     apt-get -y --no-install-recommends upgrade && \
-    if [ -n "$APT_MIRROR" ]; then \
-       rm -f /etc/apt/sources.list.d/ubuntu.sources; \
-    fi
-
-RUN apt-get -y update && \
-    apt-get -y --no-install-recommends install unminimize apt && \
+    apt-get -y --no-install-recommends install unminimize apt-utils && \
     yes | unminimize && \
     apt-get -y --no-install-recommends install clang clang-tools cmake ninja-build git flex bison lldb gdb less vim psmisc uncrustify \
     net-tools tshark tcpdump uuid-dev iproute2 man-db manpages-dev ca-certificates ssh libjansson-dev libclang-rt-18-dev llvm wget \
     libxxhash-dev liburcu-dev librdmacm-dev liburing-dev libaio-dev libunwind-dev librocksdb-dev libcurl4-openssl-dev clangd uthash-dev libnuma-dev \
     libcurl4-openssl-dev build-essential ruby-full autoconf automake make libtool pkg-config libs3-dev gh npm reuse libssl-dev openssl \
-    libkrb5-3 libkrb5-dev libgssapi-krb5-2 libwbclient-dev curl jq \
-    krb5-kdc krb5-admin-server krb5-user \
-    samba samba-ad-dc samba-ad-provision samba-vfs-modules smbclient && \
+    libkrb5-3 libkrb5-dev libgssapi-krb5-2 libwbclient-dev curl jq libicu-dev awscli \
+    krb5-kdc krb5-admin-server krb5-user python3-pip python3-setuptools \
+    samba samba-ad-dc samba-ad-provision samba-vfs-modules smbclient samba-testsuite && \
     gem install jekyll bundler
 
 RUN if [ "$ENABLE_CLAUDE" = "1" ] ; then \
@@ -77,17 +75,40 @@ RUN if [ "$ENABLE_XLIO" = "1" ] ; then \
     fi
 
 RUN apt-get -y update && \
-    apt-get -y --no-install-recommends install qemu-system-x86 qemu-utils && \
+    apt-get -y --no-install-recommends install qemu-system-x86  qemu-utils && \
     install -m 0755 -d /etc/apt/keyrings && \
     curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc && \
     chmod a+r /etc/apt/keyrings/docker.asc && \
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu resolute stable" \
         > /etc/apt/sources.list.d/docker.list && \
     apt-get -y update && \
-    apt-get -y --no-install-recommends install docker-ce docker-ce-cli containerd.io && \
+    apt-get -y --no-install-recommends install docker-ce docker-ce-cli containerd.io docker-buildx-plugin && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
+RUN apt-get -y update && \
+    apt-get -y --no-install-recommends install python3-ply python3-gssapi python3-pip && \
+    pip3 install --break-system-packages xdrlib3 && \
+    git clone --depth 1 --branch "$PYNFS_REF" https://github.com/chimera-nas/pynfs.git /opt/pynfs && \
+    cd /opt/pynfs && python3 ./setup.py build && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
 RUN if [ "$ENABLE_UV" = "1" ] ; then \
     curl -LsSf https://astral.sh/uv/install.sh | sh ; \
+    fi
+
+# .NET 8 + Microsoft Windows Protocol Test Suites (WPTS) FileServer suite, used
+# by the MS-SMB2 server conformance ctests (src/server/smb/tests). WPTS speaks
+# SMB2 from its own managed stack, so it runs host-side in a netns against the
+# chimera daemon -- no VM needed. CMake auto-detects /opt/dotnet and /opt/wpts.
+ENV DOTNET_ROOT=/opt/dotnet
+RUN if [ "$ENABLE_WPTS" = "1" ] ; then \
+    curl -sSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh && \
+    bash /tmp/dotnet-install.sh --channel 8.0 --install-dir /opt/dotnet && \
+    ln -sf /opt/dotnet/dotnet /usr/local/bin/dotnet && \
+    rm -f /tmp/dotnet-install.sh && \
+    mkdir -p /opt/wpts && \
+    curl -sSL "https://github.com/microsoft/WindowsProtocolTestSuites/releases/download/${WPTS_VERSION}/FileServer-TestSuite-ServerEP.tar.gz" -o /tmp/wpts.tar.gz && \
+    tar -C /opt/wpts -xzf /tmp/wpts.tar.gz && \
+    rm -f /tmp/wpts.tar.gz ; \
     fi
