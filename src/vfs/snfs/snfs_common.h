@@ -6,6 +6,7 @@
 
 #include "common/varint.h"
 #include "vfs/vfs_fh.h"
+#include "snfs_cvapi.h"
 
 #define snfs_debug(...) chimera_debug("snfs", \
                                       __FILE__, \
@@ -376,6 +377,12 @@ snfs_map_attrs(
         }
     }
 
+    if (attr->va_req_mask & CHIMERA_VFS_ATTR_BTIME) {
+        if (snfs_cvapi_get_btime(fd, "", &attr->va_btime) == 0) {
+            attr->va_set_mask |= CHIMERA_VFS_ATTR_BTIME;
+        }
+    }
+
 } /* snfs_map_attrs */
 
 static inline void
@@ -448,6 +455,12 @@ snfs_map_child_attrs(
 
         if (rc == 0) {
             snfs_statvfs_to_attr(attr, &stvfs);
+        }
+    }
+
+    if (attr->va_req_mask & CHIMERA_VFS_ATTR_BTIME) {
+        if (snfs_cvapi_get_btime(dirfd, name, &attr->va_btime) == 0) {
+            attr->va_set_mask |= CHIMERA_VFS_ATTR_BTIME;
         }
     }
 

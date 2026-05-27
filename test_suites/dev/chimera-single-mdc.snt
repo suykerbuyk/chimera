@@ -32,12 +32,22 @@ command allhosts curl https://nexus.mdh.quantum.com/repository/snnas-binaries/sn
 step 10m Make sure that the kernel-devel is installed
 command srv1 dnf install -y kernel-devel
 
+step 5m remove MDH path
+command srv1 rm -f /etc/profile.d/mdh-env.sh
+
 #  --------------------   install stornext  ---------------
+%ifdef HAVE_TSM
+%define SNFS_PKG full_suite
+%else
+%define SNFS_PKG snfs
+%endif
+
+
 step 10m Unpack StorNext
-command srv1 $sntest/bin/unpack_stornext snfs $sndist /tmp/stornext
+command srv1 $sntest/bin/unpack_stornext SNFS_PKG $sndist /tmp/stornext
 
 step 10m Install StorNext
-command srv1 $sntest/bin/install_stornext snfs /tmp/stornext
+command srv1 $sntest/bin/install_stornext SNFS_PKG /tmp/stornext
 
 step 10m Set StorNext Name Servers
 command allhosts $sntest/bin/set_fsnameservers $srv1
@@ -78,6 +88,9 @@ step 5m Restart StorNext on MDC
 command allhosts $sntest/bin/cvfs_control restart
 
 #  --------------------   install Chimera  ---------------
+step 3m stop NFS services
+command srv1 systemctl stop rpc-statd && systemctl stop autofs
+
 step 2m Download chimera pkg for Stornext
 command srv1 /sntest_utils/get_qb_asset.py -p chimera -t PKG_TAG -d /chimera-repo -u release/Rocky9/amd64/repo-chimera.tar.gz
 
@@ -92,7 +105,12 @@ command srv1 sed -i.back 's/\/chimera.json/\/sntest-chimera.json/'  /etc/default
                     threads: 16, \
                     external_portmap: true, \
                     max_open_files: 1048576, \
-                    rest_http_port: 8080 \
+                    rest_http_port: 8080, \
+		    vfs: { \
+		       "snfs": { \
+		          "path": "/opt/quantum/chimera/lib/libchimera_vfs_snfs.so" \
+		       } \
+		    } \
                  }, \
 		 users: [ \
 		    { username: "testuser1", smbpasswd: "systest", uid: 5000, gid: 50} \
