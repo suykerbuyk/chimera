@@ -107,24 +107,28 @@ snfs_thread_destroy(void *private_data)
 } /* snfs_thread_destroy */
 
 /**
- * @brief Apply VFS attribute changes to a Linux filesystem object.
+ * @brief Apply VFS attribute changes to a StorNext filesystem object.
  *
  * Sets one or more attributes on the file or directory identified by
  * @p dirfd and @p path according to the mask in @p attr->va_set_mask.
  * Supported attributes:
- *  - @c CHIMERA_VFS_ATTR_MODE  – file permission bits (fchmodat)
- *  - @c CHIMERA_VFS_ATTR_UID   – owner user ID (fchownat)
- *  - @c CHIMERA_VFS_ATTR_GID   – owner group ID (fchownat)
- *  - @c CHIMERA_VFS_ATTR_SIZE  – file size / truncation (truncate via /proc)
- *  - @c CHIMERA_VFS_ATTR_ATIME – access time (utimensat; CHIMERA_VFS_TIME_NOW sets to current time)
- *  - @c CHIMERA_VFS_ATTR_MTIME – modification time (utimensat; CHIMERA_VFS_TIME_NOW sets to current time)
+ *  - @c CHIMERA_VFS_ATTR_MODE  - file permission bits (fchmodat)
+ *  - @c CHIMERA_VFS_ATTR_UID   - owner user ID (fchownat)
+ *  - @c CHIMERA_VFS_ATTR_GID   - owner group ID (fchownat)
+ *  - @c CHIMERA_VFS_ATTR_SIZE  - file size / truncation (truncate via /proc)
+ *  - @c CHIMERA_VFS_ATTR_ATIME - access time (utimensat; CHIMERA_VFS_TIME_NOW sets to current time)
+ *  - @c CHIMERA_VFS_ATTR_MTIME - modification time (utimensat; CHIMERA_VFS_TIME_NOW sets to current time)
+ *  - @c CHIMERA_VFS_ATTR_BTIME - birth/creation time via StorNext CvApi_SetCreateTime
+ *                                (CHIMERA_VFS_TIME_NOW sets to current time)
  *
  * On success the corresponding bits in @p attr->va_set_mask are set to
  * confirm which attributes were applied.
  *
  * @param dirfd  Open directory file descriptor used as the base for relative
  *               path operations (AT_EMPTY_PATH semantics).  May be an O_PATH
- *               descriptor; size changes are handled via /proc/self/fd.
+ *               descriptor; size changes are handled via /proc/self/fd, and
+ *               btime changes via snfs_cvapi_set_btime() which upgrades the
+ *               fd as needed.
  * @param path   Relative path beneath @p dirfd, or an empty string ("") to
  *               operate directly on @p dirfd itself.
  * @param attr   Pointer to a chimera_vfs_attrs structure.  @c va_set_mask
@@ -228,6 +232,21 @@ snfs_set_attrs(
 
         attr->va_set_mask |= CHIMERA_VFS_ATTR_SIZE;
     }
+
+
+    if (set_mask & CHIMERA_VFS_ATTR_BTIME) {
+        rc = snfs_cvapi_set_btime(dirfd, path, &attr->va_btime);
+
+        if (rc) {
+            snfs_error("snfs_setattr: set btime failed: %s",
+                       strerror(-rc));
+
+            return rc;
+        }
+
+        attr->va_set_mask |= CHIMERA_VFS_ATTR_BTIME;
+    }
+
 
     if (set_mask & (CHIMERA_VFS_ATTR_ATIME | CHIMERA_VFS_ATTR_MTIME)) {
         struct timespec times[2];

@@ -258,6 +258,25 @@ command lnx1 mkdir -p /smb1/lnx1-smb1 && \
 	/usr/bin/elbencho /smb1/lnx1-smb1 --size=1m --dirs=4 --files=10 --mkdirs --write && \
 	/usr/bin/elbencho /smb1/lnx1-smb1 --size=1m --dirs=4 --files=10 --deldirs --delfiles --read
 
+
+# ================ Test create time ==============
+# vfs_snfs (CvApi_SetNtCreateTime)
+
+step 1m create test file
+command srv1 touch /stornext/snfs1/test_crtime
+
+step 5m get the file create time
+command srv1 sleep 30; echo show inode test_crtime | TZ=UTC /usr/cvfs/bin/cvfsdb snfs1 | grep idi_crttime.tv_sec
+command lnx1 SMBCLIENT -c 'allinfo test_crtime' | grep create_time
+
+step 1m change time to Jan 1 1990 with Linux client.
+command lnx1 SMBCLIENT  -c 'utimes test_crtime 90:01:01-00:00:00 -1 -1 -1'
+
+step 1m Confirm create time is 1990
+command srv1 sleep 30; echo show inode test_crtime | TZ=UTC /usr/cvfs/bin/cvfsdb snfs1 | grep idi_crttime.tv_sec | grep 1990
+command lnx1 SMBCLIENT -c 'allinfo test_crtime' | grep create_time | grep 1990
+
+
 %ifndef NO_NFSv3
 step 5m Mount the NFSv3 share
 command lnx1 mkdir -p /nfs1 && mount -v -o vers=3 $srv1:/nfs1 /nfs1
@@ -322,25 +341,6 @@ command lnx1 cd /home1/nfstest/NFStest-9408954 && \
 	     sudo -u nfstest -E bash -c 'PYTHONPATH=./ ./test/nfstest_posix -s $srv1 -e /nfs1'
 %endif
 
-%ifndef SKIP_FAIL
-# ================ Test create time ==============
-# vfs_snfs (CvApi_SetNtCreateTime)
-
-step 1m create test file
-command srv1 touch /stornext/snfs1/test_crtime
-
-step 5m get the file create time
-command srv1 sleep 30; echo show inode smb1/test_crtime | /usr/cvfs/bin/cvfsdb snfs1 | grep idi_crttime.tv_sec
-command lnx1 SMBCLIENT -c 'allinfo test_crtime' | grep create_time
-
-step 1m change time to Jan 1 1990 with Linux client.
-command lnx1 SMBCLIENT  -c 'utimes test_crtime 90:01:01-00:00:00 -1 -1 -1'
-
-step 1m Confirm create time is 1990
-command srv1 sleep 30; echo show inode smb1/test_crtime | /usr/cvfs/bin/cvfsdb snfs1 | grep idi_crttime.tv_sec | grep 1990
-command lnx1 SMBCLIENT -c 'allinfo test_crtime' | grep create_time | grep 1990
-
-%endif
 
 
 
