@@ -51,8 +51,11 @@ struct snfs_thread {
 };
 
 static void *
-snfs_init(const char *cfgdata)
+snfs_init(
+    const char                *cfgdata,
+    struct prometheus_metrics *metrics)
 {
+    (void) metrics;
     struct snfs_shared *shared;
 
     shared = calloc(1, sizeof(*shared));
