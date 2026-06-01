@@ -13,6 +13,9 @@
 #include "vfs_pnfs.h"
 #include "vfs_lease_types.h"
 #include "evpl/evpl.h"
+#include "prometheus-c.h"
+#include "vfs_clock.h"
+#include "common/tcp_flavor.h"
 
 #define CHIMERA_VFS_PATH_MAX 4096
 #define CHIMERA_VFS_NAME_MAX 256
@@ -22,6 +25,29 @@ struct chimera_vfs;
 struct chimera_vfs_user;
 struct chimera_vfs_user_cache;
 struct prometheus_metrics;
+
+/* RCU recycle pools: one per fungible cache (attr/name/rpl).  The per-thread
+ * magazine type is defined here (no urcu dependency) so chimera_vfs_thread can
+ * embed it; the pool itself and the helpers live in vfs_rcu_pool.h. */
+enum chimera_rcu_pool_id {
+    CHIMERA_RCU_POOL_ATTR = 0,
+    CHIMERA_RCU_POOL_NAME,
+    CHIMERA_RCU_POOL_RPL,
+    CHIMERA_RCU_POOL_COUNT
+};
+
+#define CHIMERA_RCU_MAGAZINE_CAP 64
+
+struct chimera_rcu_node;
+struct chimera_rcu_magazine {
+    struct chimera_rcu_node *head;
+    uint32_t                 count;
+    /* Stable depot stripe for this thread+pool, assigned once at thread init.
+     * An entry's recycle home follows the thread that allocated it (carried in
+     * the entry), not the transient CPU, so a worker that migrates across CPUs
+     * still recovers its own retired entries instead of stranding them. */
+    uint32_t                 stripe;
+};
 
 /* FSSTAT values used with builtin backends until statvfs tracking is implemented */
 #define CHIMERA_VFS_SYNTHETIC_FS_BYTES   ((uint64_t) 100 * 1024 * 1024 * 1024)
@@ -82,7 +108,10 @@ struct chimera_vfs_mount_options {
 #define CHIMERA_VFS_OP_LIST_XATTRS      34
 #define CHIMERA_VFS_OP_REMOVE_XATTR     35
 #define CHIMERA_VFS_OP_GET_LAYOUT       36
-#define CHIMERA_VFS_OP_NUM              37
+#define CHIMERA_VFS_OP_OPEN_STREAM      37
+#define CHIMERA_VFS_OP_LIST_STREAMS     38
+#define CHIMERA_VFS_OP_REMOVE_STREAM    39
+#define CHIMERA_VFS_OP_NUM              40
 
 #define CHIMERA_VFS_OPEN_CREATE         (1U << 0)
 #define CHIMERA_VFS_OPEN_PATH           (1U << 1)
@@ -145,13 +174,31 @@ struct chimera_vfs_open_handle {
      * create path immediately afterwards to report OPENED vs CREATED. */
     uint8_t                         r_created;
     uint32_t                        opencnt;
+    /* Identity hash of the credential that opened this handle: the open cache
+     * is keyed by (fh, access_mode, cred_hash) so each caller gets its own
+     * handle and its own authorization result (chimera_vfs_cred_hash). */
+    uint64_t                        cred_hash;
+    /* Cached effective access mask for this handle's credential, computed once
+     * (lazily, on the first gated read/write) and reused for the handle's life
+     * so the ACL check amortises across a caller's I/O.  granted_valid is 0
+     * until computed. */
+    uint32_t                        granted_access;
+    uint8_t                         granted_valid;
     struct chimera_vfs_request     *blocked_requests;
     uint64_t                        vfs_private;
+    /* Backend-generic per-file lease/state anchor.  Attached lazily (once) on
+     * the first I/O through this cached handle via an acquire/release CAS in
+     * chimera_vfs_io_lease_acquire, and holds one long-lived reference for the
+     * handle's lifetime so per-I/O lease acquire/release can skip the
+     * bucket-locked chimera_vfs_state_get/put.  NULL for synthetic/transient
+     * handles and until the first I/O.  Released (state_put) at handle teardown,
+     * outside the open-cache shard lock. */
+    struct chimera_vfs_file_state  *file_state;
     void                            ( *callback )(
         struct chimera_vfs_request     *request,
         struct chimera_vfs_open_handle *handle);
     struct chimera_vfs_request     *request;
-    struct timespec                 timestamp;
+    uint64_t                        timestamp; /* stopwatch ticks */
     struct chimera_vfs_open_handle *bucket_next;
     struct chimera_vfs_open_handle *bucket_prev;
     struct chimera_vfs_open_handle *prev;
@@ -168,6 +215,13 @@ struct chimera_vfs_open_handle {
     uint8_t                         doc_parent_fh[CHIMERA_VFS_FH_SIZE];
     char                            doc_name[CHIMERA_VFS_NAME_MAX];
 };
+
+/* Drop the per-file lease-state reference an open handle holds in
+ * handle->file_state (see that field).  Uses the file_state's own back-pointer
+ * to the owning state, so the open-cache teardown can release it without
+ * threading the state through.  No-op safe to call with a NULL argument. */
+void chimera_vfs_file_state_release(
+    struct chimera_vfs_file_state *file);
 
 
 typedef void (*chimera_vfs_lookup_callback_t)(
@@ -303,6 +357,27 @@ struct chimera_vfs_request_handle {
 
 #define CHIMERA_VFS_REQUEST_MAX_HANDLES 3
 
+/* One enumerated named stream, packed back-to-back in the list_streams reply
+ * buffer.  `name_len` bytes of (un-terminated) stream name follow this header;
+ * the next record begins at the following 8-byte-aligned offset. */
+struct chimera_vfs_stream_entry {
+    uint64_t size;        /* stream end-of-file */
+    uint64_t alloc;       /* stream allocation size */
+    uint16_t name_len;    /* bytes of name that follow this struct */
+};
+
+/*
+ * Requested/achieved write stability, carried in write.sync (request) and
+ * returned in write.r_sync (achieved).  Values match the NFS3/NFS4 stable_how
+ * enums (UNSTABLE/DATA_SYNC/FILE_SYNC = 0/1/2), so backends that only test
+ * truthiness for FUA still behave correctly (UNSTABLE=0 is the only falsy one).
+ * A backend that makes data durable but defers metadata durability returns
+ * DATASYNC; one that makes everything durable returns FILESYNC.
+ */
+#define CHIMERA_VFS_WRITE_UNSTABLE 0
+#define CHIMERA_VFS_WRITE_DATASYNC 1
+#define CHIMERA_VFS_WRITE_FILESYNC 2
+
 struct chimera_vfs_request {
     struct chimera_vfs_thread         *thread;
     const struct chimera_vfs_cred     *cred;
@@ -310,7 +385,7 @@ struct chimera_vfs_request {
     enum chimera_vfs_error             status;
     chimera_vfs_complete_callback_t    complete;
     chimera_vfs_complete_callback_t    complete_delegate;
-    struct timespec                    start_time;
+    struct prometheus_stopwatch        start_time;
     uint64_t                           elapsed_ns;
 
     /* Points to one page of memory that the plugin may use as desired */
@@ -352,6 +427,14 @@ struct chimera_vfs_request {
     void                               ( *io_next )(
         struct chimera_vfs_request *request);
     struct chimera_vfs_file_state     *io_lease_file;
+    /* Cached open handle backing this I/O, set by the read/write dispatch.  When
+     * present (and non-synthetic) chimera_vfs_io_lease_acquire attaches the
+     * per-file lease state to handle->file_state once and reuses it, skipping the
+     * per-I/O bucket-locked chimera_vfs_state_get.  io_owns_lease_ref is then 0
+     * (the handle owns the long-lived reference, so io_lease_release must not
+     * state_put); 1 = the legacy path that takes and drops its own per-I/O ref. */
+    struct chimera_vfs_open_handle    *io_handle;
+    uint8_t                            io_owns_lease_ref;
     struct chimera_vfs_pending_acquire io_lease_ticket;
 
     struct chimera_vfs_open_handle    *pending_handle;
@@ -646,6 +729,27 @@ struct chimera_vfs_request {
             uint32_t                        r_length;
             uint32_t                        r_eof;
             struct chimera_vfs_attrs        r_attr;
+            /* Set by the VFS core when it pre-allocated the read buffers on the
+             * connection thread (backend lacks CAP_READ_PROVIDES_BUFFERS).
+             * buffers_provided = number of iovecs placed in iov[]; aligned_prefix
+             * = offset - (offset & ~4095), the leading pad bytes the backend read
+             * but the client did not ask for.  The backend fills the buffers
+             * (data for file offset `offset` lands at buffer position
+             * aligned_prefix) and sets r_length/r_eof; the VFS core trims the
+             * prefix/tail and sets r_niov in chimera_vfs_read_complete(). */
+            int                             buffers_provided;
+            uint32_t                        aligned_prefix;
+            /* read_into: the caller supplied its own destination buffers
+             * (dest_iov/dest_niov) and wants the data landed there.  iov/niov
+             * above are the scratch the core/backend works in.  On completion
+             * the VFS core scatter-copies the result into dest_iov -- unless a
+             * backend was able to land the data directly in dest (e.g. the NFS
+             * proxy used dest as the RDMA write chunk), in which case it sets
+             * landed_in_dest and the core skips the copy. */
+            struct evpl_iovec              *dest_iov;
+            int                             dest_niov;
+            int                             dest_provided;
+            int                             landed_in_dest;
         } read;
 
         struct {
@@ -714,6 +818,8 @@ struct chimera_vfs_request {
             int                      new_namelen;
             const uint8_t           *target_fh; /* Optional: target FH if known (for silly rename) */
             int                      target_fh_len; /* 0 if target_fh not provided */
+            uint8_t                  source_fh[CHIMERA_VFS_FH_SIZE]; /* resolved source FH, for delegation recall */
+            int                      source_fh_len; /* 0 if source FH could not be resolved */
             struct chimera_vfs_attrs r_fromdir_pre_attr;
             struct chimera_vfs_attrs r_fromdir_post_attr;
             struct chimera_vfs_attrs r_todir_pre_attr;
@@ -870,6 +976,45 @@ struct chimera_vfs_request {
             struct chimera_vfs_attrs        r_pre_attr;
             struct chimera_vfs_attrs        r_post_attr;
         } remove_xattr;
+
+        /* Named streams (SMB Alternate Data Streams).  Gated by
+         * CHIMERA_VFS_CAP_NAMED_STREAMS.  open_stream opens/creates a named
+         * data fork on the base file referenced by `handle`; it returns a
+         * file handle (in r_attr.va_fh) and r_vfs_private exactly like open_at
+         * so the VFS open cache can wrap it.  list_streams enumerates the
+         * file's streams (the default unnamed fork first), each as a packed
+         * struct chimera_vfs_stream_entry. */
+        struct {
+            struct chimera_vfs_open_handle *handle;       /* base file handle */
+            const char                     *name;         /* stream name (no ":$DATA") */
+            uint32_t                        namelen;
+            uint32_t                        flags;        /* CHIMERA_VFS_OPEN_* */
+            struct chimera_vfs_attrs       *set_attr;
+            struct chimera_vfs_attrs        r_attr;       /* base meta + stream size; va_fh = stream fh */
+            uint64_t                        r_vfs_private;
+            uint8_t                         r_created;
+        } open_stream;
+
+        struct {
+            struct chimera_vfs_open_handle *handle;       /* base file handle */
+            uint64_t                        cookie;
+            void                           *buffer;       /* caller-provided buffer */
+            uint32_t                        max_bytes;
+            /* buffer is filled with packed chimera_vfs_stream_entry records,
+             * each followed by name_len bytes of (un-terminated) name. */
+            uint32_t                        r_len;        /* bytes written to buffer */
+            uint32_t                        r_count;      /* number of streams written */
+            uint32_t                        r_eof;
+            uint64_t                        r_cookie;
+        } list_streams;
+
+        struct {
+            struct chimera_vfs_open_handle *handle;       /* base file handle */
+            const char                     *name;
+            uint32_t                        namelen;
+            struct chimera_vfs_attrs        r_pre_attr;
+            struct chimera_vfs_attrs        r_post_attr;
+        } remove_stream;
 
         /* pNFS: a layout-sourcing backend (CHIMERA_VFS_CAP_LAYOUT_SOURCE)
          * describes where the file's data physically lives.  The NFS server
@@ -1031,19 +1176,19 @@ struct chimera_vfs_handle_state {
  * chimera_vfs_get_xattr / set_xattr / list_xattrs / remove_xattr.
  * Surfaced over NFSv4.2 (RFC 8276). Modules that leave this unset
  * cause the VFS layer to return ENOTSUP. */
-#define CHIMERA_VFS_CAP_XATTR              (1U << 18)
+#define CHIMERA_VFS_CAP_XATTR                 (1U << 18)
 
 /* setxattr_option4 values (RFC 8276 §8) passed to chimera_vfs_set_xattr().
  * Kept numerically identical to the on-the-wire NFSv4.2 enum. */
-#define CHIMERA_VFS_XATTR_EITHER           0  /* create or replace */
-#define CHIMERA_VFS_XATTR_CREATE           1  /* must not already exist */
-#define CHIMERA_VFS_XATTR_REPLACE          2  /* must already exist */
+#define CHIMERA_VFS_XATTR_EITHER              0 /* create or replace */
+#define CHIMERA_VFS_XATTR_CREATE              1 /* must not already exist */
+#define CHIMERA_VFS_XATTR_REPLACE             2 /* must already exist */
 
 /* Module persists the opaque CHIMERA_VFS_ATTR_PNFS_LAYOUT attribute, so the NFS
  * server can store per-file pNFS layout state on it and hand out pNFS layouts.
  * This is the "orchestrated" model: the module is a passive vessel and the NFS
  * server produces the layout (creating data-server backing files itself). */
-#define CHIMERA_VFS_CAP_LAYOUT             (1U << 14)
+#define CHIMERA_VFS_CAP_LAYOUT                (1U << 14)
 
 /* Module SOURCES the layout itself: it already knows where a file's data
  * physically lives and synthesizes a protocol-neutral layout via
@@ -1051,10 +1196,50 @@ struct chimera_vfs_handle_state {
  * what the module returns) and does NO orchestration.  Mutually exclusive in
  * effect with CHIMERA_VFS_CAP_LAYOUT for a given file.  Exactly one of the
  * class bits below should accompany it. */
-#define CHIMERA_VFS_CAP_LAYOUT_SOURCE      (1U << 15)
-#define CHIMERA_VFS_CAP_LAYOUT_CLASS_FLEX  (1U << 16) /* produces flex-files (RFC 8435)  */
-#define CHIMERA_VFS_CAP_LAYOUT_CLASS_BLOCK (1U << 17) /* produces block volume (RFC 5663)*/
-#define CHIMERA_VFS_CAP_LAYOUT_CLASS_SCSI  (1U << 19) /* produces SCSI volume (RFC 8154) */
+#define CHIMERA_VFS_CAP_LAYOUT_SOURCE         (1U << 15)
+#define CHIMERA_VFS_CAP_LAYOUT_CLASS_FLEX     (1U << 16) /* produces flex-files (RFC 8435)  */
+#define CHIMERA_VFS_CAP_LAYOUT_CLASS_BLOCK    (1U << 17) /* produces block volume (RFC 5663)*/
+#define CHIMERA_VFS_CAP_LAYOUT_CLASS_SCSI     (1U << 19) /* produces SCSI volume (RFC 8154) */
+
+/* If set, the backend provides the memory for READ data itself (e.g. memfs
+ * returns refs to its in-memory SHARED block iovecs; the nfs proxy returns the
+ * buffers handed up by its upstream RPC reply).  If UNSET, the VFS core
+ * allocates the read buffers on the connection thread BEFORE dispatch and
+ * places them in request->read.iov (request->read.buffers_provided != 0); the
+ * backend MUST read into those buffers and must NOT allocate its own.  Keeping
+ * read-buffer ownership on the connection thread is what makes the delegation
+ * (worker-thread) read path safe without SHARED iovecs -- the buffers are
+ * allocated and released on the same (connection) thread.  See
+ * chimera_vfs_read_owned() / chimera_vfs_read_complete(). */
+#define CHIMERA_VFS_CAP_READ_PROVIDES_BUFFERS (1U << 20)
+
+/* If set, the module stores the canonical Windows/NFSv4 ACL (via va_acl)
+ * losslessly.  If unset, the module is mode-only: the VFS translates ACLs to
+ * and from UNIX mode bits on its behalf.  There is no POSIX.1e capability by
+ * design -- Chimera carries a single ACL model (see vfs_acl.h). */
+#define CHIMERA_VFS_CAP_ACL_NATIVE            (1U << 20)
+
+/* If set, the module delegates discretionary access control to a real
+ * underlying enforcer (e.g. the host kernel, via the seteuid/setegid
+ * impersonation in chimera_setup_credential).  The central VFS access gate
+ * (chimera_vfs_gate) is then a no-op for this module, since enforcing in the
+ * engine on top of the kernel would double-evaluate and -- on a mode-only
+ * backend whose ACL is mode-derived -- could only ever agree with it anyway.
+ *
+ * Modules WITHOUT this bit (memfs, cairn, ...) have no native DAC, so the VFS
+ * engine is their sole authorization point and the gate enforces the canonical
+ * ACL for them.  Note this is orthogonal to CAP_ACL_NATIVE: "stores the ACL"
+ * and "enforces the ACL" are different properties (memfs/cairn store but do not
+ * enforce; linux/io_uring enforce in-kernel but do not store the rich ACL). */
+#define CHIMERA_VFS_CAP_DELEGATES_DAC         (1U << 21)
+
+/* If set, the module supports named streams (SMB Alternate Data Streams) on
+ * regular files via chimera_vfs_open_stream / list_streams / remove_stream.
+ * A named stream is an independent data fork addressed by name; it shares the
+ * base file's metadata (mode/owner/timestamps/ACL) but has its own size and
+ * content.  Modules that leave this unset cause the VFS layer to return
+ * ENOTSUP.  Currently only memfs advertises it. */
+#define CHIMERA_VFS_CAP_NAMED_STREAMS         (1U << 22)
 
 struct chimera_vfs_module {
     /* Required
@@ -1083,7 +1268,8 @@ struct chimera_vfs_module {
      */
 
     void      * (*init)(
-        const char *cfgdata);
+        const char                *cfgdata,
+        struct prometheus_metrics *metrics);
 
     /* Optional
      * Called once at destruction to clean up global state
@@ -1210,6 +1396,7 @@ struct chimera_vfs {
     struct chimera_vfs_name_cache        *vfs_name_cache;
     struct chimera_vfs_attr_cache        *vfs_attr_cache;
     struct chimera_vfs_user_cache        *vfs_user_cache;
+    struct chimera_vfs_identity          *identity;
     struct chimera_vfs_notify            *vfs_notify;
     struct chimera_vfs_state             *vfs_state;
     struct chimera_vfs_mount_table       *mount_table;
@@ -1220,31 +1407,35 @@ struct chimera_vfs {
     struct chimera_vfs_delegation_thread *async_delegation_threads;
     struct chimera_vfs_close_thread       close_thread;
     struct chimera_vfs_metrics            metrics;
+    enum chimera_tcp_flavor               tcp_flavor;
     int                                   machine_name_len;
     char                                  machine_name[256];
 };
 
 struct chimera_vfs_thread {
-    struct evpl                      *evpl;
-    struct chimera_vfs               *vfs;
-    void                             *module_private[CHIMERA_VFS_FH_MAGIC_MAX];
-    struct chimera_vfs_find_result   *free_find_results;
-    struct chimera_vfs_request       *free_requests;
-    struct chimera_vfs_request       *active_requests;
-    uint64_t                          num_active_requests;
-    struct chimera_vfs_open_handle   *free_synth_handles;
+    struct evpl                         *evpl;
+    struct chimera_vfs                  *vfs;
+    void                                *module_private[CHIMERA_VFS_FH_MAGIC_MAX];
+    /* Thread-local recycle magazines for the fungible RCU caches. */
+    struct chimera_rcu_magazine          rcu_magazines[CHIMERA_RCU_POOL_COUNT];
+    struct chimera_vfs_find_result      *free_find_results;
+    struct chimera_vfs_request          *free_requests;
+    struct chimera_vfs_request          *active_requests;
+    uint64_t                             num_active_requests;
+    struct chimera_vfs_open_handle      *free_synth_handles;
 
-    struct chimera_vfs_request       *pending_complete_requests;
-    struct chimera_vfs_request       *unblocked_requests;
+    struct chimera_vfs_request          *pending_complete_requests;
+    struct chimera_vfs_request          *unblocked_requests;
+    struct chimera_vfs_identity_request *pending_identity;
     /* Parked I/O requests being resumed on their owning thread (the lease
      * pump runs on whatever thread released/broke a lease, but a request's
      * dispatch+reply must run on the thread that owns its connection iovecs). */
-    struct chimera_vfs_request       *pending_io_resume;
-    struct evpl_doorbell              doorbell;
-    pthread_mutex_t                   lock;
-    uint64_t                          anon_fh_key;
+    struct chimera_vfs_request          *pending_io_resume;
+    struct evpl_doorbell                 doorbell;
+    pthread_mutex_t                      lock;
+    uint64_t                             anon_fh_key;
 
-    struct chimera_vfs_thread_metrics metrics;
+    struct chimera_vfs_thread_metrics    metrics;
 };
 
 struct chimera_vfs_module_cfg {
@@ -1266,6 +1457,14 @@ chimera_vfs_init(
 void
 chimera_vfs_destroy(
     struct chimera_vfs *vfs);
+
+/* Select the TCP transport flavor used for outbound (client) connections.
+ * Defaults to CHIMERA_TCP_FLAVOR_PLAIN; honored by VFS modules that open
+ * their own TCP connections (e.g. the NFS client). */
+void
+chimera_vfs_set_tcp_flavor(
+    struct chimera_vfs     *vfs,
+    enum chimera_tcp_flavor flavor);
 
 /* Get the root pseudo-filesystem's file handle */
 void
@@ -1321,6 +1520,28 @@ chimera_vfs_user_is_member(
     struct chimera_vfs *vfs,
     uint32_t            uid,
     uint32_t            gid);
+
+/*
+ * Identity bridge used by ACL marshalling to round-trip *real* Windows SIDs
+ * through the user cache (the single identity authority).  uid_to_sid copies
+ * the cached SID for `uid` into `buf` and returns its length, or -1 when the
+ * user has no known real SID (the caller then falls back to the algorithmic
+ * idmap SID).  sid_to_uid resolves a SID string to its cached uid (0 on
+ * success, -1 on miss).  Both are RCU-safe and must be called from a
+ * VFS-registered thread.
+ */
+int
+chimera_vfs_identity_uid_to_sid(
+    struct chimera_vfs *vfs,
+    uint32_t            uid,
+    char               *buf,
+    int                 buflen);
+
+int
+chimera_vfs_identity_sid_to_uid(
+    struct chimera_vfs *vfs,
+    const char         *sid,
+    uint32_t           *uid);
 
 
 typedef int (*chimera_vfs_user_iterate_cb)(

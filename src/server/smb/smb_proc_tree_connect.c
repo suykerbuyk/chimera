@@ -54,47 +54,38 @@ chimera_smb_tree_connect(struct chimera_smb_request *request)
             chimera_smb_complete_request(request, SMB2_STATUS_BAD_NETWORK_NAME);
             return;
         }
+    }
 
-        tree = NULL;
+    /* Each TREE_CONNECT establishes a distinct tree connection with its own
+     * unique TreeId, even when several connections target the same share
+     * (MS-SMB2 3.3.5.7).  Allocating a fresh tree per request keeps a file
+     * opened under one TID from being reachable via another TID, since open
+     * files are scoped to their tree. */
+    tree        = chimera_smb_tree_alloc(shared);
+    tree->type  = request->tree_connect.is_ipc ? CHIMERA_SMB_TREE_TYPE_PIPE : CHIMERA_SMB_TREE_TYPE_SHARE;
+    tree->share = share;
 
-        pthread_mutex_lock(&session->lock);
+    pthread_mutex_lock(&session->lock);
 
-        for (i = 1; i < session->max_trees; i++) {
-            if (session->trees[i] && session->trees[i]->share == share) {
-                tree = session->trees[i];
-                break;
-            }
+    for (i = 1; i < session->max_trees; i++) {
+
+        if (!session->trees[i]) {
+            break;
         }
     }
 
-    if (tree) {
-        tree->refcnt++;
+    if (i < session->max_trees) {
+        tree->tree_id     = i;
+        session->trees[i] = tree;
     } else {
 
-        tree        = chimera_smb_tree_alloc(shared);
-        tree->type  = request->tree_connect.is_ipc ? CHIMERA_SMB_TREE_TYPE_PIPE : CHIMERA_SMB_TREE_TYPE_SHARE;
-        tree->share = share;
+        tree->tree_id = session->max_trees;
 
-        for (i = 1; i < session->max_trees; i++) {
+        session->max_trees *= 2;
+        session->trees      = realloc(session->trees,
+                                      session->max_trees * sizeof(struct chimera_smb_tree *));
 
-            if (!session->trees[i]) {
-                break;
-            }
-        }
-
-        if (i < session->max_trees) {
-            tree->tree_id     = i;
-            session->trees[i] = tree;
-        } else {
-
-            tree->tree_id = session->max_trees;
-
-            session->max_trees *= 2;
-            session->trees      = realloc(session->trees,
-                                          session->max_trees * sizeof(struct chimera_smb_tree *));
-
-            session->trees[tree->tree_id] = tree;
-        }
+        session->trees[tree->tree_id] = tree;
     }
 
     pthread_mutex_unlock(&session->lock);
@@ -121,8 +112,16 @@ chimera_smb_tree_connect_reply(
     /* reserved */
     evpl_iovec_cursor_append_uint8(reply_cursor, 0);
 
-    /* Share Flags*/
-    evpl_iovec_cursor_append_uint32(reply_cursor, 0);
+    /* Share Flags */
+    {
+        uint32_t share_flags = 0;
+
+        if (request->tree && request->tree->share &&
+            request->tree->share->access_based_enum) {
+            share_flags |= SMB2_SHAREFLAG_ACCESS_BASED_DIRECTORY_ENUM;
+        }
+        evpl_iovec_cursor_append_uint32(reply_cursor, share_flags);
+    }
 
     /* Capabilities — advertise continuous availability for disk shares backed
     * by a CA-enabled share (gates persistent-handle grants on the client). */

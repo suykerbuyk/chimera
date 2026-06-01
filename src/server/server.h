@@ -31,12 +31,6 @@ struct chimera_server_config_smb_nic {
     uint8_t  rdma;
 };
 
-enum chimera_tcp_flavor {
-    CHIMERA_TCP_FLAVOR_PLAIN    = 0,
-    CHIMERA_TCP_FLAVOR_IO_URING = 1,
-    CHIMERA_TCP_FLAVOR_XLIO     = 2,
-};
-
 
 struct chimera_server_config *
 chimera_server_config_init(
@@ -90,6 +84,42 @@ chimera_server_config_get_smb_persistent_handles(
     const struct chimera_server_config *config);
 
 void
+chimera_server_config_set_smb_named_streams(
+    struct chimera_server_config *config,
+    int                           enable);
+
+int
+chimera_server_config_get_smb_named_streams(
+    const struct chimera_server_config *config);
+
+void
+chimera_server_config_set_smb_signing_required(
+    struct chimera_server_config *config,
+    int                           required);
+
+int
+chimera_server_config_get_smb_signing_required(
+    const struct chimera_server_config *config);
+
+void
+chimera_server_config_set_smb_encryption(
+    struct chimera_server_config *config,
+    int                           mode);
+
+int
+chimera_server_config_get_smb_encryption(
+    const struct chimera_server_config *config);
+
+void
+chimera_server_config_set_smb_notify_disabled(
+    struct chimera_server_config *config,
+    int                           disabled);
+
+int
+chimera_server_config_get_smb_notify_disabled(
+    const struct chimera_server_config *config);
+
+void
 chimera_server_config_set_cache_ttl(
     struct chimera_server_config *config,
     int                           ttl);
@@ -132,6 +162,15 @@ chimera_server_config_set_nfs4_grace_time(
 
 uint32_t
 chimera_server_config_get_nfs4_grace_time(
+    const struct chimera_server_config *config);
+
+void
+chimera_server_config_set_nfs4_courtesy_time(
+    struct chimera_server_config *config,
+    uint32_t                      seconds);
+
+uint32_t
+chimera_server_config_get_nfs4_courtesy_time(
     const struct chimera_server_config *config);
 
 void
@@ -313,6 +352,15 @@ chimera_server_config_get_rest_https_port(
     const struct chimera_server_config *config);
 
 void
+chimera_server_config_set_rest_debug_fsops(
+    struct chimera_server_config *config,
+    int                           enable);
+
+int
+chimera_server_config_get_rest_debug_fsops(
+    const struct chimera_server_config *config);
+
+void
 chimera_server_config_set_rest_ssl_cert(
     struct chimera_server_config *config,
     const char                   *cert_path);
@@ -397,6 +445,11 @@ chimera_server_create_share(
     const char            *share_name,
     const char            *share_path,
     int                    continuous_availability);
+
+int
+chimera_server_share_set_access_based_enum(
+    struct chimera_server *server,
+    const char            *share_name);
 
 int
 chimera_server_create_export(

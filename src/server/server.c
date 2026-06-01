@@ -60,13 +60,19 @@ struct chimera_server_config {
     int                                   nfs4_delegations;
     uint32_t                              nfs4_lease_time_s;
     uint32_t                              nfs4_grace_time_s;
+    uint32_t                              nfs4_courtesy_time_s;
     int                                   num_modules;
     int                                   metrics_port;
     int                                   rest_http_port;
     int                                   rest_https_port;
+    int                                   rest_debug_fsops;
     int                                   smb_num_dialects;
     uint32_t                              smb_dialects[16];
     int                                   smb_persistent_handles;
+    int                                   smb_named_streams;
+    int                                   smb_signing_required;
+    int                                   smb_encryption;
+    int                                   smb_notify_disabled;
     int                                   smb_num_nic_info;
     uint32_t                              anonuid;
     uint32_t                              anongid;
@@ -129,6 +135,7 @@ chimera_server_config_init(void)
     config->external_portmap         = 0;
     config->portmap_hostname[0]      = '\0';
     config->soft_fail_bad_req        = 0;
+    config->rest_debug_fsops         = 0;
     config->tcp_flavor               = CHIMERA_TCP_FLAVOR_PLAIN;
 
     config->smb_num_dialects = 4;
@@ -142,6 +149,24 @@ chimera_server_config_init(void)
     /* SMB3 durable/persistent handles are off by default; they are an
      * opt-in feature gated by the "smb_persistent_handles" config flag. */
     config->smb_persistent_handles = 0;
+
+    /* Named streams (SMB ADS) are off by default; opt-in via the
+     * "smb_named_streams" config flag and only honored on backends that
+     * advertise CHIMERA_VFS_CAP_NAMED_STREAMS. */
+    config->smb_named_streams = 0;
+
+    /* Server signing is advertised as enabled-but-optional by default; the
+     * "smb_signing_required" config flag makes the server advertise signing as
+     * mandatory (SMB2_SIGNING_REQUIRED). */
+    config->smb_signing_required = 0;
+
+    /* SMB3 transport encryption is off by default; the "smb_encryption" config
+     * flag enables (1) or requires (2) it. */
+    config->smb_encryption = 0;
+
+    /* CHANGE_NOTIFY is enabled by default; the "smb_notify_disabled" flag makes
+     * the server reject CHANGE_NOTIFY with STATUS_NOT_IMPLEMENTED. */
+    config->smb_notify_disabled = 0;
 
     // SMB auth config defaults - local NTLM only
     config->smb_auth.winbind_enabled    = 0;
@@ -173,9 +198,10 @@ chimera_server_config_init(void)
      * default.  When off, every OPEN returns OPEN_DELEGATE_NONE and the
      * callback channel is never established.  Distinct from the VFS
      * sync_delegation/async_delegation thread-pool knobs above. */
-    config->nfs4_delegations  = 0;
-    config->nfs4_lease_time_s = NFS4_LEASE_TIME_DEFAULT_S;
-    config->nfs4_grace_time_s = NFS4_GRACE_TIME_DEFAULT_S;
+    config->nfs4_delegations     = 0;
+    config->nfs4_lease_time_s    = NFS4_LEASE_TIME_DEFAULT_S;
+    config->nfs4_grace_time_s    = NFS4_GRACE_TIME_DEFAULT_S;
+    config->nfs4_courtesy_time_s = NFS4_COURTESY_TIME_DEFAULT_S;
 
     strncpy(config->nfs_rdma_hostname, "0.0.0.0", sizeof(config->nfs_rdma_hostname));
     config->nfs_rdma_port    = 20049;
@@ -265,6 +291,62 @@ chimera_server_config_get_smb_persistent_handles(const struct chimera_server_con
 {
     return config->smb_persistent_handles;
 } /* chimera_server_config_get_smb_persistent_handles */
+
+SYMBOL_EXPORT void
+chimera_server_config_set_smb_named_streams(
+    struct chimera_server_config *config,
+    int                           enable)
+{
+    config->smb_named_streams = enable;
+} /* chimera_server_config_set_smb_named_streams */
+
+SYMBOL_EXPORT int
+chimera_server_config_get_smb_named_streams(const struct chimera_server_config *config)
+{
+    return config->smb_named_streams;
+} /* chimera_server_config_get_smb_named_streams */
+
+SYMBOL_EXPORT void
+chimera_server_config_set_smb_signing_required(
+    struct chimera_server_config *config,
+    int                           required)
+{
+    config->smb_signing_required = required;
+} /* chimera_server_config_set_smb_signing_required */
+
+SYMBOL_EXPORT int
+chimera_server_config_get_smb_signing_required(const struct chimera_server_config *config)
+{
+    return config->smb_signing_required;
+} /* chimera_server_config_get_smb_signing_required */
+
+SYMBOL_EXPORT void
+chimera_server_config_set_smb_encryption(
+    struct chimera_server_config *config,
+    int                           mode)
+{
+    config->smb_encryption = mode;
+} /* chimera_server_config_set_smb_encryption */
+
+SYMBOL_EXPORT int
+chimera_server_config_get_smb_encryption(const struct chimera_server_config *config)
+{
+    return config->smb_encryption;
+} /* chimera_server_config_get_smb_encryption */
+
+SYMBOL_EXPORT void
+chimera_server_config_set_smb_notify_disabled(
+    struct chimera_server_config *config,
+    int                           disabled)
+{
+    config->smb_notify_disabled = disabled;
+} /* chimera_server_config_set_smb_notify_disabled */
+
+SYMBOL_EXPORT int
+chimera_server_config_get_smb_notify_disabled(const struct chimera_server_config *config)
+{
+    return config->smb_notify_disabled;
+} /* chimera_server_config_get_smb_notify_disabled */
 
 SYMBOL_EXPORT void
 chimera_server_config_set_max_open_files(
@@ -368,6 +450,20 @@ chimera_server_config_get_nfs4_grace_time(const struct chimera_server_config *co
 {
     return config->nfs4_grace_time_s;
 } /* chimera_server_config_get_nfs4_grace_time */
+
+SYMBOL_EXPORT void
+chimera_server_config_set_nfs4_courtesy_time(
+    struct chimera_server_config *config,
+    uint32_t                      seconds)
+{
+    config->nfs4_courtesy_time_s = seconds;
+} /* chimera_server_config_set_nfs4_courtesy_time */
+
+SYMBOL_EXPORT uint32_t
+chimera_server_config_get_nfs4_courtesy_time(const struct chimera_server_config *config)
+{
+    return config->nfs4_courtesy_time_s;
+} /* chimera_server_config_get_nfs4_courtesy_time */
 
 SYMBOL_EXPORT void
 chimera_server_config_set_kv_module(
@@ -632,6 +728,20 @@ chimera_server_config_get_rest_http_port(const struct chimera_server_config *con
 } /* chimera_server_config_get_rest_http_port */
 
 SYMBOL_EXPORT void
+chimera_server_config_set_rest_debug_fsops(
+    struct chimera_server_config *config,
+    int                           enable)
+{
+    config->rest_debug_fsops = enable;
+} /* chimera_server_config_set_rest_debug_fsops */
+
+SYMBOL_EXPORT int
+chimera_server_config_get_rest_debug_fsops(const struct chimera_server_config *config)
+{
+    return config->rest_debug_fsops;
+} /* chimera_server_config_get_rest_debug_fsops */
+
+SYMBOL_EXPORT void
 chimera_server_config_set_rest_https_port(
     struct chimera_server_config *config,
     int                           port)
@@ -772,15 +882,7 @@ chimera_server_config_get_tcp_flavor(const struct chimera_server_config *config)
 SYMBOL_EXPORT enum evpl_protocol_id
 chimera_server_config_get_tcp_stream_protocol(const struct chimera_server_config *config)
 {
-    switch (config->tcp_flavor) {
-        case CHIMERA_TCP_FLAVOR_IO_URING:
-            return EVPL_STREAM_IO_URING_TCP;
-        case CHIMERA_TCP_FLAVOR_XLIO:
-            return EVPL_STREAM_XLIO_TCP;
-        case CHIMERA_TCP_FLAVOR_PLAIN:
-        default:
-            return EVPL_STREAM_SOCKET_TCP;
-    } /* switch */
+    return chimera_tcp_flavor_to_protocol(config->tcp_flavor);
 } /* chimera_server_config_get_tcp_stream_protocol */
 
 static void
@@ -817,7 +919,7 @@ chimera_server_thread_init(
                                                                         [i]);
     }
 
-    thread->rest_thread = chimera_rest_thread_init(evpl, server->rest);
+    thread->rest_thread = chimera_rest_thread_init(evpl, server->rest, thread->vfs_thread);
 
     pthread_mutex_lock(&server->lock);
     if (++server->threads_online == server->config->core_threads) {
@@ -948,6 +1050,19 @@ chimera_server_create_share(
 } /* chimera_server_create_share */
 
 SYMBOL_EXPORT int
+chimera_server_share_set_access_based_enum(
+    struct chimera_server *server,
+    const char            *share_name)
+{
+    if (!server->smb_shared) {
+        return -1;
+    }
+
+    return chimera_smb_share_set_access_based_enum(server->smb_shared,
+                                                   share_name);
+} /* chimera_server_share_set_access_based_enum */
+
+SYMBOL_EXPORT int
 chimera_server_create_export(
     struct chimera_server *server,
     const char            *name,
@@ -1038,6 +1153,10 @@ chimera_server_init(
                                    config->kv_module,
                                    config->cache_ttl,
                                    metrics);
+
+    /* Propagate the common TCP flavor so VFS client modules (e.g. nfs)
+     * open outbound connections with the same transport. */
+    chimera_vfs_set_tcp_flavor(server->vfs, config->tcp_flavor);
 
     /* Enable the pNFS feature whenever configured.  Orchestrated flex-files
      * needs a data-server table (below); a layout-sourcing backend (e.g. diskfs

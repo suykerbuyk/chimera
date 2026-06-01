@@ -31,6 +31,8 @@ void rocksdb_flush_wal(
 
 #include "vfs/vfs.h"
 #include "vfs/vfs_internal.h"
+#include "vfs/vfs_acl.h"
+#include "vfs/vfs_acl_serialize.h"
 #include "cairn.h"
 #include "common/logging.h"
 #include "common/misc.h"
@@ -44,6 +46,7 @@ void rocksdb_flush_wal(
 #define CAIRN_KEY_SUPER          4
 #define CAIRN_KEY_KV             5
 #define CAIRN_KEY_XATTR          6
+#define CAIRN_KEY_ACL            7
 
 /*
  * Storage layout:
@@ -116,6 +119,11 @@ struct cairn_extent_key {
     uint64_t offset;
 } __attribute__((packed));
 
+struct cairn_acl_key {
+    uint8_t  keytype;
+    uint64_t inum;
+} __attribute__((packed));
+
 struct cairn_xattr_key {
     uint8_t  keytype;
     uint64_t inum;
@@ -170,6 +178,7 @@ struct cairn_inode {
     struct timespec atime;
     struct timespec mtime;
     struct timespec ctime;
+    struct timespec btime;
 };
 
 struct cairn_inode_handle {
@@ -724,6 +733,182 @@ cairn_remove_symlink_target(
     chimera_cairn_abort_if(err, "Error deleting symlink target: %s\n", err);
 } /* cairn_remove_symlink_target */
 
+/* Scratch big enough to (de)serialize the largest permitted ACL. */
+#define CAIRN_ACL_SCRATCH        (CHIMERA_ACL_SERIAL_HDR + \
+                                  CHIMERA_ACL_MAX_ACES * CHIMERA_ACL_SERIAL_ACE)
+#define CAIRN_ACL_STRUCT_SCRATCH (sizeof(struct chimera_acl) + \
+                                  CHIMERA_ACL_MAX_ACES * sizeof(struct chimera_ace))
+
+static inline void
+cairn_put_acl(
+    struct cairn_thread      *thread,
+    uint64_t                  inum,
+    const struct chimera_acl *acl)
+{
+    rocksdb_transaction_t  *txn = cairn_get_meta_txn(thread);
+    char                   *err = NULL;
+    struct cairn_acl_key    key;
+    static __thread uint8_t buf[CAIRN_ACL_SCRATCH];
+    int                     len;
+
+    len = chimera_acl_serialize(acl, buf, sizeof(buf));
+    if (len < 0) {
+        return;
+    }
+
+    key.keytype = CAIRN_KEY_ACL;
+    key.inum    = inum;
+
+    rocksdb_transaction_put(txn, (const char *) &key, sizeof(key),
+                            (const char *) buf, len, &err);
+    chimera_cairn_abort_if(err, "Error putting acl: %s\n", err);
+} /* cairn_put_acl */
+
+static inline void
+cairn_remove_acl(
+    struct cairn_thread *thread,
+    uint64_t             inum)
+{
+    rocksdb_transaction_t *txn = cairn_get_meta_txn(thread);
+    char                  *err = NULL;
+    struct cairn_acl_key   key;
+
+    key.keytype = CAIRN_KEY_ACL;
+    key.inum    = inum;
+
+    rocksdb_transaction_delete(txn, (const char *) &key, sizeof(key), &err);
+    chimera_cairn_abort_if(err, "Error deleting acl: %s\n", err);
+} /* cairn_remove_acl */
+
+/*
+ * Load the stored ACL for `inum` into `out` (capacity for CHIMERA_ACL_MAX_ACES
+ * ACEs); returns 1 if a stored ACL was found, 0 otherwise.
+ */
+static inline int
+cairn_load_acl(
+    struct cairn_thread *thread,
+    uint64_t             inum,
+    struct chimera_acl  *out)
+{
+    rocksdb_pinnableslice_t *slice;
+    struct cairn_acl_key     key;
+    char                    *err = NULL;
+    const char              *blob;
+    size_t                   len;
+    int                      found = 0;
+
+    key.keytype = CAIRN_KEY_ACL;
+    key.inum    = inum;
+
+    slice = cairn_meta_get_pinned(thread, &key, sizeof(key), &err);
+    chimera_cairn_abort_if(err, "Error getting acl: %s\n", err);
+
+    if (slice) {
+        blob = rocksdb_pinnableslice_value(slice, &len);
+        if (chimera_acl_deserialize(blob, len, out, CHIMERA_ACL_MAX_ACES) >= 0) {
+            found = 1;
+        }
+        rocksdb_pinnableslice_destroy(slice);
+    }
+
+    return found;
+} /* cairn_load_acl */
+
+/*
+ * Populate attr->va_acl when CHIMERA_VFS_ATTR_ACL is requested: the stored ACL
+ * if present, else one synthesised from the inode mode.  Uses a per-thread
+ * scratch buffer valid for the duration of the (synchronous) completion.
+ */
+static inline void
+cairn_map_acl(
+    struct cairn_thread      *thread,
+    struct chimera_vfs_attrs *attr,
+    const struct cairn_inode *inode)
+{
+    static __thread uint8_t scratch[CAIRN_ACL_STRUCT_SCRATCH];
+    struct chimera_acl     *dst = (struct chimera_acl *) scratch;
+
+    if (!(attr->va_req_mask & CHIMERA_VFS_ATTR_ACL)) {
+        return;
+    }
+
+    if (!cairn_load_acl(thread, inode->inum, dst)) {
+        chimera_acl_from_mode(inode->mode, dst, CHIMERA_ACL_MAX_ACES);
+    }
+
+    attr->va_acl       = dst;
+    attr->va_set_mask |= CHIMERA_VFS_ATTR_ACL;
+} /* cairn_map_acl */
+
+/*
+ * Seed a freshly-created child's ACL, mirroring memfs_inherit_acl():
+ *   1. An explicit ACL supplied at create is stored as-is.
+ *   2. Otherwise inherit the parent's inheritable ACEs, if any.
+ *   3. Otherwise, for an SMB-originated create (windows_default), store a
+ *      Windows-style default DACL granting the owner full control while
+ *      leaving the POSIX mode intact (plain mode would deny e.g. FILE_EXECUTE
+ *      and WRITE_OWNER on a 0644 file).
+ *   4. Otherwise leave the child mode-derived (no stored ACL).
+ * The ACL is written into the current meta transaction, so the create's own
+ * attribute readback (cairn_map_acl) reflects it immediately.
+ */
+static void
+cairn_inherit_acl(
+    struct cairn_thread            *thread,
+    struct cairn_inode             *child,
+    uint64_t                        parent_inum,
+    const struct chimera_vfs_attrs *set_attr,
+    int                             windows_default)
+{
+    static __thread uint8_t pbuf[CAIRN_ACL_STRUCT_SCRATCH];
+    struct chimera_acl     *pacl   = (struct chimera_acl *) pbuf;
+    int                     is_dir = S_ISDIR(child->mode);
+    uint16_t                want   = CHIMERA_ACE_FLAG_FILE_INHERIT |
+        (is_dir ? CHIMERA_ACE_FLAG_DIR_INHERIT : 0);
+
+    if ((set_attr->va_set_mask & CHIMERA_VFS_ATTR_ACL) &&
+        set_attr->va_acl && set_attr->va_acl->num_aces) {
+        cairn_put_acl(thread, child->inum, set_attr->va_acl);
+        child->mode = (child->mode & S_IFMT) | chimera_acl_to_mode(set_attr->va_acl);
+        return;
+    }
+
+    if (cairn_load_acl(thread, parent_inum, pacl)) {
+        int has_inh = 0;
+
+        for (unsigned i = 0; i < pacl->num_aces; i++) {
+            if (pacl->aces[i].flags & want) {
+                has_inh = 1;
+                break;
+            }
+        }
+
+        if (has_inh) {
+            unsigned            cap = pacl->num_aces * 2;
+            struct chimera_acl *tmp = malloc(chimera_acl_size(cap));
+            int                 n   = chimera_acl_inherit(pacl, is_dir,
+                                                          child->mode & 07777, tmp, cap);
+
+            if (n > 0) {
+                cairn_put_acl(thread, child->inum, tmp);
+                child->mode = (child->mode & S_IFMT) | chimera_acl_to_mode(tmp);
+                free(tmp);
+                return;
+            }
+            free(tmp);
+        }
+    }
+
+    if (windows_default) {
+        uint8_t             buf[sizeof(struct chimera_acl) + 4 * sizeof(struct chimera_ace)];
+        struct chimera_acl *def = (struct chimera_acl *) buf;
+
+        if (chimera_acl_default_acl(child->mode & 07777, def, 4) > 0) {
+            cairn_put_acl(thread, child->inum, def);
+        }
+    }
+} /* cairn_inherit_acl */
+
 static inline void
 cairn_remove_directory_contents(
     struct cairn_thread *thread,
@@ -825,8 +1010,11 @@ cairn_remove_file_extents(
 } /* cairn_remove_file_extents */
 
 static void *
-cairn_init(const char *cfgdata)
+cairn_init(
+    const char                *cfgdata,
+    struct prometheus_metrics *metrics)
 {
+    (void) metrics;
     struct cairn_shared *shared = calloc(1, sizeof(*shared));
     json_t              *cfg;
     json_error_t         json_error;
@@ -1021,10 +1209,15 @@ cairn_init(const char *cfgdata)
         inode.gid         = 0;
         inode.nlink       = 2;
         inode.rdev        = 0;
-        inode.mode        = S_IFDIR | 0755;
-        inode.atime       = now;
-        inode.mtime       = now;
-        inode.ctime       = now;
+        /* World-writable fresh root: with VFS-layer ADD_FILE/ADD_SUBDIRECTORY
+         * enforcement a root-owned 0755 root would refuse all creation by
+         * non-root clients on this engine-authoritative backend.  Subdirs are
+         * still created owned by their creator with 0755. */
+        inode.mode  = S_IFDIR | 0777;
+        inode.atime = now;
+        inode.mtime = now;
+        inode.ctime = now;
+        inode.btime = now;
 
         super.fsid = chimera_rand64();
 
@@ -1505,6 +1698,13 @@ cairn_map_attrs(
         attr->va_rdev       = inode->rdev;
     }
 
+    /* Birth time (SMB create time) is tracked natively but lives outside
+     * MASK_STAT, so map it only when explicitly requested. */
+    if (attr->va_req_mask & CHIMERA_VFS_ATTR_BTIME) {
+        attr->va_set_mask |= CHIMERA_VFS_ATTR_BTIME;
+        attr->va_btime     = inode->btime;
+    }
+
     if (attr->va_req_mask & CHIMERA_VFS_ATTR_FSID) {
         attr->va_set_mask |= CHIMERA_VFS_ATTR_FSID;
         attr->va_fsid      = shared->fsid;
@@ -1572,6 +1772,15 @@ cairn_apply_attrs(
         }
     }
 
+    if (set_mask & CHIMERA_VFS_ATTR_BTIME) {
+        attr->va_set_mask |= CHIMERA_VFS_ATTR_BTIME;
+        if (attr->va_btime.tv_nsec == CHIMERA_VFS_TIME_NOW) {
+            inode->btime = now;
+        } else {
+            inode->btime = attr->va_btime;
+        }
+    }
+
     inode->ctime = now;
 
 } /* cairn_apply_attrs */
@@ -1598,6 +1807,7 @@ cairn_getattr(
     inode = ih.inode;
 
     cairn_map_attrs(shared, &request->getattr.r_attr, inode);
+    cairn_map_acl(thread, &request->getattr.r_attr, inode);
 
     cairn_inode_handle_release(&ih);
 
@@ -1629,9 +1839,11 @@ cairn_setattr(
 
     if ((request->setattr.set_attr->va_set_mask & CHIMERA_VFS_ATTR_SIZE) &&
         !S_ISREG(inode->mode)) {
-        cairn_inode_handle_release(&ih);
+        /* `inode` points into the pinned RocksDB slice owned by `ih`, so read
+         * inode->mode before releasing the handle -- releasing frees the slice. */
         request->status = S_ISDIR(inode->mode) ?
             CHIMERA_VFS_EISDIR : CHIMERA_VFS_EINVAL;
+        cairn_inode_handle_release(&ih);
         request->complete(request);
         return;
     }
@@ -1649,7 +1861,47 @@ cairn_setattr(
         cairn_punch_hole(thread, shared, inode, new_size, old_size - new_size);
     }
 
+    /* cairn_apply_attrs() rewrites set_attr->va_set_mask down to the scalar
+     * bits it consumes (it drops the ACL bit), so capture the caller's original
+     * mask first -- the ACL-coherence block below keys off it. */
+    uint64_t orig_set_mask = request->setattr.set_attr->va_set_mask;
+
     cairn_apply_attrs(inode, request->setattr.set_attr);
+
+    /* Restore the caller's mask: on an optimistic-commit conflict cairn rolls
+     * back and re-dispatches this queued request, and the replay re-reads
+     * orig_set_mask from this field.  If it stayed scalar-only the ACL re-put
+     * would be skipped and the replayed transaction would drop the descriptor
+     * (an intermittent, load-dependent read-your-writes failure for SET-ACL). */
+    request->setattr.set_attr->va_set_mask = orig_set_mask;
+
+    /* ACL coherence (mirrors memfs): an explicit ACL set is persisted and the
+     * mode re-derived; a bare chmod regenerates the special-who ACEs of any
+     * stored ACL while preserving named entries. */
+    {
+        struct chimera_vfs_attrs *sa = request->setattr.set_attr;
+
+        if (orig_set_mask & CHIMERA_VFS_ATTR_ACL) {
+            if (sa->va_acl && sa->va_acl->num_aces) {
+                cairn_put_acl(thread, inode->inum, sa->va_acl);
+                inode->mode = (inode->mode & S_IFMT) |
+                    chimera_acl_to_mode(sa->va_acl);
+            } else {
+                cairn_remove_acl(thread, inode->inum);
+            }
+        } else if (orig_set_mask & CHIMERA_VFS_ATTR_MODE) {
+            static __thread uint8_t old_buf[CAIRN_ACL_STRUCT_SCRATCH];
+            static __thread uint8_t new_buf[CAIRN_ACL_STRUCT_SCRATCH];
+            struct chimera_acl     *old_acl = (struct chimera_acl *) old_buf;
+            struct chimera_acl     *new_acl = (struct chimera_acl *) new_buf;
+
+            if (cairn_load_acl(thread, inode->inum, old_acl) &&
+                chimera_acl_chmod(old_acl, inode->mode, new_acl,
+                                  CHIMERA_ACL_MAX_ACES) >= 0) {
+                cairn_put_acl(thread, inode->inum, new_acl);
+            }
+        }
+    }
 
     cairn_map_attrs(shared, &request->setattr.r_post_attr, inode);
 
@@ -1969,10 +2221,16 @@ cairn_mkdir_at(
     inode.atime       = now;
     inode.mtime       = now;
     inode.ctime       = now;
+    inode.btime       = now;
 
     cairn_apply_attrs(&inode, request->mkdir_at.set_attr);
 
+    cairn_inherit_acl(thread, &inode, parent_inode->inum,
+                      request->mkdir_at.set_attr,
+                      request->cred->flavor == CHIMERA_VFS_AUTH_ATTR);
+
     cairn_map_attrs(shared, &request->mkdir_at.r_attr, &inode);
+    cairn_map_acl(thread, &request->mkdir_at.r_attr, &inode);
 
     dirent_value.inum     = inode.inum;
     dirent_value.name_len = request->mkdir_at.name_len;
@@ -2067,6 +2325,7 @@ cairn_mknod_at(
     inode.atime       = now;
     inode.mtime       = now;
     inode.ctime       = now;
+    inode.btime       = now;
 
     /* Set mode (including file type bits) and rdev from set_attr */
     if (request->mknod_at.set_attr->va_set_mask & CHIMERA_VFS_ATTR_MODE) {
@@ -2208,6 +2467,7 @@ cairn_remove_at(
             }
 
             cairn_remove_inode(thread, inode);
+            cairn_remove_acl(thread, inode->inum);
         } else {
             cairn_put_inode(thread, inode);
         }
@@ -2377,6 +2637,7 @@ cairn_readdir(
         dirent_inode = dirent_ih.inode;
 
         cairn_map_attrs(shared, &attr, dirent_inode);
+        cairn_map_acl(thread, &attr, dirent_inode);
 
         cairn_inode_handle_release(&dirent_ih);
 
@@ -2525,9 +2786,14 @@ cairn_open_at(
         new_inode.atime      = now;
         new_inode.mtime      = now;
         new_inode.ctime      = now;
+        new_inode.btime      = now;
         new_inode.refcnt     = 1;
 
         cairn_apply_attrs(&new_inode, request->open_at.set_attr);
+
+        cairn_inherit_acl(thread, &new_inode, parent_inode->inum,
+                          request->open_at.set_attr,
+                          request->cred->flavor == CHIMERA_VFS_AUTH_ATTR);
 
         new_dirent_value.inum     = new_inode.inum;
         new_dirent_value.name_len = request->open_at.namelen;
@@ -2574,6 +2840,19 @@ cairn_open_at(
         return;
     }
 
+    /* No coarse mode-based open access check here: it is ACL-blind (it would
+     * deny e.g. a Windows owner-full-control DACL on a 0644 file) and
+     * mishandles SMB control-only opens.  Access is enforced by the ACL-aware
+     * VFS gate and the protocol create-time check, as on memfs/diskfs. */
+
+    if (!is_new_inode &&
+        (request->open_at.set_attr->va_set_mask & CHIMERA_VFS_ATTR_SIZE) &&
+        request->open_at.set_attr->va_size == 0 &&
+        S_ISREG(inode->mode)) {
+        cairn_apply_attrs(inode, request->open_at.set_attr);
+        inode->space_used = 0;
+    }
+
     if (flags & CHIMERA_VFS_OPEN_INFERRED) {
         /* If this is an inferred open (ie an NFS3 create)
          * then we aren't returning a handle so we don't need
@@ -2588,6 +2867,7 @@ cairn_open_at(
 
     cairn_map_attrs(shared, &request->open_at.r_dir_post_attr, parent_inode);
     cairn_map_attrs(shared, &request->open_at.r_attr, inode);
+    cairn_map_acl(thread, &request->open_at.r_attr, inode);
 
     cairn_put_inode(thread, parent_inode);
     cairn_put_inode(thread, inode);
@@ -2635,6 +2915,7 @@ cairn_close(
         }
 
         cairn_remove_inode(thread, inode);
+        cairn_remove_acl(thread, inode->inum);
     } else {
         cairn_put_inode(thread, inode);
     }
@@ -2676,7 +2957,7 @@ cairn_read(
         request->status        = CHIMERA_VFS_OK;
         request->read.r_niov   = 0;
         request->read.r_length = 0;
-        request->read.r_eof    = 1;
+        request->read.r_eof    = 0;
         request->complete(request);
         return;
     }
@@ -2699,6 +2980,12 @@ cairn_read(
 
     inode = ih.inode;
 
+    /* relatime: only stamp atime when the file changed since last access or the
+     * recorded atime is a day stale, so steady-state reads neither rewrite the
+     * inode to RocksDB nor churn the VFS attr cache. */
+    need_atime = need_atime &&
+        chimera_vfs_relatime_needs_update(&inode->atime, &inode->mtime, &inode->ctime, &now);
+
     if (offset >= inode->size) {
         cairn_map_attrs(shared, &request->read.r_attr, inode);
         cairn_inode_handle_release(&ih);
@@ -2711,7 +2998,7 @@ cairn_read(
         return;
     }
 
-    if (offset + length > inode->size) {
+    if (length >= inode->size - offset) {
         length = inode->size - offset;
         eof    = 1;
     }
@@ -2989,6 +3276,17 @@ cairn_write(
 
     cairn_map_attrs(shared, &request->write.r_pre_attr, inode);
 
+    if (request->write.length == 0) {
+        cairn_map_attrs(shared, &request->write.r_post_attr, inode);
+        cairn_inode_handle_release(&ih);
+
+        request->status         = CHIMERA_VFS_OK;
+        request->write.r_length = 0;
+        request->write.r_sync   = CHIMERA_VFS_WRITE_FILESYNC;
+        request->complete(request);
+        return;
+    }
+
     if (inode->size > request->write.offset) {
         cairn_punch_hole(thread, shared, inode, request->write.offset, request->write.length);
     }
@@ -3034,7 +3332,7 @@ cairn_write(
 
     request->status         = CHIMERA_VFS_OK;
     request->write.r_length = request->write.length;
-    request->write.r_sync   = 1;
+    request->write.r_sync   = CHIMERA_VFS_WRITE_FILESYNC;
 
     /* Note: Write iovecs are NOT released here. They were allocated on the
      * server thread and must be released there. The server's write completion
@@ -3341,6 +3639,7 @@ cairn_symlink_at(
     new_inode.atime      = now;
     new_inode.mtime      = now;
     new_inode.ctime      = now;
+    new_inode.btime      = now;
 
     dirent_value.inum     = new_inode.inum;
     dirent_value.name_len = request->symlink_at.namelen;
@@ -3679,6 +3978,7 @@ cairn_rename_at(
                     }
 
                     cairn_remove_inode(thread, existing_inode);
+                    cairn_remove_acl(thread, existing_inode->inum);
                 } else {
                     cairn_put_inode(thread, existing_inode);
                 }
@@ -4520,11 +4820,18 @@ cairn_dispatch(
 } /* cairn_dispatch */
 
 SYMBOL_EXPORT struct chimera_vfs_module vfs_cairn = {
-    .name         = "cairn",
-    .fh_magic     = CHIMERA_VFS_FH_MAGIC_CAIRN,
-    .capabilities = CHIMERA_VFS_CAP_BLOCKING | CHIMERA_VFS_CAP_FS | CHIMERA_VFS_CAP_KV |
-        CHIMERA_VFS_CAP_FS_RELATIVE_OP | CHIMERA_VFS_CAP_ATOMIC_HANDLE_STATE |
-        CHIMERA_VFS_CAP_XATTR,
+    .name     = "cairn",
+    .fh_magic = CHIMERA_VFS_FH_MAGIC_CAIRN,
+    /* CAP_READ_PROVIDES_BUFFERS: cairn_read fills a single contiguous buffer it
+     * allocates itself (SHARED, so the CAP_BLOCKING worker->connection-thread
+     * release is safe).  TODO: drop this cap and convert cairn_read to scatter
+     * its RocksDB extent fill across VFS-core-provided buffers via an
+     * append-blob cursor, like diskfs/linux/io_uring, so it can use cheaper
+     * non-SHARED connection-thread buffers. */
+    .capabilities   = CHIMERA_VFS_CAP_BLOCKING | CHIMERA_VFS_CAP_FS | CHIMERA_VFS_CAP_KV |
+        CHIMERA_VFS_CAP_FS_RELATIVE_OP | CHIMERA_VFS_CAP_ACL_NATIVE |
+        CHIMERA_VFS_CAP_ATOMIC_HANDLE_STATE |
+        CHIMERA_VFS_CAP_XATTR | CHIMERA_VFS_CAP_READ_PROVIDES_BUFFERS,
     .init           = cairn_init,
     .destroy        = cairn_destroy,
     .thread_init    = cairn_thread_init,

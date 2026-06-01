@@ -128,6 +128,10 @@ struct nfs_request {
     uint32_t                          replay_slot_id;
     uint8_t                           replay_action;
     struct nfs_request               *next;
+    /* Park slot used while this request is awaiting a 4.0 callback-channel
+     * CB_NULL probe completion (see nfs4_callback.c probe-defer path).
+     * Owned by chan->owner_thread; no extra synchronization needed. */
+    struct nfs_request               *probe_next;
     union {
         struct mountargs3       *args_mount;
         struct ACCESS3args      *args_access;
@@ -245,6 +249,7 @@ struct chimera_server_nfs_shared {
      * config knobs would override these in nfs_server_init. */
     uint32_t                            nfs_lease_time_s;
     uint32_t                            nfs_grace_time_s;
+    uint32_t                            nfs_courtesy_time_s;
 
     struct nfs4_client_table            nfs4_shared_clients;
     struct nfs_state_table              nfs4_state_table;

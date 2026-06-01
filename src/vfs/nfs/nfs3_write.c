@@ -83,7 +83,7 @@ chimera_nfs3_write(
     args.file.data.len  = fhlen;
     args.offset         = request->write.offset;
     args.count          = request->write.length;
-    args.stable         = request->write.sync ? FILE_SYNC : UNSTABLE;
+    args.stable         = request->write.sync;     /* 3-level UNSTABLE/DATA_SYNC/FILE_SYNC */
     args.data.iov       = request->write.iov;
     args.data.niov      = request->write.niov;
     args.data.length    = request->write.length;
@@ -93,5 +93,5 @@ chimera_nfs3_write(
                                request->thread->vfs->machine_name_len);
 
     shared->nfs_v3.send_call_NFSPROC3_WRITE(&shared->nfs_v3.rpc2, thread->evpl, server_thread->nfs_conn, &rpc2_cred,
-                                            &args, 1, 0, 0, chimera_nfs3_write_callback, request);
+                                            &args, 1, 0, NULL, 0, 0, chimera_nfs3_write_callback, request);
 } /* chimera_nfs3_write */

@@ -69,23 +69,27 @@ chimera_vfs_open_cache_shard_remove(
 } // chimera_vfs_open_cache_shard_remove
 
 /*
- * Find a handle in the shard matching fh and access_mode.
+ * Find a handle in the shard matching fh, access_mode, and credential identity.
  *
- * For RW requests, only an exact RW match is returned.
- * For RO requests, any matching handle (RW or RO) is returned,
- * since a RW handle can satisfy reads.
+ * The cache is keyed by cred_hash so each caller gets its own handle (and its
+ * own authorization result); the RW/RO pooling below therefore applies only
+ * within a single identity.  For RW requests, only an exact RW match is
+ * returned.  For RO requests, any matching handle (RW or RO) is returned, since
+ * a RW handle can satisfy reads.
  */
 static inline struct chimera_vfs_open_handle *
 chimera_vfs_open_cache_shard_find(
     struct vfs_open_cache_shard *shard,
     const void                  *fh,
     uint32_t                     fhlen,
-    uint8_t                      access_mode)
+    uint8_t                      access_mode,
+    uint64_t                     cred_hash)
 {
     struct chimera_vfs_open_handle *h;
 
     for (h = shard->handles; h; h = h->bucket_next) {
-        if (h->fh_len == fhlen && memcmp(h->fh, fh, fhlen) == 0) {
+        if (h->fh_len == fhlen && h->cred_hash == cred_hash &&
+            memcmp(h->fh, fh, fhlen) == 0) {
             if (h->access_mode == CHIMERA_VFS_ACCESS_MODE_RW ||
                 access_mode == CHIMERA_VFS_ACCESS_MODE_RO) {
                 return h;
@@ -212,6 +216,16 @@ chimera_vfs_open_cache_free(
     struct vfs_open_cache_shard    *shard,
     struct chimera_vfs_open_handle *handle)
 {
+    /* Drop the per-file lease-state reference the handle anchored, if any (see
+     * chimera_vfs_open_handle::file_state).  Safe under the shard lock:
+     * chimera_vfs_state_put takes a vfs_state bucket lock and no path takes a
+     * shard lock while holding a bucket lock, so there is no ordering cycle.
+     * NULL the field afterwards because the free list is reused without memset,
+     * so a recycled handle struct must not carry a stale pointer. */
+    if (handle->file_state) {
+        chimera_vfs_file_state_release(handle->file_state);
+        handle->file_state = NULL;
+    }
     LL_PREPEND(shard->free_handles, handle);
 } /* chimera_vfs_open_cache_free */
 
@@ -311,7 +325,7 @@ chimera_vfs_open_cache_release(
                                   close_hash, NULL, NULL);
                 return;
             }
-            clock_gettime(CLOCK_MONOTONIC, &handle->timestamp);
+            handle->timestamp = chimera_vfs_now_ticks();
             DL_APPEND(shard->pending_close, handle);
         }
     }
@@ -413,15 +427,17 @@ chimera_vfs_open_cache_acquire(
     struct vfs_open_cache_shard    *shard;
     struct chimera_vfs_open_handle *handle, *existing;
     uint8_t                         access_mode;
+    uint64_t                        cred_hash;
     int                             done = 0;
 
     access_mode = chimera_vfs_open_access_mode(open_flags);
+    cred_hash   = chimera_vfs_cred_hash(request->cred);
 
     shard = &cache->shards[fh_hash & cache->shard_mask];
 
     pthread_mutex_lock(&shard->lock);
 
-    handle = chimera_vfs_open_cache_shard_find(shard, fh, fhlen, access_mode);
+    handle = chimera_vfs_open_cache_shard_find(shard, fh, fhlen, access_mode, cred_hash);
 
     if (handle) {
 
@@ -451,6 +467,8 @@ chimera_vfs_open_cache_acquire(
         handle->vfs_module          = module;
         handle->fh_hash             = fh_hash;
         handle->fh_len              = fhlen;
+        handle->cred_hash           = cred_hash;
+        handle->granted_valid       = 0;
         handle->opencnt             = 1;
         handle->access_mode         = access_mode;
         handle->flags               = exclusive ? CHIMERA_VFS_OPEN_HANDLE_EXCLUSIVE : 0;
@@ -527,8 +545,10 @@ chimera_vfs_open_cache_insert(
     struct vfs_open_cache_shard    *shard;
     struct chimera_vfs_open_handle *handle, *existing;
     uint8_t                         access_mode;
+    uint64_t                        cred_hash;
 
     access_mode = chimera_vfs_open_access_mode(open_flags);
+    cred_hash   = chimera_vfs_cred_hash(request->cred);
 
     shard = &cache->shards[fh_hash & cache->shard_mask];
 
@@ -541,6 +561,8 @@ chimera_vfs_open_cache_insert(
     handle->vfs_module          = module;
     handle->fh_hash             = fh_hash;
     handle->fh_len              = fhlen;
+    handle->cred_hash           = cred_hash;
+    handle->granted_valid       = 0;
     handle->opencnt             = 1;
     handle->access_mode         = access_mode;
     handle->flags               = 0;
@@ -552,8 +574,8 @@ chimera_vfs_open_cache_insert(
 
     memcpy(handle->fh, fh, fhlen);
 
-    /* Check for existing entry with same (fh, access_mode) */
-    existing = chimera_vfs_open_cache_shard_find(shard, fh, fhlen, access_mode);
+    /* Check for existing entry with same (fh, access_mode, cred) */
+    existing = chimera_vfs_open_cache_shard_find(shard, fh, fhlen, access_mode, cred_hash);
 
     if (existing) {
         if (existing->opencnt == 0) {
@@ -623,7 +645,7 @@ chimera_vfs_open_cache_insert(
 static inline struct chimera_vfs_open_handle *
 chimera_vfs_open_cache_defer_close(
     struct vfs_open_cache *cache,
-    struct timespec       *timestamp,
+    uint64_t               now_ticks,
     uint64_t               min_age,
     uint64_t              *r_count)
 {
@@ -640,7 +662,8 @@ chimera_vfs_open_cache_defer_close(
 
             handle = shard->pending_close;
 
-            elapsed = chimera_get_elapsed_ns(timestamp, &handle->timestamp);
+            elapsed = now_ticks > handle->timestamp ?
+                chimera_vfs_ticks_to_ns(now_ticks - handle->timestamp) : 0;
 
             if (elapsed < min_age) {
                 break;
@@ -717,8 +740,7 @@ chimera_vfs_open_cache_mark_for_close_by_mount(
         for (handle = shard->handles; handle; handle = handle->bucket_next) {
             if (memcmp(handle->fh, mount_id, CHIMERA_VFS_MOUNT_ID_SIZE) == 0) {
                 /* Set timestamp to 0 so it will be closed immediately */
-                handle->timestamp.tv_sec  = 0;
-                handle->timestamp.tv_nsec = 0;
+                handle->timestamp = 0;
                 count++;
             }
         }
@@ -953,7 +975,7 @@ chimera_vfs_open_cache_release_doc(
                               close_hash, NULL, NULL);
             return 0;
         }
-        clock_gettime(CLOCK_MONOTONIC, &handle->timestamp);
+        handle->timestamp = chimera_vfs_now_ticks();
         DL_APPEND(shard->pending_close, handle);
     }
 

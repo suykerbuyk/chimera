@@ -497,11 +497,11 @@ test_create_response_mxac_on_maximum_allowed(void)
     memset(&open_file, 0, sizeof(open_file));
 
     req.create.ctx_present_mask = CHIMERA_SMB_CREATE_CTX_MXAC;
-    /* Client opened with MAXIMUM_ALLOWED — this is the only case where Phase 0
-     * emits the MxAc reply (per spec, MaximalAccess is the user's effective
-     * rights; for specific-access opens we don't have DACL evaluation yet). */
+    /* MaximalAccess is the caller's effective rights against the DACL, computed
+     * at open and stored on the handle (open_file.maximal_access). */
     req.create.desired_access = SMB2_MAXIMUM_ALLOWED;
     open_file.desired_access  = 0x001f01ff;            /* FILE_ALL_ACCESS */
+    open_file.maximal_access  = 0x001f01ff;            /* effective rights */
     req.create.r_open_file    = &open_file;
 
     ctx_len = chimera_smb_build_create_response_contexts(&req, ctx_buf, sizeof(ctx_buf));
@@ -539,19 +539,24 @@ test_create_response_mxac_suppressed_on_specific_access(void)
     memset(&req,       0, sizeof(req));
     memset(&open_file, 0, sizeof(open_file));
 
-    /* Client sent MxAc but opened with specific bits — we suppress the reply
-     * because we don't have effective-rights evaluation yet. */
+    /* MxAc reports the caller's maximal (effective) access regardless of the
+     * specific bits requested at open -- it is a "what could I get" query, now
+     * answered from the DACL-derived maximal_access on the handle. */
     req.create.ctx_present_mask = CHIMERA_SMB_CREATE_CTX_MXAC;
     req.create.desired_access   = 0x00000080;          /* FILE_READ_ATTRIBUTES */
     open_file.desired_access    = 0x00000080;
+    open_file.maximal_access    = 0x001f01ff;          /* effective rights */
     req.create.r_open_file      = &open_file;
 
     ctx_len = chimera_smb_build_create_response_contexts(&req, ctx_buf, sizeof(ctx_buf));
 
-    if (ctx_len == 0) {
-        TEST_PASS("MxAc suppressed for specific-access open (no DACL eval yet)");
+    /* 32-byte MxAc chain entry with MaximalAccess = 0x001f01ff. */
+    if (ctx_len == 32 &&
+        ctx_buf[16] == 'M' && ctx_buf[17] == 'x' && ctx_buf[18] == 'A' && ctx_buf[19] == 'c' &&
+        ctx_buf[28] == 0xff && ctx_buf[29] == 0x01 && ctx_buf[30] == 0x1f && ctx_buf[31] == 0x00) {
+        TEST_PASS("MxAc reports maximal_access for specific-access open");
     } else {
-        TEST_FAIL("MxAc suppressed for specific-access open (no DACL eval yet)");
+        TEST_FAIL("MxAc reports maximal_access for specific-access open");
     }
 } /* test_create_response_mxac_suppressed_on_specific_access */
 
@@ -938,6 +943,7 @@ test_durable_register_park_claim(void)
     uint8_t                           guid[16];
     uint8_t                           cguid[16];
     uint8_t                           other[16];
+    uint8_t                           lkey[16];
     uint32_t                          status;
     bool                              cold;
     int                               i;
@@ -949,6 +955,7 @@ test_durable_register_park_claim(void)
         guid[i]  = (uint8_t) (0x10 + i);
         cguid[i] = (uint8_t) (0x20 + i);
         other[i] = (uint8_t) (0x90 + i);
+        lkey[i]  = (uint8_t) (0x30 + i);
     }
     of.file_id.pid        = 0xABCDEF;
     of.durable_flags      = CHIMERA_SMB_DURABLE_V2;
@@ -977,21 +984,37 @@ test_durable_register_park_claim(void)
         TEST_PASS("durable: create-guid mismatch rejected");
     }
 
-    /* Wrong client GUID is ACCESS_DENIED. */
+    /* An oplock-only (no-lease) durable handle is not bound to the ClientGuid:
+     * a reconnect from a different ClientGuid reclaims it (MS-SMB2 3.3.5.9.7
+     * binds the GUID check to leased opens).  of.oplock_level is 0 here. */
     claimed = chimera_smb_durable_claim(shared, 0xABCDEF, guid, other, "foo.txt", 7, false, NULL, &cold, &status);
-    if (claimed != NULL || status != SMB2_STATUS_OBJECT_NAME_NOT_FOUND) {
-        TEST_FAIL("durable: client-guid mismatch -> OBJECT_NAME_NOT_FOUND");
+    if (claimed == &of && status == SMB2_STATUS_SUCCESS) {
+        TEST_PASS("durable: oplock reconnect ignores client-guid");
     } else {
-        TEST_PASS("durable: client-guid mismatch -> OBJECT_NAME_NOT_FOUND");
+        TEST_FAIL("durable: oplock reconnect ignores client-guid");
     }
 
-    /* Matching reconnect succeeds and returns the surviving open. */
-    claimed = chimera_smb_durable_claim(shared, 0xABCDEF, guid, cguid, "foo.txt", 7, false, NULL, &cold, &status);
+    /* The reclaim above made the handle live again; re-park it. */
+    chimera_smb_durable_park(shared, &of);
+
+    /* A *leased* handle IS bound to the ClientGuid: a mismatch is rejected. */
+    of.oplock_level = SMB2_OPLOCK_LEVEL_LEASE;
+    memcpy(of.lease_key, lkey, 16);
+    claimed = chimera_smb_durable_claim(shared, 0xABCDEF, guid, other, "foo.txt", 7, true, lkey, &cold, &status);
+    if (claimed != NULL || status != SMB2_STATUS_OBJECT_NAME_NOT_FOUND) {
+        TEST_FAIL("durable: leased reconnect rejects client-guid mismatch");
+    } else {
+        TEST_PASS("durable: leased reconnect rejects client-guid mismatch");
+    }
+
+    /* Matching reconnect (correct ClientGuid + lease key) reclaims the open. */
+    claimed = chimera_smb_durable_claim(shared, 0xABCDEF, guid, cguid, "foo.txt", 7, true, lkey, &cold, &status);
     if (claimed == &of && status == SMB2_STATUS_SUCCESS) {
         TEST_PASS("durable: matching reconnect reclaims the open");
     } else {
         TEST_FAIL("durable: matching reconnect reclaims the open");
     }
+    of.oplock_level = 0;
 
     /* A second reconnect must fail — the handle is now live again. */
     claimed = chimera_smb_durable_claim(shared, 0xABCDEF, guid, cguid, "foo.txt", 7, false, NULL, &cold, &status);

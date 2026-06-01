@@ -178,10 +178,12 @@ chimera_vfs_request_alloc_common(
 
     /* Reset implicit-lease mediation state: requests are pooled and not
      * fully memset on reuse, so a prior op's owner/pin must not leak in. */
-    request->io_owner_valid = 0;
-    request->io_recall_all  = 0;
-    request->io_next        = NULL;
-    request->io_lease_file  = NULL;
+    request->io_owner_valid    = 0;
+    request->io_recall_all     = 0;
+    request->io_next           = NULL;
+    request->io_lease_file     = NULL;
+    request->io_handle         = NULL;
+    request->io_owns_lease_ref = 0;
 
     if (fh && fhlen > 0) {
         memcpy(request->fh, fh, fhlen);
@@ -191,7 +193,7 @@ chimera_vfs_request_alloc_common(
     request->active_prev = NULL;
     request->active_next = NULL;
 
-    clock_gettime(CLOCK_MONOTONIC, &request->start_time);
+    prometheus_stopwatch_start(&request->start_time);
 
     thread->num_active_requests++;
     DL_APPEND2(thread->active_requests, request, active_prev, active_next);
@@ -295,6 +297,7 @@ chimera_vfs_synth_handle_alloc(struct chimera_vfs_thread *thread)
         handle           = calloc(1, sizeof(struct chimera_vfs_open_handle));
         handle->cache_id = CHIMERA_VFS_OPEN_ID_SYNTHETIC;
     }
+    handle->granted_valid = 0;
     return handle;
 } /* chimera_vfs_synth_handle_alloc */
 
@@ -313,14 +316,11 @@ chimera_vfs_complete(struct chimera_vfs_request *request)
 {
     struct chimera_vfs_thread *thread = request->thread;
 
-    struct timespec            now;
-
-    clock_gettime(CLOCK_MONOTONIC, &now);
-
-    request->elapsed_ns = chimera_get_elapsed_ns(&now, &request->start_time);
+    request->elapsed_ns = prometheus_stopwatch_elapsed_ns(&request->start_time);
 
     if (thread->metrics.op_latency_series) {
-        prometheus_histogram_sample(thread->metrics.op_latency_series[request->opcode], request->elapsed_ns);
+        prometheus_time_histogram_sample(thread->metrics.op_latency_series[request->opcode],
+                                         &request->start_time);
     }
 
     chimera_vfs_dump_reply(request);

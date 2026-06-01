@@ -116,12 +116,21 @@ void chimera_rest_handle_openapi_json(
     struct evpl *,
     struct evpl_http_request *);
 
+/* External handler from rest_debug.c (test-only) */
+void chimera_rest_handle_debug_fsop(
+    struct evpl *,
+    struct evpl_http_request *,
+    struct chimera_rest_thread *,
+    const char *,
+    int);
+
 /* Deferred POST handler types */
 enum chimera_rest_post_handler {
     REST_POST_USERS_CREATE,
     REST_POST_EXPORTS_CREATE,
     REST_POST_SHARES_CREATE,
     REST_POST_BUCKETS_CREATE,
+    REST_POST_DEBUG_FSOP,
 };
 
 #define REST_POST_MAX_BODY 65536
@@ -194,10 +203,56 @@ chimera_rest_notify(
             chimera_rest_handle_buckets_create(evpl, request, thread,
                                                body, body_len);
             break;
+        case REST_POST_DEBUG_FSOP:
+            chimera_rest_handle_debug_fsop(evpl, request, thread,
+                                           body, body_len);
+            break;
     } /* switch */
 
     free(ctx);
 } /* chimera_rest_notify */
+
+void
+chimera_rest_send_json(
+    struct evpl              *evpl,
+    struct evpl_http_request *request,
+    int                       status,
+    json_t                   *obj)
+{
+    char             *json_str;
+    struct evpl_iovec iov;
+    int               len;
+
+    json_str = json_dumps(obj, JSON_COMPACT);
+    json_decref(obj);
+
+    len = strlen(json_str);
+    evpl_iovec_alloc(evpl, len, 0, 1, 0, &iov);
+    memcpy(evpl_iovec_data(&iov), json_str, len);
+    evpl_iovec_set_length(&iov, len);
+    free(json_str);
+
+    evpl_http_request_add_header(request, "Content-Type", "application/json");
+    evpl_http_request_add_datav(request, &iov, 1);
+    evpl_http_server_set_response_length(request, len);
+    evpl_http_server_dispatch_default(request, status);
+} /* chimera_rest_send_json */
+
+void
+chimera_rest_send_error(
+    struct evpl              *evpl,
+    struct evpl_http_request *request,
+    int                       status,
+    const char               *error,
+    const char               *message)
+{
+    json_t *obj = json_object();
+
+    json_object_set_new(obj, "error", json_string(error));
+    json_object_set_new(obj, "message", json_string(message));
+
+    chimera_rest_send_json(evpl, request, status, obj);
+} /* chimera_rest_send_error */
 
 static void
 chimera_rest_send_json_response(
@@ -496,6 +551,23 @@ chimera_rest_dispatch(
         }
     }
 
+    /* Debug fsop API (test-only): POST /api/v1/debug/fsop performs a
+     * server-side filesystem mutation to drive delegation recalls. Routed
+     * only when explicitly enabled via the rest_debug_fsops config flag, so
+     * the endpoint is invisible (404) by default. */
+    if (thread->shared->debug_fsops &&
+        url_len == 18 && strncmp(url, "/api/v1/debug/fsop", 18) == 0) {
+        if (req_type == EVPL_HTTP_REQUEST_TYPE_POST) {
+            struct chimera_rest_post_ctx *ctx;
+            ctx          = calloc(1, sizeof(*ctx));
+            ctx->handler = REST_POST_DEBUG_FSOP;
+            *notify_data = ctx;
+        } else {
+            chimera_rest_handle_method_not_allowed(evpl, request);
+        }
+        return;
+    }
+
     chimera_rest_handle_not_found(evpl, request);
 } /* chimera_rest_dispatch */
 
@@ -520,9 +592,10 @@ chimera_rest_init(
 
     rest = calloc(1, sizeof(*rest));
 
-    rest->http_port  = http_port;
-    rest->https_port = https_port;
-    rest->server     = server;
+    rest->http_port   = http_port;
+    rest->https_port  = https_port;
+    rest->server      = server;
+    rest->debug_fsops = chimera_server_config_get_rest_debug_fsops(config);
 
     if (http_port != 0) {
         rest->http_endpoint = evpl_endpoint_create("0.0.0.0", http_port);
@@ -600,7 +673,8 @@ chimera_rest_destroy(struct chimera_rest_server *rest)
 SYMBOL_EXPORT void *
 chimera_rest_thread_init(
     struct evpl                *evpl,
-    struct chimera_rest_server *rest)
+    struct chimera_rest_server *rest,
+    struct chimera_vfs_thread  *vfs_thread)
 {
     struct chimera_rest_thread *thread;
 
@@ -610,9 +684,10 @@ chimera_rest_thread_init(
 
     thread = calloc(1, sizeof(*thread));
 
-    thread->evpl   = evpl;
-    thread->shared = rest;
-    thread->agent  = evpl_http_init(evpl);
+    thread->evpl       = evpl;
+    thread->shared     = rest;
+    thread->vfs_thread = vfs_thread;
+    thread->agent      = evpl_http_init(evpl);
 
     if (rest->http_listener) {
         thread->http_server = evpl_http_attach(thread->agent, rest->http_listener,

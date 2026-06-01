@@ -5,8 +5,6 @@
 set(CHIMERA_BINARY ${CMAKE_BINARY_DIR}/src/daemon/chimera)
 set(PYNFS_WRAPPER ${CMAKE_SOURCE_DIR}/scripts/pynfs_test_wrapper.sh)
 set(PYNFS_DIR /opt/pynfs)
-set(PYNFS_STABLE_PASS_FILE ${CMAKE_CURRENT_SOURCE_DIR}/stable-passing-tests.txt)
-option(PYNFS_ENABLE_UNSTABLE_TESTS "Enable all generated pynfs tests, including tests outside the stable pass list" OFF)
 
 set(PYNFS_BACKENDS memfs linux io_uring diskfs_io_uring)
 
@@ -37,16 +35,25 @@ set(PYNFS_FLAGS_2 ${PYNFS_FLAGS_1} copy sparse)
 
 set(PYNFS_MINOR_VERSIONS 0 1 2)
 
-# Exact CTest names validated as stable by repeated full-matrix pynfs runs.
-# Everything else is still registered but marked DISABLED, so the full matrix
-# remains visible and failed/flaky tests can be promoted individually.
-file(STRINGS ${PYNFS_STABLE_PASS_FILE} PYNFS_STABLE_PASS_TESTS)
-
 # Extra pynfs flag tokens for specific suites.  pynfs excludes any test tagged
 # with a "no<flag>" token, so this drops tests a suite pulls in that the server
 # does not support.  currentstateid's CSID7 is tagged pnfs (LAYOUTGET); chimera
 # is not a pNFS server, so exclude it.
 set(PYNFS_EXTRA_currentstateid nopnfs)
+
+# Per-code backend skip list: (code -> backends) pairs that are not even
+# registered as CTest entries (so they do not appear at all, rather than as
+# noisy DISABLED entries).  WRT18 (testChangeGranularityWrite) and SATT15
+# (testChangeGranularity) require the change attribute to advance on *every*
+# rapid write/setattr.  For the passthrough backends (linux, io_uring) the change
+# attribute is the host filesystem's ctime, which only advances per-rapid-op when
+# the kernel provides multigrain timestamps (Linux >= 6.13 on an FS_MGTIME
+# filesystem).  Our CI runner's kernel predates multigrain, so these cannot pass
+# there.  They are still registered and pass on memfs/cairn/diskfs (which carry
+# their own fine-grained change clock) and on modern-kernel deployments.  Keyed
+# by pynfs code; WRT18/SATT15 are nfs4.0-only, so the code names are unambiguous.
+set(PYNFS_SKIP_BACKENDS_WRT18  linux io_uring)
+set(PYNFS_SKIP_BACKENDS_SATT15 linux io_uring)
 
 # Per-code NFSv4 lease-time override (seconds).  Delegation recall-handshake
 # tests open a file as one client, then drive a *second* client's conflicting
@@ -56,10 +63,14 @@ set(PYNFS_EXTRA_currentstateid nopnfs)
 # revoked before the recall round-trips -- a load-dependent false failure.  These
 # tests perform no lease-scaled sleeps, so a longer lease adds no wall-clock cost.
 # Keyed by pynfs flag; listed codes get PYNFS_LEASE_OVERRIDE_SECONDS.  DELEG6
-# (4.0 testRenew) is deliberately excluded: it scales its own sleeps to the lease
-# period, so a longer lease would slow it down / trip the per-test timeout.
+# (4.0 testRenew) also scales its own sleeps to the lease period, but it first
+# drives an unanswered CB_RECALL; with the wrapper's 5s default lease, Chimera's
+# 15s recall-failure path can expire the delegation holder before the test sends
+# RENEW.  Give it a lease beyond the recall window and a matching timeout.
 set(PYNFS_LEASE_OVERRIDE_SECONDS 30)
-set(PYNFS_LEASE_OVERRIDE_delegations DELEG1 DELEG4 DELEG5 DELEG7 DELEG9 DELEG14)
+set(PYNFS_LEASE_OVERRIDE_delegations DELEG1 DELEG4 DELEG5 DELEG6 DELEG7 DELEG9 DELEG14)
+set(PYNFS_LEASE_OVERRIDE_SECONDS_delegations 40)
+set(PYNFS_TIMEOUT_delegations 180)
 set(PYNFS_LEASE_OVERRIDE_deleg DELEG8)
 
 # Courteous-server tests (st_courtesy.py, COUR1-COUR7) need a longer lease for a
@@ -87,6 +98,41 @@ set(PYNFS_LEASE_OVERRIDE_deleg DELEG8)
 set(PYNFS_LEASE_OVERRIDE_courteous COUR1 COUR2 COUR3 COUR4 COUR5 COUR6 COUR7)
 set(PYNFS_LEASE_OVERRIDE_SECONDS_courteous 20)
 set(PYNFS_TIMEOUT_courteous 90)
+
+# Per-code delegation-enable override.  The wrapper enables NFSv4 protocol
+# delegations only for the deleg/delegations suites, so the other suites
+# exercise the default (delegations-off) behavior.  DSESS9002/DSESS9003 live in
+# the destroy_session suite but need delegations on: each destroys and recreates
+# a client's session and drives a CB_RECALL to verify the backchannel survives a
+# DESTROY_SESSION/CREATE_SESSION cycle.  DSESS9002 grants the delegation over the
+# new session; DSESS9003 grants it over the old session, leaves the recall
+# unanswered, then expects the server to re-drive that recall over the recreated
+# session (see nfs4_cb_resend_recalls_on_rebind).  Keyed by pynfs flag; listed
+# codes get PYNFS_FORCE_DELEG=1.  These recall tests share the delegation suite's
+# lease/timeout sensitivity: DSESS9003 in particular drives an *unanswered*
+# CB_RECALL (so chimera's 15s recall-failure window is in play) and then a recall
+# round-trip over the recreated session, which under a heavy ctest -j ASan run
+# can run long.  Mirror the delegations suite -- a 40s lease (beyond the recall
+# window) and a 180s wrapper timeout -- so the handshake has headroom and the
+# first client's lease cannot lapse mid-test.
+set(PYNFS_FORCE_DELEG_destroy_session DSESS9002 DSESS9003)
+set(PYNFS_LEASE_OVERRIDE_destroy_session DSESS9002 DSESS9003)
+set(PYNFS_LEASE_OVERRIDE_SECONDS_destroy_session 40)
+set(PYNFS_TIMEOUT_destroy_session 180)
+
+# The readdir suite carries one CPU-bound code, RDDR8b
+# (st_readdir.testDircountVarious), which loops 300 sequential READDIR
+# compounds through pynfs's pure-Python RPC client.  On amd64 it runs in
+# ~20s wall clock; on the emulated-arm64 devcontainer CI runner (Python
+# under QEMU TCG, 3-5x slower) it bumps against the wrapper's 60s default
+# and all six backends in that job time out together at ~62s.  Server side
+# is irrelevant -- chimera's READDIR finishes in microseconds for these
+# parameters; the budget is purely the client's Python-cost x 300 calls.
+# Raise the readdir-suite timeout to give RDDR8b headroom on the slow
+# runner; the other readdir codes finish in well under 1s, so a higher
+# cap is a no-op for them.  Matches the headroom used for the (similarly
+# pynfs-client-bound) delegations and destroy_session suites.
+set(PYNFS_TIMEOUT_readdir 180)
 
 function(pynfs_codes_for_flag flag minor out_var)
     if("${minor}" STREQUAL "0")
@@ -139,9 +185,13 @@ function(pynfs_codes_for_flag flag minor out_var)
     set(${out_var} ${codes} PARENT_SCOPE)
 endfunction()
 
-# Register one PyNFS code per CTest entry, enabling it only when the exact
-# generated test name is on the validated stable-pass list.
+# Register one CTest entry per PyNFS code/backend, except (code, backend) pairs
+# in PYNFS_SKIP_BACKENDS_<code>, which are not registered at all (see above).
 function(pynfs_add_code_test flag code backend minor)
+    if("${backend}" IN_LIST PYNFS_SKIP_BACKENDS_${code})
+        return()
+    endif()
+
     set(name chimera/pynfs/${flag}/${code}_${backend}_nfs4.${minor})
     add_test(NAME ${name}
         COMMAND bash ${PYNFS_WRAPPER}
@@ -164,13 +214,15 @@ function(pynfs_add_code_test flag code backend minor)
         list(APPEND test_env "PYNFS_NFS4_LEASE_TIME=${lease_seconds}")
     endif()
 
+    # Delegation-sensitive tests outside the deleg suites: see
+    # PYNFS_FORCE_DELEG_* above.
+    if("${code}" IN_LIST PYNFS_FORCE_DELEG_${flag})
+        list(APPEND test_env "PYNFS_FORCE_DELEG=1")
+    endif()
+
     set_tests_properties(${name} PROPERTIES
         LABELS pynfs
         ENVIRONMENT "${test_env}")
-
-    if(NOT PYNFS_ENABLE_UNSTABLE_TESTS AND NOT "${name}" IN_LIST PYNFS_STABLE_PASS_TESTS)
-        set_tests_properties(${name} PROPERTIES DISABLED TRUE)
-    endif()
 endfunction()
 
 foreach(minor ${PYNFS_MINOR_VERSIONS})
@@ -197,7 +249,4 @@ foreach(code ${PYNFS_FLEX_CODES})
     set_tests_properties(${name} PROPERTIES
         LABELS pynfs
         ENVIRONMENT "PYTHONUNBUFFERED=1;PYNFS_RUNDEPS=1")
-    if(NOT PYNFS_ENABLE_UNSTABLE_TESTS AND NOT "${name}" IN_LIST PYNFS_STABLE_PASS_TESTS)
-        set_tests_properties(${name} PROPERTIES DISABLED TRUE)
-    endif()
 endforeach()

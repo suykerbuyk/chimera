@@ -8,6 +8,7 @@
 #include "common/misc.h"
 #include "vfs/vfs.h"
 #include "vfs/vfs_procs.h"
+#include "vfs/vfs_release.h"
 #include "xxhash.h"
 
 static unsigned int
@@ -35,6 +36,13 @@ chimera_smb_query_directory_readdir_complete(
     void                           *private_data)
 {
     struct chimera_smb_request *request = private_data;
+
+    /* Drop the extra handle reference taken in chimera_smb_query_directory.  Do
+     * this before releasing the open_file: once the readdir is done with the
+     * handle it is safe to let a racing CLOSE finish tearing it down. */
+    if (handle && handle->cache_id != CHIMERA_VFS_OPEN_ID_SYNTHETIC) {
+        chimera_vfs_release(request->compound->thread->vfs_thread, handle);
+    }
 
     if (request->query_directory.last_file_offset) {
         *request->query_directory.last_file_offset = 0;
@@ -93,6 +101,28 @@ chimera_smb_query_directory_readdir_callback(
     if (!match) {
         return 0;
     }
+
+
+    /* Access-based directory enumeration: hide an entry the caller cannot read.
+     * Windows requires the DACL itself to grant the read rights (DATA + EA +
+     * ATTRIBUTES), so evaluate the raw ACL -- not the engine's implicit grants.
+     * "." and ".." (the directory the caller already opened) are never hidden. */
+    if (request->tree && request->tree->share &&
+        request->tree->share->access_based_enum &&
+        !(namelen == 1 && name[0] == '.') &&
+        !(namelen == 2 && name[0] == '.' && name[1] == '.')) {
+        uint32_t want = CHIMERA_ACE_READ_DATA | CHIMERA_ACE_READ_NAMED_ATTRS |
+            CHIMERA_ACE_READ_ATTRIBUTES;
+        uint32_t got = chimera_acl_access_raw(
+            (attrs->va_set_mask & CHIMERA_VFS_ATTR_ACL) ? attrs->va_acl : NULL,
+            attrs->va_uid, attrs->va_gid,
+            &request->session_handle->session->cred, want);
+
+        if ((got & want) != want) {
+            return 0;
+        }
+    }
+
     smb_attrs.smb_attr_mask = 0;
 
     file_index = (uint32_t) (XXH3_64bits(name, namelen) & 0xffffffff);
@@ -110,7 +140,9 @@ chimera_smb_query_directory_readdir_callback(
 
     switch (request->query_directory.info_class) {
         case SMB2_FILE_DIRECTORY_INFORMATION:
-            expected_length = 4 + namelen_padded;
+            /* NextEntryOffset(4) + FileIndex(4) + 6x time/size(48) +
+             * FileAttributes(4) + FileNameLength(4) = 64, then the name. */
+            expected_length = 64 + namelen_padded;
             break;
         case SMB2_FILE_BOTH_DIRECTORY_INFORMATION:
             expected_length = 94 + namelen_padded;
@@ -302,17 +334,48 @@ chimera_smb_query_directory(struct chimera_smb_request *request)
         request->query_directory.open_file->position = 0;
     }
 
+    /* The reply buffer is allocated below as a single contiguous iovec
+     * (max_iovecs == 1).  A client may advertise an OutputBufferLength far
+     * larger than the negotiated MaxTransactSize (smbtorture's
+     * compound_find_close uses 8 MiB), which cannot be satisfied by one
+     * libevpl buffer and would otherwise spin evpl_iovec_alloc() forever.
+     * Cap the buffer at MaxTransactSize; the readdir callback honours the
+     * same bound, and a client that wants more simply re-issues the FIND
+     * for the next batch (MS-SMB2 §3.3.5.18 allows returning fewer bytes
+     * than OutputBufferLength). */
+    if (request->query_directory.max_output_length > CHIMERA_SMB_MAX_TRANSACT_SIZE) {
+        request->query_directory.max_output_length = CHIMERA_SMB_MAX_TRANSACT_SIZE;
+    }
+
     evpl_iovec_alloc(evpl,
                      request->query_directory.max_output_length,
                      4096,
                      1,
                      0, &request->query_directory.iov);
 
+    /* Hold an extra reference on the directory's VFS handle for the duration of
+     * the readdir.  The readdir is async (e.g. diskfs walks the directory's
+     * b+tree across block I/O), so a separate, pipelined CLOSE for the same
+     * file id can run before it completes.  Without this reference that CLOSE
+     * drops the handle's last open count and -- if the handle was detached (a
+     * second open of the same fh, which the file-creation path does to the
+     * parent directory) -- closes the backend handle immediately, tearing down
+     * the directory inode while the readdir is still iterating it.  The matching
+     * release is in chimera_smb_query_directory_readdir_complete. */
+    if (request->query_directory.open_file->handle->cache_id != CHIMERA_VFS_OPEN_ID_SYNTHETIC) {
+        chimera_vfs_dup_handle(thread->vfs_thread, request->query_directory.open_file->handle);
+    }
+
     chimera_vfs_readdir(
         thread->vfs_thread,
         &request->session_handle->session->cred,
         request->query_directory.open_file->handle,
-        CHIMERA_VFS_ATTR_MASK_STAT | CHIMERA_VFS_ATTR_BTIME,
+        /* Access-based enumeration needs each entry's ACL to decide
+         * visibility. */
+        (request->tree && request->tree->share &&
+         request->tree->share->access_based_enum) ?
+        (CHIMERA_VFS_ATTR_MASK_STAT | CHIMERA_VFS_ATTR_BTIME | CHIMERA_VFS_ATTR_ACL) :
+        (CHIMERA_VFS_ATTR_MASK_STAT | CHIMERA_VFS_ATTR_BTIME),
         0, /* dir_attr_mask */
         request->query_directory.open_file->position,
         0, /* verifier */

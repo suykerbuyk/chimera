@@ -24,6 +24,7 @@
 #include <linux/version.h>
 #include "vfs/vfs_error.h"
 #include "vfs/vfs_internal.h"
+#include "vfs/vfs_acl.h"
 
 // fchmodat support for AT_SYMLINK_NOFOLLOW was added in Linux 6.6
 #if defined(LINUX_VERSION_CODE) && defined(KERNEL_VERSION)
@@ -52,8 +53,11 @@ struct chimera_linux_thread {
 };
 
 static void *
-chimera_linux_init(const char *cfgdata)
+chimera_linux_init(
+    const char                *cfgdata,
+    struct prometheus_metrics *metrics)
 {
+    (void) metrics;
     struct chimera_linux_shared *shared;
 
     shared = calloc(1, sizeof(*shared));
@@ -143,6 +147,15 @@ chimera_linux_set_attrs(
     int      rc;
     uint64_t set_mask = attr->va_set_mask;
 
+    /* Mode-only backend: a set-ACL request is down-projected to the equivalent
+    * POSIX mode and applied as a chmod (lossy, by design -- see vfs_acl.h). */
+    if ((set_mask & CHIMERA_VFS_ATTR_ACL) &&
+        !(set_mask & CHIMERA_VFS_ATTR_MODE) && attr->va_acl) {
+        attr->va_mode = (attr->va_mode & S_IFMT) |
+            chimera_acl_to_mode(attr->va_acl);
+        set_mask |= CHIMERA_VFS_ATTR_MODE;
+    }
+
     if (set_mask & CHIMERA_VFS_ATTR_MODE) {
 #ifdef HAVE_FCHMODAT_AT_SYMLINK_NOFOLLOW
         // Use fchmodat with AT_SYMLINK_NOFOLLOW on kernels >= 6.6
@@ -213,6 +226,14 @@ chimera_linux_set_attrs(
     }
 
     if (set_mask & CHIMERA_VFS_ATTR_SIZE) {
+        // A size that does not fit in a signed off_t cannot be set on any
+        // backing filesystem (truncate would see it as negative and fail
+        // EINVAL).  Report it as "file too large" so NFS returns FBIG rather
+        // than INVAL.
+        if (attr->va_size > (uint64_t) INT64_MAX) {
+            return -EFBIG;
+        }
+
         // dirfd might be O_PATH which doesn't support ftruncate directly,
         // so use truncate() on /proc/self/fd/N path which follows the symlink
         char procpath[64];
@@ -282,6 +303,25 @@ chimera_linux_getattr(
     chimera_linux_map_attrs(CHIMERA_VFS_FH_MAGIC_LINUX,
                             &request->getattr.r_attr,
                             fd);
+
+    /* Mode-only backend: synthesise an ACL from the POSIX mode bits when the
+     * caller asked for one (lossy, one-way -- see vfs_acl.h).  This makes the
+     * SMB security-descriptor path emit a DACL (no S-1-5-88-3 modefromsid ACE),
+     * exactly like the engine backends (memfs/cairn/diskfs): under the cthon
+     * 'modefromsid' cifs mount, a SD with no modefromsid ACE leaves the client
+     * on its mount-default file_mode (0755), so copied binaries stay
+     * executable.  Emitting the modefromsid ACE instead conveys the real 0644
+     * mode and strips +x over SMB (cthon 'special' could not exec). */
+    if ((request->getattr.r_attr.va_req_mask & CHIMERA_VFS_ATTR_ACL) &&
+        (request->getattr.r_attr.va_set_mask & CHIMERA_VFS_ATTR_MODE)) {
+        static __thread uint8_t scratch[sizeof(struct chimera_acl) +
+                                        8 * sizeof(struct chimera_ace)];
+        struct chimera_acl     *dst = (struct chimera_acl *) scratch;
+
+        chimera_acl_from_mode(request->getattr.r_attr.va_mode, dst, 8);
+        request->getattr.r_attr.va_acl       = dst;
+        request->getattr.r_attr.va_set_mask |= CHIMERA_VFS_ATTR_ACL;
+    }
 
     request->status = CHIMERA_VFS_OK;
     request->complete(request);
@@ -612,6 +652,15 @@ chimera_linux_open_at(
     if (request->open_at.set_attr->va_set_mask & CHIMERA_VFS_ATTR_MODE) {
         mode                                    = request->open_at.set_attr->va_mode;
         request->open_at.set_attr->va_set_mask &= ~CHIMERA_VFS_ATTR_MODE;
+        /* The explicit mode -- applied atomically by the openat() below -- is
+         * authoritative on this mode-only backend.  An SMB create SD commonly
+         * carries BOTH the modefromsid mode (recovered into va_mode) and a
+         * Windows DACL; if we left va_acl set, chimera_linux_set_attrs() would
+         * run its ACL->mode projection (now that ATTR_MODE is cleared) and
+         * overwrite the requested mode with a lossy ACL-derived one -- e.g. a
+         * 0755 binary copied over CIFS would lose +x and could no longer be
+         * executed.  The ACL cannot be stored here anyway, so drop it. */
+        request->open_at.set_attr->va_set_mask &= ~CHIMERA_VFS_ATTR_ACL;
     } else {
         mode = 0600;
     }
@@ -877,10 +926,12 @@ chimera_linux_read(
     void                       *private_data)
 {
     struct chimera_linux_thread *thread = private_data;
-    struct evpl                 *evpl   = thread->evpl;
     int                          fd, i;
     ssize_t                      len, left = request->read.length;
     struct iovec                *iov;
+    struct stat                  st;
+
+    (void) thread;
 
     /* Handle 0-byte reads specially - preadv with uninitialized iov causes EFAULT */
     if (request->read.length == 0) {
@@ -888,26 +939,35 @@ chimera_linux_read(
         chimera_linux_map_attrs(CHIMERA_VFS_FH_MAGIC_LINUX, &request->read.r_attr, fd);
         request->read.r_niov   = 0;
         request->read.r_length = 0;
-        request->read.r_eof    = 1;
+        request->read.r_eof    = 0;
         request->status        = CHIMERA_VFS_OK;
         request->complete(request);
         return;
     }
 
-    request->read.r_niov = evpl_iovec_alloc(evpl,
-                                            request->read.length,
-                                            4096,
-                                            8,
-                                            EVPL_IOVEC_FLAG_SHARED, request->read.iov);
+    /* The VFS core allocated the read buffers on the connection thread (linux
+     * does not advertise CAP_READ_PROVIDES_BUFFERS) and placed them in
+     * request->read.iov, padded to a 4 KiB boundary on both sides.  Build the
+     * preadv vector from them: offset the first buffer by aligned_prefix so
+     * file offset `offset` lands where the VFS core trims to on completion, and
+     * cap the vector at the requested length.  The VFS core owns the buffers --
+     * linux neither allocates nor releases them. */
+    chimera_vfs_abort_if(request->read.buffers_provided == 0,
+                         "linux read dispatched without VFS-provided buffers");
 
     iov = request->plugin_data;
 
-    for (i = 0; left && i < request->read.r_niov; i++) {
+    for (i = 0; left && i < request->read.buffers_provided; i++) {
 
         iov[i].iov_base = request->read.iov[i].data;
         iov[i].iov_len  = request->read.iov[i].length;
 
-        if (iov[i].iov_len > left) {
+        if (i == 0) {
+            iov[i].iov_base = (char *) iov[i].iov_base + request->read.aligned_prefix;
+            iov[i].iov_len -= request->read.aligned_prefix;
+        }
+
+        if (iov[i].iov_len > (size_t) left) {
             iov[i].iov_len = left;
         }
 
@@ -918,30 +978,45 @@ chimera_linux_read(
 
     len = preadv(fd,
                  iov,
-                 request->read.r_niov,
+                 i,
                  request->read.offset);
 
     if (len < 0) {
-        request->status = chimera_linux_errno_to_status(errno);
+        /* Reading at/after EOF surfaces as EINVAL on some backends; report it
+         * as a clean zero-length EOF read.  The VFS core owns request->read.iov
+         * and releases it on completion (r_length stays 0 here). */
+        if (errno == EINVAL &&
+            fstat(fd, &st) == 0 &&
+            request->read.offset >= (uint64_t) st.st_size) {
+            chimera_linux_map_attrs(CHIMERA_VFS_FH_MAGIC_LINUX, &request->read.r_attr, fd);
 
-        evpl_iovecs_release(evpl, request->read.iov, request->read.r_niov);
+            request->read.r_length = 0;
+            request->read.r_eof    = 1;
+            request->status        = CHIMERA_VFS_OK;
+            request->complete(request);
+            return;
+        }
 
-        request->read.r_niov   = 0;
+        request->status        = chimera_linux_errno_to_status(errno);
         request->read.r_length = 0;
         request->read.r_eof    = 0;
         request->complete(request);
         return;
     }
 
-    if (len == 0) {
-        evpl_iovecs_release(evpl, request->read.iov, request->read.r_niov);
-        request->read.r_niov = 0;
+    if (fstat(fd, &st) == 0) {
+        if (request->read.r_attr.va_req_mask & CHIMERA_VFS_ATTR_MASK_STAT) {
+            chimera_linux_stat_to_attr(&request->read.r_attr, &st);
+        }
+
+        request->read.r_eof = (request->read.offset + len >= (uint64_t) st.st_size);
+    } else {
+        chimera_linux_map_attrs(CHIMERA_VFS_FH_MAGIC_LINUX, &request->read.r_attr, fd);
+
+        request->read.r_eof = (len < request->read.length);
     }
 
-    chimera_linux_map_attrs(CHIMERA_VFS_FH_MAGIC_LINUX, &request->read.r_attr, fd);
-
     request->read.r_length = len;
-    request->read.r_eof    = (len < request->read.length);
 
     request->status = CHIMERA_VFS_OK;
     request->complete(request);
@@ -1830,7 +1905,7 @@ SYMBOL_EXPORT struct chimera_vfs_module vfs_linux = {
         CHIMERA_VFS_CAP_FS | CHIMERA_VFS_CAP_FS_RELATIVE_OP | CHIMERA_VFS_CAP_FS_PATH_OP |
         CHIMERA_VFS_CAP_FS_LOCK | CHIMERA_VFS_CAP_RPL |
         CHIMERA_VFS_CAP_COPY_RANGE | CHIMERA_VFS_CAP_CLONE_RANGE |
-        CHIMERA_VFS_CAP_XATTR
+        CHIMERA_VFS_CAP_DELEGATES_DAC | CHIMERA_VFS_CAP_XATTR
     ,
     .init           = chimera_linux_init,
     .destroy        = chimera_linux_destroy,

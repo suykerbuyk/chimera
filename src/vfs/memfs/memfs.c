@@ -18,6 +18,7 @@
 
 #include "vfs/vfs.h"
 #include "vfs/vfs_internal.h"
+#include "vfs/vfs_acl.h"
 #include "memfs.h"
 #include "common/logging.h"
 #include "common/misc.h"
@@ -79,6 +80,17 @@ struct memfs_block {
     struct evpl_iovec    iov[CHIMERA_MEMFS_BLOCK_MAX_IOV];
 };
 
+/* A regular file's data fork: a sparse array of fixed-size blocks.  The inode's
+ * default (unnamed) data fork lives in the inode union as `file`; each named
+ * stream carries its own fork.  Note the default fork's logical size lives in
+ * inode->size / inode->space_used (shared with the stat path), whereas a named
+ * stream keeps its own size/space_used (see struct memfs_named_stream). */
+struct memfs_fork {
+    struct memfs_block **blocks;
+    unsigned int         num_blocks;
+    unsigned int         max_blocks;
+};
+
 struct memfs_dirent {
     uint64_t             inum;
     uint32_t             gen;
@@ -118,6 +130,33 @@ struct memfs_xattr {
     uint32_t            value_len;
 };
 
+/* A named stream (SMB Alternate Data Stream) hung off a regular-file inode.
+ * It is an independent data fork with its own size, but shares the base file's
+ * metadata.  `id` is a stable, never-reused per-inode identifier used to encode
+ * the stream into a file handle.  `linked` is 1 while the stream is present in
+ * inode->streams (analogous to nlink); `refcnt` counts open handles.  An
+ * unlinked stream with open handles survives until its last close. */
+struct memfs_named_stream {
+    struct memfs_named_stream *next;
+    char                      *name;
+    uint16_t                   name_len;
+    uint8_t                    linked;
+    uint32_t                   id;
+    uint32_t                   refcnt;
+    uint64_t                   size;
+    uint64_t                   space_used;
+    struct memfs_fork          fork;
+};
+
+/* Per-open descriptor for a named-stream handle.  A stream open stores
+ * `(uintptr_t)desc | 1` in the open handle's vfs_private; the low tag bit
+ * distinguishes it from a plain inode pointer (heap pointers are >= 8-aligned).
+ * `stream == NULL` denotes the default/unnamed fork. */
+struct memfs_stream_open {
+    struct memfs_inode        *inode;
+    struct memfs_named_stream *stream;
+};
+
 /* Opaque per-file pNFS layout state (CHIMERA_VFS_ATTR_PNFS_LAYOUT).  memfs
  * persists and returns this blob verbatim via getattr/setattr; only the NFS
  * server interprets it.  Present (non-NULL) once the NFS server has recorded a
@@ -128,26 +167,33 @@ struct memfs_remote {
 };
 
 struct memfs_inode {
-    uint64_t             inum;
-    uint32_t             gen;
-    uint32_t             refcnt;
-    uint64_t             size;
-    uint64_t             space_used;
-    uint32_t             mode;
-    uint32_t             nlink;
-    uint32_t             uid;
-    uint32_t             gid;
-    uint64_t             rdev;
-    uint32_t             dos_attributes;
-    struct timespec      atime;
-    struct timespec      mtime;
-    struct timespec      ctime;
-    struct timespec      btime;
-    struct memfs_inode  *next;
-    struct memfs_xattr  *xattrs;
-    struct memfs_remote *remote;   /* non-NULL => pNFS stub (data lives on a DS) */
+    uint64_t                   inum;
+    uint32_t                   gen;
+    uint32_t                   refcnt;
+    uint64_t                   size;
+    uint64_t                   space_used;
+    uint32_t                   mode;
+    uint32_t                   nlink;
+    uint32_t                   uid;
+    uint32_t                   gid;
+    uint64_t                   rdev;
+    uint32_t                   dos_attributes;
+    struct chimera_acl        *acl; /* NULL => mode-derived; CAP_ACL_NATIVE storage */
+    struct timespec            atime;
+    struct timespec            mtime;
+    struct timespec            ctime;
+    struct timespec            btime;
+    struct memfs_inode        *next;
+    struct memfs_xattr        *xattrs;
+    struct memfs_remote       *remote; /* non-NULL => pNFS stub (data lives on a DS) */
 
-    pthread_mutex_t      lock;
+    /* Named streams (SMB ADS) attached to a regular file.  NULL when none.
+     * next_stream_id is a monotonic per-inode id allocator (ids are never
+     * reused so a stale stream file handle resolves to nothing). */
+    struct memfs_named_stream *streams;
+    uint32_t                   next_stream_id;
+
+    pthread_mutex_t            lock;
 
     union {
         struct {
@@ -155,11 +201,7 @@ struct memfs_inode {
             uint64_t       parent_inum;
             uint32_t       parent_gen;
         } dir;
-        struct {
-            struct memfs_block **blocks;
-            unsigned int         num_blocks;
-            unsigned int         max_blocks;
-        } file;
+        struct memfs_fork file;
         struct {
             struct memfs_symlink_target *target;
         } symlink;
@@ -187,6 +229,7 @@ struct memfs_shared {
     uint32_t                 block_size;
     uint32_t                 block_shift;
     uint32_t                 block_mask;
+    int                      noatime;     /* config: disable atime updates on read */
     pthread_mutex_t          lock;
 };
 
@@ -210,6 +253,84 @@ memfs_fh_to_inum(
 {
     chimera_vfs_decode_fh_inum(fh, fhlen, inum, gen);
 } /* memfs_fh_to_inum */
+
+/* A named-stream file handle is the base file's inum+gen fragment with a
+ * non-zero stream id varint appended.  The base inum/gen still decode with the
+ * shared chimera_vfs_decode_fh_inum (which ignores the trailing bytes), so the
+ * stream handle resolves to the base inode; the stream id selects the fork. */
+static inline uint32_t
+memfs_encode_stream_fh(
+    const void *parent_fh,
+    uint64_t    inum,
+    uint32_t    gen,
+    uint32_t    stream_id,
+    void       *out_fh)
+{
+    uint8_t *fh  = out_fh;
+    uint8_t *ptr = fh + CHIMERA_VFS_MOUNT_ID_SIZE;
+
+    memcpy(fh, parent_fh, CHIMERA_VFS_MOUNT_ID_SIZE);
+    ptr += chimera_encode_uint64(inum, ptr);
+    ptr += chimera_encode_uint32(gen, ptr);
+    ptr += chimera_encode_uint32(stream_id, ptr);
+
+    return ptr - fh;
+} /* memfs_encode_stream_fh */
+
+static inline void
+memfs_decode_stream_fh(
+    const void *fh,
+    int         fhlen,
+    uint64_t   *inum,
+    uint32_t   *gen,
+    uint32_t   *stream_id)
+{
+    const uint8_t *ptr = (const uint8_t *) fh + CHIMERA_VFS_MOUNT_ID_SIZE;
+    const uint8_t *end = (const uint8_t *) fh + fhlen;
+
+    ptr += chimera_decode_uint64(ptr, inum);
+    ptr += chimera_decode_uint32(ptr, gen);
+
+    if (ptr < end) {
+        chimera_decode_uint32(ptr, stream_id);
+    } else {
+        *stream_id = 0;
+    }
+} /* memfs_decode_stream_fh */
+
+static inline struct memfs_named_stream *
+memfs_stream_find_by_name(
+    struct memfs_inode *inode,
+    const char         *name,
+    uint32_t            name_len)
+{
+    struct memfs_named_stream *stream;
+
+    for (stream = inode->streams; stream; stream = stream->next) {
+        if (stream->name_len == name_len &&
+            memcmp(stream->name, name, name_len) == 0) {
+            return stream;
+        }
+    }
+
+    return NULL;
+} /* memfs_stream_find_by_name */
+
+static inline struct memfs_named_stream *
+memfs_stream_find_by_id(
+    struct memfs_inode *inode,
+    uint32_t            id)
+{
+    struct memfs_named_stream *stream;
+
+    for (stream = inode->streams; stream; stream = stream->next) {
+        if (stream->id == id) {
+            return stream;
+        }
+    }
+
+    return NULL;
+} /* memfs_stream_find_by_id */
 
 static inline struct memfs_inode *
 memfs_inode_get_inum(
@@ -262,6 +383,58 @@ memfs_inode_get_fh(
 
     return memfs_inode_get_inum(shared, inum, gen);
 } /* memfs_inode_get_fh */
+
+/* Resolve (and lock) the base inode plus target named stream for a handle-based
+ * data op.  Prefers the open handle's vfs_private: a tagged value (low bit set)
+ * points at a struct memfs_stream_open (carrying base inode + named stream);
+ * an untagged non-zero value is a plain base-inode pointer; zero falls back to
+ * decoding the file handle (which may itself carry a stream id).  Returns the
+ * locked inode or NULL (caller maps to ENOENT).  *out_stream is the target
+ * named fork, or NULL for the default/unnamed fork. */
+static inline struct memfs_inode *
+memfs_resolve_io(
+    struct memfs_shared            *shared,
+    struct chimera_vfs_open_handle *handle,
+    const uint8_t                  *fh,
+    int                             fhlen,
+    struct memfs_named_stream     **out_stream)
+{
+    uint64_t            vp = handle ? handle->vfs_private : 0;
+    struct memfs_inode *inode;
+
+    *out_stream = NULL;
+
+    if (vp & 1) {
+        struct memfs_stream_open *so =
+            (struct memfs_stream_open *) (uintptr_t) (vp & ~1ULL);
+
+        inode = so->inode;
+        pthread_mutex_lock(&inode->lock);
+        *out_stream = so->stream;
+        return inode;
+    }
+
+    if (vp) {
+        inode = (struct memfs_inode *) (uintptr_t) vp;
+        pthread_mutex_lock(&inode->lock);
+        return inode;
+    }
+
+    {
+        uint64_t inum;
+        uint32_t gen, sid = 0;
+
+        memfs_decode_stream_fh(fh, fhlen, &inum, &gen, &sid);
+
+        inode = memfs_inode_get_inum(shared, inum, gen);
+
+        if (inode && sid) {
+            *out_stream = memfs_stream_find_by_id(inode, sid);
+        }
+
+        return inode;
+    }
+} /* memfs_resolve_io */
 
 static inline struct memfs_block *
 memfs_block_alloc(struct memfs_thread *thread)
@@ -369,7 +542,7 @@ memfs_inode_alloc(
             }
         }
 
-        inodes = malloc(CHIMERA_MEMFS_INODE_BLOCK * sizeof(*inodes));
+        inodes = calloc(CHIMERA_MEMFS_INODE_BLOCK, sizeof(*inodes));
 
         base_id = bi << CHIMERA_MEMFS_INODE_BLOCK_SHIFT;
 
@@ -408,12 +581,37 @@ memfs_inode_alloc(
     inode->refcnt         = 1;
     inode->mode           = 0;
     inode->dos_attributes = 0;
+    inode->acl            = NULL;
     inode->xattrs         = NULL;
     inode->remote         = NULL;
+    inode->streams        = NULL;
+    inode->next_stream_id = 0;
 
     return inode;
 
 } /* memfs_inode_alloc */
+
+/*
+ * Replace inode->acl with a deep copy of `src` (NULL clears it).  Caller holds
+ * the inode lock.
+ */
+static inline void
+memfs_inode_set_acl(
+    struct memfs_inode       *inode,
+    const struct chimera_acl *src)
+{
+    if (inode->acl) {
+        free(inode->acl);
+        inode->acl = NULL;
+    }
+
+    if (src && src->num_aces) {
+        size_t sz = chimera_acl_size(src->num_aces);
+
+        inode->acl = malloc(sz);
+        memcpy(inode->acl, src, sz);
+    }
+} /* memfs_inode_set_acl */
 
 static inline struct memfs_inode *
 memfs_inode_alloc_thread(struct memfs_thread *thread)
@@ -424,6 +622,11 @@ memfs_inode_alloc_thread(struct memfs_thread *thread)
 
     return memfs_inode_alloc(shared, list_id);
 } /* memfs_inode_alloc */
+
+static void
+memfs_dirent_release(
+    struct rb_node *node,
+    void           *private_data);
 
 static inline void
 memfs_xattr_free_all(struct memfs_inode *inode)
@@ -464,6 +667,63 @@ memfs_inode_truncate_blocks(
     inode->file.max_blocks = 0;
 } /* memfs_inode_truncate_blocks */
 
+/* Free all data blocks of an arbitrary fork (a named stream's fork) and reset
+ * its block tracking.  The fork's logical size is the caller's concern. */
+static void
+memfs_fork_free_blocks(
+    struct memfs_thread *thread,
+    struct memfs_fork   *fork)
+{
+    unsigned int i;
+
+    if (fork->blocks) {
+        for (i = 0; i < fork->num_blocks; i++) {
+            if (fork->blocks[i]) {
+                memfs_block_free(thread, fork->blocks[i]);
+                fork->blocks[i] = NULL;
+            }
+        }
+        free(fork->blocks);
+        fork->blocks = NULL;
+    }
+    fork->num_blocks = 0;
+    fork->max_blocks = 0;
+} /* memfs_fork_free_blocks */
+
+/* Free a single named-stream node (its fork blocks, name and the node itself).
+ * The node must already be unlinked from inode->streams. */
+static void
+memfs_stream_node_free(
+    struct memfs_thread       *thread,
+    struct memfs_named_stream *stream)
+{
+    memfs_fork_free_blocks(thread, &stream->fork);
+    free(stream->name);
+    free(stream);
+} /* memfs_stream_node_free */
+
+/* Unlink and (where possible) free every named stream attached to an inode,
+ * used when the base file is freed or superseded.  A stream with open handles
+ * is unlinked but not freed; its last close releases it.  When called from
+ * memfs_inode_free the inode's refcnt is already zero, so no stream can have an
+ * open handle and every node is freed here. */
+static void
+memfs_streams_free_all(
+    struct memfs_thread *thread,
+    struct memfs_inode  *inode)
+{
+    struct memfs_named_stream *stream;
+
+    while (inode->streams) {
+        stream         = inode->streams;
+        inode->streams = stream->next;
+        stream->linked = 0;
+        if (stream->refcnt == 0) {
+            memfs_stream_node_free(thread, stream);
+        }
+    }
+} /* memfs_streams_free_all */
+
 static void
 memfs_inode_free(
     struct memfs_thread *thread,
@@ -476,15 +736,30 @@ memfs_inode_free(
 
     inode_list = &shared->inode_list[list_id];
 
+    if (inode->acl) {
+        free(inode->acl);
+        inode->acl = NULL;
+    }
+
     if (S_ISREG(inode->mode)) {
         memfs_inode_truncate_blocks(thread, inode);
     } else if (S_ISLNK(inode->mode)) {
         memfs_symlink_target_free(thread, inode->symlink.target);
         inode->symlink.target = NULL;
+    } else if (S_ISDIR(inode->mode)) {
+        /* Release any remaining directory entries.  For a normally-removed
+         * (empty) directory this is a no-op; it also prevents leaking the
+         * entries of a directory torn down while still populated. */
+        rb_tree_destroy(&inode->dir.dirents, memfs_dirent_release, thread);
     }
 
     /* Extended attributes hang off every inode type. */
     memfs_xattr_free_all(inode);
+
+    /* Named streams cascade with the base file. */
+    if (inode->streams) {
+        memfs_streams_free_all(thread, inode);
+    }
 
     if (inode->remote) {
         free(inode->remote);
@@ -607,8 +882,11 @@ memfs_kv_entry_release(
 } /* memfs_kv_entry_release */
 
 static void *
-memfs_init(const char *cfgdata)
+memfs_init(
+    const char                *cfgdata,
+    struct prometheus_metrics *metrics)
 {
+    (void) metrics;
     struct memfs_shared     *shared = calloc(1, sizeof(*shared));
     struct memfs_inode_list *inode_list;
     struct memfs_inode      *inode;
@@ -616,7 +894,7 @@ memfs_init(const char *cfgdata)
     struct timespec          now;
     uint32_t                 block_size = CHIMERA_MEMFS_BLOCK_SIZE_DEFAULT;
 
-    clock_gettime(CLOCK_REALTIME, &now);
+    chimera_vfs_realtime(&now);
 
     pthread_mutex_init(&shared->lock, NULL);
 
@@ -661,6 +939,10 @@ memfs_init(const char *cfgdata)
             }
         }
 
+        /* noatime disables read atime updates entirely; default (off) keeps
+         * relatime semantics. */
+        shared->noatime = json_is_true(json_object_get(cfg, "noatime"));
+
         json_decref(cfg);
     }
 
@@ -701,11 +983,18 @@ memfs_init(const char *cfgdata)
     inode->uid        = 0;
     inode->gid        = 0;
     inode->nlink      = 2;
-    inode->mode       = S_IFDIR | 0755;
-    inode->atime      = now;
-    inode->mtime      = now;
-    inode->ctime      = now;
-    inode->btime      = now;
+    /* The freshly-created in-memory root has no configured ownership, so make
+     * it world-writable: a fresh memfs share is a blank scratch namespace any
+     * connecting user may populate (mirroring a writable share root).  Now that
+     * the VFS layer enforces ADD_FILE/ADD_SUBDIRECTORY on the parent, a
+     * root-owned 0755 root would (correctly) refuse all creation by non-root
+     * clients.  Subdirectories created beneath it are owned by their creator
+     * with the usual 0755. */
+    inode->mode  = S_IFDIR | 0777;
+    inode->atime = now;
+    inode->mtime = now;
+    inode->ctime = now;
+    inode->btime = now;
 
     rb_tree_init(&inode->dir.dirents);
 
@@ -742,6 +1031,10 @@ memfs_destroy(void *private_data)
                     continue;
                 }
 
+                if (inode->acl) {
+                    free(inode->acl);
+                    inode->acl = NULL;
+                }
                 memfs_xattr_free_all(inode);
 
                 if (S_ISDIR(inode->mode)) {
@@ -762,6 +1055,33 @@ memfs_destroy(void *private_data)
 
                     if (inode->file.blocks) {
                         free(inode->file.blocks);
+                    }
+
+                    /* Named-stream forks are freed the same way as the main
+                     * fork (direct release, not via the per-thread freelist,
+                     * which is gone by destroy time). */
+                    while (inode->streams) {
+                        struct memfs_named_stream *stream = inode->streams;
+                        unsigned int               sbi;
+
+                        inode->streams = stream->next;
+
+                        for (sbi = 0; sbi < stream->fork.num_blocks; sbi++) {
+                            if (stream->fork.blocks[sbi]) {
+                                for (iovi = 0;
+                                     iovi < stream->fork.blocks[sbi]->niov;
+                                     iovi++) {
+                                    evpl_iovec_release(NULL,
+                                                       &stream->fork.blocks[sbi]->iov[iovi]);
+                                }
+                                free(stream->fork.blocks[sbi]);
+                            }
+                        }
+                        if (stream->fork.blocks) {
+                            free(stream->fork.blocks);
+                        }
+                        free(stream->name);
+                        free(stream);
                     }
 
                     /* Stubs are always regular files; free the remote
@@ -886,6 +1206,26 @@ memfs_map_attrs(
         attr->va_dos_attributes = inode->dos_attributes;
     }
 
+    if (attr->va_req_mask & CHIMERA_VFS_ATTR_ACL) {
+        /* Copy into a per-thread scratch buffer: memfs releases the inode lock
+         * before the (synchronous) completion runs, so we must not hand out the
+         * live inode->acl pointer.  The scratch is valid through completion
+         * because each memfs thread serves one request at a time. */
+        static __thread uint8_t acl_scratch[
+            sizeof(struct chimera_acl) +
+            CHIMERA_ACL_MAX_ACES * sizeof(struct chimera_ace)];
+        struct chimera_acl     *dst = (struct chimera_acl *) acl_scratch;
+
+        if (inode->acl) {
+            memcpy(dst, inode->acl, chimera_acl_size(inode->acl->num_aces));
+        } else {
+            chimera_acl_from_mode(inode->mode, dst, CHIMERA_ACL_MAX_ACES);
+        }
+
+        attr->va_acl       = dst;
+        attr->va_set_mask |= CHIMERA_VFS_ATTR_ACL;
+    }
+
     /* Birth time is optional and lives outside MASK_STAT, so report it under
      * its own request bit. */
     if (attr->va_req_mask & CHIMERA_VFS_ATTR_BTIME) {
@@ -918,6 +1258,35 @@ memfs_map_attrs(
 
 } /* memfs_map_attrs */
 
+/* Map attributes for a (possibly named-stream) data fork.  Metadata is always
+* the base inode's; for a named stream the reported size/allocation come from
+* the stream's own fork and the returned file handle encodes the stream id. */
+static inline void
+memfs_map_attrs_fork(
+    struct memfs_shared       *shared,
+    struct chimera_vfs_attrs  *attr,
+    struct memfs_inode        *inode,
+    struct memfs_named_stream *stream,
+    const void                *base_fh)
+{
+    memfs_map_attrs(shared, attr, inode, base_fh);
+
+    if (!stream) {
+        return;
+    }
+
+    if (attr->va_set_mask & CHIMERA_VFS_ATTR_SIZE) {
+        attr->va_size       = stream->size;
+        attr->va_space_used = stream->space_used;
+    }
+
+    if (attr->va_set_mask & CHIMERA_VFS_ATTR_FH) {
+        attr->va_fh_len = memfs_encode_stream_fh(base_fh, inode->inum,
+                                                 inode->gen, stream->id,
+                                                 attr->va_fh);
+    }
+} /* memfs_map_attrs_fork */
+
 static inline void
 memfs_apply_attrs(
     struct memfs_inode       *inode,
@@ -926,7 +1295,7 @@ memfs_apply_attrs(
     struct timespec now;
     uint64_t        set_mask = attr->va_set_mask;
 
-    clock_gettime(CLOCK_REALTIME, &now);
+    chimera_vfs_realtime(&now);
 
     attr->va_set_mask = CHIMERA_VFS_ATTR_ATOMIC;
 
@@ -973,6 +1342,29 @@ memfs_apply_attrs(
         }
     }
 
+    /* ACL coherence.  An explicit ACL set replaces storage and re-derives mode;
+     * a bare chmod (MODE without ACL) regenerates the special-who ACEs of any
+     * existing rich ACL while preserving named entries. */
+    if (set_mask & CHIMERA_VFS_ATTR_ACL) {
+        memfs_inode_set_acl(inode, attr->va_acl);
+        if (inode->acl) {
+            inode->mode = (inode->mode & S_IFMT) | chimera_acl_to_mode(inode->acl);
+        }
+        attr->va_set_mask |= CHIMERA_VFS_ATTR_ACL;
+    } else if ((set_mask & CHIMERA_VFS_ATTR_MODE) && inode->acl) {
+        unsigned            cap = inode->acl->num_aces + 8;
+        struct chimera_acl *tmp = malloc(chimera_acl_size(cap));
+        int                 n   = chimera_acl_chmod(inode->acl, inode->mode,
+                                                    tmp, cap);
+
+        if (n >= 0) {
+            free(inode->acl);
+            inode->acl = tmp;
+        } else {
+            free(tmp);
+        }
+    }
+
     if (set_mask & CHIMERA_VFS_ATTR_BTIME) {
         attr->va_set_mask |= CHIMERA_VFS_ATTR_BTIME;
         if (attr->va_btime.tv_nsec == CHIMERA_VFS_TIME_NOW) {
@@ -998,52 +1390,76 @@ memfs_apply_attrs(
 
 } /* memfs_apply_attrs */
 
-static int
-memfs_cred_can_access(
-    const struct memfs_inode      *inode,
-    const struct chimera_vfs_cred *cred,
-    uint32_t                       user_bit,
-    uint32_t                       group_bit,
-    uint32_t                       other_bit)
+/*
+ * Seed a freshly-created child's ACL.  Precedence:
+ *   1. An explicit ACL supplied at create (e.g. an SMB SD) is kept as-is.
+ *   2. Otherwise, if the parent holds ACEs inheritable for the child's type,
+ *      compute the inherited ACL via the shared engine and store it, re-deriving
+ *      the mode from it (Windows inheritance defines the child's access).
+ *   3. Otherwise, for an SMB-originated create (`windows_default`), store a
+ *      Windows-style default DACL granting the owner full control while leaving
+ *      the POSIX mode intact, so a Windows client sees owner-full-control (plain
+ *      mode would deny e.g. FILE_EXECUTE on a 0644 file).
+ *   4. Otherwise (NFS/POSIX create, no inheritance) the child stays mode-derived
+ *      (acl == NULL) -- matching legacy and mode-only-backend behaviour.
+ * Both inodes are held locked by the caller.
+ */
+static void
+memfs_inherit_acl(
+    struct memfs_inode *child,
+    struct memfs_inode *parent,
+    int                 windows_default)
 {
-    if (cred->uid == 0) {
-        return 1;
+    int      is_dir = S_ISDIR(child->mode);
+    uint16_t want   = CHIMERA_ACE_FLAG_FILE_INHERIT |
+        (is_dir ? CHIMERA_ACE_FLAG_DIR_INHERIT : 0);
+    int      has_inh = 0;
+
+    if (child->acl) {
+        return;
     }
 
-    if ((uint64_t) cred->uid == inode->uid) {
-        return !!(inode->mode & user_bit);
-    }
-
-    int in_group = ((uint64_t) cred->gid == inode->gid);
-
-    for (uint32_t i = 0; !in_group && i < cred->ngids; i++) {
-        if ((uint64_t) cred->gids[i] == inode->gid) {
-            in_group = 1;
+    if (parent->acl) {
+        for (unsigned i = 0; i < parent->acl->num_aces; i++) {
+            if (parent->acl->aces[i].flags & want) {
+                has_inh = 1;
+                break;
+            }
         }
     }
 
-    if (in_group) {
-        return !!(inode->mode & group_bit);
+    if (has_inh) {
+        /* A directory child can yield up to two ACEs per inheritable parent ACE
+         * (an effective entry plus an inherit-only continuation). */
+        unsigned            cap = parent->acl->num_aces * 2;
+        struct chimera_acl *tmp = malloc(chimera_acl_size(cap));
+        int                 n   = chimera_acl_inherit(parent->acl, is_dir,
+                                                      child->mode & 07777, tmp, cap);
+
+        if (n > 0) {
+            memfs_inode_set_acl(child, tmp);
+            child->mode = (child->mode & S_IFMT) | chimera_acl_to_mode(child->acl);
+        }
+        free(tmp);
+
+        if (child->acl) {
+            return;
+        }
+        /* Nothing actually inherited (e.g. an OBJECT_INHERIT-only ACE on a new
+         * directory): fall through to the default below. */
     }
 
-    return !!(inode->mode & other_bit);
-} /* memfs_cred_can_access */
+    if (windows_default) {
+        uint8_t             buf[sizeof(struct chimera_acl) +
+                                4 * sizeof(struct chimera_ace)];
+        struct chimera_acl *def = (struct chimera_acl *) buf;
 
-static int
-memfs_cred_can_read(
-    const struct memfs_inode      *inode,
-    const struct chimera_vfs_cred *cred)
-{
-    return memfs_cred_can_access(inode, cred, S_IRUSR, S_IRGRP, S_IROTH);
-} /* memfs_cred_can_read */
+        if (chimera_acl_default_acl(child->mode & 07777, def, 4) > 0) {
+            memfs_inode_set_acl(child, def);
+        }
+    }
+} /* memfs_inherit_acl */
 
-static int
-memfs_cred_can_write(
-    const struct memfs_inode      *inode,
-    const struct chimera_vfs_cred *cred)
-{
-    return memfs_cred_can_access(inode, cred, S_IWUSR, S_IWGRP, S_IWOTH);
-} /* memfs_cred_can_write */
 
 static void
 memfs_getattr(
@@ -1052,9 +1468,11 @@ memfs_getattr(
     struct chimera_vfs_request *request,
     void                       *private_data)
 {
-    struct memfs_inode *inode;
+    struct memfs_inode        *inode;
+    struct memfs_named_stream *stream;
 
-    inode = memfs_inode_get_fh(shared, request->fh, request->fh_len);
+    inode = memfs_resolve_io(shared, request->getattr.handle,
+                             request->fh, request->fh_len, &stream);
 
     if (unlikely(!inode)) {
         request->status = CHIMERA_VFS_ENOENT;
@@ -1062,7 +1480,7 @@ memfs_getattr(
         return;
     }
 
-    memfs_map_attrs(shared, &request->getattr.r_attr, inode, request->fh);
+    memfs_map_attrs_fork(shared, &request->getattr.r_attr, inode, stream, request->fh);
 
     pthread_mutex_unlock(&inode->lock);
 
@@ -1107,10 +1525,14 @@ memfs_setattr(
     struct chimera_vfs_request *request,
     void                       *private_data)
 {
-    struct memfs_inode       *inode;
-    struct chimera_vfs_attrs *attr = request->setattr.set_attr;
+    struct memfs_inode        *inode;
+    struct memfs_named_stream *stream;
+    struct memfs_fork         *fork;
+    uint64_t                  *p_size, *p_space_used;
+    struct chimera_vfs_attrs  *attr = request->setattr.set_attr;
 
-    inode = memfs_inode_get_fh(shared, request->fh, request->fh_len);
+    inode = memfs_resolve_io(shared, request->setattr.handle,
+                             request->fh, request->fh_len, &stream);
 
     if (unlikely(!inode)) {
         request->status = CHIMERA_VFS_ENOENT;
@@ -1120,7 +1542,8 @@ memfs_setattr(
 
     /* SETATTR(SIZE) is only meaningful for regular files. RFC 7530 §5.7:
      * directories must report ISDIR; symlinks should report SYMLINK or
-     * INVAL; other non-regular file types report INVAL. */
+     * INVAL; other non-regular file types report INVAL.  (A named-stream
+     * handle always resolves to a regular base inode, so streams pass.) */
     if ((attr->va_set_mask & CHIMERA_VFS_ATTR_SIZE) &&
         !S_ISREG(inode->mode)) {
         enum chimera_vfs_error err;
@@ -1135,12 +1558,16 @@ memfs_setattr(
         return;
     }
 
-    memfs_map_attrs(shared, &request->setattr.r_pre_attr, inode, request->fh);
+    fork         = stream ? &stream->fork : &inode->file;
+    p_size       = stream ? &stream->size : &inode->size;
+    p_space_used = stream ? &stream->space_used : &inode->space_used;
+
+    memfs_map_attrs_fork(shared, &request->setattr.r_pre_attr, inode, stream, request->fh);
 
     /* Handle truncation: free blocks past new EOF and zero partial block */
     if ((attr->va_set_mask & CHIMERA_VFS_ATTR_SIZE) &&
         S_ISREG(inode->mode) &&
-        attr->va_size < inode->size) {
+        attr->va_size < *p_size) {
 
         struct evpl   *evpl           = thread->evpl;
         const uint32_t block_size     = shared->block_size;
@@ -1152,11 +1579,11 @@ memfs_setattr(
         uint64_t       bi;
 
         /* Free blocks that are entirely past the new EOF */
-        if (inode->file.blocks) {
-            for (bi = new_num_blocks; bi < inode->file.num_blocks; bi++) {
-                if (inode->file.blocks[bi]) {
-                    memfs_block_free(thread, inode->file.blocks[bi]);
-                    inode->file.blocks[bi] = NULL;
+        if (fork->blocks) {
+            for (bi = new_num_blocks; bi < fork->num_blocks; bi++) {
+                if (fork->blocks[bi]) {
+                    memfs_block_free(thread, fork->blocks[bi]);
+                    fork->blocks[bi] = NULL;
                 }
             }
         }
@@ -1167,11 +1594,11 @@ memfs_setattr(
         if (new_size > 0 && (new_size & block_mask)) {
             uint64_t last_block_idx = (new_size - 1) >> block_shift;
 
-            if (inode->file.blocks &&
-                last_block_idx < inode->file.num_blocks &&
-                inode->file.blocks[last_block_idx]) {
+            if (fork->blocks &&
+                last_block_idx < fork->num_blocks &&
+                fork->blocks[last_block_idx]) {
 
-                struct memfs_block      *old_block = inode->file.blocks[last_block_idx];
+                struct memfs_block      *old_block = fork->blocks[last_block_idx];
                 struct memfs_block      *new_block;
                 struct evpl_iovec_cursor old_cursor;
                 uint32_t                 offset_in_block = new_size &
@@ -1203,24 +1630,34 @@ memfs_setattr(
                 memfs_block_free(thread, old_block);
 
                 /* Replace old block with new block */
-                inode->file.blocks[last_block_idx] = new_block;
+                fork->blocks[last_block_idx] = new_block;
             }
         }
 
         /* Only update num_blocks if blocks array exists.
          * If blocks is NULL (sparse file extended via setattr), keep num_blocks=0. */
-        if (inode->file.blocks) {
-            inode->file.num_blocks = new_num_blocks;
-            inode->space_used      = new_num_blocks * block_size;
+        if (fork->blocks) {
+            fork->num_blocks = new_num_blocks;
+            *p_space_used    = new_num_blocks * block_size;
         } else {
-            inode->file.num_blocks = 0;
-            inode->space_used      = 0;
+            fork->num_blocks = 0;
+            *p_space_used    = 0;
         }
     }
 
-    memfs_apply_attrs(inode, attr);
+    /* Apply the new logical size to the resolved fork ourselves (the base
+     * inode's size lives on the inode, a stream's on its node), then mask the
+     * SIZE bit off so memfs_apply_attrs only touches base-inode metadata. */
+    if ((attr->va_set_mask & CHIMERA_VFS_ATTR_SIZE) && S_ISREG(inode->mode)) {
+        *p_size            = attr->va_size;
+        attr->va_set_mask &= ~CHIMERA_VFS_ATTR_SIZE;
+        memfs_apply_attrs(inode, attr);
+        attr->va_set_mask |= CHIMERA_VFS_ATTR_SIZE;
+    } else {
+        memfs_apply_attrs(inode, attr);
+    }
 
-    memfs_map_attrs(shared, &request->setattr.r_post_attr, inode, request->fh);
+    memfs_map_attrs_fork(shared, &request->setattr.r_post_attr, inode, stream, request->fh);
 
     pthread_mutex_unlock(&inode->lock);
 
@@ -1382,6 +1819,100 @@ memfs_umount(
     request->complete(request);
 } /* memfs_umount */
 
+/*
+ * Reverse-path-lookup: given a directory FH, return its parent's FH and the
+ * directory's own name within that parent.  The change-notify subtree
+ * resolver walks the ancestor directory chain with this (memfs advertises
+ * CHIMERA_VFS_CAP_RPL), so it only ever needs to resolve directories — which
+ * track their parent via dir.parent_inum/parent_gen.
+ */
+static void
+memfs_getparent(
+    struct memfs_thread        *thread,
+    struct memfs_shared        *shared,
+    struct chimera_vfs_request *request,
+    void                       *private_data)
+{
+    struct memfs_inode  *inode, *parent_inode;
+    struct memfs_dirent *dirent;
+    uint64_t             parent_inum;
+    uint32_t             parent_gen;
+    uint64_t             child_inum;
+    uint32_t             child_gen;
+    int                  found = 0;
+
+    inode = memfs_inode_get_fh(shared, request->fh, request->fh_len);
+
+    if (unlikely(!inode)) {
+        request->status = CHIMERA_VFS_ENOENT;
+        request->complete(request);
+        return;
+    }
+
+    if (unlikely(!S_ISDIR(inode->mode))) {
+        pthread_mutex_unlock(&inode->lock);
+        request->status = CHIMERA_VFS_ENOTDIR;
+        request->complete(request);
+        return;
+    }
+
+    child_inum  = inode->inum;
+    child_gen   = inode->gen;
+    parent_inum = inode->dir.parent_inum;
+    parent_gen  = inode->dir.parent_gen;
+
+    pthread_mutex_unlock(&inode->lock);
+
+    /* Encode the parent FH using the child FH as the magic/mount template. */
+    request->getparent.r_parent_fh_len =
+        chimera_vfs_encode_fh_inum_parent(request->fh, parent_inum, parent_gen,
+                                          request->getparent.r_parent_fh);
+    request->getparent.r_name_len = 0;
+
+    /* The root directory is its own parent: there is no enclosing name.  The
+     * resolver detects the mount root by FH and stops, so an empty name is
+     * fine here. */
+    if (parent_inum == child_inum && parent_gen == child_gen) {
+        request->status = CHIMERA_VFS_OK;
+        request->complete(request);
+        return;
+    }
+
+    parent_inode = memfs_inode_get_inum(shared, parent_inum, parent_gen);
+
+    if (unlikely(!parent_inode)) {
+        request->status = CHIMERA_VFS_ENOENT;
+        request->complete(request);
+        return;
+    }
+
+    /* Scan the parent's entries for the one pointing back at this child. */
+    rb_tree_first(&parent_inode->dir.dirents, dirent);
+
+    while (dirent) {
+        if (dirent->inum == child_inum && dirent->gen == child_gen) {
+            uint16_t nlen = dirent->name_len;
+            if (nlen > sizeof(request->getparent.r_name)) {
+                nlen = sizeof(request->getparent.r_name);
+            }
+            memcpy(request->getparent.r_name, dirent->name, nlen);
+            request->getparent.r_name_len = nlen;
+            found                         = 1;
+            break;
+        }
+        dirent = rb_tree_next(&parent_inode->dir.dirents, dirent);
+    }
+
+    pthread_mutex_unlock(&parent_inode->lock);
+
+    /* A missing name (child unlinked from the parent mid-walk) is not fatal
+     * for the resolver — it still has the parent FH to continue upward. */
+    (void) found;
+
+    request->status = CHIMERA_VFS_OK;
+    request->complete(request);
+} /* memfs_getparent */
+
 static void
 memfs_lookup_at(
     struct memfs_thread        *thread,
@@ -1424,8 +1955,19 @@ memfs_lookup_at(
         return;
     }
 
-    /* Handle ".." - return the parent directory */
+    /* Handle ".." - return the parent directory.  The root directory is its
+     * own parent, so locking the parent here would re-lock the inode we
+     * already hold and deadlock on the non-recursive mutex; resolve ".." to
+     * the directory itself in that case (mirrors the readdir ".." handling). */
     if (namelen == 2 && name[0] == '.' && name[1] == '.') {
+        if (inode->dir.parent_inum == inode->inum &&
+            inode->dir.parent_gen == inode->gen) {
+            memfs_map_attrs(shared, &request->lookup_at.r_attr, inode, request->fh);
+            pthread_mutex_unlock(&inode->lock);
+            request->status = CHIMERA_VFS_OK;
+            request->complete(request);
+            return;
+        }
         child = memfs_inode_get_inum(shared, inode->dir.parent_inum, inode->dir.parent_gen);
         if (unlikely(!child)) {
             pthread_mutex_unlock(&inode->lock);
@@ -1484,7 +2026,7 @@ memfs_mkdir_at(
     struct timespec           now;
     uint64_t                  hash;
 
-    clock_gettime(CLOCK_REALTIME, &now);
+    chimera_vfs_realtime(&now);
 
     hash = request->mkdir_at.name_hash;
 
@@ -1538,6 +2080,12 @@ memfs_mkdir_at(
     /* Set parent pointer for .. lookup support */
     inode->dir.parent_inum = parent_inode->inum;
     inode->dir.parent_gen  = parent_inode->gen;
+
+    /* Inherit the parent's inheritable ACEs (or seed a Windows default DACL for
+     * SMB creates); refresh the child's attrs since the mode may have changed. */
+    memfs_inherit_acl(inode, parent_inode,
+                      request->cred->flavor == CHIMERA_VFS_AUTH_ATTR);
+    memfs_map_attrs(shared, r_attr, inode, request->fh);
 
     memfs_map_attrs(shared, r_dir_pre_attr, parent_inode, request->fh);
 
@@ -1594,7 +2142,7 @@ memfs_mknod_at(
     struct timespec           now;
     uint64_t                  hash;
 
-    clock_gettime(CLOCK_REALTIME, &now);
+    chimera_vfs_realtime(&now);
 
     hash = request->mknod_at.name_hash;
 
@@ -1705,7 +2253,7 @@ memfs_remove_at(
     struct timespec      now;
     uint64_t             hash;
 
-    clock_gettime(CLOCK_REALTIME, &now);
+    chimera_vfs_realtime(&now);
 
     hash = request->remove_at.name_hash;
 
@@ -2005,7 +2553,7 @@ memfs_open_at(
     struct timespec      now;
     uint64_t             hash;
 
-    clock_gettime(CLOCK_REALTIME, &now);
+    chimera_vfs_realtime(&now);
 
     hash = request->open_at.name_hash;
 
@@ -2055,6 +2603,9 @@ memfs_open_at(
 
         memfs_apply_attrs(inode, request->open_at.set_attr);
 
+        memfs_inherit_acl(inode, parent_inode,
+                          request->cred->flavor == CHIMERA_VFS_AUTH_ATTR);
+
         dirent = memfs_dirent_alloc(thread,
                                     inode->inum,
                                     inode->gen,
@@ -2083,9 +2634,14 @@ memfs_open_at(
         }
 
         /* Overwrite/supersede disposition: replace the existing file's
-         * contents (truncate to zero) and apply the new attributes. */
+         * contents (truncate to zero) and apply the new attributes.  NTFS
+         * drops a file's named streams on SUPERSEDE/OVERWRITE, so discard them
+         * on the explicit truncate-on-open path (but not on a plain create). */
         if ((flags & CHIMERA_VFS_OPEN_TRUNCATE) && S_ISREG(inode->mode)) {
             memfs_inode_truncate_blocks(thread, inode);
+            if (inode->streams) {
+                memfs_streams_free_all(thread, inode);
+            }
             inode->size       = 0;
             inode->space_used = 0;
             memfs_apply_attrs(inode, request->open_at.set_attr);
@@ -2107,23 +2663,11 @@ memfs_open_at(
         return;
     }
 
-    if (!(flags & CHIMERA_VFS_OPEN_INFERRED)) {
-        bool allowed;
-
-        if (flags & CHIMERA_VFS_OPEN_READ_ONLY) {
-            allowed = memfs_cred_can_read(inode, request->cred);
-        } else {
-            allowed = memfs_cred_can_write(inode, request->cred);
-        }
-
-        if (!allowed) {
-            pthread_mutex_unlock(&inode->lock);
-            pthread_mutex_unlock(&parent_inode->lock);
-            request->status = CHIMERA_VFS_EACCES;
-            request->complete(request);
-            return;
-        }
-    }
+    /* Access is enforced at the VFS layer (the credential-keyed gate in
+    * chimera_vfs_read/write and the protocol's own create-time check), which
+    * is ACL-aware and honors each protocol's access semantics; memfs does not
+    * re-check here -- a coarse read/write test would mis-handle SMB opens that
+    * carry only control rights (e.g. WRITE_DAC) and not data access. */
 
     if (flags & CHIMERA_VFS_OPEN_INFERRED) {
         /* If this is an inferred open (ie an NFS3 create)
@@ -2163,7 +2707,7 @@ memfs_create_unlinked(
     struct memfs_inode *inode = NULL;
     struct timespec     now;
 
-    clock_gettime(CLOCK_REALTIME, &now);
+    chimera_vfs_realtime(&now);
 
     inode = memfs_inode_alloc_thread(thread);
 
@@ -2201,19 +2745,44 @@ memfs_close(
     struct chimera_vfs_request *request,
     void                       *private_data)
 {
-    struct memfs_inode *inode;
+    struct memfs_inode        *inode;
+    struct memfs_named_stream *stream    = NULL;
+    struct memfs_stream_open  *stream_op = NULL;
+    uint64_t                   vp        = request->close.vfs_private;
 
-    inode = (struct memfs_inode *) request->close.vfs_private;
+    if (vp & 1) {
+        stream_op = (struct memfs_stream_open *) (uintptr_t) (vp & ~1ULL);
+        inode     = stream_op->inode;
+        stream    = stream_op->stream;
+    } else {
+        inode = (struct memfs_inode *) (uintptr_t) vp;
+    }
 
     pthread_mutex_lock(&inode->lock);
+
+    /* Release the stream node first.  An unlinked stream (removed by
+     * remove_stream while still open) is no longer in inode->streams, so the
+     * inode_free cascade below would miss it -- free it here on its last
+     * close, independent of whether the inode itself is being freed. */
+    if (stream && stream->refcnt > 0) {
+        stream->refcnt--;
+    }
+    if (stream && stream->refcnt == 0 && !stream->linked) {
+        memfs_stream_node_free(thread, stream);
+    }
 
     --inode->refcnt;
 
     if (inode->refcnt == 0) {
+        /* Frees the inode and cascades its remaining (still-linked) streams. */
         memfs_inode_free(thread, inode);
     }
 
     pthread_mutex_unlock(&inode->lock);
+
+    if (stream_op) {
+        free(stream_op);
+    }
 
     request->status = CHIMERA_VFS_OK;
     request->complete(request);
@@ -2226,21 +2795,33 @@ memfs_read(
     struct chimera_vfs_request *request,
     void                       *private_data)
 {
-    struct memfs_inode      *inode;
-    struct memfs_block      *block;
-    struct evpl_iovec_cursor cursor;
-    uint64_t                 offset, length;
-    uint32_t                 eof = 0;
-    uint64_t                 first_block, last_block, max_iov, bi;
-    uint32_t                 block_offset, left, block_len;
-    struct evpl_iovec       *iov;
-    int                      niov = 0;
-    struct timespec          now;
+    struct memfs_inode        *inode;
+    struct memfs_named_stream *stream;
+    struct memfs_fork         *fork;
+    uint64_t                   fork_size;
+    struct memfs_block        *block;
+    struct evpl_iovec_cursor   cursor;
+    uint64_t                   offset, length;
+    uint32_t                   eof = 0;
+    uint64_t                   first_block, last_block, max_iov, bi;
+    uint32_t                   block_offset, left, block_len;
+    struct evpl_iovec         *iov;
+    int                        niov = 0;
+    struct timespec            now;
 
-    clock_gettime(CLOCK_REALTIME, &now);
+    chimera_vfs_realtime(&now);
 
     offset = request->read.offset;
     length = request->read.length;
+
+    /* memfs advertises CAP_READ_PROVIDES_BUFFERS: it returns zero-copy refs to
+     * its own SHARED block iovecs, so the VFS core never pre-allocates buffers
+     * for it (buffers_provided is always 0).  If a future VFS data cache ever
+     * hands memfs buffers to populate, this is where memfs would memcpy its
+     * block data into request->read.iov instead of cloning refs below. */
+    chimera_memfs_abort_if(request->read.buffers_provided,
+                           "memfs read received VFS-provided buffers but only "
+                           "implements the zero-copy ref path");
 
     if (unlikely(length == 0)) {
         request->status        = CHIMERA_VFS_OK;
@@ -2251,29 +2832,25 @@ memfs_read(
         return;
     }
 
-    if (request->read.handle->vfs_private) {
-        inode = (struct memfs_inode *) request->read.handle->vfs_private;
-        pthread_mutex_lock(&inode->lock);
-    } else {
-        inode = memfs_inode_get_fh(shared, request->fh, request->fh_len);
+    inode = memfs_resolve_io(shared, request->read.handle,
+                             request->fh, request->fh_len, &stream);
 
-        if (unlikely(!inode)) {
-            request->status = CHIMERA_VFS_ENOENT;
-            request->complete(request);
-            return;
-        }
-
-    }
-
-    if (!memfs_cred_can_read(inode, request->cred)) {
-        pthread_mutex_unlock(&inode->lock);
-        request->status = CHIMERA_VFS_EACCES;
+    if (unlikely(!inode)) {
+        request->status = CHIMERA_VFS_ENOENT;
         request->complete(request);
         return;
     }
 
-    if (unlikely(inode->size <= offset)) {
-        memfs_map_attrs(shared, &request->read.r_attr, inode, request->fh);
+    fork      = stream ? &stream->fork : &inode->file;
+    fork_size = stream ? stream->size : inode->size;
+
+    /* Read authorization is enforced by the VFS-layer ACL gate (and the
+     * credential-keyed open cache), not by an ACL-blind mode check here -- so
+     * main's memfs_cred_can_read() check is intentionally dropped on this
+     * branch (it is undefined here and would double-evaluate / ignore ACLs). */
+
+    if (unlikely(fork_size <= offset)) {
+        memfs_map_attrs_fork(shared, &request->read.r_attr, inode, stream, request->fh);
         pthread_mutex_unlock(&inode->lock);
         request->status        = CHIMERA_VFS_OK;
         request->read.r_niov   = 0;
@@ -2283,8 +2860,8 @@ memfs_read(
         return;
     }
 
-    if (offset + length >= inode->size) {
-        length = inode->size > offset ? inode->size - offset : 0;
+    if (length >= fork_size - offset) {
+        length = fork_size - offset;
         eof    = 1;
     }
 
@@ -2292,7 +2869,7 @@ memfs_read(
         /* Nothing to read. Returning early also avoids the
          * (offset + length - 1) underflow below that would spin the
          * block loop on a zero-length request. */
-        memfs_map_attrs(shared, &request->read.r_attr, inode, request->fh);
+        memfs_map_attrs_fork(shared, &request->read.r_attr, inode, stream, request->fh);
         pthread_mutex_unlock(&inode->lock);
         request->status        = CHIMERA_VFS_OK;
         request->read.r_niov   = 0;
@@ -2323,8 +2900,8 @@ memfs_read(
             block_len = block_size - block_offset;
         }
 
-        if (inode->file.blocks && bi < inode->file.num_blocks) {
-            block = inode->file.blocks[bi];
+        if (fork->blocks && bi < fork->num_blocks) {
+            block = fork->blocks[bi];
         } else {
             block = NULL;
         }
@@ -2351,9 +2928,15 @@ memfs_read(
         left        -= block_len;
     }
 
-    inode->atime = now;
+    /* relatime: only advance atime when the file changed since last access or
+     * the recorded atime is a day stale, so steady-state reads return identical
+     * attrs (and stop churning the VFS attr cache). */
+    if (!shared->noatime &&
+        chimera_vfs_relatime_needs_update(&inode->atime, &inode->mtime, &inode->ctime, &now)) {
+        inode->atime = now;
+    }
 
-    memfs_map_attrs(shared, &request->read.r_attr, inode, request->fh);
+    memfs_map_attrs_fork(shared, &request->read.r_attr, inode, stream, request->fh);
 
     pthread_mutex_unlock(&inode->lock);
 
@@ -2372,19 +2955,22 @@ memfs_write(
     struct chimera_vfs_request *request,
     void                       *private_data)
 {
-    struct evpl             *evpl = thread->evpl;
-    struct memfs_inode      *inode;
-    struct memfs_block     **blocks, *block, *old_block;
-    struct evpl_iovec_cursor cursor, old_block_cursor;
-    uint64_t                 first_block, last_block, bi;
-    uint32_t                 block_offset, left, block_len;
-    struct timespec          now;
+    struct evpl               *evpl = thread->evpl;
+    struct memfs_inode        *inode;
+    struct memfs_named_stream *stream;
+    struct memfs_fork         *fork;
+    uint64_t                  *p_size, *p_space_used;
+    struct memfs_block       **blocks, *block, *old_block;
+    struct evpl_iovec_cursor   cursor, old_block_cursor;
+    uint64_t                   first_block, last_block, bi;
+    uint32_t                   block_offset, left, block_len;
+    struct timespec            now;
 
-    clock_gettime(CLOCK_REALTIME, &now);
+    chimera_vfs_realtime(&now);
 
-    const uint32_t           block_size  = shared->block_size;
-    const uint32_t           block_shift = shared->block_shift;
-    const uint32_t           block_mask  = shared->block_mask;
+    const uint32_t             block_size  = shared->block_size;
+    const uint32_t             block_shift = shared->block_shift;
+    const uint32_t             block_mask  = shared->block_mask;
 
     evpl_iovec_cursor_init(&cursor, request->write.iov, request->write.niov);
 
@@ -2394,17 +2980,13 @@ memfs_write(
         block_shift;
     left = request->write.length;
 
-    if (request->write.handle->vfs_private) {
-        inode = (struct memfs_inode *) request->write.handle->vfs_private;
-        pthread_mutex_lock(&inode->lock);
-    } else {
-        inode = memfs_inode_get_fh(shared, request->fh, request->fh_len);
+    inode = memfs_resolve_io(shared, request->write.handle,
+                             request->fh, request->fh_len, &stream);
 
-        if (unlikely(!inode)) {
-            request->status = CHIMERA_VFS_ENOENT;
-            request->complete(request);
-            return;
-        }
+    if (unlikely(!inode)) {
+        request->status = CHIMERA_VFS_ENOENT;
+        request->complete(request);
+        return;
     }
 
     if (!S_ISREG(inode->mode)) {
@@ -2415,33 +2997,33 @@ memfs_write(
         return;
     }
 
-    if (!memfs_cred_can_write(inode, request->cred)) {
-        request->status = CHIMERA_VFS_EACCES;
-        pthread_mutex_unlock(&inode->lock);
-        request->complete(request);
-        return;
-    }
+    fork         = stream ? &stream->fork : &inode->file;
+    p_size       = stream ? &stream->size : &inode->size;
+    p_space_used = stream ? &stream->space_used : &inode->space_used;
 
-    memfs_map_attrs(shared, &request->write.r_pre_attr, inode, request->fh);
+    /* Write access is enforced at the VFS layer (credential-keyed gate); see
+     * the note in memfs_open_at. */
+
+    memfs_map_attrs_fork(shared, &request->write.r_pre_attr, inode, stream, request->fh);
 
     if (request->write.length == 0) {
         /* A zero-length write changes nothing. Returning early also avoids
          * the (offset + length - 1) underflow above, which drives last_block
          * to a huge value and spins the 32-bit block-growth loop forever. */
-        memfs_map_attrs(shared, &request->write.r_post_attr, inode, request->fh);
+        memfs_map_attrs_fork(shared, &request->write.r_post_attr, inode, stream, request->fh);
         pthread_mutex_unlock(&inode->lock);
         request->status         = CHIMERA_VFS_OK;
         request->write.r_length = 0;
-        request->write.r_sync   = 1;
+        request->write.r_sync   = CHIMERA_VFS_WRITE_FILESYNC;
         request->complete(request);
         return;
     }
 
-    if (inode->file.max_blocks <= last_block || !inode->file.blocks) {
+    if (fork->max_blocks <= last_block || !fork->blocks) {
         struct memfs_block **new_blocks;
         unsigned int         new_max_blocks;
 
-        blocks = inode->file.blocks;
+        blocks = fork->blocks;
 
         new_max_blocks = 1024;
 
@@ -2449,7 +3031,11 @@ memfs_write(
             new_max_blocks <<= 1;
         }
 
-        new_blocks = malloc(new_max_blocks * sizeof(struct memfs_block *));
+        /* calloc (not malloc+memset) so a sparse write at a high block index
+         * does not force the whole pointer array resident: large allocations
+         * are served by mmap and the unwritten tail stays backed by the zero
+         * page until a block is actually stored there. */
+        new_blocks = calloc(new_max_blocks, sizeof(struct memfs_block *));
 
         if (!new_blocks) {
             pthread_mutex_unlock(&inode->lock);
@@ -2460,22 +3046,17 @@ memfs_write(
 
         if (blocks) {
             memcpy(new_blocks, blocks,
-                   inode->file.num_blocks * sizeof(struct memfs_block *));
+                   fork->num_blocks * sizeof(struct memfs_block *));
             free(blocks);
         }
 
-        memset(new_blocks + inode->file.num_blocks,
-               0,
-               (new_max_blocks - inode->file.num_blocks) *
-               sizeof(struct memfs_block *));
-
-        inode->file.blocks     = new_blocks;
-        inode->file.max_blocks = new_max_blocks;
+        fork->blocks     = new_blocks;
+        fork->max_blocks = new_max_blocks;
     }
 
     /* Only increase num_blocks, never decrease it during write */
-    if (last_block + 1 > inode->file.num_blocks) {
-        inode->file.num_blocks = last_block + 1;
+    if (last_block + 1 > fork->num_blocks) {
+        fork->num_blocks = last_block + 1;
     }
 
     for (bi = first_block; bi <= last_block; bi++) {
@@ -2486,7 +3067,7 @@ memfs_write(
             block_len = left;
         }
 
-        old_block = inode->file.blocks ? inode->file.blocks[bi] : NULL;
+        old_block = fork->blocks ? fork->blocks[bi] : NULL;
 
         block = memfs_block_alloc(thread);
 
@@ -2520,7 +3101,7 @@ memfs_write(
                                        block_size - block_len -
                                        block_offset);
 
-                inode->file.blocks[bi] = NULL;
+                fork->blocks[bi] = NULL;
                 memfs_block_free(thread, old_block);
             } else {
                 memset(block->iov[0].data, 0, block_offset);
@@ -2530,7 +3111,7 @@ memfs_write(
             }
         } else if (old_block) {
             /* Full block overwrite: free the old block */
-            inode->file.blocks[bi] = NULL;
+            fork->blocks[bi] = NULL;
             memfs_block_free(thread, old_block);
         }
 
@@ -2538,26 +3119,26 @@ memfs_write(
                                block->iov[0].data + block_offset,
                                block_len);
 
-        inode->file.blocks[bi] = block;
-        block_offset           = 0;
-        left                  -= block_len;
+        fork->blocks[bi] = block;
+        block_offset     = 0;
+        left            -= block_len;
     }
 
-    if (inode->size < request->write.offset + request->write.length) {
-        inode->size       = request->write.offset + request->write.length;
-        inode->space_used = (inode->size + 4095) & ~4095;
+    if (*p_size < request->write.offset + request->write.length) {
+        *p_size       = request->write.offset + request->write.length;
+        *p_space_used = (*p_size + 4095) & ~4095;
     }
 
     inode->mtime = now;
     inode->ctime = now;
 
-    memfs_map_attrs(shared, &request->write.r_post_attr, inode, request->fh);
+    memfs_map_attrs_fork(shared, &request->write.r_post_attr, inode, stream, request->fh);
 
     pthread_mutex_unlock(&inode->lock);
 
     request->status         = CHIMERA_VFS_OK;
     request->write.r_length = request->write.length;
-    request->write.r_sync   = 1;
+    request->write.r_sync   = CHIMERA_VFS_WRITE_FILESYNC;
 
     request->complete(request);
 } /* memfs_write */
@@ -2570,26 +3151,29 @@ memfs_allocate(
     struct chimera_vfs_request *request,
     void                       *private_data)
 {
-    struct evpl        *evpl = thread->evpl;
-    struct memfs_inode *inode;
-    struct timespec     now;
+    struct evpl               *evpl = thread->evpl;
+    struct memfs_inode        *inode;
+    struct memfs_named_stream *stream;
+    struct memfs_fork         *fork;
+    uint64_t                  *p_size, *p_space_used;
+    struct timespec            now;
 
-    clock_gettime(CLOCK_REALTIME, &now);
+    chimera_vfs_realtime(&now);
 
-    if (request->allocate.handle->vfs_private) {
-        inode = (struct memfs_inode *) request->allocate.handle->vfs_private;
-        pthread_mutex_lock(&inode->lock);
-    } else {
-        inode = memfs_inode_get_fh(shared, request->fh, request->fh_len);
+    inode = memfs_resolve_io(shared, request->allocate.handle,
+                             request->fh, request->fh_len, &stream);
 
-        if (unlikely(!inode)) {
-            request->status = CHIMERA_VFS_ENOENT;
-            request->complete(request);
-            return;
-        }
+    if (unlikely(!inode)) {
+        request->status = CHIMERA_VFS_ENOENT;
+        request->complete(request);
+        return;
     }
 
-    memfs_map_attrs(shared, &request->allocate.r_pre_attr, inode, request->fh);
+    fork         = stream ? &stream->fork : &inode->file;
+    p_size       = stream ? &stream->size : &inode->size;
+    p_space_used = stream ? &stream->space_used : &inode->space_used;
+
+    memfs_map_attrs_fork(shared, &request->allocate.r_pre_attr, inode, stream, request->fh);
 
     if (request->allocate.flags & CHIMERA_VFS_ALLOCATE_DEALLOCATE) {
         /* DEALLOCATE: punch hole in [offset, offset+length) */
@@ -2599,16 +3183,16 @@ memfs_allocate(
         uint64_t       hole_end    = hole_start + request->allocate.length;
         uint64_t       first_block, last_block, bi;
 
-        if (hole_end > inode->size) {
-            hole_end = inode->size;
+        if (hole_end > *p_size) {
+            hole_end = *p_size;
         }
 
-        if (hole_start < hole_end && inode->file.blocks) {
+        if (hole_start < hole_end && fork->blocks) {
             first_block = hole_start >> block_shift;
             last_block  = (hole_end - 1) >> block_shift;
 
-            for (bi = first_block; bi <= last_block && bi < inode->file.num_blocks; bi++) {
-                if (!inode->file.blocks[bi]) {
+            for (bi = first_block; bi <= last_block && bi < fork->num_blocks; bi++) {
+                if (!fork->blocks[bi]) {
                     continue;
                 }
 
@@ -2617,11 +3201,11 @@ memfs_allocate(
 
                 if (hole_start <= block_start && hole_end >= block_end) {
                     /* Entire block is within hole - free it */
-                    memfs_block_free(thread, inode->file.blocks[bi]);
-                    inode->file.blocks[bi] = NULL;
+                    memfs_block_free(thread, fork->blocks[bi]);
+                    fork->blocks[bi] = NULL;
                 } else {
                     /* Partial block - COW and zero the hole portion */
-                    struct memfs_block      *old_block = inode->file.blocks[bi];
+                    struct memfs_block      *old_block = fork->blocks[bi];
                     struct memfs_block      *new_block;
                     struct evpl_iovec_cursor old_cursor;
                     uint32_t                 zero_start, zero_end;
@@ -2656,15 +3240,15 @@ memfs_allocate(
                            zero_end - zero_start);
 
                     memfs_block_free(thread, old_block);
-                    inode->file.blocks[bi] = new_block;
+                    fork->blocks[bi] = new_block;
                 }
             }
 
-            inode->space_used = 0;
+            *p_space_used = 0;
 
-            for (bi = 0; bi < inode->file.num_blocks; bi++) {
-                if (inode->file.blocks[bi]) {
-                    inode->space_used += block_size;
+            for (bi = 0; bi < fork->num_blocks; bi++) {
+                if (fork->blocks[bi]) {
+                    *p_space_used += block_size;
                 }
             }
         }
@@ -2672,15 +3256,15 @@ memfs_allocate(
         /* ALLOCATE: extend file size if needed */
         uint64_t new_end = request->allocate.offset + request->allocate.length;
 
-        if (new_end > inode->size) {
-            inode->size = new_end;
+        if (new_end > *p_size) {
+            *p_size = new_end;
         }
     }
 
     inode->mtime = now;
     inode->ctime = now;
 
-    memfs_map_attrs(shared, &request->allocate.r_post_attr, inode, request->fh);
+    memfs_map_attrs_fork(shared, &request->allocate.r_post_attr, inode, stream, request->fh);
 
     pthread_mutex_unlock(&inode->lock);
 
@@ -2820,6 +3404,15 @@ memfs_copy_range(
         return;
     }
 
+    /* Range copy between named streams is not supported; a tagged vfs_private
+     * is a stream descriptor, not an inode pointer. */
+    if ((request->copy_range.src_handle->vfs_private & 1) ||
+        (request->copy_range.dst_handle->vfs_private & 1)) {
+        request->status = CHIMERA_VFS_ENOTSUP;
+        request->complete(request);
+        return;
+    }
+
     src_inode = (struct memfs_inode *) request->copy_range.src_handle->vfs_private;
     dst_inode = (struct memfs_inode *) request->copy_range.dst_handle->vfs_private;
 
@@ -2851,7 +3444,7 @@ memfs_copy_range(
         }
     }
 
-    clock_gettime(CLOCK_REALTIME, &now);
+    chimera_vfs_realtime(&now);
 
     /* Lock in deterministic order to avoid AB/BA deadlock */
     if (src_inode == dst_inode) {
@@ -3035,6 +3628,14 @@ memfs_move_range(
         return;
     }
 
+    /* Range move between named streams is not supported. */
+    if ((request->move_range.src_handle->vfs_private & 1) ||
+        (request->move_range.dst_handle->vfs_private & 1)) {
+        request->status = CHIMERA_VFS_ENOTSUP;
+        request->complete(request);
+        return;
+    }
+
     src_inode = (struct memfs_inode *) request->move_range.src_handle->vfs_private;
     dst_inode = (struct memfs_inode *) request->move_range.dst_handle->vfs_private;
 
@@ -3054,7 +3655,7 @@ memfs_move_range(
         }
     }
 
-    clock_gettime(CLOCK_REALTIME, &now);
+    chimera_vfs_realtime(&now);
 
     if (src_inode == dst_inode) {
         pthread_mutex_lock(&src_inode->lock);
@@ -3177,6 +3778,14 @@ memfs_clone_range(
         return;
     }
 
+    /* Range clone between named streams is not supported. */
+    if ((request->clone_range.src_handle->vfs_private & 1) ||
+        (request->clone_range.dst_handle->vfs_private & 1)) {
+        request->status = CHIMERA_VFS_ENOTSUP;
+        request->complete(request);
+        return;
+    }
+
     src_inode = (struct memfs_inode *) request->clone_range.src_handle->vfs_private;
     dst_inode = (struct memfs_inode *) request->clone_range.dst_handle->vfs_private;
 
@@ -3196,7 +3805,7 @@ memfs_clone_range(
         }
     }
 
-    clock_gettime(CLOCK_REALTIME, &now);
+    chimera_vfs_realtime(&now);
 
     if (src_inode == dst_inode) {
         pthread_mutex_lock(&src_inode->lock);
@@ -3309,24 +3918,26 @@ memfs_seek(
     struct chimera_vfs_request *request,
     void                       *private_data)
 {
-    struct memfs_inode *inode;
-    uint64_t            offset = request->seek.offset;
-    uint64_t            bi, block_start;
+    struct memfs_inode        *inode;
+    struct memfs_named_stream *stream;
+    struct memfs_fork         *fork;
+    uint64_t                   fork_size;
+    uint64_t                   offset = request->seek.offset;
+    uint64_t                   bi, block_start;
 
-    if (request->seek.handle->vfs_private) {
-        inode = (struct memfs_inode *) request->seek.handle->vfs_private;
-        pthread_mutex_lock(&inode->lock);
-    } else {
-        inode = memfs_inode_get_fh(shared, request->fh, request->fh_len);
+    inode = memfs_resolve_io(shared, request->seek.handle,
+                             request->fh, request->fh_len, &stream);
 
-        if (unlikely(!inode)) {
-            request->status = CHIMERA_VFS_ENOENT;
-            request->complete(request);
-            return;
-        }
+    if (unlikely(!inode)) {
+        request->status = CHIMERA_VFS_ENOENT;
+        request->complete(request);
+        return;
     }
 
-    if (offset >= inode->size) {
+    fork      = stream ? &stream->fork : &inode->file;
+    fork_size = stream ? stream->size : inode->size;
+
+    if (offset >= fork_size) {
         pthread_mutex_unlock(&inode->lock);
         request->seek.r_eof    = 1;
         request->seek.r_offset = 0;
@@ -3341,8 +3952,8 @@ memfs_seek(
         /* SEEK_DATA: find first non-NULL block from offset forward */
         bi = offset >> block_shift;
 
-        while (bi < inode->file.num_blocks) {
-            if (inode->file.blocks && inode->file.blocks[bi]) {
+        while (bi < fork->num_blocks) {
+            if (fork->blocks && fork->blocks[bi]) {
                 block_start = bi << block_shift;
 
                 request->seek.r_offset = (block_start > offset) ?
@@ -3367,8 +3978,8 @@ memfs_seek(
         /* SEEK_HOLE: find first NULL block or past num_blocks from offset */
         bi = offset >> block_shift;
 
-        while (bi < inode->file.num_blocks) {
-            if (!inode->file.blocks || !inode->file.blocks[bi]) {
+        while (bi < fork->num_blocks) {
+            if (!fork->blocks || !fork->blocks[bi]) {
                 block_start = bi << block_shift;
 
                 request->seek.r_offset = (block_start > offset) ?
@@ -3383,15 +3994,15 @@ memfs_seek(
         }
 
         /* Virtual hole at EOF - all blocks are data */
-        request->seek.r_offset = inode->file.num_blocks <<
+        request->seek.r_offset = fork->num_blocks <<
             block_shift;
 
         if (request->seek.r_offset < offset) {
             request->seek.r_offset = offset;
         }
 
-        if (request->seek.r_offset >= inode->size) {
-            request->seek.r_offset = inode->size;
+        if (request->seek.r_offset >= fork_size) {
+            request->seek.r_offset = fork_size;
         }
 
         request->seek.r_eof = 0;
@@ -3414,7 +4025,7 @@ memfs_symlink_at(
     struct timespec      now;
     uint64_t             hash;
 
-    clock_gettime(CLOCK_REALTIME, &now);
+    chimera_vfs_realtime(&now);
 
     hash = request->symlink_at.name_hash;
 
@@ -3559,7 +4170,7 @@ memfs_rename_at(
     struct timespec      now;
     uint64_t             hash, new_hash;
 
-    clock_gettime(CLOCK_REALTIME, &now);
+    chimera_vfs_realtime(&now);
 
     hash     = request->rename_at.name_hash;
     new_hash = request->rename_at.new_name_hash;
@@ -3791,7 +4402,7 @@ memfs_link_at(
     struct timespec      now;
     uint64_t             hash;
 
-    clock_gettime(CLOCK_REALTIME, &now);
+    chimera_vfs_realtime(&now);
 
     hash = request->link_at.name_hash;
 
@@ -4258,7 +4869,7 @@ memfs_set_xattr(
         inode->xattrs = xattr;
     }
 
-    clock_gettime(CLOCK_REALTIME, &now);
+    chimera_vfs_realtime(&now);
     inode->ctime = now;
 
     memfs_map_attrs(shared, &request->set_xattr.r_post_attr, inode, request->fh);
@@ -4357,7 +4968,7 @@ memfs_remove_xattr(
     free(xattr->value);
     free(xattr);
 
-    clock_gettime(CLOCK_REALTIME, &now);
+    chimera_vfs_realtime(&now);
     inode->ctime = now;
 
     memfs_map_attrs(shared, &request->remove_xattr.r_post_attr, inode, request->fh);
@@ -4367,6 +4978,220 @@ memfs_remove_xattr(
     request->status = CHIMERA_VFS_OK;
     request->complete(request);
 } /* memfs_remove_xattr */
+
+static void
+memfs_open_stream(
+    struct memfs_thread        *thread,
+    struct memfs_shared        *shared,
+    struct chimera_vfs_request *request,
+    void                       *private_data)
+{
+    struct memfs_inode        *inode;
+    struct memfs_named_stream *stream;
+    struct memfs_stream_open  *so;
+    unsigned int               flags = request->open_stream.flags;
+    struct timespec            now;
+
+    chimera_vfs_realtime(&now);
+
+    inode = memfs_inode_get_fh(shared, request->fh, request->fh_len);
+
+    if (unlikely(!inode)) {
+        request->status = CHIMERA_VFS_ENOENT;
+        request->complete(request);
+        return;
+    }
+
+    /* Named streams attach only to regular files. */
+    if (!S_ISREG(inode->mode)) {
+        pthread_mutex_unlock(&inode->lock);
+        request->status = CHIMERA_VFS_EINVAL;
+        request->complete(request);
+        return;
+    }
+
+    stream = memfs_stream_find_by_name(inode, request->open_stream.name,
+                                       request->open_stream.namelen);
+
+    if (!stream) {
+        if (!(flags & CHIMERA_VFS_OPEN_CREATE)) {
+            pthread_mutex_unlock(&inode->lock);
+            request->status = CHIMERA_VFS_ENOENT;
+            request->complete(request);
+            return;
+        }
+
+        stream       = calloc(1, sizeof(*stream));
+        stream->name = malloc(request->open_stream.namelen);
+        memcpy(stream->name, request->open_stream.name,
+               request->open_stream.namelen);
+        stream->name_len               = request->open_stream.namelen;
+        stream->id                     = ++inode->next_stream_id;
+        stream->linked                 = 1;
+        stream->next                   = inode->streams;
+        inode->streams                 = stream;
+        inode->mtime                   = now;
+        inode->ctime                   = now;
+        request->open_stream.r_created = 1;
+    } else if (flags & CHIMERA_VFS_OPEN_EXCLUSIVE) {
+        pthread_mutex_unlock(&inode->lock);
+        request->status = CHIMERA_VFS_EEXIST;
+        request->complete(request);
+        return;
+    } else if (flags & CHIMERA_VFS_OPEN_TRUNCATE) {
+        memfs_fork_free_blocks(thread, &stream->fork);
+        stream->size       = 0;
+        stream->space_used = 0;
+        inode->mtime       = now;
+        inode->ctime       = now;
+    }
+
+    /* A stream open pins both the stream node and the base inode. */
+    stream->refcnt++;
+    inode->refcnt++;
+
+    so         = malloc(sizeof(*so));
+    so->inode  = inode;
+    so->stream = stream;
+
+    request->open_stream.r_vfs_private = (uint64_t) (uintptr_t) so | 1ULL;
+
+    memfs_map_attrs_fork(shared, &request->open_stream.r_attr, inode, stream,
+                         request->fh);
+
+    pthread_mutex_unlock(&inode->lock);
+
+    request->status = CHIMERA_VFS_OK;
+    request->complete(request);
+} /* memfs_open_stream */
+
+static void
+memfs_list_streams(
+    struct memfs_thread        *thread,
+    struct memfs_shared        *shared,
+    struct chimera_vfs_request *request,
+    void                       *private_data)
+{
+    struct memfs_inode             *inode;
+    struct memfs_named_stream      *stream;
+    uint8_t                        *buf    = request->list_streams.buffer;
+    uint32_t                        max    = request->list_streams.max_bytes;
+    uint32_t                        offset = 0;
+    uint32_t                        count  = 0;
+    struct chimera_vfs_stream_entry entry;
+    uint32_t                        rec;
+
+    inode = memfs_inode_get_fh(shared, request->fh, request->fh_len);
+
+    if (unlikely(!inode)) {
+        request->status = CHIMERA_VFS_ENOENT;
+        request->complete(request);
+        return;
+    }
+
+    /* Default unnamed data fork ("::$DATA"), reported first with an empty name
+     * so the SMB layer can format it as the default stream. */
+    rec = sizeof(entry);
+    if (offset + rec > max) {
+        pthread_mutex_unlock(&inode->lock);
+        request->status = CHIMERA_VFS_ERANGE;
+        request->complete(request);
+        return;
+    }
+    entry.size     = inode->size;
+    entry.alloc    = inode->space_used;
+    entry.name_len = 0;
+    memcpy(buf + offset, &entry, sizeof(entry));
+    offset += rec;
+    offset  = (offset + 7) & ~7u;
+    count++;
+
+    for (stream = inode->streams; stream; stream = stream->next) {
+        rec = sizeof(entry) + stream->name_len;
+        if (offset + rec > max) {
+            pthread_mutex_unlock(&inode->lock);
+            request->status = CHIMERA_VFS_ERANGE;
+            request->complete(request);
+            return;
+        }
+        entry.size     = stream->size;
+        entry.alloc    = stream->space_used;
+        entry.name_len = stream->name_len;
+        memcpy(buf + offset, &entry, sizeof(entry));
+        memcpy(buf + offset + sizeof(entry), stream->name, stream->name_len);
+        offset += rec;
+        offset  = (offset + 7) & ~7u;
+        count++;
+    }
+
+    pthread_mutex_unlock(&inode->lock);
+
+    request->list_streams.r_len    = offset;
+    request->list_streams.r_count  = count;
+    request->list_streams.r_eof    = 1;
+    request->list_streams.r_cookie = 0;
+    request->status                = CHIMERA_VFS_OK;
+    request->complete(request);
+} /* memfs_list_streams */
+
+static void
+memfs_remove_stream(
+    struct memfs_thread        *thread,
+    struct memfs_shared        *shared,
+    struct chimera_vfs_request *request,
+    void                       *private_data)
+{
+    struct memfs_inode        *inode;
+    struct memfs_named_stream *stream, **pprev;
+    struct timespec            now;
+
+    chimera_vfs_realtime(&now);
+
+    inode = memfs_inode_get_fh(shared, request->fh, request->fh_len);
+
+    if (unlikely(!inode)) {
+        request->status = CHIMERA_VFS_ENOENT;
+        request->complete(request);
+        return;
+    }
+
+    memfs_map_attrs(shared, &request->remove_stream.r_pre_attr, inode, request->fh);
+
+    pprev = &inode->streams;
+    for (stream = inode->streams; stream; stream = stream->next) {
+        if (stream->name_len == request->remove_stream.namelen &&
+            memcmp(stream->name, request->remove_stream.name,
+                   request->remove_stream.namelen) == 0) {
+            break;
+        }
+        pprev = &stream->next;
+    }
+
+    if (!stream) {
+        pthread_mutex_unlock(&inode->lock);
+        request->status = CHIMERA_VFS_ENOENT;
+        request->complete(request);
+        return;
+    }
+
+    /* Unlink from the inode's stream list.  If no handle holds it open, free it
+     * now; otherwise it survives (unlinked) until its last close. */
+    *pprev         = stream->next;
+    stream->linked = 0;
+
+    if (stream->refcnt == 0) {
+        memfs_stream_node_free(thread, stream);
+    }
+
+    inode->ctime = now;
+
+    memfs_map_attrs(shared, &request->remove_stream.r_post_attr, inode, request->fh);
+
+    pthread_mutex_unlock(&inode->lock);
+
+    request->status = CHIMERA_VFS_OK;
+    request->complete(request);
+} /* memfs_remove_stream */
 
 static void
 memfs_dispatch(
@@ -4385,6 +5210,9 @@ memfs_dispatch(
             break;
         case CHIMERA_VFS_OP_LOOKUP_AT:
             memfs_lookup_at(thread, shared, request, private_data);
+            break;
+        case CHIMERA_VFS_OP_GETPARENT:
+            memfs_getparent(thread, shared, request, private_data);
             break;
         case CHIMERA_VFS_OP_GETATTR:
             memfs_getattr(thread, shared, request, private_data);
@@ -4476,6 +5304,15 @@ memfs_dispatch(
         case CHIMERA_VFS_OP_REMOVE_XATTR:
             memfs_remove_xattr(thread, shared, request, private_data);
             break;
+        case CHIMERA_VFS_OP_OPEN_STREAM:
+            memfs_open_stream(thread, shared, request, private_data);
+            break;
+        case CHIMERA_VFS_OP_LIST_STREAMS:
+            memfs_list_streams(thread, shared, request, private_data);
+            break;
+        case CHIMERA_VFS_OP_REMOVE_STREAM:
+            memfs_remove_stream(thread, shared, request, private_data);
+            break;
         default:
             chimera_memfs_error("memfs_dispatch: unknown operation %d",
                                 request->opcode);
@@ -4491,7 +5328,9 @@ SYMBOL_EXPORT struct chimera_vfs_module vfs_memfs = {
     .capabilities = CHIMERA_VFS_CAP_CREATE_UNLINKED | CHIMERA_VFS_CAP_FS | CHIMERA_VFS_CAP_KV |
         CHIMERA_VFS_CAP_FS_RELATIVE_OP |
         CHIMERA_VFS_CAP_COPY_RANGE | CHIMERA_VFS_CAP_CLONE_RANGE | CHIMERA_VFS_CAP_MOVE_RANGE |
-        CHIMERA_VFS_CAP_XATTR | CHIMERA_VFS_CAP_LAYOUT | CHIMERA_VFS_CAP_ATOMIC_HANDLE_STATE,
+        CHIMERA_VFS_CAP_ACL_NATIVE | CHIMERA_VFS_CAP_XATTR | CHIMERA_VFS_CAP_LAYOUT |
+        CHIMERA_VFS_CAP_ATOMIC_HANDLE_STATE | CHIMERA_VFS_CAP_READ_PROVIDES_BUFFERS |
+        CHIMERA_VFS_CAP_NAMED_STREAMS | CHIMERA_VFS_CAP_RPL,
     .init           = memfs_init,
     .destroy        = memfs_destroy,
     .thread_init    = memfs_thread_init,

@@ -21,6 +21,7 @@
 #include "vfs/vfs_name_cache.h"
 #include "vfs/vfs_attr_cache.h"
 #include "vfs/vfs_user_cache.h"
+#include "vfs/vfs_identity.h"
 #include "vfs/vfs_notify.h"
 #include "vfs/vfs_state.h"
 #include "vfs/vfs_pnfs.h"
@@ -41,6 +42,33 @@
 #include "common/macros.h"
 #include "prometheus-c.h"
 
+SYMBOL_EXPORT struct chimera_vfs_clock chimera_vfs_clock;
+
+SYMBOL_EXPORT void
+chimera_vfs_clock_init(void)
+{
+    struct timespec ts;
+
+    if (chimera_vfs_clock.initialized) {
+        return; /* process-global singleton; first vfs wins */
+    }
+
+    stopwatch_context_init(&chimera_vfs_clock.ctx);
+
+    clock_gettime(CLOCK_REALTIME, &ts);
+    chimera_vfs_clock.base_wall_ns = (uint64_t) ts.tv_sec * 1000000000ULL + (uint64_t) ts.tv_nsec;
+    stopwatch_start(&chimera_vfs_clock.ctx, &chimera_vfs_clock.base_sw);
+    chimera_vfs_clock.delta_ns         = 0;
+    chimera_vfs_clock.last_refresh     = 0;
+    chimera_vfs_clock.refresh_interval = chimera_vfs_ns_to_ticks(1000000000ULL); /* ~1s */
+    chimera_vfs_clock.initialized      = 1;
+} /* chimera_vfs_clock_init */
+
+SYMBOL_EXPORT void
+chimera_vfs_clock_shutdown(void)
+{
+    chimera_vfs_clock.initialized = 0;
+} /* chimera_vfs_clock_shutdown */
 
 static void
 chimera_vfs_delegation_drain(struct chimera_vfs_delegation_thread *delegation_thread)
@@ -144,13 +172,10 @@ chimera_vfs_close_thread_sweep(
     uint64_t                         min_age)
 {
     struct chimera_vfs_thread      *thread = close_thread->vfs_thread;
-    struct timespec                 now;
-    uint64_t                        count = 0;
+    uint64_t                        count  = 0;
     struct chimera_vfs_open_handle *handles, *handle;
 
-    clock_gettime(CLOCK_MONOTONIC, &now);
-
-    handles = chimera_vfs_open_cache_defer_close(cache, &now, min_age, &count);
+    handles = chimera_vfs_open_cache_defer_close(cache, chimera_vfs_now_ticks(), min_age, &count);
 
     while (handles) {
 
@@ -166,6 +191,10 @@ chimera_vfs_close_thread_sweep(
                           chimera_vfs_close_thread_callback,
                           close_thread);
 
+        /* defer_close removed the handle from the bucket but frees the struct
+         * here (not via open_cache_free), so drop its anchored lease ref. */
+        chimera_vfs_file_state_release(handle->file_state);
+
         free(handle);
     }
 
@@ -178,33 +207,40 @@ chimera_vfs_close_thread_wake_shutdown(
     struct evpl_doorbell *doorbell)
 {
     struct chimera_vfs_close_thread *close_thread = container_of(doorbell, struct chimera_vfs_close_thread, doorbell);
+    int                              shutdown     = close_thread->shutdown;
     uint64_t                         min_age, count;
 
-    pthread_mutex_lock(&close_thread->lock);
+    min_age = shutdown ? 0 : 100000000UL;
 
-    if (close_thread->shutdown) {
-        min_age = 0;
-    } else {
-        min_age = 100000000UL;
-    }
-
+    /* Sweep OUTSIDE close_thread->lock.  A close can re-enter this thread's
+     * event loop -- diskfs commit drains its submission queue with a nested
+     * evpl_continue() -- which re-fires this doorbell (and the periodic timer)
+     * on this same thread; holding the lock across the sweep would self-deadlock
+     * when the re-entrant callback tries to re-acquire it.  The lock guards only
+     * the shutdown cond handshake with chimera_vfs_destroy, and the sweep state
+     * it touches (num_pending, the open caches) is owned by this thread / the
+     * per-shard cache locks, so it needs no protection here. */
     count  = chimera_vfs_close_thread_sweep(evpl, close_thread, close_thread->vfs->vfs_open_path_cache, min_age);
     count += chimera_vfs_close_thread_sweep(evpl, close_thread, close_thread->vfs->vfs_open_file_cache, min_age);
 
-    if (close_thread->shutdown && count == 0 && close_thread->num_pending == 0) {
-        pthread_cond_signal(&close_thread->cond);
+    if (!shutdown) {
+        return;
+    }
+
+    if (count == 0 && close_thread->num_pending == 0) {
+        /* Fully drained: hand off to the waiter in chimera_vfs_destroy.  Signal
+         * under the lock so the wakeup can't be lost against its cond_wait. */
+        pthread_mutex_lock(&close_thread->lock);
         close_thread->signaled = 1;
+        pthread_cond_signal(&close_thread->cond);
         pthread_mutex_unlock(&close_thread->lock);
         return;
     }
 
-    if (close_thread->shutdown) {
-        evpl_ring_doorbell(doorbell);
-    }
+    /* Closes still in flight -- keep sweeping until they complete. */
+    evpl_ring_doorbell(doorbell);
 
-    pthread_mutex_unlock(&close_thread->lock);
-
-} /* chimera_vfs_close_thread_wake */
+} /* chimera_vfs_close_thread_wake_shutdown */
 
 static void
 chimera_vfs_close_thread_wake_timer(
@@ -214,14 +250,14 @@ chimera_vfs_close_thread_wake_timer(
     struct chimera_vfs_close_thread *close_thread = container_of(timer, struct chimera_vfs_close_thread, timer);
     uint64_t                         min_age;
 
-    pthread_mutex_lock(&close_thread->lock);
-
     min_age = 100000000UL;
 
+    /* No lock: the periodic sweep touches only this thread's state (num_pending)
+     * and the open caches (guarded by their own per-shard locks).  Holding
+     * close_thread->lock here would self-deadlock if a close re-enters the event
+     * loop and re-fires this timer (see chimera_vfs_close_thread_wake_shutdown). */
     chimera_vfs_close_thread_sweep(evpl, close_thread, close_thread->vfs->vfs_open_path_cache, min_age);
     chimera_vfs_close_thread_sweep(evpl, close_thread, close_thread->vfs->vfs_open_file_cache, min_age);
-
-    pthread_mutex_unlock(&close_thread->lock);
 
     /* Drop implicit I/O leases that have gone idle, bounding resident
      * per-file state for write-once / read-once workloads. */
@@ -387,6 +423,19 @@ chimera_vfs_init(
     void                      *handle;
     const char                *effective_kv_module;
 
+    /* Bring up the process-wide TSC clock before any cache/timestamp use. */
+    chimera_vfs_clock_init();
+
+    /* Scale RCU reclaim across CPUs: spawn one call_rcu worker per CPU so the
+     * fungible-cache retire callbacks (attr/name/rpl) keep up with per-request
+     * churn.  Without this liburcu uses a single default worker for the whole
+     * process.  Best-effort -- on failure call_rcu falls back to that default
+     * worker. */
+    if (create_all_cpu_call_rcu_data(0) != 0) {
+        chimera_vfs_error("Failed to create per-CPU call_rcu workers; "
+                          "falling back to the default RCU reclaim thread");
+    }
+
     vfs = calloc(1, sizeof(*vfs));
 
     /* Synthesize machine name for identification */
@@ -396,10 +445,10 @@ chimera_vfs_init(
 
     if (metrics) {
         vfs->metrics.metrics    = metrics;
-        vfs->metrics.op_latency = prometheus_metrics_create_histogram_exponential(metrics,
-                                                                                  "chimera_vfs_op_latency",
-                                                                                  "The latency of VFS operations",
-                                                                                  24);
+        vfs->metrics.op_latency = prometheus_metrics_create_histogram_time(metrics,
+                                                                           "chimera_vfs_op_latency_nanoseconds",
+                                                                           "The latency of VFS operations in nanoseconds",
+                                                                           34);
 
         vfs->metrics.op_latency_series = calloc(CHIMERA_VFS_OP_NUM, sizeof(struct prometheus_histogram_series *));
 
@@ -422,6 +471,7 @@ chimera_vfs_init(
     vfs->vfs_attr_cache = chimera_vfs_attr_cache_create(8, 4, 2, cache_ttl, metrics);
 
     vfs->vfs_user_cache = chimera_vfs_user_cache_create(8192, 600);
+    vfs->identity       = chimera_vfs_identity_create(vfs, 4);
 
     vfs->vfs_notify = chimera_vfs_notify_init(vfs);
     vfs->vfs_state  = chimera_vfs_state_init();
@@ -510,6 +560,14 @@ chimera_vfs_init(
     return vfs;
 } /* chimera_vfs_init */
 
+SYMBOL_EXPORT void
+chimera_vfs_set_tcp_flavor(
+    struct chimera_vfs     *vfs,
+    enum chimera_tcp_flavor flavor)
+{
+    vfs->tcp_flavor = flavor;
+} /* chimera_vfs_set_tcp_flavor */
+
 SYMBOL_EXPORT int
 chimera_vfs_fh_is_plausible(
     struct chimera_vfs_thread *thread,
@@ -548,6 +606,14 @@ chimera_vfs_destroy(struct chimera_vfs *vfs)
 
     pthread_cond_wait(&vfs->close_thread.cond, &vfs->close_thread.lock);
     pthread_mutex_unlock(&vfs->close_thread.lock);
+
+    /* Stop the identity resolver first: its workers ring protocol/delegation
+     * thread doorbells and write the user cache, both of which must still be
+     * alive while the workers drain. */
+    if (vfs->identity) {
+        chimera_vfs_identity_destroy(vfs->identity);
+        vfs->identity = NULL;
+    }
 
     /* Destroy delegation threads before the close thread so that any
      * in-flight delegated close operations finish and their completion
@@ -606,6 +672,10 @@ chimera_vfs_destroy(struct chimera_vfs *vfs)
     chimera_vfs_open_cache_destroy(vfs->vfs_open_path_cache);
     chimera_vfs_open_cache_destroy(vfs->vfs_open_file_cache);
 
+    /* All RCU caches are destroyed above and each drained via rcu_barrier(), so
+     * no callbacks remain; tear down the per-CPU call_rcu workers. */
+    free_all_cpu_call_rcu_data();
+
     if (vfs->metrics.op_latency) {
         for (int i = 0; i < CHIMERA_VFS_OP_NUM; i++) {
             prometheus_histogram_destroy_series(vfs->metrics.op_latency, vfs->metrics.op_latency_series[i]);
@@ -613,6 +683,8 @@ chimera_vfs_destroy(struct chimera_vfs *vfs)
         free(vfs->metrics.op_latency_series);
         prometheus_histogram_destroy(vfs->metrics.metrics, vfs->metrics.op_latency);
     }
+
+    chimera_vfs_clock_shutdown();
 
     free(vfs);
 } /* chimera_vfs_destroy */
@@ -653,13 +725,15 @@ chimera_vfs_process_completion(
         chimera_vfs_state_io_resume(request);
     }
 
+    /* Deliver any identity-resolver jobs that completed for this thread. */
+    chimera_vfs_identity_thread_complete(thread);
+
 } /* chimera_vfs_process_completion */
 
 SYMBOL_EXPORT void
 chimera_vfs_watchdog(struct chimera_vfs_thread *thread)
 {
     struct chimera_vfs_request *request;
-    struct timespec             now;
     uint64_t                    elapsed;
 
     request = thread->active_requests;
@@ -668,9 +742,7 @@ chimera_vfs_watchdog(struct chimera_vfs_thread *thread)
         return;
     }
 
-    clock_gettime(CLOCK_MONOTONIC, &now);
-
-    elapsed = chimera_get_elapsed_ns(&now, &request->start_time);
+    elapsed = prometheus_stopwatch_elapsed_ns(&request->start_time);
 
     if (elapsed > 10000000000UL) {
         chimera_vfs_debug("oldest request has been active for %lu ns", elapsed);
@@ -691,6 +763,20 @@ chimera_vfs_thread_init(
     thread       = calloc(1, sizeof(*thread));
     thread->evpl = evpl;
     thread->vfs  = vfs;
+
+    /* Assign this thread a stable RCU recycle stripe (shared across its pools).
+     * Entries it allocates record this stripe and are returned to it after the
+     * grace period, so its recycle traffic stays on one stripe regardless of
+     * CPU migration -- and never strands in a stripe nothing pops. */
+    {
+        static uint32_t rcu_stripe_seq;
+        uint32_t        s = __atomic_fetch_add(&rcu_stripe_seq, 1, __ATOMIC_RELAXED);
+        int             p;
+
+        for (p = 0; p < CHIMERA_RCU_POOL_COUNT; p++) {
+            thread->rcu_magazines[p].stripe = s;
+        }
+    }
 
     if (vfs->metrics.metrics) {
         thread->metrics.op_latency_series = calloc(CHIMERA_VFS_OP_NUM, sizeof(struct prometheus_histogram_instance *));
@@ -779,6 +865,12 @@ chimera_vfs_thread_destroy(struct chimera_vfs_thread *thread)
         free(thread->metrics.op_latency_series);
     }
 
+    /* Return this thread's recycled RCU cache entries to their pool depots so
+     * they are reclaimed at cache destroy (the pools outlive the threads). */
+    for (i = 0; i < CHIMERA_RCU_POOL_COUNT; i++) {
+        chimera_rcu_magazine_drain(&thread->rcu_magazines[i]);
+    }
+
     free(thread);
 
     urcu_memb_unregister_thread();
@@ -792,7 +884,7 @@ chimera_vfs_register(
 {
     vfs->modules[module->fh_magic] = module;
 
-    vfs->module_private[module->fh_magic] = module->init(cfgdata);
+    vfs->module_private[module->fh_magic] = module->init(cfgdata, vfs->metrics.metrics);
 
     if (vfs->module_private[module->fh_magic] == NULL) {
         chimera_vfs_error("Failed to initialize module %s", module->name);
@@ -858,6 +950,57 @@ chimera_vfs_user_is_member(
 {
     return chimera_vfs_user_cache_is_member(vfs->vfs_user_cache, uid, gid);
 } /* chimera_vfs_user_is_member */
+
+SYMBOL_EXPORT int
+chimera_vfs_identity_uid_to_sid(
+    struct chimera_vfs *vfs,
+    uint32_t            uid,
+    char               *buf,
+    int                 buflen)
+{
+    const struct chimera_vfs_user *user;
+    int                            rc = -1;
+
+    urcu_memb_read_lock();
+
+    user = chimera_vfs_user_cache_lookup_by_uid(vfs->vfs_user_cache, uid);
+
+    if (user && user->sid[0]) {
+        int len = (int) strlen(user->sid);
+
+        if (len + 1 <= buflen) {
+            memcpy(buf, user->sid, len + 1);
+            rc = len;
+        }
+    }
+
+    urcu_memb_read_unlock();
+
+    return rc;
+} /* chimera_vfs_identity_uid_to_sid */
+
+SYMBOL_EXPORT int
+chimera_vfs_identity_sid_to_uid(
+    struct chimera_vfs *vfs,
+    const char         *sid,
+    uint32_t           *uid)
+{
+    const struct chimera_vfs_user *user;
+    int                            rc = -1;
+
+    urcu_memb_read_lock();
+
+    user = chimera_vfs_user_cache_lookup_by_sid(vfs->vfs_user_cache, sid);
+
+    if (user) {
+        *uid = user->uid;
+        rc   = 0;
+    }
+
+    urcu_memb_read_unlock();
+
+    return rc;
+} /* chimera_vfs_identity_sid_to_uid */
 
 
 SYMBOL_EXPORT void
