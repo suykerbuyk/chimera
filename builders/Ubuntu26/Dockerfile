@@ -17,6 +17,7 @@ RUN apt-get -y update && \
             librdmacm-dev libjansson-dev libxxhash-dev liburcu-dev libunwind-dev libssl-dev \
             openssl libnuma-dev curl ca-certificates make libcurl4-openssl-dev libnfs-dev \
 	    iproute2 libs3-dev python3 python3-pip python3-venv python3-requests pkg-config \
+	    dh-python build-essential pybuild-plugin-pyproject debhelper-compat \
 	    libwbclient-dev
 
 # install uncrustify version 0.78
