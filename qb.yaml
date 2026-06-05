@@ -334,7 +334,7 @@ tasks:
         -DKVM_IMAGE_CACHE_REGISTRY=repository.mdh.quantum.com:5004/cache
         -S /context -B /build
       - ninja
-      - ctest --output-on-failure --test-output-size-failed 65536 --timeout 300 -j 24
+      - ctest --output-on-failure --test-output-size-failed 65536 --timeout 300 -j 32
     dependencies:
       builder:
         project: chimera
@@ -357,7 +357,7 @@ tasks:
         -DKVM_IMAGE_CACHE_REGISTRY=repository.mdh.quantum.com:5004/cache
         -S /context -B /build
       - ninja
-      - ctest --output-on-failure --test-output-size-failed 65536 --timeout 300 -j 24
+      - ctest --output-on-failure --test-output-size-failed 65536 --timeout 300 -j 32
     dependencies:
       builder:
         project: chimera
