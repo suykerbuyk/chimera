@@ -179,6 +179,7 @@ struct cairn_inode {
     struct timespec mtime;
     struct timespec ctime;
     struct timespec btime;
+    uint32_t        dos_attributes;
 };
 
 struct cairn_inode_handle {
@@ -854,11 +855,11 @@ cairn_map_acl(
  */
 static void
 cairn_inherit_acl(
-    struct cairn_thread            *thread,
-    struct cairn_inode             *child,
-    uint64_t                        parent_inum,
-    const struct chimera_vfs_attrs *set_attr,
-    int                             windows_default)
+    struct cairn_thread      *thread,
+    struct cairn_inode       *child,
+    uint64_t                  parent_inum,
+    const struct chimera_acl *new_acl,
+    int                       windows_default)
 {
     static __thread uint8_t pbuf[CAIRN_ACL_STRUCT_SCRATCH];
     struct chimera_acl     *pacl   = (struct chimera_acl *) pbuf;
@@ -866,10 +867,16 @@ cairn_inherit_acl(
     uint16_t                want   = CHIMERA_ACE_FLAG_FILE_INHERIT |
         (is_dir ? CHIMERA_ACE_FLAG_DIR_INHERIT : 0);
 
-    if ((set_attr->va_set_mask & CHIMERA_VFS_ATTR_ACL) &&
-        set_attr->va_acl && set_attr->va_acl->num_aces) {
-        cairn_put_acl(thread, child->inum, set_attr->va_acl);
-        child->mode = (child->mode & S_IFMT) | chimera_acl_to_mode(set_attr->va_acl);
+    /* An explicit ACL supplied at create (e.g. an SMB SD via SecD) takes
+     * precedence over inheritance / the windows_default below.  The caller
+     * extracts new_acl from set_attr BEFORE cairn_apply_attrs() runs, since
+     * apply_attrs resets va_set_mask down to the bits it applied (ACL isn't
+     * one of them).  Passing the pointer explicitly avoids relying on a
+     * possibly-uninitialized set_attr->va_acl pointer in callers that don't
+     * always set ATTR_ACL (e.g., NFS3 creates). */
+    if (new_acl && new_acl->num_aces) {
+        cairn_put_acl(thread, child->inum, new_acl);
+        child->mode = (child->mode & S_IFMT) | chimera_acl_to_mode(new_acl);
         return;
     }
 
@@ -1213,11 +1220,12 @@ cairn_init(
          * enforcement a root-owned 0755 root would refuse all creation by
          * non-root clients on this engine-authoritative backend.  Subdirs are
          * still created owned by their creator with 0755. */
-        inode.mode  = S_IFDIR | 0777;
-        inode.atime = now;
-        inode.mtime = now;
-        inode.ctime = now;
-        inode.btime = now;
+        inode.mode           = S_IFDIR | 0777;
+        inode.atime          = now;
+        inode.mtime          = now;
+        inode.ctime          = now;
+        inode.btime          = now;
+        inode.dos_attributes = 0;
 
         super.fsid = chimera_rand64();
 
@@ -1696,6 +1704,11 @@ cairn_map_attrs(
         attr->va_ino        = inode->inum;
         attr->va_dev        = (42UL << 32) | 42;
         attr->va_rdev       = inode->rdev;
+
+        /* cairn persists DOS attributes natively, so report them alongside
+         * stat (matching memfs). */
+        attr->va_set_mask      |= CHIMERA_VFS_ATTR_DOS_ATTRIBUTES;
+        attr->va_dos_attributes = inode->dos_attributes;
     }
 
     /* Birth time (SMB create time) is tracked natively but lives outside
@@ -1758,7 +1771,7 @@ cairn_apply_attrs(
         attr->va_set_mask |= CHIMERA_VFS_ATTR_ATIME;
         if (attr->va_atime.tv_nsec == CHIMERA_VFS_TIME_NOW) {
             inode->atime = now;
-        } else {
+        } else if (attr->va_atime.tv_nsec != CHIMERA_VFS_TIME_OMIT) {
             inode->atime = attr->va_atime;
         }
     }
@@ -1767,7 +1780,7 @@ cairn_apply_attrs(
         attr->va_set_mask |= CHIMERA_VFS_ATTR_MTIME;
         if (attr->va_mtime.tv_nsec == CHIMERA_VFS_TIME_NOW) {
             inode->mtime = now;
-        } else {
+        } else if (attr->va_mtime.tv_nsec != CHIMERA_VFS_TIME_OMIT) {
             inode->mtime = attr->va_mtime;
         }
     }
@@ -1776,12 +1789,29 @@ cairn_apply_attrs(
         attr->va_set_mask |= CHIMERA_VFS_ATTR_BTIME;
         if (attr->va_btime.tv_nsec == CHIMERA_VFS_TIME_NOW) {
             inode->btime = now;
-        } else {
+        } else if (attr->va_btime.tv_nsec != CHIMERA_VFS_TIME_OMIT) {
             inode->btime = attr->va_btime;
         }
     }
 
-    inode->ctime = now;
+    if (set_mask & CHIMERA_VFS_ATTR_DOS_ATTRIBUTES) {
+        attr->va_set_mask    |= CHIMERA_VFS_ATTR_DOS_ATTRIBUTES;
+        inode->dos_attributes = attr->va_dos_attributes;
+    }
+
+    /* ctime: round-trip a caller-supplied change_time (SMB FileBasicInformation
+     * SetInfo) or preserve it on TIME_OMIT; otherwise stamp it with now for the
+     * implicit metadata change.  See memfs_apply_attrs() for the rationale. */
+    if (set_mask & CHIMERA_VFS_ATTR_CTIME) {
+        attr->va_set_mask |= CHIMERA_VFS_ATTR_CTIME;
+        if (attr->va_ctime.tv_nsec == CHIMERA_VFS_TIME_NOW) {
+            inode->ctime = now;
+        } else if (attr->va_ctime.tv_nsec != CHIMERA_VFS_TIME_OMIT) {
+            inode->ctime = attr->va_ctime;
+        }
+    } else {
+        inode->ctime = now;
+    }
 
 } /* cairn_apply_attrs */
 
@@ -2210,23 +2240,30 @@ cairn_mkdir_at(
     }
 
     cairn_alloc_inum(thread, &inode);
-    inode.parent_inum = parent_inode->inum; /* Set parent for ".." lookup */
-    inode.size        = 4096;
-    inode.space_used  = 4096;
-    inode.uid         = request->cred->uid;
-    inode.gid         = request->cred->gid;
-    inode.nlink       = 2;
-    inode.rdev        = 0;
-    inode.mode        = S_IFDIR | 0755;
-    inode.atime       = now;
-    inode.mtime       = now;
-    inode.ctime       = now;
-    inode.btime       = now;
+    inode.parent_inum    = parent_inode->inum; /* Set parent for ".." lookup */
+    inode.size           = 4096;
+    inode.space_used     = 4096;
+    inode.uid            = request->cred->uid;
+    inode.gid            = request->cred->gid;
+    inode.nlink          = 2;
+    inode.rdev           = 0;
+    inode.mode           = S_IFDIR | 0755;
+    inode.atime          = now;
+    inode.mtime          = now;
+    inode.ctime          = now;
+    inode.btime          = now;
+    inode.dos_attributes = 0;
+
+    /* Snapshot any explicit ACL pointer BEFORE cairn_apply_attrs() rewrites
+     * va_set_mask and drops the ATTR_ACL bit. */
+    const struct chimera_acl *new_acl_mkdir =
+        (request->mkdir_at.set_attr->va_set_mask & CHIMERA_VFS_ATTR_ACL)
+        ? request->mkdir_at.set_attr->va_acl : NULL;
 
     cairn_apply_attrs(&inode, request->mkdir_at.set_attr);
 
     cairn_inherit_acl(thread, &inode, parent_inode->inum,
-                      request->mkdir_at.set_attr,
+                      new_acl_mkdir,
                       request->cred->flavor == CHIMERA_VFS_AUTH_ATTR);
 
     cairn_map_attrs(shared, &request->mkdir_at.r_attr, &inode);
@@ -2315,17 +2352,18 @@ cairn_mknod_at(
     }
 
     cairn_alloc_inum(thread, &inode);
-    inode.parent_inum = parent_inode->inum;
-    inode.size        = 0;
-    inode.space_used  = 0;
-    inode.uid         = request->cred->uid;
-    inode.gid         = request->cred->gid;
-    inode.nlink       = 1;
-    inode.rdev        = 0;
-    inode.atime       = now;
-    inode.mtime       = now;
-    inode.ctime       = now;
-    inode.btime       = now;
+    inode.parent_inum    = parent_inode->inum;
+    inode.size           = 0;
+    inode.space_used     = 0;
+    inode.uid            = request->cred->uid;
+    inode.gid            = request->cred->gid;
+    inode.nlink          = 1;
+    inode.rdev           = 0;
+    inode.atime          = now;
+    inode.mtime          = now;
+    inode.ctime          = now;
+    inode.btime          = now;
+    inode.dos_attributes = 0;
 
     /* Set mode (including file type bits) and rdev from set_attr */
     if (request->mknod_at.set_attr->va_set_mask & CHIMERA_VFS_ATTR_MODE) {
@@ -2776,23 +2814,30 @@ cairn_open_at(
         is_new_inode = 1;
 
         cairn_alloc_inum(thread, &new_inode);
-        new_inode.size       = 0;
-        new_inode.space_used = 0;
-        new_inode.uid        = request->cred->uid;
-        new_inode.gid        = request->cred->gid;
-        new_inode.nlink      = 1;
-        new_inode.rdev       = 0;
-        new_inode.mode       = S_IFREG |  0644;
-        new_inode.atime      = now;
-        new_inode.mtime      = now;
-        new_inode.ctime      = now;
-        new_inode.btime      = now;
-        new_inode.refcnt     = 1;
+        new_inode.size           = 0;
+        new_inode.space_used     = 0;
+        new_inode.uid            = request->cred->uid;
+        new_inode.gid            = request->cred->gid;
+        new_inode.nlink          = 1;
+        new_inode.rdev           = 0;
+        new_inode.mode           = S_IFREG |  0644;
+        new_inode.atime          = now;
+        new_inode.mtime          = now;
+        new_inode.ctime          = now;
+        new_inode.btime          = now;
+        new_inode.dos_attributes = 0;
+        new_inode.refcnt         = 1;
+
+        /* Snapshot any explicit ACL pointer BEFORE cairn_apply_attrs() rewrites
+         * va_set_mask and drops the ATTR_ACL bit. */
+        const struct chimera_acl *new_acl_open =
+            (request->open_at.set_attr->va_set_mask & CHIMERA_VFS_ATTR_ACL)
+            ? request->open_at.set_attr->va_acl : NULL;
 
         cairn_apply_attrs(&new_inode, request->open_at.set_attr);
 
         cairn_inherit_acl(thread, &new_inode, parent_inode->inum,
-                          request->open_at.set_attr,
+                          new_acl_open,
                           request->cred->flavor == CHIMERA_VFS_AUTH_ATTR);
 
         new_dirent_value.inum     = new_inode.inum;
@@ -2803,6 +2848,12 @@ cairn_open_at(
 
         parent_inode->mtime = now;
         parent_inode->ctime = now;
+
+        /* Signal to the protocol layer that this open created the file (vs.
+         * opened an existing one) so the SMB CREATE reply reports the correct
+         * Create Action (FILE_CREATED vs FILE_OPENED) for OPEN_IF / SUPERSEDE /
+         * OVERWRITE_IF dispositions.  Matches memfs/diskfs. */
+        request->open_at.r_created = 1;
 
         inode = &new_inode;
     } else if (flags & CHIMERA_VFS_OPEN_EXCLUSIVE) {
@@ -2845,10 +2896,22 @@ cairn_open_at(
      * mishandles SMB control-only opens.  Access is enforced by the ACL-aware
      * VFS gate and the protocol create-time check, as on memfs/diskfs. */
 
-    if (!is_new_inode &&
-        (request->open_at.set_attr->va_set_mask & CHIMERA_VFS_ATTR_SIZE) &&
-        request->open_at.set_attr->va_size == 0 &&
-        S_ISREG(inode->mode)) {
+    if (!is_new_inode && S_ISREG(inode->mode) &&
+        (flags & CHIMERA_VFS_OPEN_TRUNCATE)) {
+        /* Overwrite/supersede disposition: replace the existing file's
+         * contents (truncate to zero) and apply the new attributes (including
+         * DOS attributes), mirroring memfs.  The SMB layer conveys the truncate
+         * via OPEN_TRUNCATE rather than a SIZE=0 set_attr, so key off the flag. */
+        if (inode->size) {
+            cairn_punch_hole(thread, shared, inode, 0, inode->size);
+        }
+        inode->size       = 0;
+        inode->space_used = 0;
+        cairn_apply_attrs(inode, request->open_at.set_attr);
+    } else if (!is_new_inode &&
+               (request->open_at.set_attr->va_set_mask & CHIMERA_VFS_ATTR_SIZE) &&
+               request->open_at.set_attr->va_size == 0 &&
+               S_ISREG(inode->mode)) {
         cairn_apply_attrs(inode, request->open_at.set_attr);
         inode->space_used = 0;
     }
@@ -3629,17 +3692,18 @@ cairn_symlink_at(
     }
 
     cairn_alloc_inum(thread, &new_inode);
-    new_inode.size       = request->symlink_at.targetlen;
-    new_inode.space_used = request->symlink_at.targetlen;
-    new_inode.uid        = request->cred->uid;
-    new_inode.gid        = request->cred->gid;
-    new_inode.nlink      = 1;
-    new_inode.rdev       = 0;
-    new_inode.mode       = S_IFLNK | 0755;
-    new_inode.atime      = now;
-    new_inode.mtime      = now;
-    new_inode.ctime      = now;
-    new_inode.btime      = now;
+    new_inode.size           = request->symlink_at.targetlen;
+    new_inode.space_used     = request->symlink_at.targetlen;
+    new_inode.uid            = request->cred->uid;
+    new_inode.gid            = request->cred->gid;
+    new_inode.nlink          = 1;
+    new_inode.rdev           = 0;
+    new_inode.mode           = S_IFLNK | 0755;
+    new_inode.atime          = now;
+    new_inode.mtime          = now;
+    new_inode.ctime          = now;
+    new_inode.btime          = now;
+    new_inode.dos_attributes = 0;
 
     dirent_value.inum     = new_inode.inum;
     dirent_value.name_len = request->symlink_at.namelen;

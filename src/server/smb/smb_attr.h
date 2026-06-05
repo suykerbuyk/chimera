@@ -154,12 +154,26 @@ chimera_smb_marshal_basic_attrs(
             break;
     } // switch
 
-    /* A regular file always reports at least ARCHIVE when it carries none of
-     * the settable attribute bits (so e.g. a sparse-but-otherwise-plain file
-     * still shows ARCHIVE, matching Windows). */
-    if ((smb_attr->smb_attributes & SMB_DOS_ATTR_SETTABLE) == 0 &&
-        (attr->va_mode & S_IFMT) == S_IFREG) {
-        smb_attr->smb_attributes |= SMB2_FILE_ATTRIBUTE_ARCHIVE;
+    /* SMB never reports an all-zero attribute word for a regular file.  How the
+     * empty set is filled depends on whether the backend persists DOS bits:
+     *
+     *  - Backend persists them (DOS_ATTRIBUTES in set_mask): report exactly what
+     *    is stored.  An empty set is FILE_ATTRIBUTE_NORMAL (0x80) -- a file
+     *    explicitly cleared to NORMAL must read back NORMAL, not a synthesized
+     *    ARCHIVE (smb2.winattr).  ARCHIVE is stamped and persisted at
+     *    create/modify time instead (see chimera_smb_create_issue_open).
+     *
+     *  - Backend does not persist them (passthrough linux/io_uring): synthesize
+     *    ARCHIVE for a plain file, matching Windows' default for a new file,
+     *    since there is no stored value to honor. */
+    if ((attr->va_mode & S_IFMT) == S_IFREG) {
+        if (attr->va_set_mask & CHIMERA_VFS_ATTR_DOS_ATTRIBUTES) {
+            if (smb_attr->smb_attributes == 0) {
+                smb_attr->smb_attributes |= SMB2_FILE_ATTRIBUTE_NORMAL;
+            }
+        } else if ((smb_attr->smb_attributes & SMB_DOS_ATTR_SETTABLE) == 0) {
+            smb_attr->smb_attributes |= SMB2_FILE_ATTRIBUTE_ARCHIVE;
+        }
     }
     smb_attr->smb_attr_mask |= SMB_ATTR_ATTRIBUTES;
 } /* chimera_smb_marshal_basic_attrs */
@@ -383,31 +397,48 @@ chimera_smb_unmarshal_basic_info(
     attr->va_req_mask = 0;
     attr->va_set_mask = 0;
 
-    /* Each timestamp is only applied when the client supplied a real value;
-     * the omit/freeze/thaw sentinels leave the stored value alone. */
+    /* MS-FSCC 2.4.7 FileBasicInformation: a non-zero timestamp replaces the
+     * stored value; a zero (or freeze/thaw sentinel) means "don't change".
+     * Carry every time field through to the backend even when it is omitted,
+     * using the TIME_OMIT sentinel — that way the implicit ctime bump (which
+     * apply_attrs would otherwise stamp because the co-present DOS-attribute
+     * change is a metadata write) is suppressed for the fields the client
+     * asked to leave alone.  apply_attrs treats TIME_OMIT as "preserve". */
     if (!chimera_smb_time_is_omit(smb_attrs->smb_atime)) {
         chimera_nt_to_epoch(smb_attrs->smb_atime, &attr->va_atime);
-        attr->va_req_mask |= CHIMERA_VFS_ATTR_ATIME;
-        attr->va_set_mask |= CHIMERA_VFS_ATTR_ATIME;
+    } else {
+        attr->va_atime.tv_sec  = 0;
+        attr->va_atime.tv_nsec = CHIMERA_VFS_TIME_OMIT;
     }
+    attr->va_req_mask |= CHIMERA_VFS_ATTR_ATIME;
+    attr->va_set_mask |= CHIMERA_VFS_ATTR_ATIME;
 
     if (!chimera_smb_time_is_omit(smb_attrs->smb_mtime)) {
         chimera_nt_to_epoch(smb_attrs->smb_mtime, &attr->va_mtime);
-        attr->va_req_mask |= CHIMERA_VFS_ATTR_MTIME;
-        attr->va_set_mask |= CHIMERA_VFS_ATTR_MTIME;
+    } else {
+        attr->va_mtime.tv_sec  = 0;
+        attr->va_mtime.tv_nsec = CHIMERA_VFS_TIME_OMIT;
     }
+    attr->va_req_mask |= CHIMERA_VFS_ATTR_MTIME;
+    attr->va_set_mask |= CHIMERA_VFS_ATTR_MTIME;
 
     if (!chimera_smb_time_is_omit(smb_attrs->smb_ctime)) {
         chimera_nt_to_epoch(smb_attrs->smb_ctime, &attr->va_ctime);
-        attr->va_req_mask |= CHIMERA_VFS_ATTR_CTIME;
-        attr->va_set_mask |= CHIMERA_VFS_ATTR_CTIME;
+    } else {
+        attr->va_ctime.tv_sec  = 0;
+        attr->va_ctime.tv_nsec = CHIMERA_VFS_TIME_OMIT;
     }
+    attr->va_req_mask |= CHIMERA_VFS_ATTR_CTIME;
+    attr->va_set_mask |= CHIMERA_VFS_ATTR_CTIME;
 
     if (!chimera_smb_time_is_omit(smb_attrs->smb_crttime)) {
         chimera_nt_to_epoch(smb_attrs->smb_crttime, &attr->va_btime);
-        attr->va_req_mask |= CHIMERA_VFS_ATTR_BTIME;
-        attr->va_set_mask |= CHIMERA_VFS_ATTR_BTIME;
+    } else {
+        attr->va_btime.tv_sec  = 0;
+        attr->va_btime.tv_nsec = CHIMERA_VFS_TIME_OMIT;
     }
+    attr->va_req_mask |= CHIMERA_VFS_ATTR_BTIME;
+    attr->va_set_mask |= CHIMERA_VFS_ATTR_BTIME;
 
     /* A FileAttributes value of 0 means "no change" (MS-FSCC 2.4.7); any
      * non-zero value replaces the persisted DOS attribute set. */

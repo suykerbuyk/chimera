@@ -88,7 +88,9 @@ static uint32_t
 chimera_nfs4_encode_ff_device_addr(
     uint8_t    *buf,
     const char *netid,
-    const char *uaddr)
+    const char *uaddr,
+    uint32_t    version,
+    uint32_t    minorversion)
 {
     void *p = buf;
 
@@ -97,10 +99,11 @@ chimera_nfs4_encode_ff_device_addr(
     pnfs_put_opaque(&p, netid, strlen(netid));
     pnfs_put_opaque(&p, uaddr, strlen(uaddr));
 
-    /* ffda_versions<>: one entry advertising NFSv3, loosely coupled. */
+    /* ffda_versions<>: one entry advertising the configured NFS version
+     * (NFSv3 or NFSv4.x), loosely coupled. */
     pnfs_put_u32(&p, 1);
-    pnfs_put_u32(&p, 3);                      /* ffdv_version          */
-    pnfs_put_u32(&p, 0);                      /* ffdv_minorversion     */
+    pnfs_put_u32(&p, version);                /* ffdv_version          */
+    pnfs_put_u32(&p, minorversion);           /* ffdv_minorversion     */
     pnfs_put_u32(&p, NFS4_PNFS_STRIPE_UNIT);  /* ffdv_rsize            */
     pnfs_put_u32(&p, NFS4_PNFS_STRIPE_UNIT);  /* ffdv_wsize            */
     pnfs_put_u32(&p, 0);                      /* ffdv_tightly_coupled=false */
@@ -150,7 +153,9 @@ chimera_nfs4_getdeviceinfo(
         (ds = chimera_vfs_pnfs_find_device(vfs, args->gdia_device_id)) != NULL) {
         /* Orchestrated flex: device lives in the chimera DS table. */
         out_type = LAYOUT4_FLEX_FILES;
-        body_len = chimera_nfs4_encode_ff_device_addr(body, ds->netid, ds->uaddr);
+        body_len = chimera_nfs4_encode_ff_device_addr(body, ds->netid, ds->uaddr,
+                                                      (uint32_t) ds->version,
+                                                      (uint32_t) ds->minorversion);
     } else if (nfs_pnfs_devcache_find(&thread->shared->nfs4_pnfs_devcache,
                                       args->gdia_device_id, &dev)) {
         /* Backend-sourced: device came from a get_layout response. */
@@ -178,7 +183,9 @@ chimera_nfs4_getdeviceinfo(
                 body_len = chimera_nfs4_encode_scsi_device_addr(body, &dev);
                 break;
             default:
-                body_len = chimera_nfs4_encode_ff_device_addr(body, dev.netid, dev.uaddr);
+                /* Backend-sourced flex device: not driven by the data_servers
+                 * config, so advertise NFSv3 as before. */
+                body_len = chimera_nfs4_encode_ff_device_addr(body, dev.netid, dev.uaddr, 3, 0);
                 break;
         } /* switch */
     } else {
@@ -514,13 +521,28 @@ ff_lg_emit(struct ff_layoutget_ctx *ctx)
         return;
     }
 
-    /* Unpack [deviceid][backing-fh-len][backing-fh]; recover the DS's native v3
-     * handle by skipping the nfs-module prefix. */
+    /* Unpack [deviceid][backing-fh-len][backing-fh]. */
     deviceid       = ctx->blob;
     backing_fh_len = ctx->blob[CHIMERA_VFS_DEVICEID_SIZE];
     backing_fh     = ctx->blob + CHIMERA_VFS_DEVICEID_SIZE + 1;
-    native_fh      = backing_fh + FF_BLOB_FH_SKIP;
-    native_fh_len  = backing_fh_len - FF_BLOB_FH_SKIP;
+
+    /* Recover the handle the client will use against the data server.  A remote
+     * DS is reached through the nfs proxy module, so the backing handle is the
+     * proxy's [mount-id][...] wrapper around the DS's native handle -- skip the
+     * wrapper.  A *local* DS (the MDS is also a data server, backed by a local
+     * mount) is served by this same server over NFS, so the DS handle IS the
+     * backing handle as stored -- skipping would corrupt it (see backing_local
+     * in chimera_server_pnfs_resolve). */
+    const struct chimera_vfs_ds *ds =
+        chimera_vfs_pnfs_find_device(req->thread->shared->vfs, deviceid);
+
+    if (ds && ds->backing_local) {
+        native_fh     = backing_fh;
+        native_fh_len = backing_fh_len;
+    } else {
+        native_fh     = backing_fh + FF_BLOB_FH_SKIP;
+        native_fh_len = backing_fh_len - FF_BLOB_FH_SKIP;
+    }
 
     client_short_id = (uint32_t) client->client_id;
 
@@ -644,9 +666,18 @@ ff_lg_dsroot_cb(
     /* One backing file per MDS file, named by its fileid (flat on the DS). */
     snprintf(ctx->backing_name, sizeof(ctx->backing_name), "%016lx", ctx->fileid);
 
+    /* Backing files are internal data containers; real access control is the
+     * client's OPEN against the MDS metadata file.  flex-files steers DS I/O
+     * with synthetic, per-iomode principals (ffds_user "0" for RW, "1" for
+     * READ), so the backing object must be reachable by both.  A dedicated DS
+     * in data_server mode serves them statelessly (bypassing the permission
+     * check), but a co-located DS (the MDS is also the data server, local
+     * backing) enforces it -- with mode 0600/owner-root the synthetic READ
+     * principal is denied and the client spins re-fetching the layout.  Create
+     * them world-rw so both topologies work. */
     memset(&ctx->set_attr, 0, sizeof(ctx->set_attr));
     ctx->set_attr.va_set_mask = CHIMERA_VFS_ATTR_MODE;
-    ctx->set_attr.va_mode     = S_IFREG | 0600;
+    ctx->set_attr.va_mode     = S_IFREG | 0666;
 
     chimera_vfs_open_at(req->thread->vfs_thread, &req->cred, ctx->ds_root_handle,
                         ctx->backing_name, strlen(ctx->backing_name),
@@ -1050,6 +1081,30 @@ chimera_nfs4_layoutstats(
     }
     chimera_nfs4_compound_complete(req, res->lsr_status);
 } /* chimera_nfs4_layoutstats */
+
+void
+chimera_nfs4_layouterror(
+    struct chimera_server_nfs_thread *thread,
+    struct nfs_request               *req,
+    struct nfs_argop4                *argop,
+    struct nfs_resop4                *resop)
+{
+    struct LAYOUTERROR4res *res = &resop->oplayouterror;
+
+    (void) argop;
+
+    /* LAYOUTERROR (RFC 7862 §15.x, used by flex-files RFC 8435 §6) lets the
+     * client report a data-server I/O error to the MDS so it can, e.g., pick a
+     * different mirror.  Chimera hands out a single-mirror layout and does not
+     * yet act on the report, so accept and acknowledge rather than returning
+     * NFS4ERR_NOTSUPP (which makes the client re-report). */
+    if (!chimera_vfs_pnfs_feature_enabled(thread->shared->vfs)) {
+        res->ler_status = NFS4ERR_NOTSUPP;
+    } else {
+        res->ler_status = NFS4_OK;
+    }
+    chimera_nfs4_compound_complete(req, res->ler_status);
+} /* chimera_nfs4_layouterror */
 
 static void
 chimera_nfs4_layoutcommit_setattr_complete(

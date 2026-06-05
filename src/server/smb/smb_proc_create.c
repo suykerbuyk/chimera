@@ -382,9 +382,19 @@ chimera_smb_create_gen_open_file(
          * server; if the backend can't do server-side copy the client falls
          * back to a cache-mediated copy that reads stale data (fsx READ BAD
          * DATA on diskfs/cairn).  Where copy_range is unavailable we leave the
-         * file uncached (write-through), which is correct. */
+         * file uncached (write-through), which is correct.
+         *
+         * Durable-aware opens are the exception: MS-SMB2 3.3.5.9 requires a
+         * durable grant to be paired with a batch oplock or HANDLE-caching
+         * lease, and durable-aware clients (WPTS, smbtorture durable suites)
+         * verify that response context on the initial CREATE.  Without a
+         * caching grant the durable request is silently dropped and the suite
+         * fails before it even disconnects.  Durable-aware Windows clients do
+         * not stream copy_file_range through a durable handle, so opting in
+         * for those opens does not re-introduce the fsx hazard. */
         bool backend_copy_safe =
-            (oh->vfs_module->capabilities & CHIMERA_VFS_CAP_COPY_RANGE) != 0;
+            (oh->vfs_module->capabilities & CHIMERA_VFS_CAP_COPY_RANGE) != 0 ||
+            durable_request;
 
         /* An explicitly requested SMB2 lease (RqLs) is acquired even for an
          * attribute-only ("stat") open: a handle/read-caching lease is about the
@@ -1464,15 +1474,26 @@ chimera_smb_create_issue_open(struct chimera_smb_request *request)
                 break;
         } /* switch */
 
-        /* Replacing a file's contents truncates it and stamps it ARCHIVE
-        * (MS-FSCC).  OPEN_TRUNCATE makes the backend apply both to an existing
-        * file (a fresh create already starts empty with these attrs). */
+        /* Replacing an existing file's contents truncates it; OPEN_TRUNCATE
+         * makes the backend do that (a fresh create already starts empty). */
         if (chimera_smb_disposition_overwrites(request->create.create_disposition)) {
-            flags                                      |= CHIMERA_VFS_OPEN_TRUNCATE;
-            request->create.set_attr.va_dos_attributes |= SMB2_FILE_ATTRIBUTE_ARCHIVE;
-            request->create.set_attr.va_req_mask       |= CHIMERA_VFS_ATTR_DOS_ATTRIBUTES;
-            request->create.set_attr.va_set_mask       |= CHIMERA_VFS_ATTR_DOS_ATTRIBUTES;
+            flags |= CHIMERA_VFS_OPEN_TRUNCATE;
         }
+    }
+
+    /* A file is stamped FILE_ATTRIBUTE_ARCHIVE when it is created, and again
+     * when an overwrite/supersede replaces its contents (MS-FSCC).  Both reduce
+     * to "request ARCHIVE on any create-capable open": the backend applies
+     * set_attr only when it actually creates the inode or truncates it on an
+     * overwrite, so an existing file opened without truncation keeps its stored
+     * attributes (e.g. one explicitly cleared to NORMAL).  ARCHIVE must be
+     * persisted at create time, not synthesized on read (see
+     * chimera_smb_marshal_basic_attrs).  OPEN_TRUNCATE covers a plain OVERWRITE
+     * of an existing file (which never carries OPEN_CREATE). */
+    if (flags & (CHIMERA_VFS_OPEN_CREATE | CHIMERA_VFS_OPEN_TRUNCATE)) {
+        request->create.set_attr.va_dos_attributes |= SMB2_FILE_ATTRIBUTE_ARCHIVE;
+        request->create.set_attr.va_req_mask       |= CHIMERA_VFS_ATTR_DOS_ATTRIBUTES;
+        request->create.set_attr.va_set_mask       |= CHIMERA_VFS_ATTR_DOS_ATTRIBUTES;
     }
 
     /* Persistent-handle grants are keyed by the base file name; skip them for
@@ -2455,9 +2476,21 @@ parse_ctx_secd(
     uint32_t                    data_len,
     struct chimera_smb_request *request)
 {
+    /* The create-context parser is also exercised standalone by
+     * phase0_contexts_test with a zeroed request (no compound/thread/shared),
+     * so fall back to canonical behaviour when the server context is not
+     * reachable. */
+    int canonicalize = 1;
+
+    if (request->compound) {
+        canonicalize = request->compound->thread->shared->config.
+            acl_inherited_canonicalize;
+    }
+
     chimera_smb_parse_sd_to_acl(data, data_len, &request->create.set_attr,
                                 request->create.acl_storage,
-                                sizeof(request->create.acl_storage));
+                                sizeof(request->create.acl_storage),
+                                canonicalize);
 } /* parse_ctx_secd */
 
 static void
@@ -2778,9 +2811,15 @@ chimera_smb_parse_create(
         request->create.parent_path_len = 0;
     }
 
-    /* Initialize create-time attributes (may be populated by SD create context) */
+    /* Initialize create-time attributes (may be populated by SD create context).
+     * The request slot is pooled and its set_attr.va_acl pointer survives from
+     * a prior CREATE; clear it explicitly so the backend's create-time ACL
+     * precedence check (which keys off the va_acl pointer, since
+     * <backend>_apply_attrs strips the va_set_mask ACL bit before
+     * <backend>_inherit_acl runs) doesn't fire on a stale pointer. */
     request->create.set_attr.va_req_mask = 0;
     request->create.set_attr.va_set_mask = 0;
+    request->create.set_attr.va_acl      = NULL;
     request->create.ctx_present_mask     = 0;
 
     /* Persist any settable DOS attribute bits supplied at create time. */

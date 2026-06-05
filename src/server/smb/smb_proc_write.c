@@ -176,6 +176,25 @@ chimera_smb_write(struct chimera_smb_request *request)
         return;
     }
 
+    /* MS-SMB2 3.3.5.13: a WRITE request must be rejected with ACCESS_DENIED
+     * when the open does not carry write access.  The handle's desired_access
+     * may still be in NT generic form (GENERIC_WRITE / GENERIC_ALL /
+     * MAXIMUM_ALLOWED), so accept any access bit that resolves to write data;
+     * only an open lacking all of them (as smbtorture's deny test deliberately
+     * constructs: SEC_FILE_READ_DATA only, no write bit) should be denied
+     * here.  Without this gate, native backends -- which run the write through
+     * the VFS regardless of the per-handle access mask -- silently accept
+     * writes on read-only handles, while the passthrough backends are caught
+     * by the underlying kernel open. */
+    if (!(request->write.open_file->desired_access &
+          (SMB2_FILE_WRITE_DATA | SMB2_FILE_APPEND_DATA |
+           SMB2_GENERIC_WRITE | SMB2_GENERIC_ALL | SMB2_MAXIMUM_ALLOWED))) {
+        evpl_iovecs_release(evpl, request->write.iov, request->write.niov);
+        chimera_smb_open_file_release(request, request->write.open_file);
+        chimera_smb_complete_request(request, SMB2_STATUS_ACCESS_DENIED);
+        return;
+    }
+
     /* MS-SMB2 3.3.5.13: reject writes whose offset is beyond the maximum file
     * size (INT64_MAX) and writes whose last byte would extend past the
     * server's maximum supported file size.  A zero-length write at any
@@ -190,12 +209,24 @@ chimera_smb_write(struct chimera_smb_request *request)
         return;
     }
 
-    struct chimera_vfs_lease_owner io_owner = {
-        .protocol   = CHIMERA_VFS_LEASE_PROTO_SMB2,
-        .client_key = request->session_handle->session->session_id,
-        .owner_lo   = request->write.open_file->file_id.pid,
-        .owner_hi   = request->write.open_file->file_id.vid,
-    };
+    /* When the open holds a caching lease, use the lease's owner identity for
+     * the write so chimera_vfs_break_reads_for_write self-exempts (mode.granted
+     * & MODE_W AND owner_equal): the holder is writing through its own granted
+     * write cache and must NOT break itself.  For RqLs leases the owner is the
+     * lease_key; for legacy oplocks it is the open's file_id.  Without this the
+     * lease is broken on every self-write, which races a server-initiated
+     * OPLOCK_BREAK notification with the WRITE response and surfaces as
+     * INVALID_NETWORK_RESPONSE on the client. */
+    struct chimera_vfs_lease_owner io_owner;
+    io_owner.protocol   = CHIMERA_VFS_LEASE_PROTO_SMB2;
+    io_owner.client_key = request->session_handle->session->session_id;
+    if (request->write.open_file->caching_lease_inserted) {
+        io_owner.owner_lo = request->write.open_file->caching_lease.owner.owner_lo;
+        io_owner.owner_hi = request->write.open_file->caching_lease.owner.owner_hi;
+    } else {
+        io_owner.owner_lo = request->write.open_file->file_id.pid;
+        io_owner.owner_hi = request->write.open_file->file_id.vid;
+    }
 
     /* Mandatory byte-range lock enforcement: a shared lock denies writes from
      * everyone, an exclusive lock denies writes from other opens.  (The

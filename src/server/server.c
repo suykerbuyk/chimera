@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <sys/socket.h>
 #include <netdb.h>
 #include <arpa/inet.h>
@@ -24,6 +25,8 @@
 #include "vfs/vfs_procs.h"
 #include "vfs/vfs_pnfs.h"
 #include "vfs/vfs_mount_table.h"
+#include "vfs/vfs_cred.h"
+#include "vfs/vfs_release.h"
 #include "common/macros.h"
 #include "server/server.h"
 #include "smb/smb2.h"
@@ -46,6 +49,7 @@ struct chimera_server_config {
     int                                   nfs_lockmgr_port;
     int                                   nfs_port;
     int                                   nfs_data_server;
+    uint64_t                              nfs_server_scope;
     int                                   external_portmap;
     char                                  portmap_hostname[256];
     int                                   soft_fail_bad_req;
@@ -73,6 +77,7 @@ struct chimera_server_config {
     int                                   smb_signing_required;
     int                                   smb_encryption;
     int                                   smb_notify_disabled;
+    int                                   smb_acl_inherited_canonicalize;
     int                                   smb_num_nic_info;
     uint32_t                              anonuid;
     uint32_t                              anongid;
@@ -91,6 +96,8 @@ struct chimera_server_config {
         char netid[8];
         char uaddr[64];
         char backing_path[CHIMERA_PNFS_BACKING_MAX];
+        int  version;                     /* NFS version the client uses for DS I/O */
+        int  minorversion;                /* NFS minor version (4.x)                */
     }                                     pnfs_ds[CHIMERA_PNFS_MAX_DS];
 };
 
@@ -168,6 +175,15 @@ chimera_server_config_init(void)
      * the server reject CHANGE_NOTIFY with STATUS_NOT_IMPLEMENTED. */
     config->smb_notify_disabled = 0;
 
+    /* Windows-style canonicalisation of the DACL_AUTO_INHERITED bit on
+     * SET_SECURITY: a client-supplied AUTO_INHERITED without the matching
+     * AUTO_INHERIT_REQ is silently stripped before storage (the default,
+     * matching Samba's "acl flag inherited canonicalization = yes" and the
+     * Windows server reference behaviour).  Set to 0 to preserve the bit
+     * verbatim (Samba's "= no" mode that the smb2.acls_non_canonical suite
+     * exercises). */
+    config->smb_acl_inherited_canonicalize = 1;
+
     // SMB auth config defaults - local NTLM only
     config->smb_auth.winbind_enabled    = 0;
     config->smb_auth.kerberos_enabled   = 0;
@@ -186,6 +202,15 @@ chimera_server_config_init(void)
      * service so a pNFS data server can coexist with an MDS on one host. */
     config->nfs_port        = 2049;
     config->nfs_data_server = 0;
+
+    /* NFSv4.1 server identity (EXCHANGE_ID eir_server_scope).  Clients treat two
+     * server addresses returning the same scope as the same server (shared
+     * state, eligible for trunking).  Independent chimera servers that do not
+     * share state -- e.g. a pNFS data server co-deployed with its MDS -- must
+     * advertise distinct scopes or the client coalesces them and misroutes I/O.
+     * Default preserves the historical value; override per instance via
+     * "nfs_server_scope". */
+    config->nfs_server_scope = 42;
 
     config->cache_ttl = 60;
 
@@ -349,6 +374,20 @@ chimera_server_config_get_smb_notify_disabled(const struct chimera_server_config
 } /* chimera_server_config_get_smb_notify_disabled */
 
 SYMBOL_EXPORT void
+chimera_server_config_set_smb_acl_inherited_canonicalize(
+    struct chimera_server_config *config,
+    int                           enable)
+{
+    config->smb_acl_inherited_canonicalize = enable;
+} /* chimera_server_config_set_smb_acl_inherited_canonicalize */
+
+SYMBOL_EXPORT int
+chimera_server_config_get_smb_acl_inherited_canonicalize(const struct chimera_server_config *config)
+{
+    return config->smb_acl_inherited_canonicalize;
+} /* chimera_server_config_get_smb_acl_inherited_canonicalize */
+
+SYMBOL_EXPORT void
 chimera_server_config_set_max_open_files(
     struct chimera_server_config *config,
     int                           open_files)
@@ -505,7 +544,9 @@ chimera_server_config_add_pnfs_ds(
     struct chimera_server_config *config,
     const char                   *netid,
     const char                   *uaddr,
-    const char                   *backing_path)
+    const char                   *backing_path,
+    int                           version,
+    int                           minorversion)
 {
     struct chimera_server_config_pnfs_ds *ds;
     int                                   idx;
@@ -520,6 +561,8 @@ chimera_server_config_add_pnfs_ds(
     snprintf(ds->netid, sizeof(ds->netid), "%s", netid ? netid : "tcp");
     snprintf(ds->uaddr, sizeof(ds->uaddr), "%s", uaddr ? uaddr : "");
     snprintf(ds->backing_path, sizeof(ds->backing_path), "%s", backing_path ? backing_path : "");
+    ds->version      = version ? version : 3;
+    ds->minorversion = minorversion;
 
     return idx;
 } /* chimera_server_config_add_pnfs_ds */
@@ -551,6 +594,20 @@ chimera_server_config_get_nfs_data_server(const struct chimera_server_config *co
 {
     return config->nfs_data_server;
 } /* chimera_server_config_get_nfs_data_server */
+
+SYMBOL_EXPORT void
+chimera_server_config_set_nfs_server_scope(
+    struct chimera_server_config *config,
+    uint64_t                      scope)
+{
+    config->nfs_server_scope = scope;
+} /* chimera_server_config_set_nfs_server_scope */
+
+SYMBOL_EXPORT uint64_t
+chimera_server_config_get_nfs_server_scope(const struct chimera_server_config *config)
+{
+    return config->nfs_server_scope;
+} /* chimera_server_config_get_nfs_server_scope */
 
 SYMBOL_EXPORT void
 chimera_server_config_set_nfs_rdma_hostname(
@@ -977,6 +1034,316 @@ chimera_server_mount(
 
 } /* chimera_server_create_share */
 
+/*
+ * Ensure a directory path exists inside a backend before it is mounted, for the
+ * "create" mount option.  A backend's MOUNT op only walks the path read-only
+ * (it returns ENOENT for a missing component), and creating a directory needs
+ * an open handle to its parent -- which in turn needs the backend registered in
+ * the mount table.  So: transiently mount the backend root, walk the target
+ * path component by component creating any that are missing, unmount, and let
+ * the caller perform the real mount of the now-existing path.
+ *
+ * Synchronous (init-time) wrapper around an async lookup-or-mkdir chain, driven
+ * on a private evpl like chimera_server_mount.  Returns 0 on success.
+ */
+#define CHIMERA_MKPATH_TMP_NAME "__chimera_mkpath_tmp"
+
+struct chimera_mkpath_ctx {
+    struct chimera_vfs             *vfs;
+    struct chimera_vfs_thread      *thread;
+    char                            path[256];
+    int                             pathlen;
+    int                             offset;
+    uint32_t                        mode;
+    struct chimera_vfs_open_handle *oh;      /* current parent directory */
+    char                            comp[256];
+    int                             complen;
+    uint8_t                         child_fh[CHIMERA_VFS_FH_SIZE + 16];
+    uint32_t                        child_fh_len;
+    struct chimera_vfs_attrs        set_attr;
+    enum chimera_vfs_error status;
+    int                             done;
+};
+
+static void chimera_mkpath_next(
+    struct chimera_mkpath_ctx *ctx);
+
+static void
+chimera_mkpath_umount_cb(
+    struct chimera_vfs_thread *thread,
+    enum chimera_vfs_error     status,
+    void                      *private_data)
+{
+    struct chimera_mkpath_ctx *ctx = private_data;
+
+    ctx->done = 1;
+} /* chimera_mkpath_umount_cb */
+
+/* Release the current handle and tear down the transient root mount, recording
+ * the final walk status.  Both the success and failure paths funnel here. */
+static void
+chimera_mkpath_finish(
+    struct chimera_mkpath_ctx *ctx,
+    enum chimera_vfs_error     status)
+{
+    ctx->status = status;
+
+    if (ctx->oh) {
+        chimera_vfs_release(ctx->thread, ctx->oh);
+        ctx->oh = NULL;
+    }
+
+    chimera_vfs_umount(ctx->thread, chimera_vfs_get_server_cred(),
+                       CHIMERA_MKPATH_TMP_NAME, chimera_mkpath_umount_cb, ctx);
+} /* chimera_mkpath_finish */
+
+/* The just-resolved/created child becomes the new parent; descend. */
+static void
+chimera_mkpath_descend_cb(
+    enum chimera_vfs_error          error_code,
+    struct chimera_vfs_open_handle *oh,
+    void                           *private_data)
+{
+    struct chimera_mkpath_ctx *ctx = private_data;
+
+    if (error_code != CHIMERA_VFS_OK) {
+        chimera_mkpath_finish(ctx, error_code);
+        return;
+    }
+
+    if (ctx->oh) {
+        chimera_vfs_release(ctx->thread, ctx->oh);
+    }
+    ctx->oh = oh;
+    chimera_mkpath_next(ctx);
+} /* chimera_mkpath_descend_cb */
+
+static void
+chimera_mkpath_open_child(struct chimera_mkpath_ctx *ctx)
+{
+    chimera_vfs_open_fh(ctx->thread, chimera_vfs_get_server_cred(),
+                        ctx->child_fh, ctx->child_fh_len,
+                        CHIMERA_VFS_OPEN_DIRECTORY | CHIMERA_VFS_OPEN_PATH,
+                        chimera_mkpath_descend_cb, ctx);
+} /* chimera_mkpath_open_child */
+
+static void
+chimera_mkpath_mkdir_cb(
+    enum chimera_vfs_error    error_code,
+    struct chimera_vfs_attrs *set_attr,
+    struct chimera_vfs_attrs *attr,
+    struct chimera_vfs_attrs *dir_pre_attr,
+    struct chimera_vfs_attrs *dir_post_attr,
+    void                     *private_data)
+{
+    struct chimera_mkpath_ctx *ctx = private_data;
+
+    if (error_code != CHIMERA_VFS_OK || attr->va_fh_len == 0) {
+        chimera_mkpath_finish(ctx, error_code != CHIMERA_VFS_OK ? error_code : CHIMERA_VFS_EIO);
+        return;
+    }
+
+    memcpy(ctx->child_fh, attr->va_fh, attr->va_fh_len);
+    ctx->child_fh_len = attr->va_fh_len;
+    chimera_mkpath_open_child(ctx);
+} /* chimera_mkpath_mkdir_cb */
+
+static void
+chimera_mkpath_lookup_cb(
+    enum chimera_vfs_error    error_code,
+    struct chimera_vfs_attrs *attr,
+    struct chimera_vfs_attrs *dir_attr,
+    void                     *private_data)
+{
+    struct chimera_mkpath_ctx *ctx = private_data;
+
+    if (error_code == CHIMERA_VFS_OK) {
+        /* Component already exists; descend into it. */
+        if (attr->va_fh_len == 0) {
+            chimera_mkpath_finish(ctx, CHIMERA_VFS_EIO);
+            return;
+        }
+        memcpy(ctx->child_fh, attr->va_fh, attr->va_fh_len);
+        ctx->child_fh_len = attr->va_fh_len;
+        chimera_mkpath_open_child(ctx);
+        return;
+    }
+
+    if (error_code == CHIMERA_VFS_ENOENT) {
+        memset(&ctx->set_attr, 0, sizeof(ctx->set_attr));
+        ctx->set_attr.va_set_mask = CHIMERA_VFS_ATTR_MODE |
+            CHIMERA_VFS_ATTR_UID | CHIMERA_VFS_ATTR_GID;
+        ctx->set_attr.va_mode = S_IFDIR | (ctx->mode & 07777);
+        ctx->set_attr.va_uid  = 0;
+        ctx->set_attr.va_gid  = 0;
+
+        chimera_vfs_mkdir_at(ctx->thread, chimera_vfs_get_server_cred(), ctx->oh,
+                             ctx->comp, ctx->complen, &ctx->set_attr,
+                             CHIMERA_VFS_ATTR_FH, 0, 0,
+                             chimera_mkpath_mkdir_cb, ctx);
+        return;
+    }
+
+    chimera_mkpath_finish(ctx, error_code);
+} /* chimera_mkpath_lookup_cb */
+
+/* Advance to the next '/'-separated component; when none remain the path is
+ * fully present and we finish successfully. */
+static void
+chimera_mkpath_next(struct chimera_mkpath_ctx *ctx)
+{
+    int start;
+
+    while (ctx->offset < ctx->pathlen && ctx->path[ctx->offset] == '/') {
+        ctx->offset++;
+    }
+
+    if (ctx->offset >= ctx->pathlen) {
+        chimera_mkpath_finish(ctx, CHIMERA_VFS_OK);
+        return;
+    }
+
+    start = ctx->offset;
+    while (ctx->offset < ctx->pathlen && ctx->path[ctx->offset] != '/') {
+        ctx->offset++;
+    }
+
+    ctx->complen = ctx->offset - start;
+    if (ctx->complen >= (int) sizeof(ctx->comp)) {
+        chimera_mkpath_finish(ctx, CHIMERA_VFS_ENAMETOOLONG);
+        return;
+    }
+    memcpy(ctx->comp, ctx->path + start, ctx->complen);
+    ctx->comp[ctx->complen] = '\0';
+
+    chimera_vfs_lookup_at(ctx->thread, chimera_vfs_get_server_cred(), ctx->oh,
+                          ctx->comp, ctx->complen, CHIMERA_VFS_ATTR_FH, 0,
+                          chimera_mkpath_lookup_cb, ctx);
+} /* chimera_mkpath_next */
+
+static void
+chimera_mkpath_root_open_cb(
+    enum chimera_vfs_error          error_code,
+    struct chimera_vfs_open_handle *oh,
+    void                           *private_data)
+{
+    struct chimera_mkpath_ctx *ctx = private_data;
+
+    if (error_code != CHIMERA_VFS_OK) {
+        chimera_mkpath_finish(ctx, error_code);
+        return;
+    }
+    ctx->oh = oh;
+    chimera_mkpath_next(ctx);
+} /* chimera_mkpath_root_open_cb */
+
+static void
+chimera_mkpath_mounted_cb(
+    struct chimera_vfs_thread *thread,
+    enum chimera_vfs_error     status,
+    void                      *private_data)
+{
+    struct chimera_mkpath_ctx *ctx = private_data;
+    struct chimera_vfs_mount  *m;
+
+    if (status != CHIMERA_VFS_OK) {
+        /* Root mount failed -- nothing registered, nothing to unmount. */
+        ctx->status = status;
+        ctx->done   = 1;
+        return;
+    }
+
+    m = chimera_vfs_mount_table_find_by_path(ctx->vfs->mount_table,
+                                             CHIMERA_MKPATH_TMP_NAME,
+                                             strlen(CHIMERA_MKPATH_TMP_NAME));
+    if (!m) {
+        chimera_mkpath_finish(ctx, CHIMERA_VFS_EIO);
+        return;
+    }
+
+    chimera_vfs_open_fh(thread, chimera_vfs_get_server_cred(),
+                        m->root_fh, m->root_fh_len,
+                        CHIMERA_VFS_OPEN_DIRECTORY | CHIMERA_VFS_OPEN_PATH,
+                        chimera_mkpath_root_open_cb, ctx);
+} /* chimera_mkpath_mounted_cb */
+
+SYMBOL_EXPORT int
+chimera_server_mkpath(
+    struct chimera_server *server,
+    const char            *module_name,
+    const char            *module_path,
+    uint32_t               mode)
+{
+    struct evpl              *evpl;
+    struct chimera_mkpath_ctx ctx;
+
+    memset(&ctx, 0, sizeof(ctx));
+
+    if (!module_name || !module_path ||
+        strlen(module_path) >= sizeof(ctx.path)) {
+        return -1;
+    }
+
+    evpl        = evpl_create(NULL);
+    ctx.vfs     = server->vfs;
+    ctx.thread  = chimera_vfs_thread_init(evpl, server->vfs);
+    ctx.mode    = mode ? mode : 0755;
+    ctx.status  = CHIMERA_VFS_OK;
+    ctx.pathlen = snprintf(ctx.path, sizeof(ctx.path), "%s", module_path);
+
+    /* Transiently mount the backend root so we have a handle to walk under. */
+    chimera_vfs_mount(ctx.thread, chimera_vfs_get_server_cred(),
+                      CHIMERA_MKPATH_TMP_NAME, module_name, "/", NULL,
+                      chimera_mkpath_mounted_cb, &ctx);
+
+    while (!ctx.done) {
+        evpl_continue(evpl);
+    }
+
+    chimera_vfs_thread_destroy(ctx.thread);
+    evpl_destroy(evpl);
+
+    return ctx.status == CHIMERA_VFS_OK ? 0 : -1;
+} /* chimera_server_mkpath */
+
+static void
+chimera_server_umount_callback(
+    struct chimera_vfs_thread *thread,
+    enum chimera_vfs_error     status,
+    void                      *private_data)
+{
+    struct mount_ctx *ctx = private_data;
+
+    ctx->done   = 1;
+    ctx->status = status;
+} /* chimera_server_umount_callback */
+
+SYMBOL_EXPORT int
+chimera_server_unmount(
+    struct chimera_server *server,
+    const char            *mount_path)
+{
+    struct evpl               *evpl;
+    struct chimera_vfs_thread *thread;
+    struct mount_ctx           ctx = { .done = 0, .status = 0 };
+
+    evpl = evpl_create(NULL);
+
+    thread = chimera_vfs_thread_init(evpl, server->vfs);
+
+    chimera_vfs_umount(thread, NULL, mount_path, chimera_server_umount_callback, &ctx);
+
+    while (!ctx.done) {
+        evpl_continue(evpl);
+    }
+
+    chimera_vfs_thread_destroy(thread);
+
+    evpl_destroy(evpl);
+
+    return ctx.status;
+} /* chimera_server_unmount */
+
 SYMBOL_EXPORT int
 chimera_server_pnfs_resolve(struct chimera_server *server)
 {
@@ -1007,10 +1374,19 @@ chimera_server_pnfs_resolve(struct chimera_server *server)
         }
 
         chimera_vfs_pnfs_set_device_root(vfs, i, m->root_fh, m->root_fh_len);
-        chimera_server_info("pNFS data server %d backing root resolved via '%s' (module=%s path=%s root_fh_len=%d)",
-                            i, ds->backing_path,
-                            m->module ? m->module->name : "?",
-                            m->path ? m->path : "?", m->root_fh_len);
+
+        /* If the backing mount is not the nfs proxy, the data server is local
+         * to this node: this server itself serves the backing handle, so the
+         * handle handed to the client is the backing handle as-is (no proxy
+         * wrapper to strip).  See chimera_nfs4_encode_ff_layout callers. */
+        ds->backing_local = (m->module &&
+                             m->module->fh_magic != CHIMERA_VFS_FH_MAGIC_NFS) ? 1 : 0;
+
+        chimera_server_info(
+            "pNFS data server %d backing root resolved via '%s' (module=%s path=%s root_fh_len=%d local=%d)",
+            i, ds->backing_path,
+            m->module ? m->module->name : "?",
+            m->path ? m->path : "?", m->root_fh_len, ds->backing_local);
         resolved++;
     }
 
@@ -1168,7 +1544,9 @@ chimera_server_init(
             chimera_vfs_pnfs_add_device(server->vfs,
                                         config->pnfs_ds[i].netid,
                                         config->pnfs_ds[i].uaddr,
-                                        config->pnfs_ds[i].backing_path);
+                                        config->pnfs_ds[i].backing_path,
+                                        config->pnfs_ds[i].version,
+                                        config->pnfs_ds[i].minorversion);
         }
         chimera_server_info("pNFS enabled with %d data server(s)", config->pnfs_num_ds);
     }
@@ -1415,6 +1793,129 @@ chimera_server_iterate_buckets(
 
     chimera_s3_iterate_buckets(server->s3_shared, callback, data);
 } /* chimera_server_iterate_buckets */
+
+struct mount_iterate_ctx {
+    chimera_server_mount_iterate_cb callback;
+    void                           *data;
+};
+
+static int
+mount_iterate_wrapper(
+    struct chimera_vfs_mount *mount,
+    void                     *data)
+{
+    struct mount_iterate_ctx *ctx = data;
+
+    return ctx->callback(mount->path,
+                         mount->module ? mount->module->name : "",
+                         mount->module_path ? mount->module_path : "",
+                         ctx->data);
+} /* mount_iterate_wrapper */
+
+SYMBOL_EXPORT void
+chimera_server_iterate_mounts(
+    struct chimera_server          *server,
+    chimera_server_mount_iterate_cb callback,
+    void                           *data)
+{
+    struct mount_iterate_ctx ctx = { .callback = callback, .data = data };
+
+    chimera_vfs_mount_table_foreach(server->vfs->mount_table,
+                                    mount_iterate_wrapper, &ctx);
+} /* chimera_server_iterate_mounts */
+
+struct mount_in_use_ctx {
+    struct chimera_vfs *vfs;
+    const char         *target;
+    int                 target_len;
+    int                 in_use;
+};
+
+/*
+ * Resolve the path of a share/export/bucket to its owning mount and flag a
+ * match against the target mount.  Paths are normalized (leading slashes
+ * stripped) the same way chimera_vfs_mount registers them.  Returns non-zero
+ * once a match is found to stop the enclosing iteration early.
+ */
+static int
+mount_in_use_check_path(
+    struct mount_in_use_ctx *ctx,
+    const char              *path)
+{
+    struct chimera_vfs_mount *mount;
+
+    while (*path == '/') {
+        path++;
+    }
+
+    mount = chimera_vfs_mount_table_find_by_path(ctx->vfs->mount_table,
+                                                 path, strlen(path));
+
+    if (mount &&
+        mount->pathlen == (uint32_t) ctx->target_len &&
+        memcmp(mount->path, ctx->target, ctx->target_len) == 0) {
+        ctx->in_use = 1;
+        return 1;
+    }
+
+    return 0;
+} /* mount_in_use_check_path */
+
+static int
+mount_in_use_share_cb(
+    const struct chimera_smb_share *share,
+    void                           *data)
+{
+    return mount_in_use_check_path(data, chimera_smb_share_get_path(share));
+} /* mount_in_use_share_cb */
+
+static int
+mount_in_use_export_cb(
+    const struct chimera_nfs_export *export,
+    void                            *data)
+{
+    return mount_in_use_check_path(data, chimera_nfs_export_get_path(export));
+} /* mount_in_use_export_cb */
+
+static int
+mount_in_use_bucket_cb(
+    const struct s3_bucket *bucket,
+    void                   *data)
+{
+    return mount_in_use_check_path(data, chimera_s3_bucket_get_path(bucket));
+} /* mount_in_use_bucket_cb */
+
+SYMBOL_EXPORT int
+chimera_server_mount_in_use(
+    struct chimera_server *server,
+    const char            *mount_path)
+{
+    struct mount_in_use_ctx ctx;
+    const char             *target = mount_path;
+
+    while (*target == '/') {
+        target++;
+    }
+
+    ctx.vfs        = server->vfs;
+    ctx.target     = target;
+    ctx.target_len = strlen(target);
+    ctx.in_use     = 0;
+
+    if (server->smb_shared) {
+        chimera_smb_iterate_shares(server->smb_shared, mount_in_use_share_cb, &ctx);
+    }
+
+    if (!ctx.in_use && server->nfs_shared) {
+        chimera_nfs_iterate_exports(server->nfs_shared, mount_in_use_export_cb, &ctx);
+    }
+
+    if (!ctx.in_use && server->s3_shared) {
+        chimera_s3_iterate_buckets(server->s3_shared, mount_in_use_bucket_cb, &ctx);
+    }
+
+    return ctx.in_use;
+} /* chimera_server_mount_in_use */
 
 SYMBOL_EXPORT struct chimera_vfs *
 chimera_server_get_vfs(struct chimera_server *server)

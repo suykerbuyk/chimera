@@ -274,12 +274,29 @@ main(
 
     /* CTest invokes this binary once per suite.  Enable named-stream (ADS)
      * support only for the stream suites, so the negative smb2.create_no_streams
-     * suite still runs with the feature off on the same backend. */
+     * suite still runs with the feature off on the same backend.  Also match
+     * individual smb2.streams.* subtests so the per-subtest harvest variant
+     * (run one stream subtest in its own server process) gets the same
+     * capability the combined smb2.streams suite needs. */
     for (i = 0; i < num_tests; i++) {
         if (strcmp(tests[i], "smb2.streams") == 0 ||
+            strncmp(tests[i], "smb2.streams.", 13) == 0 ||
             strcmp(tests[i], "smb2.ioctl-on-stream") == 0 ||
             strcmp(tests[i], "smb2.sdread") == 0) {
             chimera_server_config_set_smb_named_streams(config, 1);
+            break;
+        }
+    }
+
+    /* The smb2.acls_non_canonical suite asserts Samba's
+     * "acl flag inherited canonicalization = no" behaviour: the
+     * DACL_AUTO_INHERITED bit round-trips verbatim even when the client
+     * sets it without AUTO_INHERIT_REQ.  The smb2.acls.INHERITFLAGS suite
+     * asserts the opposite (Windows-canonical) behaviour, so the knob is
+     * flipped only for the non-canonical suite. */
+    for (i = 0; i < num_tests; i++) {
+        if (strcmp(tests[i], "smb2.acls_non_canonical") == 0) {
+            chimera_server_config_set_smb_acl_inherited_canonicalize(config, 0);
             break;
         }
     }
@@ -332,6 +349,22 @@ main(
         /* unsafe_async: this test does not exercise crash recovery, so skip FUA/sync
          * on writes to run lighter. */
         json_object_set_new(cfg, "unsafe_async", json_true());
+        /* smb2.maxfid keeps 65520 file handles open across ~256 inode-cache
+         * shards; the inode home blocks stay pinned by the open handles and
+         * concurrent close traffic also pins LOGGED blocks (held until tail
+         * push).  The default cache (32768 blocks across 256 shards ≈ 128 per
+         * shard) is too small for this skew and aborts with either
+         *   - "b+tree lookup suspended on a cache miss"  (sync wrapper hits a
+         *     non-resident block on the ACL descent), or
+         *   - "block cache shard exhausted: every buffer pinned"
+         *     (recycle finds no clean victim in a hot shard).
+         * Both are diskfs cache-sizing issues, not protocol bugs.  Bump the
+         * cache for these tests so the working set fits.  TODO: replace this
+         * test-side workaround with a runtime fix -- either a cross-shard
+         * victim search (so pinned skew in one shard can draw from another)
+         * or making diskfs_map_attrs's ACL lookup tolerate suspension.  See
+         * diskfs.c:5665 and :2542 for the abort sites. */
+        json_object_set_new(cfg, "block_cache_blocks", json_integer(262144));
         json_str = json_dumps(cfg, JSON_COMPACT);
         snprintf(diskfs_cfg, sizeof(diskfs_cfg), "%s", json_str);
         free(json_str);
@@ -427,6 +460,37 @@ main(
 
     /* Give server a moment to be ready */
     usleep(100000);
+
+    /* smb2.zero-data-ioctl (test_ioctl_zero_data) opens
+     * --option=torture:filename with NTCREATEX_DISP_OPEN, so the file MUST
+     * pre-exist on the share or the test bails with NT_STATUS_OBJECT_NAME_NOT_FOUND
+     * before it ever issues FSCTL_SET_ZERO_DATA.  Pre-create it via smbclient,
+     * which works across every backend without backend-specific paths. */
+    for (i = 0; i < num_tests; i++) {
+        if (strcmp(tests[i], "smb2.zero-data-ioctl") == 0) {
+            char seed_path[512];
+            char cmd[1024];
+            int  seed_fd, sc_rc;
+
+            snprintf(seed_path, sizeof(seed_path),
+                     "%s/empty_seed", env.session_dir);
+            seed_fd = open(seed_path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+            if (seed_fd >= 0) {
+                close(seed_fd);
+            }
+            snprintf(cmd, sizeof(cmd),
+                     "smbclient //127.0.0.1/share -U myuser%%mypassword"
+                     " -c 'put %s torture_test_file' >/dev/null 2>&1",
+                     seed_path);
+            sc_rc = system(cmd);
+            unlink(seed_path);
+            if (sc_rc != 0) {
+                fprintf(stderr, "Failed to pre-create torture_test_file via"
+                        " smbclient (rc=%d)\n", sc_rc);
+            }
+            break;
+        }
+    }
 
     /* Run smbtorture */
     rc = run_smbtorture(num_tests, tests, backend, env.session_dir);

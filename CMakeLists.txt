@@ -30,6 +30,12 @@ else()
     set(FIO_ENABLED false)
 endif()
 
+if (EXISTS "/elbencho/source/backend/elbencho_plugin.h")
+    set(ELBENCHO_ENABLED true)
+else()
+    set(ELBENCHO_ENABLED false)
+endif()
+
 if (CUDA_ENABLED)
     project(chimera LANGUAGES C CUDA)
 else()
@@ -42,6 +48,14 @@ execute_process(COMMAND ln -sf ${CMAKE_BINARY_DIR}/compile_commands.json ${CMAKE
 
 add_definitions(-DCHIMERA_VERSION="${CHIMERA_VERSION}")
 add_definitions(-DCHIMERA_STATE_DIR="${CMAKE_INSTALL_PREFIX}/share/state")
+
+# chimera uses userspace-RCU in the QSBR flavor process-wide.  <urcu/urcu-qsbr.h>
+# clears the unprefixed RCU API map (rcu_read_lock, call_rcu, rcu_barrier, ...)
+# at the end of the header unless URCU_API_MAP is defined, so we set it globally:
+# any TU that (even transitively) includes a chimera RCU header -- the VFS caches,
+# the mount table, the identity/cred caches -- needs the map kept active.  It is
+# a no-op for TUs that include no urcu headers (e.g. the fio plugin).
+add_definitions(-DURCU_API_MAP)
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/ext/libevpl/ext/prometheus-c)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/ext/libevpl/ext/prometheus-c/ext/stopwatch)
@@ -104,6 +118,12 @@ if (FIO_ENABLED)
     message(STATUS "FIO enabled")
 else()
     message(STATUS "FIO disabled")
+endif()
+
+if (ELBENCHO_ENABLED)
+    message(STATUS "elbencho plugin enabled")
+else()
+    message(STATUS "elbencho plugin disabled")
 endif()
 
 if (IO_URING_ENABLED)

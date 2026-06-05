@@ -16,8 +16,7 @@
 #include <limits.h>
 #include <jansson.h>
 #include <utlist.h>
-#include <urcu.h>
-#include <urcu/urcu-memb.h>
+#include <urcu/urcu-qsbr.h>
 #include <xxhash.h>     /* XXH_INLINE_ALL set in CMakeLists; header-only */
 
 #include "common/varint.h"
@@ -493,6 +492,7 @@ struct diskfs_inode {
     uint32_t                    ctime_nsec;
     uint32_t                    mtime_nsec;
     uint32_t                    btime_nsec;
+    uint32_t                    dos_attributes;
 
     /* Inode-cache linkage, keyed by inum.  Lock state and the wait list
      * below are protected by the owning shard's mutex, never held across
@@ -663,6 +663,7 @@ struct diskfs_dinode {
     uint32_t mtime_nsec;
     uint32_t ctime_nsec;
     uint32_t btime_nsec;
+    uint32_t dos_attributes;
     uint64_t parent_inum;     /* directories only */
     uint32_t parent_gen;
 };
@@ -2395,27 +2396,28 @@ diskfs_inode_load_sync(
     rb_tree_query_exact(&shard->inodes, inum, inum, inode);
     if (!inode) {
         diskfs_inode_cache_recycle_locked(shared, shard);
-        inode              = calloc(1, sizeof(*inode));
-        inode->inum        = inum;
-        inode->refcnt      = 1;
-        inode->gen         = di->gen;
-        inode->mode        = di->mode;
-        inode->nlink       = di->nlink;
-        inode->uid         = di->uid;
-        inode->gid         = di->gid;
-        inode->rdev        = di->rdev;
-        inode->size        = di->size;
-        inode->space_used  = di->space_used;
-        inode->atime_sec   = di->atime_sec;
-        inode->atime_nsec  = di->atime_nsec;
-        inode->mtime_sec   = di->mtime_sec;
-        inode->mtime_nsec  = di->mtime_nsec;
-        inode->ctime_sec   = di->ctime_sec;
-        inode->ctime_nsec  = di->ctime_nsec;
-        inode->btime_sec   = di->btime_sec;
-        inode->btime_nsec  = di->btime_nsec;
-        inode->parent_inum = di->parent_inum;
-        inode->parent_gen  = di->parent_gen;
+        inode                 = calloc(1, sizeof(*inode));
+        inode->inum           = inum;
+        inode->refcnt         = 1;
+        inode->gen            = di->gen;
+        inode->mode           = di->mode;
+        inode->nlink          = di->nlink;
+        inode->uid            = di->uid;
+        inode->gid            = di->gid;
+        inode->rdev           = di->rdev;
+        inode->size           = di->size;
+        inode->space_used     = di->space_used;
+        inode->atime_sec      = di->atime_sec;
+        inode->atime_nsec     = di->atime_nsec;
+        inode->mtime_sec      = di->mtime_sec;
+        inode->mtime_nsec     = di->mtime_nsec;
+        inode->ctime_sec      = di->ctime_sec;
+        inode->ctime_nsec     = di->ctime_nsec;
+        inode->btime_sec      = di->btime_sec;
+        inode->btime_nsec     = di->btime_nsec;
+        inode->dos_attributes = di->dos_attributes;
+        inode->parent_inum    = di->parent_inum;
+        inode->parent_gen     = di->parent_gen;
         rb_tree_insert(&shard->inodes, inum, inode);
         shard->ninodes++;
         diskfs_metric_inode_cache(thread, DISKFS_METRIC_INODE_CACHE_LOAD);
@@ -3518,23 +3520,24 @@ diskfs_inode_flush(struct diskfs_inode *inode)
 
     di = inode->block->iov.data;
 
-    di->inum       = inode->inum;
-    di->gen        = inode->gen;
-    di->mode       = inode->mode;
-    di->nlink      = inode->nlink;
-    di->uid        = inode->uid;
-    di->gid        = inode->gid;
-    di->rdev       = inode->rdev;
-    di->size       = inode->size;
-    di->space_used = inode->space_used;
-    di->atime_sec  = inode->atime_sec;
-    di->mtime_sec  = inode->mtime_sec;
-    di->ctime_sec  = inode->ctime_sec;
-    di->btime_sec  = inode->btime_sec;
-    di->atime_nsec = inode->atime_nsec;
-    di->mtime_nsec = inode->mtime_nsec;
-    di->ctime_nsec = inode->ctime_nsec;
-    di->btime_nsec = inode->btime_nsec;
+    di->inum           = inode->inum;
+    di->gen            = inode->gen;
+    di->mode           = inode->mode;
+    di->nlink          = inode->nlink;
+    di->uid            = inode->uid;
+    di->gid            = inode->gid;
+    di->rdev           = inode->rdev;
+    di->size           = inode->size;
+    di->space_used     = inode->space_used;
+    di->atime_sec      = inode->atime_sec;
+    di->mtime_sec      = inode->mtime_sec;
+    di->ctime_sec      = inode->ctime_sec;
+    di->btime_sec      = inode->btime_sec;
+    di->atime_nsec     = inode->atime_nsec;
+    di->mtime_nsec     = inode->mtime_nsec;
+    di->ctime_nsec     = inode->ctime_nsec;
+    di->btime_nsec     = inode->btime_nsec;
+    di->dos_attributes = inode->dos_attributes;
     if (S_ISDIR(inode->mode)) {
         di->parent_inum = inode->parent_inum;
         di->parent_gen  = inode->parent_gen;
@@ -6384,25 +6387,26 @@ diskfs_inode_load_complete(
     rb_tree_query_exact(&shard->inodes, lc->inum, inum, inode);
     if (!inode) {
         diskfs_inode_cache_recycle_locked(shared, shard);
-        inode              = diskfs_inode_struct_new(lc->inum);
-        inode->gen         = di->gen;
-        inode->mode        = di->mode;
-        inode->nlink       = di->nlink;
-        inode->uid         = di->uid;
-        inode->gid         = di->gid;
-        inode->rdev        = di->rdev;
-        inode->size        = di->size;
-        inode->space_used  = di->space_used;
-        inode->atime_sec   = di->atime_sec;
-        inode->atime_nsec  = di->atime_nsec;
-        inode->mtime_sec   = di->mtime_sec;
-        inode->mtime_nsec  = di->mtime_nsec;
-        inode->ctime_sec   = di->ctime_sec;
-        inode->ctime_nsec  = di->ctime_nsec;
-        inode->btime_sec   = di->btime_sec;
-        inode->btime_nsec  = di->btime_nsec;
-        inode->parent_inum = di->parent_inum;
-        inode->parent_gen  = di->parent_gen;
+        inode                 = diskfs_inode_struct_new(lc->inum);
+        inode->gen            = di->gen;
+        inode->mode           = di->mode;
+        inode->nlink          = di->nlink;
+        inode->uid            = di->uid;
+        inode->gid            = di->gid;
+        inode->rdev           = di->rdev;
+        inode->size           = di->size;
+        inode->space_used     = di->space_used;
+        inode->atime_sec      = di->atime_sec;
+        inode->atime_nsec     = di->atime_nsec;
+        inode->mtime_sec      = di->mtime_sec;
+        inode->mtime_nsec     = di->mtime_nsec;
+        inode->ctime_sec      = di->ctime_sec;
+        inode->ctime_nsec     = di->ctime_nsec;
+        inode->btime_sec      = di->btime_sec;
+        inode->btime_nsec     = di->btime_nsec;
+        inode->dos_attributes = di->dos_attributes;
+        inode->parent_inum    = di->parent_inum;
+        inode->parent_gen     = di->parent_gen;
         rb_tree_insert(&shard->inodes, inum, inode);
         shard->ninodes++;
         diskfs_metric_inode_cache(thread, DISKFS_METRIC_INODE_CACHE_LOAD);
@@ -8350,6 +8354,32 @@ diskfs_mount_io_flush(
     return w.status ? -1 : 0;
 } /* diskfs_mount_io_flush */
 
+/* Discard (deallocate) a device byte range, pumping the mount-time evpl to
+ * completion.  Used at mkfs to clear whole devices.  Backends without native
+ * discard treat it as a no-op success. */
+static int
+diskfs_mount_io_discard(
+    void    *user,
+    uint32_t device_id,
+    uint64_t offset,
+    uint64_t length)
+{
+    struct diskfs_mount_io     *io = user;
+    struct diskfs_mount_io_wait w  = { 0, 0 };
+
+    if (device_id >= (uint32_t) io->shared->num_devices ||
+        !io->queue[device_id]) {
+        return -1;
+    }
+
+    evpl_block_discard(io->evpl, io->queue[device_id], offset, length,
+                       diskfs_mount_io_complete, &w);
+    while (!w.done) {
+        evpl_continue(io->evpl);
+    }
+    return w.status ? -1 : 0;
+} /* diskfs_mount_io_discard */
+
 static struct sm_io
 diskfs_mount_sm_io(struct diskfs_mount_io *io)
 {
@@ -8815,6 +8845,28 @@ diskfs_init(
                                                                   shared->root_fh);
         }
 
+        /* Fresh format: deallocate every device before writing any metadata,
+         * so the filesystem starts on a clean slate.  This drops the drives'
+         * stale FTL mappings (resetting GC/wear state) and makes cold-cache
+         * behavior reproducible run to run.  Deallocate is only a hint and the
+         * post-discard read value is unspecified, but diskfs never relies on
+         * device-provided zeros (unwritten extents read as zeros from the
+         * b+tree), so a device that ignores it is harmless.  Backends without
+         * native discard treat it as a no-op success. */
+        if (mode == 0) {
+            for (i = 0; i < shared->num_devices; i++) {
+                if (!shared->devices[i].bdev) {
+                    continue;
+                }
+                if (diskfs_mount_io_discard(mio, i, 0,
+                                            shared->devices[i].size) != 0) {
+                    chimera_diskfs_info(
+                        "device %d: full-device discard failed or unsupported; "
+                        "continuing format", i);
+                }
+            }
+        }
+
         /* Clear the CLEAN flag for this session: an unclean teardown then
          * leaves it clear, so the next mount won't mistake a crash for a
          * clean shutdown. */
@@ -8943,15 +8995,16 @@ diskfs_bootstrap(struct diskfs_thread *thread)
      * enforcement a root-owned 0755 root would refuse all creation by non-root
      * clients on this engine-authoritative backend (matches memfs/cairn).
      * Subdirs are still created owned by their creator with 0755. */
-    inode->mode       = S_IFDIR | 0777;
-    inode->atime_sec  = now.tv_sec;
-    inode->atime_nsec = now.tv_nsec;
-    inode->mtime_sec  = now.tv_sec;
-    inode->mtime_nsec = now.tv_nsec;
-    inode->ctime_sec  = now.tv_sec;
-    inode->ctime_nsec = now.tv_nsec;
-    inode->btime_sec  = now.tv_sec;
-    inode->btime_nsec = now.tv_nsec;
+    inode->mode           = S_IFDIR | 0777;
+    inode->atime_sec      = now.tv_sec;
+    inode->atime_nsec     = now.tv_nsec;
+    inode->mtime_sec      = now.tv_sec;
+    inode->mtime_nsec     = now.tv_nsec;
+    inode->ctime_sec      = now.tv_sec;
+    inode->ctime_nsec     = now.tv_nsec;
+    inode->btime_sec      = now.tv_sec;
+    inode->btime_nsec     = now.tv_nsec;
+    inode->dos_attributes = 0;
 
     /* Root directory's parent is itself for ".." lookup */
     inode->parent_inum = inode->inum;
@@ -8986,20 +9039,21 @@ diskfs_bootstrap(struct diskfs_thread *thread)
                                                              DISKFS_ORPHAN_INUM, &odev);
         struct diskfs_inode *oin = diskfs_inode_struct_new(DISKFS_ORPHAN_INUM);
 
-        oin->size        = 4096;
-        oin->space_used  = 4096;
-        oin->nlink       = 1;
-        oin->mode        = S_IFDIR | 0700;
-        oin->atime_sec   = now.tv_sec;
-        oin->atime_nsec  = now.tv_nsec;
-        oin->mtime_sec   = now.tv_sec;
-        oin->mtime_nsec  = now.tv_nsec;
-        oin->ctime_sec   = now.tv_sec;
-        oin->ctime_nsec  = now.tv_nsec;
-        oin->btime_sec   = now.tv_sec;
-        oin->btime_nsec  = now.tv_nsec;
-        oin->parent_inum = DISKFS_ORPHAN_INUM;
-        oin->parent_gen  = oin->gen;
+        oin->size           = 4096;
+        oin->space_used     = 4096;
+        oin->nlink          = 1;
+        oin->mode           = S_IFDIR | 0700;
+        oin->atime_sec      = now.tv_sec;
+        oin->atime_nsec     = now.tv_nsec;
+        oin->mtime_sec      = now.tv_sec;
+        oin->mtime_nsec     = now.tv_nsec;
+        oin->ctime_sec      = now.tv_sec;
+        oin->ctime_nsec     = now.tv_nsec;
+        oin->btime_sec      = now.tv_sec;
+        oin->btime_nsec     = now.tv_nsec;
+        oin->dos_attributes = 0;
+        oin->parent_inum    = DISKFS_ORPHAN_INUM;
+        oin->parent_gen     = oin->gen;
 
         diskfs_inode_cache_insert(shared, oin);
 
@@ -9663,22 +9717,38 @@ diskfs_acl_store(
  */
 static void
 diskfs_inherit_acl(
-    struct diskfs_thread *thread,
-    struct diskfs_txn    *txn,
-    struct diskfs_inode  *child,
-    struct diskfs_inode  *parent,
-    int                   windows_default)
+    struct diskfs_thread     *thread,
+    struct diskfs_txn        *txn,
+    struct diskfs_inode      *child,
+    struct diskfs_inode      *parent,
+    const struct chimera_acl *new_acl,
+    int                       windows_default)
 {
     int                 is_dir = S_ISDIR(child->mode);
     uint16_t            want   = CHIMERA_ACE_FLAG_FILE_INHERIT |
         (is_dir ? CHIMERA_ACE_FLAG_DIR_INHERIT : 0);
     uint8_t             pserial[DISKFS_ACL_REC_MAX];
-    int                 plen = diskfs_bt_lookup_exact(thread, parent, &diskfs_acl_key,
-                                                      pserial, sizeof(pserial));
+    int                 plen;
     uint8_t             pbuf[sizeof(struct chimera_acl) +
                              DISKFS_ACL_REC_MAX_ACES * sizeof(struct chimera_ace)];
     struct chimera_acl *parent_acl = (struct chimera_acl *) pbuf;
     int                 has_inh    = 0;
+
+    /* An explicit ACL supplied at create (e.g. an SMB SD via SecD) takes
+     * precedence over inheritance and the windows_default below.  The caller
+     * snapshots new_acl from set_attr BEFORE diskfs_apply_attrs() runs, since
+     * apply_attrs resets va_set_mask down to the bits it applied (ACL isn't
+     * one of them).  Passing the pointer explicitly avoids relying on a
+     * possibly-uninitialized set_attr->va_acl in callers that don't always
+     * set ATTR_ACL (e.g., NFS3 creates). */
+    if (new_acl && new_acl->num_aces) {
+        diskfs_acl_store(thread, txn, child, new_acl);
+        child->mode = (child->mode & S_IFMT) | chimera_acl_to_mode(new_acl);
+        return;
+    }
+
+    plen = diskfs_bt_lookup_exact(thread, parent, &diskfs_acl_key,
+                                  pserial, sizeof(pserial));
 
     if (plen < 0 ||
         chimera_acl_deserialize((const char *) pserial, plen, parent_acl,
@@ -9755,6 +9825,11 @@ diskfs_map_attrs(
         attr->va_ino           = inode->inum;
         attr->va_dev           = (42UL << 32) | 42;
         attr->va_rdev          = inode->rdev;
+
+        /* diskfs persists DOS attributes natively (in-memory + on-disk
+         * dinode), so report them alongside stat (matching memfs/cairn). */
+        attr->va_set_mask      |= CHIMERA_VFS_ATTR_DOS_ATTRIBUTES;
+        attr->va_dos_attributes = inode->dos_attributes;
     }
 
     /* Birth time (SMB create time) is tracked natively but lives outside
@@ -9857,7 +9932,7 @@ diskfs_apply_attrs(
         if (attr->va_atime.tv_nsec == CHIMERA_VFS_TIME_NOW) {
             inode->atime_sec  = now.tv_sec;
             inode->atime_nsec = now.tv_nsec;
-        } else {
+        } else if (attr->va_atime.tv_nsec != CHIMERA_VFS_TIME_OMIT) {
             inode->atime_sec  = attr->va_atime.tv_sec;
             inode->atime_nsec = attr->va_atime.tv_nsec;
         }
@@ -9868,7 +9943,7 @@ diskfs_apply_attrs(
         if (attr->va_mtime.tv_nsec == CHIMERA_VFS_TIME_NOW) {
             inode->mtime_sec  = now.tv_sec;
             inode->mtime_nsec = now.tv_nsec;
-        } else {
+        } else if (attr->va_mtime.tv_nsec != CHIMERA_VFS_TIME_OMIT) {
             inode->mtime_sec  = attr->va_mtime.tv_sec;
             inode->mtime_nsec = attr->va_mtime.tv_nsec;
         }
@@ -9879,14 +9954,33 @@ diskfs_apply_attrs(
         if (attr->va_btime.tv_nsec == CHIMERA_VFS_TIME_NOW) {
             inode->btime_sec  = now.tv_sec;
             inode->btime_nsec = now.tv_nsec;
-        } else {
+        } else if (attr->va_btime.tv_nsec != CHIMERA_VFS_TIME_OMIT) {
             inode->btime_sec  = attr->va_btime.tv_sec;
             inode->btime_nsec = attr->va_btime.tv_nsec;
         }
     }
 
-    inode->ctime_sec  = now.tv_sec;
-    inode->ctime_nsec = now.tv_nsec;
+    if (set_mask & CHIMERA_VFS_ATTR_DOS_ATTRIBUTES) {
+        attr->va_set_mask    |= CHIMERA_VFS_ATTR_DOS_ATTRIBUTES;
+        inode->dos_attributes = attr->va_dos_attributes;
+    }
+
+    /* ctime: round-trip a caller-supplied change_time (SMB FileBasicInformation
+     * SetInfo) or preserve it on TIME_OMIT; otherwise stamp it with now for the
+     * implicit metadata change.  See memfs_apply_attrs() for the rationale. */
+    if (set_mask & CHIMERA_VFS_ATTR_CTIME) {
+        attr->va_set_mask |= CHIMERA_VFS_ATTR_CTIME;
+        if (attr->va_ctime.tv_nsec == CHIMERA_VFS_TIME_NOW) {
+            inode->ctime_sec  = now.tv_sec;
+            inode->ctime_nsec = now.tv_nsec;
+        } else if (attr->va_ctime.tv_nsec != CHIMERA_VFS_TIME_OMIT) {
+            inode->ctime_sec  = attr->va_ctime.tv_sec;
+            inode->ctime_nsec = attr->va_ctime.tv_nsec;
+        }
+    } else {
+        inode->ctime_sec  = now.tv_sec;
+        inode->ctime_nsec = now.tv_nsec;
+    }
 
 } /* diskfs_apply_attrs */
 
@@ -10578,30 +10672,39 @@ diskfs_mkdir_at_alloc_cb(
 
     clock_gettime(CLOCK_REALTIME, &now);
 
-    inode->size       = 4096;
-    inode->space_used = 4096;
-    inode->uid        = request->cred->uid;
-    inode->gid        = request->cred->gid;
-    inode->nlink      = 2;
-    inode->mode       = S_IFDIR | 0755;
-    inode->atime_sec  = now.tv_sec;
-    inode->atime_nsec = now.tv_nsec;
-    inode->mtime_sec  = now.tv_sec;
-    inode->mtime_nsec = now.tv_nsec;
-    inode->ctime_sec  = now.tv_sec;
-    inode->ctime_nsec = now.tv_nsec;
-    inode->btime_sec  = now.tv_sec;
-    inode->btime_nsec = now.tv_nsec;
+    inode->size           = 4096;
+    inode->space_used     = 4096;
+    inode->uid            = request->cred->uid;
+    inode->gid            = request->cred->gid;
+    inode->nlink          = 2;
+    inode->mode           = S_IFDIR | 0755;
+    inode->atime_sec      = now.tv_sec;
+    inode->atime_nsec     = now.tv_nsec;
+    inode->mtime_sec      = now.tv_sec;
+    inode->mtime_nsec     = now.tv_nsec;
+    inode->ctime_sec      = now.tv_sec;
+    inode->ctime_nsec     = now.tv_nsec;
+    inode->btime_sec      = now.tv_sec;
+    inode->btime_nsec     = now.tv_nsec;
+    inode->dos_attributes = 0;
 
     inode->parent_inum = parent->inum;
     inode->parent_gen  = parent->gen;
+
+    /* Snapshot any explicit ACL pointer BEFORE diskfs_apply_attrs() rewrites
+     * va_set_mask and drops the ATTR_ACL bit. */
+    const struct chimera_acl *new_acl_mkdir =
+        (request->mkdir_at.set_attr->va_set_mask & CHIMERA_VFS_ATTR_ACL)
+        ? request->mkdir_at.set_attr->va_acl : NULL;
 
     diskfs_apply_attrs(inode, request->mkdir_at.set_attr);
 
     /* Seed the new directory's ACL (inherited, or a Windows default DACL for
      * SMB creates) before mapping attrs so r_attr reflects any inherited mode
-     * and carries the freshly-stored ACL. */
+     * and carries the freshly-stored ACL.  An explicit ACL in set_attr (e.g.
+     * an SMB SD via SecD) takes precedence. */
     diskfs_inherit_acl(thread, p->txn, inode, parent,
+                       new_acl_mkdir,
                        request->cred->flavor == CHIMERA_VFS_AUTH_ATTR);
 
     diskfs_map_attrs(thread, &request->mkdir_at.r_attr, inode);
@@ -10754,20 +10857,21 @@ diskfs_mknod_at_alloc_cb(
 
     clock_gettime(CLOCK_REALTIME, &now);
 
-    inode->size       = 0;
-    inode->space_used = 0;
-    inode->uid        = request->cred->uid;
-    inode->gid        = request->cred->gid;
-    inode->nlink      = 1;
-    inode->rdev       = 0;
-    inode->atime_sec  = now.tv_sec;
-    inode->atime_nsec = now.tv_nsec;
-    inode->mtime_sec  = now.tv_sec;
-    inode->mtime_nsec = now.tv_nsec;
-    inode->ctime_sec  = now.tv_sec;
-    inode->ctime_nsec = now.tv_nsec;
-    inode->btime_sec  = now.tv_sec;
-    inode->btime_nsec = now.tv_nsec;
+    inode->size           = 0;
+    inode->space_used     = 0;
+    inode->uid            = request->cred->uid;
+    inode->gid            = request->cred->gid;
+    inode->nlink          = 1;
+    inode->rdev           = 0;
+    inode->atime_sec      = now.tv_sec;
+    inode->atime_nsec     = now.tv_nsec;
+    inode->mtime_sec      = now.tv_sec;
+    inode->mtime_nsec     = now.tv_nsec;
+    inode->ctime_sec      = now.tv_sec;
+    inode->ctime_nsec     = now.tv_nsec;
+    inode->btime_sec      = now.tv_sec;
+    inode->btime_nsec     = now.tv_nsec;
+    inode->dos_attributes = 0;
 
     if (request->mknod_at.set_attr->va_set_mask & CHIMERA_VFS_ATTR_MODE) {
         inode->mode = request->mknod_at.set_attr->va_mode;
@@ -11506,11 +11610,20 @@ diskfs_open_at_existing_cb(
      * and would ignore a stored ACL that grants more (or less) than the mode.
      * (Mirrors the memfs and cairn backends.) */
 
-    if ((request->open_at.set_attr->va_set_mask & CHIMERA_VFS_ATTR_SIZE) &&
-        request->open_at.set_attr->va_size == 0 &&
-        S_ISREG(inode->mode)) {
-        diskfs_apply_attrs(inode, request->open_at.set_attr);
+    /* Overwrite/supersede disposition: replace the existing file's contents
+     * (truncate to zero) and apply the new attributes (including DOS
+     * attributes), mirroring memfs/cairn.  The SMB layer conveys the truncate
+     * via the OPEN_TRUNCATE flag rather than a SIZE=0 set_attr, so honor both.
+     * As with the pre-existing SIZE=0 path, this resets EOF without reclaiming
+     * the data extents here (the open flow finishes synchronously); a non-empty
+     * file's extents are reclaimed lazily / on the async setattr-truncate path. */
+    if (S_ISREG(inode->mode) &&
+        ((request->open_at.flags & CHIMERA_VFS_OPEN_TRUNCATE) ||
+         ((request->open_at.set_attr->va_set_mask & CHIMERA_VFS_ATTR_SIZE) &&
+          request->open_at.set_attr->va_size == 0))) {
+        inode->size       = 0;
         inode->space_used = 0;
+        diskfs_apply_attrs(inode, request->open_at.set_attr);
     }
 
     diskfs_open_at_finish(request, parent, inode);
@@ -11527,6 +11640,11 @@ diskfs_open_at_inserted_cb(
 
     (void) result;
     diskfs_bt_op_free(p->thread, op);
+    /* Signal to the protocol layer that this open created the file (vs.
+     * opened an existing one) so the SMB CREATE reply reports the correct
+     * Create Action (FILE_CREATED vs FILE_OPENED) for OPEN_IF / SUPERSEDE /
+     * OVERWRITE_IF dispositions.  Matches memfs/cairn. */
+    request->open_at.r_created = 1;
     diskfs_open_at_finish(request, p->inode_stash[0], p->inode_stash[1]);
 } /* diskfs_open_at_inserted_cb */
 
@@ -11550,26 +11668,35 @@ diskfs_open_at_alloc_cb(
 
     clock_gettime(CLOCK_REALTIME, &now);
 
-    inode->size       = 0;
-    inode->space_used = 0;
-    inode->uid        = request->cred->uid;
-    inode->gid        = request->cred->gid;
-    inode->nlink      = 1;
-    inode->mode       = S_IFREG | 0644;
-    inode->atime_sec  = now.tv_sec;
-    inode->atime_nsec = now.tv_nsec;
-    inode->mtime_sec  = now.tv_sec;
-    inode->mtime_nsec = now.tv_nsec;
-    inode->ctime_sec  = now.tv_sec;
-    inode->ctime_nsec = now.tv_nsec;
-    inode->btime_sec  = now.tv_sec;
-    inode->btime_nsec = now.tv_nsec;
+    inode->size           = 0;
+    inode->space_used     = 0;
+    inode->uid            = request->cred->uid;
+    inode->gid            = request->cred->gid;
+    inode->nlink          = 1;
+    inode->mode           = S_IFREG | 0644;
+    inode->atime_sec      = now.tv_sec;
+    inode->atime_nsec     = now.tv_nsec;
+    inode->mtime_sec      = now.tv_sec;
+    inode->mtime_nsec     = now.tv_nsec;
+    inode->ctime_sec      = now.tv_sec;
+    inode->ctime_nsec     = now.tv_nsec;
+    inode->btime_sec      = now.tv_sec;
+    inode->btime_nsec     = now.tv_nsec;
+    inode->dos_attributes = 0;
+
+    /* Snapshot any explicit ACL pointer BEFORE diskfs_apply_attrs() rewrites
+     * va_set_mask and drops the ATTR_ACL bit. */
+    const struct chimera_acl *new_acl_open =
+        (request->open_at.set_attr->va_set_mask & CHIMERA_VFS_ATTR_ACL)
+        ? request->open_at.set_attr->va_acl : NULL;
 
     diskfs_apply_attrs(inode, request->open_at.set_attr);
 
     /* Seed the new file's ACL (inherited from the parent, or a Windows default
-     * DACL for SMB creates) into the child's fresh, resident b+tree. */
+     * DACL for SMB creates) into the child's fresh, resident b+tree.  An
+     * explicit ACL in set_attr (e.g. an SMB SD via SecD) takes precedence. */
     diskfs_inherit_acl(thread, p->txn, inode, parent,
+                       new_acl_open,
                        request->cred->flavor == CHIMERA_VFS_AUTH_ATTR);
 
     parent->mtime_sec  = now.tv_sec;
@@ -11696,20 +11823,21 @@ diskfs_create_unlinked_alloc_cb(
 
     clock_gettime(CLOCK_REALTIME, &now);
 
-    inode->size       = 0;
-    inode->space_used = 0;
-    inode->uid        = request->cred->uid;
-    inode->gid        = request->cred->gid;
-    inode->nlink      = 0;
-    inode->mode       = S_IFREG | 0644;
-    inode->atime_sec  = now.tv_sec;
-    inode->atime_nsec = now.tv_nsec;
-    inode->mtime_sec  = now.tv_sec;
-    inode->mtime_nsec = now.tv_nsec;
-    inode->ctime_sec  = now.tv_sec;
-    inode->ctime_nsec = now.tv_nsec;
-    inode->btime_sec  = now.tv_sec;
-    inode->btime_nsec = now.tv_nsec;
+    inode->size           = 0;
+    inode->space_used     = 0;
+    inode->uid            = request->cred->uid;
+    inode->gid            = request->cred->gid;
+    inode->nlink          = 0;
+    inode->mode           = S_IFREG | 0644;
+    inode->atime_sec      = now.tv_sec;
+    inode->atime_nsec     = now.tv_nsec;
+    inode->mtime_sec      = now.tv_sec;
+    inode->mtime_nsec     = now.tv_nsec;
+    inode->ctime_sec      = now.tv_sec;
+    inode->ctime_nsec     = now.tv_nsec;
+    inode->btime_sec      = now.tv_sec;
+    inode->btime_nsec     = now.tv_nsec;
+    inode->dos_attributes = 0;
 
     diskfs_apply_attrs(inode, request->create_unlinked.set_attr);
 
@@ -14341,20 +14469,21 @@ diskfs_symlink_at_alloc_cb(
 
     clock_gettime(CLOCK_REALTIME, &now);
 
-    inode->size       = request->symlink_at.targetlen;
-    inode->space_used = request->symlink_at.targetlen;
-    inode->uid        = request->cred->uid;
-    inode->gid        = request->cred->gid;
-    inode->nlink      = 1;
-    inode->mode       = S_IFLNK | 0755;
-    inode->atime_sec  = now.tv_sec;
-    inode->atime_nsec = now.tv_nsec;
-    inode->mtime_sec  = now.tv_sec;
-    inode->mtime_nsec = now.tv_nsec;
-    inode->ctime_sec  = now.tv_sec;
-    inode->ctime_nsec = now.tv_nsec;
-    inode->btime_sec  = now.tv_sec;
-    inode->btime_nsec = now.tv_nsec;
+    inode->size           = request->symlink_at.targetlen;
+    inode->space_used     = request->symlink_at.targetlen;
+    inode->uid            = request->cred->uid;
+    inode->gid            = request->cred->gid;
+    inode->nlink          = 1;
+    inode->mode           = S_IFLNK | 0755;
+    inode->atime_sec      = now.tv_sec;
+    inode->atime_nsec     = now.tv_nsec;
+    inode->mtime_sec      = now.tv_sec;
+    inode->mtime_nsec     = now.tv_nsec;
+    inode->ctime_sec      = now.tv_sec;
+    inode->ctime_nsec     = now.tv_nsec;
+    inode->btime_sec      = now.tv_sec;
+    inode->btime_nsec     = now.tv_nsec;
+    inode->dos_attributes = 0;
 
     diskfs_map_attrs(thread, &request->symlink_at.r_attr, inode);
 

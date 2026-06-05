@@ -131,6 +131,10 @@ struct chimera_smb_config {
      * a watch (the "change notify = no" share behaviour Windows exposes;
      * smb2.change_notify_disabled expects this). */
     int                            notify_disabled;
+    /* Windows-style canonicalisation of the DACL_AUTO_INHERITED bit on
+     * SET_SECURITY; see chimera_server_config_set_smb_acl_inherited_canonicalize
+     * for semantics.  Default 1 (canonical). */
+    int                            acl_inherited_canonicalize;
     uint32_t                       capabilities;
     uint32_t                       dialects[16];
     struct chimera_smb_nic_info    nic_info[16];
@@ -534,6 +538,10 @@ struct chimera_smb_request {
                 uint64_t dst_offset;
                 uint32_t length;
             }                               cc_chunks[CHIMERA_SMB_COPYCHUNK_MAX];
+            /* FSCTL_CREATE_OR_GET_OBJECT_ID response buffer (MS-FSCC 2.4.28
+             * FILE_OBJECTID_BUFFER, type 1): ObjectId(16) + BirthVolumeId(16)
+             * + BirthObjectId(16) + DomainId(16) = 64 bytes. */
+            uint8_t                         oid_buffer[64];
         } ioctl;
         struct {
             uint8_t                         info_type;

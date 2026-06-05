@@ -120,6 +120,15 @@ chimera_server_config_get_smb_notify_disabled(
     const struct chimera_server_config *config);
 
 void
+chimera_server_config_set_smb_acl_inherited_canonicalize(
+    struct chimera_server_config *config,
+    int                           enable);
+
+int
+chimera_server_config_get_smb_acl_inherited_canonicalize(
+    const struct chimera_server_config *config);
+
+void
 chimera_server_config_set_cache_ttl(
     struct chimera_server_config *config,
     int                           ttl);
@@ -249,7 +258,9 @@ chimera_server_config_add_pnfs_ds(
     struct chimera_server_config *config,
     const char                   *netid,
     const char                   *uaddr,
-    const char                   *backing_path);
+    const char                   *backing_path,
+    int                           version,
+    int                           minorversion);
 
 /* After mounts are established, resolve each pNFS data server's backing root
  * (its nfs-mounted export directory) into the device table so the MDS can
@@ -274,6 +285,15 @@ chimera_server_config_set_nfs_data_server(
 
 int
 chimera_server_config_get_nfs_data_server(
+    const struct chimera_server_config *config);
+
+void
+chimera_server_config_set_nfs_server_scope(
+    struct chimera_server_config *config,
+    uint64_t                      scope);
+
+uint64_t
+chimera_server_config_get_nfs_server_scope(
     const struct chimera_server_config *config);
 
 void
@@ -432,6 +452,38 @@ chimera_server_mount(
     const char            *module_name,
     const char            *module_path,
     const char            *options);
+
+/* Ensure module_path exists inside module_name (creating intermediate dirs with
+ * the given mode, owner 0/0) before it is mounted -- backs the "create" mount
+ * option.  Returns 0 on success, -1 if any component could not be created. */
+int
+chimera_server_mkpath(
+    struct chimera_server *server,
+    const char            *module_name,
+    const char            *module_path,
+    uint32_t               mode);
+
+int
+chimera_server_unmount(
+    struct chimera_server *server,
+    const char            *mount_path);
+
+int
+chimera_server_mount_in_use(
+    struct chimera_server *server,
+    const char            *mount_path);
+
+typedef int (*chimera_server_mount_iterate_cb)(
+    const char *mount_path,
+    const char *module_name,
+    const char *module_path,
+    void       *data);
+
+void
+chimera_server_iterate_mounts(
+    struct chimera_server          *server,
+    chimera_server_mount_iterate_cb callback,
+    void                           *data);
 
 int
 chimera_server_create_bucket(
