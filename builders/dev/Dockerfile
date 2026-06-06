@@ -29,10 +29,9 @@ RUN if [ -n "$APT_MIRROR" ]; then \
     rm -f /etc/apt/sources.list.d/ubuntu.sources; \
     fi
 
+# Quantum note. We do not need to unminimize since it is only a build_container
 RUN apt-get -y update && \
     apt-get -y --no-install-recommends upgrade && \
-    apt-get -y --no-install-recommends install unminimize apt-utils && \
-    yes | unminimize && \
     apt-get -y --no-install-recommends install clang clang-tools cmake ninja-build git flex bison lldb gdb less vim psmisc uncrustify \
     net-tools tshark tcpdump uuid-dev iproute2 man-db manpages-dev ca-certificates ssh libjansson-dev libclang-rt-18-dev llvm wget \
     libxxhash-dev liburcu-dev librdmacm-dev liburing-dev libaio-dev libunwind-dev librocksdb-dev libcurl4-openssl-dev clangd uthash-dev libnuma-dev \
