@@ -213,6 +213,31 @@ chimera_smb_ioctl(struct chimera_smb_request *request)
             chimera_smb_complete_request(request, SMB2_STATUS_SUCCESS);
             break;
 
+        case SMB2_FSCTL_SRV_ENUMERATE_SNAPSHOTS:
+            /* MS-SMB2 3.3.5.15.1 / MS-FSCC 2.3.20: enumerate the previous
+             * versions (VSS snapshots) of the open.  We don't expose
+             * snapshots, so return an empty SRV_SNAPSHOT_ARRAY (all counts
+             * zero) with SUCCESS rather than NOT_SUPPORTED — that is what a
+             * server with no snapshots reports, and clients expect it. */
+            open_file = chimera_smb_open_file_resolve(request, &request->ioctl.file_id);
+
+            if (unlikely(!open_file)) {
+                chimera_smb_complete_request(request, SMB2_STATUS_FILE_CLOSED);
+                return;
+            }
+
+            chimera_smb_open_file_release(request, open_file);
+
+            /* The SRV_SNAPSHOT_ARRAY response is a 12-byte header; the client
+             * must offer at least that much output space. */
+            if (request->ioctl.max_output_response < 12) {
+                chimera_smb_complete_request(request, SMB2_STATUS_INVALID_PARAMETER);
+                return;
+            }
+
+            chimera_smb_complete_request(request, SMB2_STATUS_SUCCESS);
+            break;
+
         default:
             /* MS-SMB2 3.3.5.15: an FSCTL the server does not implement is
              * rejected with STATUS_NOT_SUPPORTED. */
@@ -261,6 +286,9 @@ chimera_smb_ioctl_reply(
         case SMB2_FSCTL_CREATE_OR_GET_OBJECT_ID:
             output_length = 64; /* FILE_OBJECTID_BUFFER (type 1) */
             break;
+        case SMB2_FSCTL_SRV_ENUMERATE_SNAPSHOTS:
+            output_length = 12; /* SRV_SNAPSHOT_ARRAY header, empty list */
+            break;
     } /* switch */
 
     evpl_iovec_cursor_append_uint16(reply_cursor, SMB2_IOCTL_REPLY_SIZE);
@@ -307,18 +335,22 @@ chimera_smb_ioctl_reply(
                 evpl_iovec_cursor_append_uint32(reply_cursor, caps); /* capabilities (RSS) */
                 evpl_iovec_cursor_append_uint32(reply_cursor, 0); /* reserved */
                 evpl_iovec_cursor_append_uint64(reply_cursor, nic_info->speed); /* speed */
+                /* SOCKADDR_STORAGE.ss_family is the Windows AF_* value on the
+                 * wire (MS-DTYP / MS-SMB2 3.2.4.20.10): 2 == AF_INET,
+                 * 23 (0x17) == AF_INET6.  Linux's AF_INET6 (10) differs, so map
+                 * it explicitly. */
                 evpl_iovec_cursor_append_uint16(reply_cursor, nic_info->addr.ss_family == AF_INET ? 2 :
-                                                10);                                                                    /* AF_INET */
+                                                23);                                                                    /* Windows AF_INET / AF_INET6 */
                 evpl_iovec_cursor_append_uint16(reply_cursor, 0); /* port */
                 if (nic_info->addr.ss_family == AF_INET) {
                     evpl_iovec_cursor_append_blob(reply_cursor,
                                                   &((struct sockaddr_in *) &nic_info->addr)->sin_addr.s_addr,
-                                                  4);                                                                   /* address: 10.67.25.209 */
+                                                  4);                                                                   /* IPv4 address */
                 } else {
                     evpl_iovec_cursor_append_blob(reply_cursor,
                                                   &((struct sockaddr_in6 *) &nic_info->addr)->sin6_addr.
                                                   s6_addr,
-                                                  16);                                                                  /* address: 10.67.25.209 */
+                                                  16);                                                                  /* IPv6 address */
                 }
                 evpl_iovec_cursor_zero(reply_cursor, 120); /* ifname length */
             }
@@ -351,6 +383,14 @@ chimera_smb_ioctl_reply(
             break;
         case SMB2_FSCTL_CREATE_OR_GET_OBJECT_ID:
             evpl_iovec_cursor_append_blob(reply_cursor, request->ioctl.oid_buffer, 64);
+            break;
+        case SMB2_FSCTL_SRV_ENUMERATE_SNAPSHOTS:
+            /* Empty SRV_SNAPSHOT_ARRAY (MS-FSCC 2.3.20): no snapshots, none
+             * returned, zero array bytes.  With NumberOfSnapShotsReturned == 0
+             * the SnapShots[] array is absent. */
+            evpl_iovec_cursor_append_uint32(reply_cursor, 0); /* NumberOfSnapShots */
+            evpl_iovec_cursor_append_uint32(reply_cursor, 0); /* NumberOfSnapShotsReturned */
+            evpl_iovec_cursor_append_uint32(reply_cursor, 0); /* SnapShotArraySize */
             break;
         default:
             break;

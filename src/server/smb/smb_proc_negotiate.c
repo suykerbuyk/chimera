@@ -57,6 +57,27 @@ chimera_smb_negotiate(struct chimera_smb_request *request)
     uint16_t                          dialect = 0, candidate;
     int                               i, j;
 
+    /* MS-SMB2 3.3.5.4: a NEGOTIATE received on a connection that already
+     * completed one (Connection.NegotiateDialect set to a concrete SMB2
+     * dialect) MUST terminate the transport connection with no reply.  WPTS
+     * DurableHandleV1_Reconnect_AfterServerDisconnect drives exactly this to
+     * force a server-side disconnect before reconnecting.  Mirror the
+     * VALIDATE_NEGOTIATE_INFO teardown: drop the compound and close the bind.
+     *
+     * Exception: 0x02ff is the wildcard "revision" recorded when an SMB1
+     * multi-protocol NEGOTIATE offered "SMB 2.???" (MS-SMB2 3.3.5.3.1).  It
+     * explicitly means "a real SMB2 NEGOTIATE follows on this same
+     * connection", so that mandatory second NEGOTIATE must be processed, not
+     * treated as a duplicate (otherwise BVT_Negotiate_Compatible_Wildcard and
+     * every real SMB1->SMB2 wildcard client get their connection dropped). */
+    if (conn->dialect != 0 && conn->dialect != 0x02ff) {
+        struct chimera_smb_compound *compound = request->compound;
+
+        chimera_smb_compound_free(thread, compound);
+        evpl_close(thread->evpl, conn->bind);
+        return;
+    }
+
     clock_gettime(
         CLOCK_REALTIME,
         &now);
@@ -141,13 +162,18 @@ chimera_smb_negotiate(struct chimera_smb_request *request)
     conn->dialect = dialect;
 
     /* SMB 3.1.1 mandates a PreauthIntegrityCapabilities context offering a
-     * hash algorithm we support (SHA-512). Per MS-SMB2 3.3.5.4, a 3.1.1
-     * NEGOTIATE without it (or offering no supported hash) fails with
-     * STATUS_INVALID_PARAMETER. */
+     * hash algorithm we support (SHA-512). Per MS-SMB2 §3.3.5.4:
+     *   - if no PreauthIntegrity context is present at all, fail with
+     *     STATUS_INVALID_PARAMETER;
+     *   - if the context is present but its HashAlgorithms array contains no
+     *     algorithm we support, fail with
+     *     STATUS_SMB_NO_PREAUTH_INTEGRITY_HASH_OVERLAP (0xC05D0000). */
     if (dialect == SMB2_DIALECT_3_1_1) {
+        int have_preauth_ctx =
+            (request->negotiate.ctx_present_mask & CHIMERA_SMB_NEGOTIATE_CTX_PREAUTH) != 0;
         int have_sha512 = 0;
 
-        if (request->negotiate.ctx_present_mask & CHIMERA_SMB_NEGOTIATE_CTX_PREAUTH) {
+        if (have_preauth_ctx) {
             for (i = 0; i < request->negotiate.preauth_in.hash_alg_count; i++) {
                 if (request->negotiate.preauth_in.hash_algs[i] == SMB2_PREAUTH_HASH_SHA_512) {
                     have_sha512 = 1;
@@ -157,7 +183,11 @@ chimera_smb_negotiate(struct chimera_smb_request *request)
         }
 
         if (!have_sha512) {
-            chimera_smb_complete_request(request, SMB2_STATUS_INVALID_PARAMETER);
+            chimera_smb_complete_request(
+                request,
+                have_preauth_ctx ?
+                SMB2_STATUS_SMB_NO_PREAUTH_INTEGRITY_OVERLAP :
+                SMB2_STATUS_INVALID_PARAMETER);
             return;
         }
     }
@@ -167,6 +197,14 @@ chimera_smb_negotiate(struct chimera_smb_request *request)
     memcpy(conn->client_guid, request->negotiate.client_guid, SMB2_GUID_SIZE);
     conn->client_security_mode = request->negotiate.security_mode;
     conn->client_capabilities  = request->negotiate.capabilities;
+
+    /* Connection.SupportsNotifications (MS-SMB2 3.3.5.4): only meaningful for
+     * 3.1.1, and only when the client advertised SMB2_GLOBAL_CAP_NOTIFICATIONS.
+     * Recorded so a binding SESSION_SETUP can be validated against the bound
+     * session's value (MS-SMB2 3.3.5.5). */
+    conn->supports_notifications =
+        (dialect == SMB2_DIALECT_3_1_1 &&
+         (request->negotiate.capabilities & SMB2_GLOBAL_CAP_NOTIFICATIONS)) ? 1 : 0;
 
     /* Pick algorithms from the client's negotiate contexts. Phase 0 records
      * presence; Phases 2/4/5 will actually flip on preauth/encryption/RDMA. */
@@ -300,6 +338,43 @@ build_encryption_capabilities_response(
     return 4;
 } /* build_encryption_capabilities_response */
 
+/* Build the SMB2_COMPRESSION_CAPABILITIES response context (MS-SMB2 §2.2.3.1.3):
+ *   CompressionAlgorithmCount(2), Padding(2)=0, Flags(4),
+ *   CompressionAlgorithms[count](2 each).
+ * The full mutually-negotiated set is echoed (selection recorded it on the
+ * connection).  Returns -1 — and so emits no context — when nothing was
+ * negotiated (e.g. compression disabled in config). */
+static int
+build_compression_capabilities_response(
+    struct chimera_smb_conn    *conn,
+    struct chimera_smb_request *request,
+    uint8_t                    *out,
+    uint32_t                    out_size)
+{
+    uint16_t count = conn->negotiated.compression_alg_count;
+    uint32_t need  = 8u + (uint32_t) count * 2u;
+    int      i;
+
+    (void) request;
+
+    if (count == 0 || out_size < need) {
+        return -1;
+    }
+
+    out[0] = count & 0xff; out[1] = (count >> 8) & 0xff;  /* CompressionAlgorithmCount */
+    out[2] = 0; out[3] = 0;                               /* Padding */
+    out[4] = conn->negotiated.compression_flags & 0xff;   /* Flags */
+    out[5] = (conn->negotiated.compression_flags >> 8) & 0xff;
+    out[6] = (conn->negotiated.compression_flags >> 16) & 0xff;
+    out[7] = (conn->negotiated.compression_flags >> 24) & 0xff;
+    for (i = 0; i < count; i++) {
+        out[8 + i * 2] = conn->negotiated.compression_algs[i] & 0xff;
+        out[9 + i * 2] = (conn->negotiated.compression_algs[i] >> 8) & 0xff;
+    }
+
+    return (int) need;
+} /* build_compression_capabilities_response */
+
 /* The negotiate-response context emitters. Only consulted when the negotiated
  * dialect is 3.1.1; each entry emits only if the client sent the matching
  * request context (need_mask_bit).
@@ -312,13 +387,15 @@ build_encryption_capabilities_response(
  * but Chimera does not activate encryption; GMAC, compression and
  * RdmaTransform contexts are not yet emitted. */
 static const struct chimera_smb_negotiate_response_emitter smb_negotiate_response_emitters[] = {
-    { CHIMERA_SMB_NEGOTIATE_CTX_PREAUTH,    SMB2_PREAUTH_INTEGRITY_CAPABILITIES,
+    { CHIMERA_SMB_NEGOTIATE_CTX_PREAUTH,     SMB2_PREAUTH_INTEGRITY_CAPABILITIES,
       build_preauth_integrity_response },
-    { CHIMERA_SMB_NEGOTIATE_CTX_ENCRYPTION, SMB2_ENCRYPTION_CAPABILITIES,
+    { CHIMERA_SMB_NEGOTIATE_CTX_ENCRYPTION,  SMB2_ENCRYPTION_CAPABILITIES,
       build_encryption_capabilities_response },
-    { CHIMERA_SMB_NEGOTIATE_CTX_SIGNING,    SMB2_SIGNING_CAPABILITIES,
+    { CHIMERA_SMB_NEGOTIATE_CTX_COMPRESSION, SMB2_COMPRESSION_CAPABILITIES,
+      build_compression_capabilities_response },
+    { CHIMERA_SMB_NEGOTIATE_CTX_SIGNING,     SMB2_SIGNING_CAPABILITIES,
       build_signing_capabilities_response },
-    { 0,                                    0,                                     NULL }
+    { 0,                                     0,                                      NULL }
 };
 
 /* Build the negotiate context list into ctx_buf. Returns total bytes written
@@ -513,12 +590,31 @@ parse_neg_ctx_compression(
 {
     uint16_t count, i;
 
+    /* MS-SMB2 §3.3.5.4: fail NEGOTIATE if DataLength is below the fixed
+     * SMB2_COMPRESSION_CAPABILITIES size (8 bytes). */
     if (data_len < 8) {
         return -1;
     }
     count = smb_wire_le16(data);
     /* data + 2: 2-byte padding (ignored) */
     request->negotiate.compression_in.flags = smb_wire_le32(data + 4);
+
+    if (count == 0) {
+        /* A CompressionAlgorithmCount of zero is handled per §3.3.5.4
+         * conditionally on whether the server negotiates compression:
+         *   - Compression enabled: the server processes the context and MUST
+         *     fail with STATUS_INVALID_PARAMETER (WPTS
+         *     Negotiate_SMB311_Compression_CompressionAlgorithmEmpty).
+         *   - Compression disabled: the context is irrelevant, so an empty
+         *     one is tolerated as "no compression offered" — Windows returns
+         *     success and WPTS Negotiate_SMB311_WithAllContexts (baseline)
+         *     asserts STATUS_SUCCESS. */
+        if (request->compound->thread->shared->config.compression) {
+            return -1;
+        }
+        request->negotiate.compression_in.alg_count = 0;
+        return 0;
+    }
 
     if (count > sizeof(request->negotiate.compression_in.algs) / sizeof(uint16_t)) {
         return -1;
@@ -727,6 +823,12 @@ chimera_smb_parse_one_negotiate_context(
     } /* switch */
 
     if (rc != 0) {
+        /* MS-SMB2 §3.3.5.4 makes a malformed COMPRESSION_CAPABILITIES context
+         * (zero algorithms or DataLength below the structure size) a fatal
+         * NEGOTIATE error; the caller maps the -1 to STATUS_INVALID_PARAMETER. */
+        if (type == SMB2_COMPRESSION_CAPABILITIES) {
+            return -1;
+        }
         chimera_smb_debug("Failed to parse negotiate context type=0x%04x len=%u (ignored)",
                           type, data_len);
         /* Body was malformed but the type is known; per spec, do not abort the
@@ -851,6 +953,51 @@ chimera_smb_select_negotiated_algorithms(
          * keys when encryption is enabled. */
         conn->negotiated.cipher_id = SMB2_ENCRYPTION_AES_128_CCM;
     }
+
+    /* SMB 3.1.1 transport compression (MS-SMB2 §3.3.5.4): when the client offers
+     * a COMPRESSION_CAPABILITIES context and compression is enabled in config,
+     * record the mutually-supported algorithms.  Unlike signing/encryption (one
+     * pick), the response context echoes the full intersection — Windows returns
+     * every shared algorithm.  CHAINED is agreed only when the client offered it
+     * (Pattern_V1 / NONE pass-through are only meaningful inside a chain). */
+    if (conn->dialect == SMB2_DIALECT_3_1_1 &&
+        conn->thread->shared->config.compression &&
+        (request->negotiate.ctx_present_mask & CHIMERA_SMB_NEGOTIATE_CTX_COMPRESSION)) {
+        /* Algorithms Chimera implements (smb_compress.c).  Plain LZ77 is the
+         * primary codec; Pattern_V1 is only meaningful as a chained run-length
+         * payload but is supported so peers may send it.  LZ77+Huffman and LZNT1
+         * are not yet implemented and so not advertised — a peer can never select
+         * a codec we cannot decode. */
+        static const uint16_t supported[] = {
+            SMB2_COMPRESSION_LZ77,
+            SMB2_COMPRESSION_PATTERN_V1,
+        };
+        int                   i, j, n = 0;
+
+        /* MS-SMB2 §3.3.5.4: set the negotiated CompressionAlgorithms to the
+         * CompressionIds from the request that the server supports, preserving
+         * the client's order (WPTS asserts an exact, order-sensitive match). */
+        for (j = 0; j < request->negotiate.compression_in.alg_count; j++) {
+            uint16_t a = request->negotiate.compression_in.algs[j];
+
+            for (i = 0; i < (int) (sizeof(supported) / sizeof(supported[0])); i++) {
+                if (a == supported[i]) {
+                    conn->negotiated.compression_algs[n++] = a;
+                    break;
+                }
+            }
+        }
+        conn->negotiated.compression_alg_count = n;
+
+        if (n > 0) {
+            if (request->negotiate.compression_in.flags & SMB2_COMPRESSION_FLAG_CHAINED) {
+                conn->negotiated.compression_flags = SMB2_COMPRESSION_FLAG_CHAINED;
+            }
+        } else {
+            /* No shared algorithm: do not emit a response context. */
+            conn->negotiated.ctx_present_mask &= ~CHIMERA_SMB_NEGOTIATE_CTX_COMPRESSION;
+        }
+    }
 } /* chimera_smb_select_negotiated_algorithms */
 
 int
@@ -937,6 +1084,7 @@ chimera_smb_parse_negotiate(
             }
 
             if (chimera_smb_parse_one_negotiate_context(request, type, data, length) < 0) {
+                request->status = SMB2_STATUS_INVALID_PARAMETER;
                 return -1;
             }
         }

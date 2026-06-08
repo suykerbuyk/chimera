@@ -39,6 +39,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WPTS_PTFCONFIG_DIR="${WPTS_PTFCONFIG_DIR:-${SCRIPT_DIR}/../src/server/smb/tests/wpts}"
 
 SUT_IP="10.0.0.1"
+# Second SUT IP for SMB3 multichannel (a redundant "NIC"). Only wired up when
+# CHIMERA_SMB_MULTICHANNEL=1; the WPTS MultipleChannel cases establish the
+# alternative channel against it (and the main channel queries it back via
+# FSCTL_QUERY_NETWORK_INTERFACE_INFO).
+SUT_IP2="10.0.0.2"
+# IPv6 SUT address for SMB3 multichannel. Only wired up when
+# CHIMERA_SMB_MULTICHANNEL=1; the NetworkInterfaceInfo_Query_ReturnsIPv4IPv6
+# case requires the server to advertise both an IPv4 and an IPv6 interface over
+# FSCTL_QUERY_NETWORK_INTERFACE_INFO. ULA address (RFC 4193).
+SUT_IPV6="fd00::1"
 NETNS_NAME="wpts_smb_$$_$(date +%s%N)"
 DUMMY_IF="wpts0"
 BUILD_DIR=$(dirname "$(dirname "$CHIMERA_BINARY")")
@@ -96,7 +106,14 @@ generate_config() {
         if [ "${CHIMERA_SMB_PERSISTENT:-0}" = "1" ] && [ "$share" = "FileShare" ]; then
             share_ca=', "continuous_availability": true'
         fi
-        shares="${shares}${sep}\"${share}\": {\"path\": \"/${share}\"${share_ca}}"
+        # SMBEncrypted is the designated per-share-encrypted share (matches
+        # EncryptedFileShare in the ptfconfig); flag it so TREE_CONNECT
+        # advertises SMB2_SHAREFLAG_ENCRYPT_DATA and its traffic is encrypted.
+        local share_enc=""
+        if [ "${CHIMERA_SMB_ENCRYPTION:-0}" = "1" ] && [ "$share" = "SMBEncrypted" ]; then
+            share_enc=', "encrypt_data": true'
+        fi
+        shares="${shares}${sep}\"${share}\": {\"path\": \"/${share}\"${share_ca}${share_enc}}"
         sep=",
         "
     done
@@ -109,10 +126,43 @@ generate_config() {
         persistent_line='"smb_persistent_handles": true,'
     fi
 
+    # Enable SMB3 transport compression when requested (the SMB2Compression
+    # WPTS cases need the feature on; default off keeps the rest of the suite
+    # exercising the uncompressed path).
+    local compression_line=""
+    if [ "${CHIMERA_SMB_COMPRESSION:-0}" = "1" ]; then
+        compression_line='"smb_compression": true,'
+    fi
+
+    # Advertise two NICs for SMB3 multichannel when requested.  The daemon
+    # reports these back over FSCTL_QUERY_NETWORK_INTERFACE_INFO so the WPTS
+    # MultipleChannel cases can discover the alternative server address.
+    local multichannel_line=""
+    if [ "${CHIMERA_SMB_MULTICHANNEL:-0}" = "1" ]; then
+        multichannel_line="\"smb_multichannel\": [{\"address\": \"${SUT_IP}\", \"speed\": 10, \"rdma\": false}, {\"address\": \"${SUT_IP2}\", \"speed\": 10, \"rdma\": false}, {\"address\": \"${SUT_IPV6}\", \"speed\": 10, \"rdma\": false}],"
+        # The MultipleChannel_Negative_SMB2002 case establishes its main channel
+        # with the original SMB 2.0.2 dialect (then verifies the bind is refused),
+        # so the multichannel harness lowers the dialect floor to 2.0.2.
+        multichannel_line="${multichannel_line}
+        \"smb_min_dialect\": \"2.0.2\","
+    fi
+
+    # Enable SMB3 transport encryption when requested. "enabled" turns on global
+    # (whole-session) encryption AND lets the per-share SMBEncrypted share opt in;
+    # default off keeps the rest of the suite on the cleartext path.
+    local encryption_line=""
+    if [ "${CHIMERA_SMB_ENCRYPTION:-0}" = "1" ]; then
+        encryption_line='"smb_encryption": "enabled",'
+    fi
+
     cat > "$CONFIG_FILE" << EOF
 {
     "server": {
         ${persistent_line}
+        ${compression_line}
+        ${multichannel_line}
+        ${encryption_line}
+        "smb_named_streams": true,
         "threads": 4,
         "delegation_threads": 4,
         "external_portmap": false
@@ -145,6 +195,15 @@ ip netns add "${NETNS_NAME}"
 ip netns exec "${NETNS_NAME}" ip link set lo up
 ip netns exec "${NETNS_NAME}" ip link add "${DUMMY_IF}" type dummy
 ip netns exec "${NETNS_NAME}" ip addr add "${SUT_IP}/24" dev "${DUMMY_IF}"
+# Second address on the same dummy interface for multichannel: both the SUT's
+# alternative NIC and the driver's second client NIC live here (loopback-routed
+# within the netns, so a single device carrying both addresses is sufficient).
+if [ "${CHIMERA_SMB_MULTICHANNEL:-0}" = "1" ]; then
+    ip netns exec "${NETNS_NAME}" ip addr add "${SUT_IP2}/24" dev "${DUMMY_IF}"
+    # IPv6 address so the daemon can advertise an AF_INET6 interface over
+    # FSCTL_QUERY_NETWORK_INTERFACE_INFO (NetworkInterfaceInfo_Query_ReturnsIPv4IPv6).
+    ip netns exec "${NETNS_NAME}" ip -6 addr add "${SUT_IPV6}/64" dev "${DUMMY_IF}"
+fi
 ip netns exec "${NETNS_NAME}" ip link set "${DUMMY_IF}" up
 
 # Start the chimera daemon inside the netns
@@ -190,6 +249,51 @@ if [ "${CHIMERA_SMB_PERSISTENT:-0}" = "1" ]; then
         -e 's#<Property name="IsPersistentHandlesSupported" value="false"/>#<Property name="IsPersistentHandlesSupported" value="true"/>#' \
         -e 's#<Property name="CAShareName" value=""/>#<Property name="CAShareName" value="FileShare"/>#' \
         -e "s#<Property name=\"CAShareServerName\" value=\"\"/>#<Property name=\"CAShareServerName\" value=\"${SUT_IP}\"/>#" \
+        "$staged"
+fi
+
+# When transport compression is enabled, advertise the supported algorithms and
+# a compressed share so the SMB2Compression cases become applicable. Chimera
+# implements Plain LZ77 and the chained Pattern_V1 run-length payload.
+if [ "${CHIMERA_SMB_COMPRESSION:-0}" = "1" ]; then
+    staged="${WPTS_BIN_DIR}/CommonTestSuite.deployment.ptfconfig"
+    sed -i \
+        -e 's#<Property name="CompressedFileShare" value=""/>#<Property name="CompressedFileShare" value="SMBBasic"/>#' \
+        -e 's#<Property name="IsChainedCompressionSupported" value="false"/>#<Property name="IsChainedCompressionSupported" value="true"/>#' \
+        -e 's#<Property name="SupportedCompressionAlgorithms" value=""/>#<Property name="SupportedCompressionAlgorithms" value="LZ77;Pattern_V1"/>#' \
+        "$staged"
+fi
+
+# When multichannel is enabled, advertise the capability and the second
+# server/client NIC addresses so the WPTS MultipleChannel cases become
+# applicable (they assert serverIps.Count > 1 and the IsMultiChannelCapable
+# capability; otherwise they are Inconclusive/skipped).
+if [ "${CHIMERA_SMB_MULTICHANNEL:-0}" = "1" ]; then
+    staged_common="${WPTS_BIN_DIR}/CommonTestSuite.deployment.ptfconfig"
+    staged_smb2="${WPTS_BIN_DIR}/MS-SMB2_ServerTestSuite.deployment.ptfconfig"
+    sed -i \
+        -e 's#<Property name="IsMultiChannelCapable" value="false"/>#<Property name="IsMultiChannelCapable" value="true"/>#' \
+        -e "s#<Property name=\"ClientNic2IPAddress\" value=\"\"/>#<Property name=\"ClientNic2IPAddress\" value=\"${SUT_IP2}\"/>#" \
+        "$staged_common"
+    sed -i \
+        -e "s#<Property name=\"SutAlternativeIPAddress\" value=\"\"/>#<Property name=\"SutAlternativeIPAddress\" value=\"${SUT_IP2}\"/>#" \
+        "$staged_smb2"
+fi
+
+# When encryption is enabled, advertise it to the driver so the Encryption cases
+# become applicable: declare support, the per-share encrypted share, and that
+# global encrypt-data is on. SutSupportedEncryptionAlgorithms is set
+# unconditionally in the fixture: even in baseline mode the SMB 3.1.1 NEGOTIATE
+# selects and echoes a CipherId from the client's offered list (transport
+# encryption is decided separately at SESSION_SETUP), so the driver must always
+# know the cipher set to validate the echoed Connection.CipherId
+# (BVT_Negotiate_SMB311).
+if [ "${CHIMERA_SMB_ENCRYPTION:-0}" = "1" ]; then
+    staged="${WPTS_BIN_DIR}/CommonTestSuite.deployment.ptfconfig"
+    sed -i \
+        -e 's#<Property name="IsEncryptionSupported" value="false"/>#<Property name="IsEncryptionSupported" value="true"/>#' \
+        -e 's#<Property name="IsGlobalEncryptDataEnabled" value="false"/>#<Property name="IsGlobalEncryptDataEnabled" value="true"/>#' \
+        -e 's#<Property name="EncryptedFileShare" value=""/>#<Property name="EncryptedFileShare" value="SMBEncrypted"/>#' \
         "$staged"
 fi
 

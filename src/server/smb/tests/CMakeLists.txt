@@ -55,6 +55,14 @@ target_include_directories(phase0_contexts_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 add_test(NAME chimera/server/smb/phase0_contexts_test
     COMMAND ${CMAKE_CURRENT_BINARY_DIR}/phase0_contexts_test)
 
+# SMB3 transport-compression codec unit test (pure MS-XCA Plain LZ77)
+add_executable(smb_compress_test smb_compress_test.c)
+target_link_libraries(smb_compress_test chimera_server chimera_smb)
+target_include_directories(smb_compress_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+add_test(NAME chimera/server/smb/smb_compress_test
+    COMMAND ${CMAKE_CURRENT_BINARY_DIR}/smb_compress_test)
+
 # REST API user/share manipulation test
 add_executable(rest_user_manip_test rest_user_manip_test.c)
 target_link_libraries(rest_user_manip_test chimera_server chimera_metrics jansson)
@@ -102,26 +110,58 @@ if(CHIMERA_NETNS_TESTING AND WPTS_DOTNET AND WPTS_SMB2_DLL AND WPTS_ARCH_SUPPORT
     # double-completion fix for QueryDir_Reopen_OnFile) are intentionally
     # enabled in that fix's PR, not here.
     set(WPTS_SMB2_ALLOWLIST
+        AppInstanceVersion_SMB302_SMB311
+        AppInstanceVersion_SMB311_SMB302
+        BVT_AppInstanceVersion_SMB311_GreaterVersion
+        BVT_AppInstanceVersion_SMB311_LowerAppInstanceVersionHigh
+        BVT_AppInstanceVersion_SMB311_LowerAppInstanceVersionLow
+        BVT_AppInstanceVersion_SMB311_SameVersion
         BVT_Compound_RelatedRequests
         BVT_Compound_UnRelatedRequests
         BVT_CreateClose_CreateAndCloseDirectory
         BVT_CreateClose_CreateAndCloseFile
+        BVT_Leasing_FileLeasingV1
+        BVT_Leasing_FileLeasingV2
+        BVT_MultiCredit_OneRequestWithMultiCredit
+        BVT_Negotiate_Compatible_2002
         BVT_Negotiate_Compatible_Wildcard
+        BVT_Negotiate_SMB2002
         BVT_Negotiate_SMB21
         BVT_Negotiate_SMB30
         BVT_Negotiate_SMB302
+        BVT_Negotiate_SMB311
+        BVT_Negotiate_SMB311_Preauthentication
         BVT_Negotiate_SigningEnabled
+        BVT_OpLockBreak
+        BVT_SMB2Basic_CancelRegisteredChangeNotify
         BVT_SMB2Basic_ChangeNotify_ChangeAttributes
         BVT_SMB2Basic_ChangeNotify_ChangeCreation
         BVT_SMB2Basic_ChangeNotify_ChangeDirName
+        BVT_SMB2Basic_ChangeNotify_ChangeEa
         BVT_SMB2Basic_ChangeNotify_ChangeFileName
         BVT_SMB2Basic_ChangeNotify_ChangeLastAccess
         BVT_SMB2Basic_ChangeNotify_ChangeLastWrite
+        BVT_SMB2Basic_ChangeNotify_ChangeSecurity
+        BVT_SMB2Basic_ChangeNotify_ChangeSize
+        BVT_SMB2Basic_ChangeNotify_ChangeStreamName
+        BVT_SMB2Basic_ChangeNotify_ChangeStreamSize
+        BVT_SMB2Basic_ChangeNotify_ChangeStreamWrite
+        BVT_SMB2Basic_ChangeNotify_MaxTransactSizeCheck_Smb2002
+        BVT_SMB2Basic_ChangeNotify_MaxTransactSizeCheck_Smb21
+        BVT_SMB2Basic_ChangeNotify_MaxTransactSizeCheck_Smb30
+        BVT_SMB2Basic_ChangeNotify_MaxTransactSizeCheck_Smb302
+        BVT_SMB2Basic_ChangeNotify_MaxTransactSizeCheck_Smb311
+        BVT_SMB2Basic_ChangeNotify_NoFileListDirectoryInGrantedAccess
         BVT_SMB2Basic_ChangeNotify_NonDirectoryFile
+        BVT_SMB2Basic_ChangeNotify_ServerReceiveSmb2Close
+        BVT_SMB2Basic_LockAndUnLock
         BVT_SMB2Basic_QueryAndSet_FileInfo
         BVT_SMB2Basic_QueryDir_Reopen_OnDir
         BVT_SMB2Basic_QueryDir_Reopen_OnEmptyDir_NoFilesReturned
+        BVT_SMB2Basic_QueryDir_Reopen_OnFile
         BVT_SMB2Basic_Query_FileAllInformation
+        BVT_SMB2Basic_Query_FileNormalizedNameInformation_DataFile
+        BVT_SMB2Basic_Query_FileNormalizedNameInformation_DirectoryFile
         BVT_SessionMgmt_NewSession
         BVT_SessionMgmt_Reauthentication
         BVT_SessionMgmt_ReconnectSessionSetup
@@ -129,10 +169,24 @@ if(CHIMERA_NETNS_TESTING AND WPTS_DOTNET AND WPTS_SMB2_DLL AND WPTS_ARCH_SUPPORT
         BVT_TreeMgmt_TreeConnectAndDisconnect
         BVT_ValidateNegotiateInfo
         CreateClose_CreateAndCloseDirWithDotDir
+        CreateClose_CreateAndCloseDirWithDoubleDotDir
         CreateClose_CreateAndCloseFileWithDotDir
+        CreateClose_CreateAndCloseFileWithDoubleDotDir
+        CreateClose_DeleteFile_DesiredAccessNotIncludeDeleteOrGenericAll
+        InvalidCreateRequestStructureSize
+        Negative_AppInstanceVersion_SMB311_NoVersion
         Negotiate_SMB311_ContextID_NetName
         Negotiate_SMB311_InvalidCipher
+        Negotiate_SMB311_InvalidHashAlgorithm
         Negotiate_SMB311_IsTransportCapabilitiesSupported
+        Negotiate_SMB311_SigningCapability
+        Negotiate_SMB311_WithAllContexts
+        Negotiate_SMB311_WithCompressionContextWithoutIntegrityContext
+        Negotiate_SMB311_WithEncryptionAndCompressionContextsWithoutIntegrityContext
+        Negotiate_SMB311_WithEncryptionContextWithoutIntegrityContext
+        Negotiate_SMB311_WithoutAnyContexts
+        SessionMgmt_ReconnectWithDifferentDialect
+        SessionMgmt_SupportsNotificationsMismatch
         Signing_VerifyAesGmacSigning
         TreeMgmt_SMB311_CLUSTER_RECONNECT
         ValidateNegotiateInfo_Negative_InvalidCapabilities
@@ -140,7 +194,9 @@ if(CHIMERA_NETNS_TESTING AND WPTS_DOTNET AND WPTS_SMB2_DLL AND WPTS_ARCH_SUPPORT
         ValidateNegotiateInfo_Negative_InvalidDialects_NoCommonDialect
         ValidateNegotiateInfo_Negative_InvalidGuid
         ValidateNegotiateInfo_Negative_InvalidMaxOutputResponse
-        ValidateNegotiateInfo_Negative_InvalidSecurityMode)
+        ValidateNegotiateInfo_Negative_InvalidSecurityMode
+        ValidateNegotiateInfo_Negative_SMB311
+        )
 
     foreach(tc ${WPTS_SMB2_ALLOWLIST})
         add_test(NAME chimera/server/smb/wpts/memfs/${tc}
@@ -155,21 +211,25 @@ if(CHIMERA_NETNS_TESTING AND WPTS_DOTNET AND WPTS_SMB2_DLL AND WPTS_ARCH_SUPPORT
             ENVIRONMENT "WPTS_BIN_DIR=${WPTS_BIN_DIR};DOTNET=${WPTS_DOTNET}")
     endforeach()
 
-    # SMB3 durable / persistent handle cases.  These need the daemon run with
-    # smb_persistent_handles enabled (the wrapper sets it from CHIMERA_SMB_PERSISTENT,
-    # which also flips the persistent-handle / CA-share ptfconfig capabilities and
-    # marks FileShare as the CA share).  Allowlist = every applicable
-    # durable/persistent case confirmed green against the current server.  Left
-    # out: DurableHandleV1_Reconnect_AfterServerDisconnect (needs
-    # negotiate-after-negotiate to drop the connection — an unrelated protocol
-    # gap) and *_WithDifferentDurableOwner / BVT_PersistentHandles (need a second
-    # user account / scale-out config the harness doesn't provide).
+    # SMB3 durable / persistent handle cases plus the Replay (channel-sequence)
+    # suite.  These need the daemon run with smb_persistent_handles enabled (the
+    # wrapper sets it from CHIMERA_SMB_PERSISTENT, which also flips the
+    # persistent-handle / CA-share ptfconfig capabilities and marks FileShare as
+    # the CA share).  The Replay_*_ReplayEligibleCleared cases — including the
+    # NonPersistentHandle variants — only become applicable once the CA / replay
+    # capability is advertised, so they live here rather than in the base list.
+    # Allowlist = every applicable durable/persistent/replay case confirmed green
+    # against the current server.  Left out: *_WithDifferentDurableOwner /
+    # BVT_PersistentHandles (need a second user account / scale-out config the
+    # harness doesn't provide — they report Inconclusive/NotExecuted), and the
+    # Replay IoCtl/Lock cases (replay-eligibility not yet cleared on those ops).
     set(WPTS_SMB2_PERSISTENT_ALLOWLIST
         BVT_DurableHandleV1_Reconnect_WithBatchOplock
         BVT_DurableHandleV1_Reconnect_WithLeaseV1
         BVT_DurableHandleV2_Reconnect_WithBatchOplock
         BVT_DurableHandleV2_Reconnect_WithLeaseV1
         BVT_PersistentHandle_Reconnect
+        DurableHandleV1_Reconnect_AfterServerDisconnect
         DurableHandleV1_Reconnect_IncludeCreateDurableHandle
         DurableHandleV1_Reconnect_IncludeReconnectV2
         DurableHandleV1_Reconnect_IncludeRequestV2
@@ -188,7 +248,19 @@ if(CHIMERA_NETNS_TESTING AND WPTS_DOTNET AND WPTS_SMB2_DLL AND WPTS_ARCH_SUPPORT
         DurableHandleV2_Reconnect_WithoutPersistence
         DurableHandleV2_WithLeaseV1AndV2_WithDifferentLeaseKey
         DurableHandleV2_WithLeaseV2_WithoutHandleCaching
-        PersistentHandle_ReOpenFromDiffClient)
+        PersistentHandle_ReOpenFromDiffClient
+        Replay_NonPersistentHandle_Flush_ReplayEligibleCleared
+        Replay_NonPersistentHandle_QueryInfo_ReplayEligibleCleared
+        Replay_NonPersistentHandle_Read_ReplayEligibleCleared
+        Replay_NonPersistentHandle_SetInfo_ReplayEligibleCleared
+        Replay_NonPersistentHandle_Write_ReplayEligibleCleared
+        Replay_PersistentHandle_ChangeNotify_ReplayEligibleCleared
+        Replay_PersistentHandle_Flush_ReplayEligibleCleared
+        Replay_PersistentHandle_QueryDirectory_ReplayEligibleCleared
+        Replay_PersistentHandle_QueryInfo_ReplayEligibleCleared
+        Replay_PersistentHandle_Read_ReplayEligibleCleared
+        Replay_PersistentHandle_SetInfo_ReplayEligibleCleared
+        Replay_PersistentHandle_Write_ReplayEligibleCleared)
 
     foreach(tc ${WPTS_SMB2_PERSISTENT_ALLOWLIST})
         add_test(NAME chimera/server/smb/wpts/memfs_persistent/${tc}
@@ -199,6 +271,183 @@ if(CHIMERA_NETNS_TESTING AND WPTS_DOTNET AND WPTS_SMB2_DLL AND WPTS_ARCH_SUPPORT
             TIMEOUT 180
             RESOURCE_LOCK wpts_smb_bin
             ENVIRONMENT "WPTS_BIN_DIR=${WPTS_BIN_DIR};DOTNET=${WPTS_DOTNET};CHIMERA_SMB_PERSISTENT=1")
+    endforeach()
+
+    # SMB3 transport-compression cases.  These need the daemon run with
+    # smb_compression enabled (the wrapper sets it from CHIMERA_SMB_COMPRESSION,
+    # which also advertises the supported algorithms + a compressed share in the
+    # ptfconfig).  Allowlist = every applicable compression case confirmed green
+    # against the current server.  Left out: the LZ77Huffman / LZNT1 / *_Encrypted
+    # variants (those codecs and the compression+encryption combination are not
+    # yet implemented, so the SUT does not advertise them and the cases skip) and
+    # ChainedCompressionNotSupported (inapplicable — the SUT supports chaining).
+    set(WPTS_SMB2_COMPRESSION_ALLOWLIST
+        BVT_Negotiate_SMB311_CompressionEnabled
+        BVT_Negotiate_SMB311_Compression_IsChainedCompressionSupported
+        BVT_SMB2Compression_Chained_PatternV1
+        BVT_SMB2Compression_LZ77
+        BVT_SMB2Compression_Unchained
+        BVT_SMB2Compression_Unchained_LargeFile
+        Negotiate_SMB311_Compression_CompressionAlgorithmEmpty
+        Negotiate_SMB311_Compression_CompressionAlgorithmNotSupported
+        Negotiate_SMB311_Compression_CompressionContextInvalidDataLength
+        Negotiate_SMB311_Compression_FlagChainedNotSet
+        Negotiate_SMB311_Compression_InvalidSmbDialect
+        Negotiate_SMB311_WithCompressionContextWithoutIntegrityContext
+        Negotiate_SMB311_WithEncryptionAndCompressionContextsWithoutIntegrityContext
+        SMB2Compression_Chained_InvalidCompressionAlgorithmInCompressionPayloadHeader
+        SMB2Compression_Chained_InvalidLengthInCompressionPayloadHeader
+        SMB2Compression_Chained_PatternV1_CompressedWriteRequest_PatternV1AtEnd
+        SMB2Compression_Chained_PatternV1_CompressedWriteRequest_PatternV1AtEnd_LargeFile
+        SMB2Compression_Chained_PatternV1_CompressedWriteRequest_PatternV1AtFront
+        SMB2Compression_Chained_PatternV1_CompressedWriteRequest_PatternV1AtFrontAndEnd
+        SMB2Compression_Chained_PatternV1_CompressedWriteRequest_PatternV1AtFrontAndEnd_LargeFile
+        SMB2Compression_Chained_PatternV1_CompressedWriteRequest_PatternV1AtFront_LargeFile
+        SMB2Compression_Chained_PatternV1_CompressibleReadResponse
+        SMB2Compression_Chained_PatternV1_CompressibleReadResponse_LargeFile
+        SMB2Compression_Chained_PatternV1_IncompressibleReadResponse
+        SMB2Compression_Chained_PatternV1_InvalidCompressionPatternPayloadV1Repetitions
+        SMB2Compression_Chained_PatternV1_LargeFile
+        SMB2Compression_CompressedWriteRequest
+        SMB2Compression_CompressedWriteRequest_LargeFile
+        SMB2Compression_CompressibleReadResponse
+        SMB2Compression_CompressibleReadResponse_LargeFile
+        SMB2Compression_IncompressibleReadResponse
+        SMB2Compression_InvalidCompressedPacketLength
+        SMB2Compression_InvalidCompressionAlgorithm
+        SMB2Compression_InvalidDecompressedProtocolId
+        SMB2Compression_LZ77_LargeFile
+        TreeMgmt_SMB311_COMPRESS_DATA)
+
+    foreach(tc ${WPTS_SMB2_COMPRESSION_ALLOWLIST})
+        add_test(NAME chimera/server/smb/wpts/memfs_compression/${tc}
+            COMMAND ${CMAKE_SOURCE_DIR}/scripts/wpts_smb_test_wrapper.sh
+                    ${CHIMERA_DAEMON} memfs "Name=${tc}")
+        set_tests_properties(chimera/server/smb/wpts/memfs_compression/${tc} PROPERTIES
+            LABELS "smb;wpts;compression"
+            TIMEOUT 180
+            RESOURCE_LOCK wpts_smb_bin
+            ENVIRONMENT "WPTS_BIN_DIR=${WPTS_BIN_DIR};DOTNET=${WPTS_DOTNET};CHIMERA_SMB_COMPRESSION=1")
+    endforeach()
+
+    # SMB3 multichannel cases.  The wrapper runs the daemon with a second NIC
+    # address (so FSCTL_QUERY_NETWORK_INTERFACE_INFO advertises an alternative
+    # server address) and flips the multichannel ptfconfig capabilities when
+    # CHIMERA_SMB_MULTICHANNEL=1.  Allowlist = the MultipleChannel cases confirmed
+    # green against the current server: the NIC-redundancy bind matrix, the
+    # 2.x-dialect bind rejection (STATUS_REQUEST_NOT_ACCEPTED), cross-channel
+    # byte-range locking, and the 3.1.1 second-channel preauth-integrity case.
+    #
+    # Left out (each a distinct unimplemented feature, not a multichannel gap):
+    #   - MultipleChannel_FileLease needs write/handle-caching lease break
+    #     delivery; chimera deliberately grants only read-caching leases
+    #     (write-through) to avoid the cthon/fsx client-cache corruption hazards
+    #     documented in chimera_smb_create.
+    #   - MultipleChannel_EncryptionOnBothChannels and the two
+    #     MultipleChannel_Negative_Encryption* cases need the multichannel and
+    #     encryption harnesses combined (a second NIC AND smb_encryption on the
+    #     same run); the two ptfconfig fixtures are wired independently today, so
+    #     these are reported Inconclusive (skipped).
+    set(WPTS_SMB2_MULTICHANNEL_ALLOWLIST
+        BVT_MultipleChannel_NicRedundantOnBoth
+        BVT_NetworkInterfaceInfo_QuerySuccessful
+        MultipleChannel_FileLease
+        MultipleChannel_LockUnlockOnDiffChannel
+        MultipleChannel_LockUnlockOnSameChannel
+        MultipleChannel_MultiChannelOnSameNic
+        MultipleChannel_Negative_SMB2002
+        MultipleChannel_Negative_SMB21
+        MultipleChannel_NicRedundantOnClient
+        MultipleChannel_NicRedundantOnServer
+        MultipleChannel_SecondChannelSessionSetupFailAtFirstTime
+        NetworkInterfaceInfo_ChangeConnection_BindCurrentSession
+        NetworkInterfaceInfo_Query_ReturnsErrorStatus
+        NetworkInterfaceInfo_Query_ReturnsIPv4IPv6
+        )
+
+    foreach(tc ${WPTS_SMB2_MULTICHANNEL_ALLOWLIST})
+        add_test(NAME chimera/server/smb/wpts/memfs_multichannel/${tc}
+            COMMAND ${CMAKE_SOURCE_DIR}/scripts/wpts_smb_test_wrapper.sh
+                    ${CHIMERA_DAEMON} memfs "Name=${tc}")
+        set_tests_properties(chimera/server/smb/wpts/memfs_multichannel/${tc} PROPERTIES
+            LABELS "smb;wpts;multichannel"
+            TIMEOUT 180
+            RESOURCE_LOCK wpts_smb_bin
+            ENVIRONMENT "WPTS_BIN_DIR=${WPTS_BIN_DIR};DOTNET=${WPTS_DOTNET};CHIMERA_SMB_MULTICHANNEL=1")
+    endforeach()
+
+    # SMB3 transport-encryption cases.  These need the daemon run with
+    # smb_encryption enabled (the wrapper sets it from CHIMERA_SMB_ENCRYPTION,
+    # which also flags the SMBEncrypted share for per-share encryption and flips
+    # the encryption ptfconfig capabilities: IsEncryptionSupported,
+    # IsGlobalEncryptDataEnabled, EncryptedFileShare and the cipher list).
+    set(WPTS_SMB2_ENCRYPTION_ALLOWLIST
+        BVT_Encryption_GlobalEncryptionEnabled
+        BVT_Encryption_PerShareEncryptionEnabled
+        BVT_Encryption_SMB311
+        BVT_Encryption_SMB311_CCM
+        BVT_Encryption_SMB311_GCM
+        BVT_Encryption_SMB311_AES_256_CCM
+        BVT_Encryption_SMB311_AES_256_GCM
+        BVT_Negotiate_SMB311_Preauthentication_Encryption_CCM
+        BVT_Negotiate_SMB311_Preauthentication_Encryption_GCM
+        BVT_Negotiate_SMB311_Preauthentication_Encryption_AES_256_CCM
+        BVT_Negotiate_SMB311_Preauthentication_Encryption_AES_256_GCM
+        BVT_TreeMgmt_SMB311_Disconnect_NoSignedNoEncryptedTreeConnect
+        Compound_Encrypt_RelatedRequests
+        Compound_Encrypt_UnrelatedRequests
+        Signing_VerifySignatureWhenEncrypted)
+
+    foreach(tc ${WPTS_SMB2_ENCRYPTION_ALLOWLIST})
+        add_test(NAME chimera/server/smb/wpts/memfs_encryption/${tc}
+            COMMAND ${CMAKE_SOURCE_DIR}/scripts/wpts_smb_test_wrapper.sh
+                    ${CHIMERA_DAEMON} memfs "Name=${tc}")
+        set_tests_properties(chimera/server/smb/wpts/memfs_encryption/${tc} PROPERTIES
+            LABELS "smb;wpts;encryption"
+            TIMEOUT 180
+            RESOURCE_LOCK wpts_smb_bin
+            ENVIRONMENT "WPTS_BIN_DIR=${WPTS_BIN_DIR};DOTNET=${WPTS_DOTNET};CHIMERA_SMB_ENCRYPTION=1")
+    endforeach()
+
+    # Compression + encryption combined cases (compress-then-encrypt, MS-SMB2
+    # §3.1.4.4).  The wrapper enables both smb_compression and smb_encryption so a
+    # compressed WRITE arrives encrypted (decrypt-then-decompress) and a
+    # compressed READ response is produced (compress-then-encrypt).  Only the
+    # implemented codecs are listed; LZ77+Huffman / LZNT1 encrypted variants skip
+    # for the same reason their plaintext variants do.
+    set(WPTS_SMB2_COMPRESSION_ENCRYPTION_ALLOWLIST
+        BVT_SMB2Compression_LZ77_Encrypted
+        BVT_SMB2Compression_Chained_PatternV1_Encrypted
+        Negotiate_SMB311_WithEncryptionAndCompressionContextsWithoutIntegrityContext)
+
+    foreach(tc ${WPTS_SMB2_COMPRESSION_ENCRYPTION_ALLOWLIST})
+        add_test(NAME chimera/server/smb/wpts/memfs_compression_encryption/${tc}
+            COMMAND ${CMAKE_SOURCE_DIR}/scripts/wpts_smb_test_wrapper.sh
+                    ${CHIMERA_DAEMON} memfs "Name=${tc}")
+        set_tests_properties(chimera/server/smb/wpts/memfs_compression_encryption/${tc} PROPERTIES
+            LABELS "smb;wpts;compression;encryption"
+            TIMEOUT 180
+            RESOURCE_LOCK wpts_smb_bin
+            ENVIRONMENT "WPTS_BIN_DIR=${WPTS_BIN_DIR};DOTNET=${WPTS_DOTNET};CHIMERA_SMB_COMPRESSION=1;CHIMERA_SMB_ENCRYPTION=1")
+    endforeach()
+
+    # Multichannel + encryption combined case: encryption is session-scoped, so
+    # the keys derived on the first channel cover every bound channel.  The
+    # MultipleChannel_Negative_Encryption* cases are intentionally not listed:
+    # they are inconclusive when IsGlobalEncryptDataEnabled is true (they exercise
+    # an encryption-supported-but-not-global mode chimera does not offer).
+    set(WPTS_SMB2_MULTICHANNEL_ENCRYPTION_ALLOWLIST
+        MultipleChannel_EncryptionOnBothChannels)
+
+    foreach(tc ${WPTS_SMB2_MULTICHANNEL_ENCRYPTION_ALLOWLIST})
+        add_test(NAME chimera/server/smb/wpts/memfs_multichannel_encryption/${tc}
+            COMMAND ${CMAKE_SOURCE_DIR}/scripts/wpts_smb_test_wrapper.sh
+                    ${CHIMERA_DAEMON} memfs "Name=${tc}")
+        set_tests_properties(chimera/server/smb/wpts/memfs_multichannel_encryption/${tc} PROPERTIES
+            LABELS "smb;wpts;multichannel;encryption"
+            TIMEOUT 180
+            RESOURCE_LOCK wpts_smb_bin
+            ENVIRONMENT "WPTS_BIN_DIR=${WPTS_BIN_DIR};DOTNET=${WPTS_DOTNET};CHIMERA_SMB_MULTICHANNEL=1;CHIMERA_SMB_ENCRYPTION=1")
     endforeach()
 
     message(STATUS "WPTS MS-SMB2 tests: enabled (${WPTS_BIN_DIR}, ${WPTS_DOTNET})")
@@ -1110,6 +1359,16 @@ set(SMBTORTURE_ENABLED_memfs
     # smb2.kernel-oplocks
     smb2.kernel-oplocks.kernel_oplocks8
     # smb2.lock
+    smb2.lock.auto-unlock
+    smb2.lock.errorcode
+    smb2.lock.lock
+    smb2.lock.multiple-unlock
+    smb2.lock.overlap
+    smb2.lock.range
+    smb2.lock.stacking
+    smb2.lock.valid-request
+    smb2.lock.zerobytelength
+    smb2.lock.zerobyteread
     smb2.lock.contend
     smb2.lock.context
     smb2.lock.ctdb-delrec-deadlock
@@ -1126,6 +1385,20 @@ set(SMBTORTURE_ENABLED_memfs
     smb2.maximum_allowed.read_only
     # smb2.mkdir
     smb2.mkdir
+    # smb2.multichannel (SMB3 session binding).  interface_info advertises the
+    # server NICs, num_channels exercises channel bind + the 32-channel limit,
+    # bug_15346 is a bind regression, and oplocks.test1 checks an oplock break
+    # delivered over a bound session.  oplocks.test1 is enabled only on the
+    # non-passthrough backends: the linux/io_uring share root keeps real on-disk
+    # files between subtests, so the test's create-disposition checks see EXISTED
+    # instead of CREATED.  oplocks.test2/test3* stay disabled (they need Samba
+    # test-only FSCTLs -- force-unacked-timeout / network block -- chimera does
+    # not implement); leases.test1-4 stay disabled (general lease-grant
+    # behaviour, not multichannel binding).
+    smb2.multichannel.bugs.bug_15346
+    smb2.multichannel.generic.interface_info
+    smb2.multichannel.generic.num_channels
+    smb2.multichannel.oplocks.test1
     # smb2.notify-inotify
     smb2.notify-inotify.inotify-rename
     # smb2.notify
@@ -1396,6 +1669,16 @@ set(SMBTORTURE_ENABLED_linux
     smb2.ioctl.sparse_set_nobuf
     smb2.ioctl.sparse_set_oversize
     # smb2.lock
+    smb2.lock.auto-unlock
+    smb2.lock.errorcode
+    smb2.lock.lock
+    smb2.lock.multiple-unlock
+    smb2.lock.overlap
+    smb2.lock.range
+    smb2.lock.stacking
+    smb2.lock.valid-request
+    smb2.lock.zerobytelength
+    smb2.lock.zerobyteread
     smb2.lock.contend
     smb2.lock.context
     smb2.lock.ctdb-delrec-deadlock
@@ -1411,6 +1694,19 @@ set(SMBTORTURE_ENABLED_linux
     smb2.maximum_allowed.read_only
     # smb2.mkdir
     smb2.mkdir
+    # smb2.multichannel (SMB3 session binding).  interface_info advertises the
+    # server NICs, num_channels exercises channel bind + the 32-channel limit,
+    # bug_15346 is a bind regression, and oplocks.test1 checks an oplock break
+    # delivered over a bound session.  oplocks.test1 is enabled only on the
+    # non-passthrough backends: the linux/io_uring share root keeps real on-disk
+    # files between subtests, so the test's create-disposition checks see EXISTED
+    # instead of CREATED.  oplocks.test2/test3* stay disabled (they need Samba
+    # test-only FSCTLs -- force-unacked-timeout / network block -- chimera does
+    # not implement); leases.test1-4 stay disabled (general lease-grant
+    # behaviour, not multichannel binding).
+    smb2.multichannel.bugs.bug_15346
+    smb2.multichannel.generic.interface_info
+    smb2.multichannel.generic.num_channels
     # smb2.notify-inotify
     smb2.notify-inotify.inotify-rename
     # smb2.notify
@@ -1653,6 +1949,16 @@ set(SMBTORTURE_ENABLED_io_uring
     smb2.ioctl.sparse_set_nobuf
     smb2.ioctl.sparse_set_oversize
     # smb2.lock
+    smb2.lock.auto-unlock
+    smb2.lock.errorcode
+    smb2.lock.lock
+    smb2.lock.multiple-unlock
+    smb2.lock.overlap
+    smb2.lock.range
+    smb2.lock.stacking
+    smb2.lock.valid-request
+    smb2.lock.zerobytelength
+    smb2.lock.zerobyteread
     smb2.lock.contend
     smb2.lock.context
     smb2.lock.ctdb-delrec-deadlock
@@ -1668,6 +1974,19 @@ set(SMBTORTURE_ENABLED_io_uring
     smb2.maximum_allowed.read_only
     # smb2.mkdir
     smb2.mkdir
+    # smb2.multichannel (SMB3 session binding).  interface_info advertises the
+    # server NICs, num_channels exercises channel bind + the 32-channel limit,
+    # bug_15346 is a bind regression, and oplocks.test1 checks an oplock break
+    # delivered over a bound session.  oplocks.test1 is enabled only on the
+    # non-passthrough backends: the linux/io_uring share root keeps real on-disk
+    # files between subtests, so the test's create-disposition checks see EXISTED
+    # instead of CREATED.  oplocks.test2/test3* stay disabled (they need Samba
+    # test-only FSCTLs -- force-unacked-timeout / network block -- chimera does
+    # not implement); leases.test1-4 stay disabled (general lease-grant
+    # behaviour, not multichannel binding).
+    smb2.multichannel.bugs.bug_15346
+    smb2.multichannel.generic.interface_info
+    smb2.multichannel.generic.num_channels
     # smb2.notify-inotify
     smb2.notify-inotify.inotify-rename
     # smb2.notify
@@ -1922,6 +2241,16 @@ set(SMBTORTURE_ENABLED_cairn
     # smb2.kernel-oplocks
     smb2.kernel-oplocks.kernel_oplocks8
     # smb2.lock
+    smb2.lock.auto-unlock
+    smb2.lock.errorcode
+    smb2.lock.lock
+    smb2.lock.multiple-unlock
+    smb2.lock.overlap
+    smb2.lock.range
+    smb2.lock.stacking
+    smb2.lock.valid-request
+    smb2.lock.zerobytelength
+    smb2.lock.zerobyteread
     smb2.lock.contend
     smb2.lock.context
     smb2.lock.ctdb-delrec-deadlock
@@ -1937,6 +2266,20 @@ set(SMBTORTURE_ENABLED_cairn
     smb2.maximum_allowed.read_only
     # smb2.mkdir
     smb2.mkdir
+    # smb2.multichannel (SMB3 session binding).  interface_info advertises the
+    # server NICs, num_channels exercises channel bind + the 32-channel limit,
+    # bug_15346 is a bind regression, and oplocks.test1 checks an oplock break
+    # delivered over a bound session.  oplocks.test1 is enabled only on the
+    # non-passthrough backends: the linux/io_uring share root keeps real on-disk
+    # files between subtests, so the test's create-disposition checks see EXISTED
+    # instead of CREATED.  oplocks.test2/test3* stay disabled (they need Samba
+    # test-only FSCTLs -- force-unacked-timeout / network block -- chimera does
+    # not implement); leases.test1-4 stay disabled (general lease-grant
+    # behaviour, not multichannel binding).
+    smb2.multichannel.bugs.bug_15346
+    smb2.multichannel.generic.interface_info
+    smb2.multichannel.generic.num_channels
+    smb2.multichannel.oplocks.test1
     # smb2.notify-inotify
     smb2.notify-inotify.inotify-rename
     # smb2.notify
@@ -2216,6 +2559,16 @@ set(SMBTORTURE_ENABLED_diskfs_io_uring
     # smb2.kernel-oplocks
     smb2.kernel-oplocks.kernel_oplocks8
     # smb2.lock
+    smb2.lock.auto-unlock
+    smb2.lock.errorcode
+    smb2.lock.lock
+    smb2.lock.multiple-unlock
+    smb2.lock.overlap
+    smb2.lock.range
+    smb2.lock.stacking
+    smb2.lock.valid-request
+    smb2.lock.zerobytelength
+    smb2.lock.zerobyteread
     smb2.lock.contend
     smb2.lock.context
     smb2.lock.ctdb-delrec-deadlock
@@ -2231,6 +2584,20 @@ set(SMBTORTURE_ENABLED_diskfs_io_uring
     smb2.maximum_allowed.read_only
     # smb2.mkdir
     smb2.mkdir
+    # smb2.multichannel (SMB3 session binding).  interface_info advertises the
+    # server NICs, num_channels exercises channel bind + the 32-channel limit,
+    # bug_15346 is a bind regression, and oplocks.test1 checks an oplock break
+    # delivered over a bound session.  oplocks.test1 is enabled only on the
+    # non-passthrough backends: the linux/io_uring share root keeps real on-disk
+    # files between subtests, so the test's create-disposition checks see EXISTED
+    # instead of CREATED.  oplocks.test2/test3* stay disabled (they need Samba
+    # test-only FSCTLs -- force-unacked-timeout / network block -- chimera does
+    # not implement); leases.test1-4 stay disabled (general lease-grant
+    # behaviour, not multichannel binding).
+    smb2.multichannel.bugs.bug_15346
+    smb2.multichannel.generic.interface_info
+    smb2.multichannel.generic.num_channels
+    smb2.multichannel.oplocks.test1
     # smb2.notify-inotify
     smb2.notify-inotify.inotify-rename
     # smb2.notify
@@ -2510,6 +2877,16 @@ set(SMBTORTURE_ENABLED_diskfs_aio
     # smb2.kernel-oplocks
     smb2.kernel-oplocks.kernel_oplocks8
     # smb2.lock
+    smb2.lock.auto-unlock
+    smb2.lock.errorcode
+    smb2.lock.lock
+    smb2.lock.multiple-unlock
+    smb2.lock.overlap
+    smb2.lock.range
+    smb2.lock.stacking
+    smb2.lock.valid-request
+    smb2.lock.zerobytelength
+    smb2.lock.zerobyteread
     smb2.lock.contend
     smb2.lock.context
     smb2.lock.ctdb-delrec-deadlock
@@ -2525,6 +2902,20 @@ set(SMBTORTURE_ENABLED_diskfs_aio
     smb2.maximum_allowed.read_only
     # smb2.mkdir
     smb2.mkdir
+    # smb2.multichannel (SMB3 session binding).  interface_info advertises the
+    # server NICs, num_channels exercises channel bind + the 32-channel limit,
+    # bug_15346 is a bind regression, and oplocks.test1 checks an oplock break
+    # delivered over a bound session.  oplocks.test1 is enabled only on the
+    # non-passthrough backends: the linux/io_uring share root keeps real on-disk
+    # files between subtests, so the test's create-disposition checks see EXISTED
+    # instead of CREATED.  oplocks.test2/test3* stay disabled (they need Samba
+    # test-only FSCTLs -- force-unacked-timeout / network block -- chimera does
+    # not implement); leases.test1-4 stay disabled (general lease-grant
+    # behaviour, not multichannel binding).
+    smb2.multichannel.bugs.bug_15346
+    smb2.multichannel.generic.interface_info
+    smb2.multichannel.generic.num_channels
+    smb2.multichannel.oplocks.test1
     # smb2.notify-inotify
     smb2.notify-inotify.inotify-rename
     # smb2.notify

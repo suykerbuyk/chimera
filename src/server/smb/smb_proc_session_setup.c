@@ -111,9 +111,73 @@ chimera_smb_session_setup(struct chimera_smb_request *request)
         input_len = 0;
     }
 
+    /* SMB3 multichannel session binding (MS-SMB2 3.3.5.5.3).  A SESSION_SETUP
+     * whose SMB2_SESSION_FLAG_BINDING bit is set asks to add this connection as
+     * an additional channel of an existing session.  The server MUST reject the
+     * bind with STATUS_REQUEST_NOT_ACCEPTED when the connection's dialect is not
+     * in the SMB 3.x family (or the server is not multichannel-capable — chimera
+     * always is).  Caught before authentication so a 2.x client never binds. */
+    if ((request->session_setup.flags & SMB2_SESSION_FLAG_BINDING) &&
+        conn->dialect < SMB2_DIALECT_3_0) {
+        chimera_smb_complete_request(request, SMB2_STATUS_REQUEST_NOT_ACCEPTED);
+        evpl_iovecs_release(thread->evpl, request->session_setup.input_iov,
+                            request->session_setup.input_niov);
+        return;
+    }
+
+    /* MS-SMB2 3.3.5.5 step 4: a SESSION_SETUP that binds a new channel to an
+     * existing session (SMB2_SESSION_FLAG_BINDING set, non-zero header
+     * SessionId, dialect in the 3.x family, and the session found in the
+     * dispatcher's lookup) MUST satisfy several constraints before the bind is
+     * processed.  A header SessionId of zero is handled earlier as a new
+     * authentication (step 3), so binding validation only applies once a
+     * session has been resolved.  The checks that are observable here and the
+     * status each mandates:
+     *
+     *   - the bind request MUST be signed (SMB2_FLAGS_SIGNED): an unsigned
+     *     bind is failed with STATUS_INVALID_PARAMETER;
+     *   - for 3.1.1, Session.SupportsNotifications MUST equal the binding
+     *     Connection.SupportsNotifications, else STATUS_INVALID_PARAMETER.
+     *
+     * (Chimera does not advertise SMB2_GLOBAL_CAP_NOTIFICATIONS, so both
+     * values are always FALSE and the notifications check never fires on its
+     * own; it is included to keep the validation faithful to the spec for when
+     * the capability is implemented.)  WPTS SessionMgmt_SupportsNotifications-
+     * Mismatch exercises this path with an unsigned bind and expects
+     * STATUS_INVALID_PARAMETER. */
+    if ((request->session_setup.flags & SMB2_SESSION_FLAG_BINDING) &&
+        conn->dialect >= SMB2_DIALECT_3_0 &&
+        request->smb2_hdr.session_id != 0 &&
+        request->session_handle) {
+        struct chimera_smb_session *bind_session = request->session_handle->session;
+        int                         reject       = 0;
+
+        if (!(request->smb2_hdr.flags & SMB2_FLAGS_SIGNED)) {
+            reject = 1;
+        } else if (conn->dialect == SMB2_DIALECT_3_1_1 &&
+                   bind_session->supports_notifications !=
+                   conn->supports_notifications) {
+            reject = 1;
+        }
+
+        if (reject) {
+            chimera_smb_complete_request(request, SMB2_STATUS_INVALID_PARAMETER);
+            evpl_iovecs_release(thread->evpl, request->session_setup.input_iov,
+                                request->session_setup.input_niov);
+            return;
+        }
+    }
+
     // Detect authentication mechanism
     mech = smb_auth_detect_mechanism(input, input_len);
     chimera_smb_debug("Session setup: detected mechanism %s", smb_auth_mech_name(mech));
+
+    /* A security buffer the server cannot parse as a recognised mechanism token
+     * is a malformed request, not an authentication failure: MS-SMB2 answers it
+     * with STATUS_INVALID_PARAMETER rather than STATUS_LOGON_FAILURE (the
+     * GSS/SSPI layer reports SEC_E_INVALID_TOKEN).  Track it so the failure
+     * completion below returns the right status. */
+    int bad_token = 0;
 
     // Route to appropriate handler
     switch (mech) {
@@ -132,7 +196,8 @@ chimera_smb_session_setup(struct chimera_smb_request *request)
 
         default:
             chimera_smb_error("Unknown authentication mechanism");
-            rc = -1;
+            rc        = -1;
+            bad_token = 1;
             break;
     } /* switch */
 
@@ -145,6 +210,21 @@ chimera_smb_session_setup(struct chimera_smb_request *request)
      * splits the hash across buckets and breaks signing-key derivation. */
     if ((rc == 0 || rc == 1) && !request->session_handle) {
         session = chimera_smb_session_alloc(shared);
+
+        /* Record the connection's negotiated dialect so a later
+         * PreviousSessionId reconnect can enforce MS-SMB2 3.3.5.5.1. */
+        session->dialect = conn->dialect;
+
+        /* Session.SupportsNotifications is inherited from the connection that
+         * first establishes the session (MS-SMB2 3.3.5.5); a later binding
+         * connection must match it. */
+        session->supports_notifications = conn->supports_notifications;
+
+        /* Bind the lease owner key to the client (ClientGuid captured at
+         * NEGOTIATE), not the session id, so same-client sessions share a
+         * lease namespace (MS-SMB2 3.3.5.9.8). */
+        session->client_key = chimera_smb_lease_client_key(conn->client_guid,
+                                                           session->session_id);
 
         session_handle = chimera_smb_session_handle_alloc(thread);
 
@@ -180,6 +260,38 @@ chimera_smb_session_setup(struct chimera_smb_request *request)
         uint8_t     session_key_saved[32];
         size_t      session_key_saved_len = 0;
         int         is_anonymous          = 0;
+
+        int         is_binding = (request->session_setup.flags &
+                                  SMB2_SESSION_FLAG_BINDING) != 0;
+
+        /* SMB3 multichannel session binding (MS-SMB2 §3.3.5.5.3): account for
+         * the new channel and enforce the per-session channel limit BEFORE any
+         * per-channel key derivation below.  Doing it first keeps the rejection
+         * response signed with the established session key the client verifies
+         * it against -- the over-limit channel never derives a channel key.  The
+         * check and increment share sessions_lock so concurrent binds on
+         * different connections cannot race past the limit. */
+        if (is_binding &&
+            (session->flags & CHIMERA_SMB_SESSION_AUTHORIZED)) {
+            int over_limit = 0;
+
+            pthread_mutex_lock(&shared->sessions_lock);
+            if (session->num_channels >= SMB2_MAX_CHANNELS) {
+                over_limit = 1;
+            } else {
+                session->num_channels++;
+                session_handle->bound_channel = 1;
+            }
+            pthread_mutex_unlock(&shared->sessions_lock);
+
+            if (over_limit) {
+                chimera_smb_complete_request(request, SMB2_STATUS_INSUFFICIENT_RESOURCES);
+                evpl_iovecs_release(thread->evpl,
+                                    request->session_setup.input_iov,
+                                    request->session_setup.input_niov);
+                return;
+            }
+        }
 
         if (mech == SMB_AUTH_MECH_NTLM) {
             uint8_t session_key[SMB_NTLM_SESSION_KEY_SIZE];
@@ -278,8 +390,16 @@ chimera_smb_session_setup(struct chimera_smb_request *request)
 
         /* SMB3 transport encryption: derive per-session keys from the raw
          * session key.  Skipped for anonymous/guest (null) sessions, which have
-         * no usable key and are never encrypted (MS-SMB2 §3.3.5.5.3). */
-        if (shared->config.encryption &&
+         * no usable key and are never encrypted (MS-SMB2 §3.3.5.5.3).
+         *
+         * Keys are derived whenever encryption is possible at all -- either the
+         * global smb_encryption knob OR any per-share encrypt_data share --
+         * because a client may tree-connect to a per-share-encrypted share even
+         * when global encryption is off.  The global knob alone decides whether
+         * the whole session is marked encrypt-all (CHIMERA_SMB_SESSION_ENCRYPT_
+         * DATA); per-share encryption leaves the flag clear and encrypts per
+         * tree (see the reply path in smb.c). */
+        if ((shared->config.encryption || shared->any_share_encrypt) &&
             conn->negotiated.cipher_id != 0 &&
             conn->dialect >= SMB2_DIALECT_3_0 &&
             session_key_saved_len > 0 &&
@@ -293,13 +413,17 @@ chimera_smb_session_setup(struct chimera_smb_request *request)
                     session_handle->enc_key, session_handle->dec_key, &klen) == 0) {
                 session_handle->enc_key_len = klen;
                 session_handle->cipher_id   = conn->negotiated.cipher_id;
-                session->flags             |= CHIMERA_SMB_SESSION_ENCRYPT_DATA;
+                if (shared->config.encryption) {
+                    session->flags |= CHIMERA_SMB_SESSION_ENCRYPT_DATA;
+                }
             }
         }
 
         if (!(session->flags & CHIMERA_SMB_SESSION_AUTHORIZED)) {
             memcpy(session->signing_key, session_handle->signing_key, sizeof(session_handle->signing_key));
-            if (session->flags & CHIMERA_SMB_SESSION_ENCRYPT_DATA) {
+            /* The primary channel counts as the session's first channel. */
+            session->num_channels = 1;
+            if (session_handle->enc_key_len > 0) {
                 memcpy(session->enc_key, session_handle->enc_key, sizeof(session->enc_key));
                 memcpy(session->dec_key, session_handle->dec_key, sizeof(session->dec_key));
                 session->enc_key_len = session_handle->enc_key_len;
@@ -313,11 +437,23 @@ chimera_smb_session_setup(struct chimera_smb_request *request)
         }
 
         /* If the client named a previous session (reconnect on a fresh
-         * transport), close it now that this one is established. */
-        if (request->session_setup.prev_session_id) {
+         * transport), close it now that this one is established.  MS-SMB2
+         * 3.3.5.5.1: when the previous session was negotiated at a different
+         * dialect than this connection, the reconnect is rejected -- close the
+         * just-created session and fail with STATUS_USER_SESSION_DELETED
+         * (smb2.session ReconnectWithDifferentDialect). */
+        if (request->session_setup.prev_session_id &&
             chimera_smb_session_invalidate_previous(thread, shared,
                                                     request->session_setup.prev_session_id,
-                                                    session);
+                                                    session, conn->dialect)) {
+            chimera_smb_complete_request(request, SMB2_STATUS_USER_SESSION_DELETED);
+
+            HASH_DEL(conn->session_handles, request->session_handle);
+            chimera_smb_session_release(thread, shared, session, false);
+            chimera_smb_session_handle_free(thread, request->session_handle);
+            request->session_handle   = NULL;
+            conn->last_session_handle = NULL;
+            return;
         }
 
         chimera_smb_complete_request(request, SMB2_STATUS_SUCCESS);
@@ -327,7 +463,9 @@ chimera_smb_session_setup(struct chimera_smb_request *request)
     } else {
         // Authentication failed
         chimera_smb_error("Authentication failed (mechanism: %s)", smb_auth_mech_name(mech));
-        chimera_smb_complete_request(request, SMB2_STATUS_LOGON_FAILURE);
+        chimera_smb_complete_request(request,
+                                     bad_token ? SMB2_STATUS_INVALID_PARAMETER :
+                                     SMB2_STATUS_LOGON_FAILURE);
 
         /* A failed channel-bind (SMB2_SESSION_FLAG_BINDING) must NOT tear the
          * existing session down — the established channel(s) survive.  Only a

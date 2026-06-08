@@ -111,6 +111,15 @@ chimera_server_config_get_smb_encryption(
     const struct chimera_server_config *config);
 
 void
+chimera_server_config_set_smb_compression(
+    struct chimera_server_config *config,
+    int                           enabled);
+
+int
+chimera_server_config_get_smb_compression(
+    const struct chimera_server_config *config);
+
+void
 chimera_server_config_set_smb_notify_disabled(
     struct chimera_server_config *config,
     int                           disabled);
@@ -258,6 +267,7 @@ chimera_server_config_add_pnfs_ds(
     struct chimera_server_config *config,
     const char                   *netid,
     const char                   *uaddr,
+    const char                   *rdma_uaddr,
     const char                   *backing_path,
     int                           version,
     int                           minorversion);
@@ -407,6 +417,11 @@ chimera_server_config_get_smb_dialects(
     const struct chimera_server_config *config,
     int                                 index);
 
+void
+chimera_server_config_set_smb_min_dialect(
+    struct chimera_server_config *config,
+    uint32_t                      min_dialect);
+
 int
 chimera_server_config_get_smb_num_nic_info(
     const struct chimera_server_config *config);
@@ -500,6 +515,11 @@ chimera_server_create_share(
 
 int
 chimera_server_share_set_access_based_enum(
+    struct chimera_server *server,
+    const char            *share_name);
+
+int
+chimera_server_share_set_encrypt_data(
     struct chimera_server *server,
     const char            *share_name);
 

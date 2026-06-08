@@ -76,6 +76,7 @@ struct chimera_server_config {
     int                                   smb_named_streams;
     int                                   smb_signing_required;
     int                                   smb_encryption;
+    int                                   smb_compression;
     int                                   smb_notify_disabled;
     int                                   smb_acl_inherited_canonicalize;
     int                                   smb_num_nic_info;
@@ -95,6 +96,7 @@ struct chimera_server_config {
     struct chimera_server_config_pnfs_ds {
         char netid[8];
         char uaddr[64];
+        char rdma_uaddr[64];              /* optional RDMA netaddr (empty = none)   */
         char backing_path[CHIMERA_PNFS_BACKING_MAX];
         int  version;                     /* NFS version the client uses for DS I/O */
         int  minorversion;                /* NFS minor version (4.x)                */
@@ -145,11 +147,12 @@ chimera_server_config_init(void)
     config->rest_debug_fsops         = 0;
     config->tcp_flavor               = CHIMERA_TCP_FLAVOR_PLAIN;
 
-    config->smb_num_dialects = 4;
-    config->smb_dialects[0]  = SMB2_DIALECT_2_1;
-    config->smb_dialects[1]  = SMB2_DIALECT_3_0;
-    config->smb_dialects[2]  = SMB2_DIALECT_3_0_2;
-    config->smb_dialects[3]  = SMB2_DIALECT_3_1_1;
+    config->smb_num_dialects = 5;
+    config->smb_dialects[0]  = SMB2_DIALECT_2_0_2;
+    config->smb_dialects[1]  = SMB2_DIALECT_2_1;
+    config->smb_dialects[2]  = SMB2_DIALECT_3_0;
+    config->smb_dialects[3]  = SMB2_DIALECT_3_0_2;
+    config->smb_dialects[4]  = SMB2_DIALECT_3_1_1;
 
     config->smb_num_nic_info = 0;
 
@@ -170,6 +173,10 @@ chimera_server_config_init(void)
     /* SMB3 transport encryption is off by default; the "smb_encryption" config
      * flag enables (1) or requires (2) it. */
     config->smb_encryption = 0;
+
+    /* SMB3 transport compression is off by default; the "smb_compression" flag
+     * enables (1) advertising/using it. */
+    config->smb_compression = 0;
 
     /* CHANGE_NOTIFY is enabled by default; the "smb_notify_disabled" flag makes
      * the server reject CHANGE_NOTIFY with STATUS_NOT_IMPLEMENTED. */
@@ -216,8 +223,12 @@ chimera_server_config_init(void)
 
     /* Default NFSv4.1 fore-channel session slots (server cap on the number
      * of concurrent SEQUENCE requests a client may have outstanding per
-     * session).  Mirrors NFS4_MAX_REPLY_CACHE_SLOTS in the NFS server. */
-    config->nfs4_session_slots = 64;
+     * session).  The chimera proxy client partitions slots one block per evpl
+     * thread, so a high-thread-count client (e.g. fio numjobs) needs this many
+     * slots or surplus threads collide on a shared slot; 256 covers typical
+     * fan-out out of the box and the replay-slot table sizes to it.  Raise
+     * further for very wide clients. */
+    config->nfs4_session_slots = 256;
 
     /* NFSv4 protocol delegations (OPEN_DELEGATE_READ/WRITE) are disabled by
      * default.  When off, every OPEN returns OPEN_DELEGATE_NONE and the
@@ -259,6 +270,9 @@ chimera_server_config_init(void)
 
     config->num_modules = 5;
 #endif /* ifdef HAVE_IO_URING */
+
+    /* The default KV module (memkv) is auto-registered by chimera_vfs_init; it
+     * need not be listed here. */
 
     return config;
 } /* chimera_server_config_init */
@@ -358,6 +372,20 @@ chimera_server_config_get_smb_encryption(const struct chimera_server_config *con
 {
     return config->smb_encryption;
 } /* chimera_server_config_get_smb_encryption */
+
+SYMBOL_EXPORT void
+chimera_server_config_set_smb_compression(
+    struct chimera_server_config *config,
+    int                           enabled)
+{
+    config->smb_compression = enabled;
+} /* chimera_server_config_set_smb_compression */
+
+SYMBOL_EXPORT int
+chimera_server_config_get_smb_compression(const struct chimera_server_config *config)
+{
+    return config->smb_compression;
+} /* chimera_server_config_get_smb_compression */
 
 SYMBOL_EXPORT void
 chimera_server_config_set_smb_notify_disabled(
@@ -544,6 +572,7 @@ chimera_server_config_add_pnfs_ds(
     struct chimera_server_config *config,
     const char                   *netid,
     const char                   *uaddr,
+    const char                   *rdma_uaddr,
     const char                   *backing_path,
     int                           version,
     int                           minorversion)
@@ -560,6 +589,7 @@ chimera_server_config_add_pnfs_ds(
 
     snprintf(ds->netid, sizeof(ds->netid), "%s", netid ? netid : "tcp");
     snprintf(ds->uaddr, sizeof(ds->uaddr), "%s", uaddr ? uaddr : "");
+    snprintf(ds->rdma_uaddr, sizeof(ds->rdma_uaddr), "%s", rdma_uaddr ? rdma_uaddr : "");
     snprintf(ds->backing_path, sizeof(ds->backing_path), "%s", backing_path ? backing_path : "");
     ds->version      = version ? version : 3;
     ds->minorversion = minorversion;
@@ -855,6 +885,34 @@ chimera_server_config_get_smb_dialects(
 {
     return config->smb_dialects[index];
 } /* chimera_server_config_get_smb_dialects */
+
+SYMBOL_EXPORT void
+chimera_server_config_set_smb_min_dialect(
+    struct chimera_server_config *config,
+    uint32_t                      min_dialect)
+{
+    /* Every SMB2/3 dialect chimera can speak, ascending.  The advertised set is
+     * this list filtered to >= min_dialect, so lowering the floor (e.g. to
+     * SMB 2.0.2) just widens the bottom of the range.  The default floor is
+     * SMB 2.1; SMB 2.0.2 is off by default because it lacks large-MTU/leasing
+     * and is only needed by conformance cases that explicitly request it. */
+    static const uint32_t all_dialects[] = {
+        SMB2_DIALECT_2_0_2,
+        SMB2_DIALECT_2_1,
+        SMB2_DIALECT_3_0,
+        SMB2_DIALECT_3_0_2,
+        SMB2_DIALECT_3_1_1,
+    };
+    int                   n = 0;
+
+    for (unsigned int i = 0; i < sizeof(all_dialects) / sizeof(all_dialects[0]); i++) {
+        if (all_dialects[i] >= min_dialect) {
+            config->smb_dialects[n++] = all_dialects[i];
+        }
+    }
+
+    config->smb_num_dialects = n;
+} /* chimera_server_config_set_smb_min_dialect */
 
 SYMBOL_EXPORT int
 chimera_server_config_get_smb_num_nic_info(const struct chimera_server_config *config)
@@ -1439,6 +1497,19 @@ chimera_server_share_set_access_based_enum(
 } /* chimera_server_share_set_access_based_enum */
 
 SYMBOL_EXPORT int
+chimera_server_share_set_encrypt_data(
+    struct chimera_server *server,
+    const char            *share_name)
+{
+    if (!server->smb_shared) {
+        return -1;
+    }
+
+    return chimera_smb_share_set_encrypt_data(server->smb_shared,
+                                              share_name);
+} /* chimera_server_share_set_encrypt_data */
+
+SYMBOL_EXPORT int
 chimera_server_create_export(
     struct chimera_server *server,
     const char            *name,
@@ -1544,6 +1615,7 @@ chimera_server_init(
             chimera_vfs_pnfs_add_device(server->vfs,
                                         config->pnfs_ds[i].netid,
                                         config->pnfs_ds[i].uaddr,
+                                        config->pnfs_ds[i].rdma_uaddr,
                                         config->pnfs_ds[i].backing_path,
                                         config->pnfs_ds[i].version,
                                         config->pnfs_ds[i].minorversion);
