@@ -14,7 +14,7 @@ ARG ENABLE_WPTS=1
 # Pinned to an exact chimera-nas/pynfs commit (on branch chimera-fast-ci).  Using a
 # SHA rather than a moving branch makes the image reproducible and busts the Docker
 # layer cache whenever pynfs is bumped.  Keep this in sync with .devcontainer/Dockerfile.
-ARG PYNFS_REF=c4bf18d62947e793752c1f77ab180ce75533f14d
+ARG PYNFS_REF=b861f7b8211b4dc798b88a7e81b300fb4615189c
 # Pinned Microsoft Windows Protocol Test Suites (WPTS) FileServer release.
 ARG WPTS_VERSION=4.26.3.0
 ARG ELBENCHO_REF=96b1bf29c35e437715c0527194e69e4c96ed9922
