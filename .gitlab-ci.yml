@@ -38,45 +38,53 @@ builder_Rocky9:
   script:
     - ${RUN_QB} builder_Rocky9
 
+build_release_Ubuntu22:
+  stage: build
+  needs: [ builder_Ubuntu22 ]
+  script:
+    - ${RUN_QB} build_release_Ubuntu22
+
 build_debug_Ubuntu22:
   stage: build
+  needs: [ builder_Ubuntu22 ]
   script:
     - ${RUN_QB} build_debug_Ubuntu22
 
 build_release_Ubuntu24:
   stage: build
+  needs: [ builder_Ubuntu24 ]
   script:
     - ${RUN_QB} build_release_Ubuntu24
 
 build_debug_Ubuntu24:
   stage: build
+  needs: [ builder_Ubuntu24 ]
   script:
     - ${RUN_QB} build_debug_Ubuntu24
 
 build_release_Ubuntu26:
   stage: build
+  needs: [ builder_Ubuntu26 ]
   script:
     - ${RUN_QB} build_release_Ubuntu26
 
 build_debug_Ubuntu26:
   stage: build
+  needs: [ builder_Ubuntu26 ]
   script:
     - ${RUN_QB} build_debug_Ubuntu26
 
-build_release_Ubuntu22:
+build_release_Rocky9:
   stage: build
+  needs: [ builder_Rocky9 ]
   script:
-    - ${RUN_QB} build_release_Ubuntu22
+    - ${RUN_QB} build_release_Rocky9
 
 build_debug_Rocky9:
   stage: build
+  needs: [ builder_Rocky9 ]
   script:
     - ${RUN_QB} build_debug_Rocky9
-
-build_release_Rocky9:
-  stage: build
-  script:
-    - ${RUN_QB} build_release_Rocky9
 
 syntax:
   stage: check
