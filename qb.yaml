@@ -318,7 +318,11 @@ tasks:
         task: chimera-dev
         tag: develop
 
-  ctest_release:
+  # The ctest suites are split into two tasks each -- the pynfs label (the bulk
+  # of the runtime) and everything else (`-LE pynfs`) -- so they run as separate
+  # parallel CI jobs. Each task still configures and builds independently because
+  # qb tasks run in isolated containers with their own empty /build.
+  ctest_release_pynfs:
     type: run_container
     architecture: [ amd64, arm64 ]
     image: chimera-dev
@@ -334,14 +338,37 @@ tasks:
         -DKVM_IMAGE_CACHE_REGISTRY=repository.mdh.quantum.com:5004/cache
         -S /context -B /build
       - ninja
-      - ctest --output-on-failure --test-output-size-failed 65536 --timeout 300 -j 12
+      - ctest --output-on-failure --test-output-size-failed 65536 --timeout 300 -j 12 -L pynfs -E diskfs_
     dependencies:
       builder:
         project: chimera
         task: chimera-dev
         tag: develop
 
-  ctest_debug:
+  ctest_release_other:
+    type: run_container
+    architecture: [ amd64, arm64 ]
+    image: chimera-dev
+    context: .
+    empty_dir:
+      - /build
+    privileged: true
+    commands:
+      - cd /build
+      - >
+        cmake -G Ninja -DCMAKE_BUILD_TYPE=Release
+        -DREQUIRE_NETNS_TESTS=ON
+        -DKVM_IMAGE_CACHE_REGISTRY=repository.mdh.quantum.com:5004/cache
+        -S /context -B /build
+      - ninja
+      - ctest --output-on-failure --test-output-size-failed 65536 --timeout 300 -j 12 -LE pynfs
+    dependencies:
+      builder:
+        project: chimera
+        task: chimera-dev
+        tag: develop
+
+  ctest_debug_pynfs:
     type: run_container
     architecture: [ amd64, arm64 ]
     image: chimera-dev
@@ -357,7 +384,30 @@ tasks:
         -DKVM_IMAGE_CACHE_REGISTRY=repository.mdh.quantum.com:5004/cache
         -S /context -B /build
       - ninja
-      - ctest --output-on-failure --test-output-size-failed 65536 --timeout 300 -j 12
+      - ctest --output-on-failure --test-output-size-failed 65536 --timeout 300 -j 12 -L pynfs -E diskfs_
+    dependencies:
+      builder:
+        project: chimera
+        task: chimera-dev
+        tag: develop
+
+  ctest_debug_other:
+    type: run_container
+    architecture: [ amd64, arm64 ]
+    image: chimera-dev
+    context: .
+    empty_dir:
+      - /build
+    privileged: true
+    commands:
+      - cd /build
+      - >
+        cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug
+        -DREQUIRE_NETNS_TESTS=ON
+        -DKVM_IMAGE_CACHE_REGISTRY=repository.mdh.quantum.com:5004/cache
+        -S /context -B /build
+      - ninja
+      - ctest --output-on-failure --test-output-size-failed 65536 --timeout 300 -j 12 -LE pynfs
     dependencies:
       builder:
         project: chimera
@@ -498,8 +548,10 @@ aliases:
     - build_release_Rocky9
   check:
     - chimera-dev
-    - ctest_debug
-    - ctest_release
+    - ctest_debug_pynfs
+    - ctest_debug_other
+    - ctest_release_pynfs
+    - ctest_release_other
     - static_analysis_debug
     - static_analysis_release
     - syntax
