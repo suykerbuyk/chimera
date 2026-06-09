@@ -121,14 +121,15 @@ ctest:
     matrix:
       - MODE: [ release, debug ]
         ARCH: [ arm64, amd64 ]
+        GROUP: [ pynfs, other ]
   script:
-    - ${RUN_QB} -a ${ARCH} -v ctest_${MODE} &> ctest_${MODE}_${ARCH}.log
+    - ${RUN_QB} -a ${ARCH} -v ctest_${MODE}_${GROUP} &> ctest_${MODE}_${GROUP}_${ARCH}.log
   after_script:
-    - tail -1000 ctest_${MODE}_${ARCH}.log || true
+    - tail -1000 ctest_${MODE}_${GROUP}_${ARCH}.log || true
   artifacts:
     when: always
     paths:
-      - ctest_${MODE}_${ARCH}.log
+      - ctest_${MODE}_${GROUP}_${ARCH}.log
     expire_in: 1 week
 
 
