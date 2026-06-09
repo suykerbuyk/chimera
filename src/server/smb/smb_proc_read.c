@@ -140,14 +140,18 @@ chimera_smb_read(struct chimera_smb_request *request)
 
     struct chimera_vfs_lease_owner io_owner = {
         .protocol   = CHIMERA_VFS_LEASE_PROTO_SMB2,
-        .client_key = request->session_handle->session->session_id,
+        .client_key = request->session_handle->session->client_key,
         .owner_lo   = request->read.open_file->file_id.pid,
         .owner_hi   = request->read.open_file->file_id.vid,
     };
 
     /* Mandatory byte-range lock enforcement: an exclusive lock held by a
-     * different open denies reads of the locked range. */
-    if (chimera_vfs_state_range_io_conflict(
+     * different open denies reads of the locked range.  A zero-length read
+     * touches no bytes, so it can conflict with no lock and is exempt
+     * (MS-SMB2 zerobyteread); it also avoids the length==0 => to-EOF
+     * convention in the range-overlap test wrongly matching every lock. */
+    if (request->read.length != 0 &&
+        chimera_vfs_state_range_io_conflict(
             thread->vfs_thread->vfs->vfs_state,
             request->read.open_file->handle->fh,
             request->read.open_file->handle->fh_len,
@@ -182,8 +186,15 @@ chimera_smb_parse_read(
     struct chimera_smb_request *request)
 {
     uint16_t blob_offset, blob_length;
+    uint8_t  padding;
     int      i;
 
+    /* MS-SMB2 §2.2.19: StructureSize(2, already consumed) is followed by
+     * Padding(1) then Flags(1).  Read both explicitly — the Length uint32 read
+     * below realigns to a 4-byte boundary, so a single byte read here would
+     * capture Padding and silently skip the Flags field (which carries
+     * SMB2_READFLAG_REQUEST_COMPRESSED). */
+    evpl_iovec_cursor_get_uint8(request_cursor, &padding);
     evpl_iovec_cursor_get_uint8(request_cursor, &request->read.flags);
     evpl_iovec_cursor_get_uint32(request_cursor, &request->read.length);
     evpl_iovec_cursor_get_uint64(request_cursor, &request->read.offset);

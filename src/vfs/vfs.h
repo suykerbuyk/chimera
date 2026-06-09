@@ -424,6 +424,15 @@ struct chimera_vfs_request {
      * mutation that must recall every caching lease on a target file (regardless
      * of owner) rather than hold an implicit lease. */
     uint8_t                            io_recall_all;
+    /* Set by chimera_vfs_io_recall() for a data-coherence recall (a setattr that
+     * touches data, e.g. SIZE/EOF) as opposed to a namespace recall (remove /
+     * rename / link).  A flush recall downgrades a write-caching (W) holder to
+     * its read+handle cache (forcing the client to flush dirty data without
+     * losing its read cache or oplock), rather than revoking the whole lease to
+     * NONE.  This decouples the load-bearing dirty-cache flush from full
+     * revocation -- the churn source for metadata-heavy single-client workloads
+     * (rewinddir/fsstress) -- while preserving coherence. */
+    uint8_t                            io_recall_flush_only;
     void                               ( *io_next )(
         struct chimera_vfs_request *request);
     struct chimera_vfs_file_state     *io_lease_file;
@@ -1058,6 +1067,10 @@ enum CHIMERA_FS_FH_MAGIC {
     CHIMERA_VFS_FH_MAGIC_CAIRN    = 4,
     CHIMERA_VFS_FH_MAGIC_DISKFS   = 5,
     CHIMERA_VFS_FH_MAGIC_NFS      = 6,
+    /* KV-only backends (no filesystem; never serve a file handle, but occupy a
+     * module slot so they can be selected as the default KV module). */
+    CHIMERA_VFS_FH_MAGIC_MEMKV    = 7,
+    CHIMERA_VFS_FH_MAGIC_SQLITE   = 8,
     // Extra value for QuantumFS
     CHIMERA_VFS_FH_MAGIC_MYRIAD   = 100,
     CHIMERA_VFS_FH_MAGIC_SNFS     = 101,

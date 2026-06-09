@@ -123,6 +123,7 @@
 #define SMB2_STATUS_EA_CORRUPT_ERROR                  0xC0000053
 #define SMB2_STATUS_FILE_LOCK_CONFLICT                0xC0000054
 #define SMB2_STATUS_LOCK_NOT_GRANTED                  0xC0000055
+#define SMB2_STATUS_INVALID_LOCK_RANGE                0xC00001A1
 #define SMB2_STATUS_DELETE_PENDING                    0xC0000056
 #define SMB2_STATUS_CTL_FILE_NOT_SUPPORTED            0xC0000057
 #define SMB2_STATUS_UNKNOWN_REVISION                  0xC0000058
@@ -543,6 +544,12 @@
 #define SMB2_STATUS_SERVER_UNAVAILABLE                0xC0000466
 #define SMB2_STATUS_FILE_NOT_AVAILABLE                0xC0000467
 
+/* STATUS_SMB_NO_PREAUTH_INTEGRITY_HASH_OVERLAP (MS-SMB2 §3.3.5.4): returned
+ * from a SMB 3.1.1 NEGOTIATE when the client's
+ * SMB2_PREAUTH_INTEGRITY_CAPABILITIES HashAlgorithms array contains no hash
+ * algorithm the server supports. */
+#define SMB2_STATUS_SMB_NO_PREAUTH_INTEGRITY_OVERLAP  0xC05D0000
+
 /* Warning codes */
 #define SMB2_STATUS_BUFFER_OVERFLOW                   0x80000005
 #define SMB2_STATUS_STOPPED_ON_SYMLINK                0x8000002D
@@ -591,13 +598,75 @@ _Static_assert(sizeof(struct smb2_transform_header) == 52,
                "SMB2 TRANSFORM_HEADER must be 52 bytes");
 
 /* TransformHeader.ProtocolId and Flags (MS-SMB2 §2.2.41) */
-#define SMB2_TRANSFORM_PROTO_ID        { 0xFD, 'S', 'M', 'B' }
-#define SMB2_TRANSFORM_FLAGS_ENCRYPTED 0x0001
+#define SMB2_TRANSFORM_PROTO_ID             { 0xFD, 'S', 'M', 'B' }
+#define SMB2_TRANSFORM_FLAGS_ENCRYPTED      0x0001
 
 /* Byte offset and length of the AEAD associated data within the transform
  * header: from the Nonce field (offset 20) through the end of the header. */
-#define SMB2_TRANSFORM_AAD_OFFSET      20
-#define SMB2_TRANSFORM_AAD_SIZE        32
+#define SMB2_TRANSFORM_AAD_OFFSET           20
+#define SMB2_TRANSFORM_AAD_SIZE             32
+
+/*
+ * SMB2 COMPRESSION_TRANSFORM_HEADER (MS-SMB2 §2.2.42) — prepended to a
+ * compressed SMB2 message.  ProtocolId is 0xFC 'S' 'M' 'B' (a 32-bit LE load of
+ * the first four bytes reads as 0x424d53fc).  The header takes one of two forms
+ * selected by Flags: unchained (Flags == SMB2_COMPRESSION_FLAG_NONE) or chained
+ * (Flags == SMB2_COMPRESSION_FLAG_CHAINED).
+ */
+#define SMB2_COMPRESSION_TRANSFORM_PROTO_ID { 0xFC, 'S', 'M', 'B' }
+
+/* Unchained (MS-SMB2 §2.2.42.1), 16 bytes.  The bytes following the header are:
+ * `offset` uncompressed-prefix bytes (typically the SMB2 header left in the
+ * clear), then the compressed segment which decompresses to
+ * original_compressed_segment_size bytes.  The full plaintext message is
+ * offset + original_compressed_segment_size bytes. */
+struct smb2_compression_transform_header {
+    uint8_t  protocol_id[4]; /* 0xFC 'S' 'M' 'B' */
+    uint32_t original_compressed_segment_size;
+    uint16_t compression_algorithm;
+    uint16_t flags;          /* SMB2_COMPRESSION_FLAG_NONE for the unchained form */
+    uint32_t offset;         /* end-of-header -> start of the compressed segment */
+} __attribute__((packed));
+
+_Static_assert(sizeof(struct smb2_compression_transform_header) == 16,
+               "SMB2 COMPRESSION_TRANSFORM_HEADER (unchained) must be 16 bytes");
+
+/* Chained (MS-SMB2 §2.2.42.2), 8 bytes, followed by a chain of
+ * SMB2_COMPRESSION_CHAINED_PAYLOAD_HEADER structures. */
+struct smb2_compression_transform_header_chained {
+    uint8_t  protocol_id[4]; /* 0xFC 'S' 'M' 'B' */
+    uint32_t original_compressed_segment_size;
+} __attribute__((packed));
+
+_Static_assert(sizeof(struct smb2_compression_transform_header_chained) == 8,
+               "SMB2 COMPRESSION_TRANSFORM_HEADER (chained) must be 8 bytes");
+
+/* SMB2_COMPRESSION_CHAINED_PAYLOAD_HEADER (MS-SMB2 §2.2.42.2.1), 8 bytes.  For
+ * the real codecs (LZNT1/LZ77/LZ77+Huffman/LZ4) a 4-byte OriginalPayloadSize
+ * immediately follows this header; it is absent for NONE and Pattern_V1.
+ * `length` counts every byte that follows this 8-byte header for the payload,
+ * including the OriginalPayloadSize field when present. */
+struct smb2_compression_chained_payload_header {
+    uint16_t compression_algorithm;
+    uint16_t flags;          /* CHAINED on the first payload, NONE afterward */
+    uint32_t length;
+} __attribute__((packed));
+
+_Static_assert(sizeof(struct smb2_compression_chained_payload_header) == 8,
+               "SMB2_COMPRESSION_CHAINED_PAYLOAD_HEADER must be 8 bytes");
+
+/* SMB2_COMPRESSION_PATTERN_PAYLOAD_V1 (MS-SMB2 §2.2.42.2.2), 8 bytes — the
+ * payload body for a Pattern_V1 chained entry: `repetitions` copies of the
+ * single byte `pattern`. */
+struct smb2_compression_pattern_payload_v1 {
+    uint8_t  pattern;
+    uint8_t  reserved1;
+    uint16_t reserved2;
+    uint32_t repetitions;
+} __attribute__((packed));
+
+_Static_assert(sizeof(struct smb2_compression_pattern_payload_v1) == 8,
+               "SMB2_COMPRESSION_PATTERN_PAYLOAD_V1 must be 8 bytes");
 
 enum smb2_command {
     SMB2_NEGOTIATE       = 0,
@@ -632,6 +701,8 @@ typedef uint8_t smb2_guid[SMB2_GUID_SIZE];
 
 // SMB2 TREE_CONNECT response ShareFlags
 #define SMB2_SHAREFLAG_ACCESS_BASED_DIRECTORY_ENUM  0x00000800
+#define SMB2_SHAREFLAG_ENCRYPT_DATA                 0x00008000 // Per-share encryption (SMB 3.0+)
+#define SMB2_SHAREFLAG_COMPRESS_DATA                0x00100000 // Share supports compression (SMB 3.1.1+)
 
 // SMB2/3 Negotiate Capabilities
 #define SMB2_GLOBAL_CAP_DFS                         0x00000001 // Server supports DFS
@@ -641,6 +712,7 @@ typedef uint8_t smb2_guid[SMB2_GUID_SIZE];
 #define SMB2_GLOBAL_CAP_PERSISTENT_HANDLES          0x00000010 // Supports persistent handles (SMB 3.0+)
 #define SMB2_GLOBAL_CAP_DIRECTORY_LEASING           0x00000020 // Supports directory leasing (SMB 3.0+)
 #define SMB2_GLOBAL_CAP_ENCRYPTION                  0x00000040 // Supports encryption (SMB 3.0+)
+#define SMB2_GLOBAL_CAP_NOTIFICATIONS               0x00000080 // Supports server-to-client notifications (SMB 3.1.1+)
 
 // SMB2 TREE_CONNECT response share capabilities (MS-SMB2 §2.2.10)
 #define SMB2_SHARE_CAP_DFS                          0x00000008
@@ -689,6 +761,15 @@ typedef uint8_t smb2_guid[SMB2_GUID_SIZE];
 /* SMB2_COMPRESSION_CAPABILITIES Flags */
 #define SMB2_COMPRESSION_FLAG_NONE                  0x00000000
 #define SMB2_COMPRESSION_FLAG_CHAINED               0x00000001
+
+/* SMB2_COMPRESSION_CAPABILITIES CompressionAlgorithm IDs (MS-SMB2 §2.2.3.1.3).
+ * NONE is only valid as a chained-payload algorithm (raw pass-through);
+ * Pattern_V1 is only valid as a chained-payload algorithm (run-length). */
+#define SMB2_COMPRESSION_NONE                       0x0000
+#define SMB2_COMPRESSION_LZNT1                      0x0001
+#define SMB2_COMPRESSION_LZ77                       0x0002
+#define SMB2_COMPRESSION_LZ77_HUFFMAN               0x0003
+#define SMB2_COMPRESSION_PATTERN_V1                 0x0004
 
 #define SMB2_NEGOTIATE_MAX_DIALECTS                 10
 
@@ -771,6 +852,11 @@ typedef uint8_t smb2_guid[SMB2_GUID_SIZE];
 #define SMB2_LEASE_READ_CACHING                     0x01
 #define SMB2_LEASE_HANDLE_CACHING                   0x02
 #define SMB2_LEASE_WRITE_CACHING                    0x04
+
+/* LeaseFlags in the RqLs create request/response context (MS-SMB2 2.2.13.2.8/
+ * 2.2.14.2.10/11) */
+#define SMB2_LEASE_FLAG_BREAK_IN_PROGRESS           0x00000002
+#define SMB2_LEASE_FLAG_PARENT_LEASE_KEY_SET        0x00000004
 
 #define SMB2_CREATE_REQUEST_LEASE_SIZE              32
 #define SMB2_CREATE_REQUEST_LEASE_V2_SIZE           52
@@ -886,6 +972,7 @@ typedef uint8_t smb2_guid[SMB2_GUID_SIZE];
 #define SMB2_READ_REQUEST_SIZE                      49
 
 #define SMB2_READFLAG_READ_UNBUFFERED               0x01
+#define SMB2_READFLAG_REQUEST_COMPRESSED            0x02
 
 #define SMB2_READ_REPLY_SIZE                        17
 
@@ -930,6 +1017,7 @@ typedef uint8_t smb2_guid[SMB2_GUID_SIZE];
 #define SMB2_FSCTL_SRV_COPYCHUNK                    0x001440F2
 #define SMB2_FSCTL_SRV_COPYCHUNK_WRITE              0x001480F2
 #define SMB2_FSCTL_CREATE_OR_GET_OBJECT_ID          0x000900C0
+#define SMB2_FSCTL_SRV_ENUMERATE_SNAPSHOTS          0x00144064
 
 #define SMB2_IO_REPARSE_TAG_NFS                     0x80000014
 #define SMB2_IO_REPARSE_TAG_SYMLINK                 0xA000000C
@@ -968,6 +1056,7 @@ typedef uint8_t smb2_guid[SMB2_GUID_SIZE];
 #define SMB2_FILE_COMPRESSION_INFO                  0x0C
 #define SMB2_FILE_NETWORK_OPEN_INFO                 0x22
 #define SMB2_FILE_ATTRIBUTE_TAG_INFO                0x23
+#define SMB2_FILE_NORMALIZED_NAME_INFO              0x30
 #define SMB2_FILE_DISPOSITION_INFO_EX               0x40
 
 /* SMB2 information types */
