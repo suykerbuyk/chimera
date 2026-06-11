@@ -47,9 +47,6 @@ RUN apt-get -y update && \
     gem install jekyll bundler
 
 
-# qb CLI (Quantum build tool). Installed from the internal repo.
-RUN curl -fsSL https://repository.mdh.quantum.com/repository/pkgs/qb/install.sh | bash
-
 RUN if [ "$ENABLE_CLAUDE" = "1" ] ; then \
     npm install -g @anthropic-ai/claude-code ; \
     fi
@@ -133,4 +130,22 @@ RUN if [ "$ENABLE_WPTS" = "1" ] ; then \
     curl -sSL "https://github.com/microsoft/WindowsProtocolTestSuites/releases/download/${WPTS_VERSION}/FileServer-TestSuite-ServerEP.tar.gz" -o /tmp/wpts.tar.gz && \
     tar -C /opt/wpts -xzf /tmp/wpts.tar.gz && \
     rm -f /tmp/wpts.tar.gz ; \
+    fi
+
+#
+# Quantum Specific addon
+#
+
+# qb CLI (Quantum build tool). Installed from the internal repo.
+RUN curl -fsSL https://repository.mdh.quantum.com/repository/pkgs/qb/install.sh | bash
+
+# install kubectl
+RUN export ARCH="`dpkg --print-architecture`" && \
+    curl -o /usr/local/bin/kubectl https://repository.mdh.quantum.com/repository/pkgs/kubectl/v1.29.5/$ARCH/kubectl &&\
+    chmod 755 /usr/local/bin/kubectl
+
+# install install snfs on amd64 arch
+RUN if [ "`dpkg --print-architecture`" = "amd64" ] ; then \
+        curl -s http://qsan.mdh.quantum.com/sw/rels/sn/7.2.5_E/GA/delivery/saveobjs/Ubuntu25_x86_64/objs-snfs-130-master.tar.gz | \
+        tar zxvf - -C / ./usr/cvfs/include ./usr/cvfs/lib ; \
     fi
