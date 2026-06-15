@@ -2,10 +2,14 @@
 #
 # SPDX-License-Identifier: Unlicense
 
-name: Build and perform build time tests
+name: CI
 
 on:
-  pull_request:        # always build for PRs but don't publish
+  # The full build/test matrix runs ONLY in the merge queue, never on raw PRs
+  # (PR-time required-check placeholders live in pr-checks.yml).  The job-level
+  # `if: github.event_name != 'pull_request'` guards below are now redundant but
+  # left in place as a harmless backstop.
+  merge_group:
   workflow_dispatch:   # allow manual runs
 
 # The full cross-OS, cross-arch test and static-analysis matrix runs nightly
@@ -13,6 +17,16 @@ on:
 #   - all OS images built for amd64 (devcontainer also for arm64)
 #   - tests on all OS images amd64; arm64 only on devcontainer
 #   - static analysis only on devcontainer
+#
+# The run is three phases, fanned out as wide as possible within each, and
+# the job display names follow the phase ("Build X" = container image,
+# "Compile X" = the source tree, "Test X" / "Analyze X" = phase 3) so the CI
+# details view reads unambiguously:
+#   1. Build    container images       (build-devcontainer, build-<os>)
+#   2. Compile  the source tree        (build-dev, build-os), build trees
+#               pushed to the local Nexus scratch repo
+#   3. Test     tests + static analysis (test, test-dev, static-analysis),
+#               all in parallel behind the Compiles-complete barrier
 
 env:
   DEV_IMAGE_TAG_PREFIX: repository.mdh.quantum.com:5004/cache/chimera-dev
@@ -21,13 +35,28 @@ env:
   U22_IMAGE_TAG_PREFIX: repository.mdh.quantum.com:5004/cache/chimera-ubuntu22
   R9_IMAGE_TAG_PREFIX: repository.mdh.quantum.com:5004/cache/chimera-rocky9
   R10_IMAGE_TAG_PREFIX: repository.mdh.quantum.com:5004/cache/chimera-rocky10
-  KVM_IMAGE_CACHE_REGISTRY: repository.mdh.quantum.com:5004/cache
+  # Internal pull-through cache for the prebuilt KVM guest images (mirrors
+  # ghcr.io/chimera-nas/kvm-test-base). Public default lives in CMake.
+  KVM_IMAGE_REGISTRY: repository.mdh.quantum.com:5009/chimera-nas/kvm-test-base
   APT_MIRROR: http://repository.mdh.quantum.com/repository/pkgs/ubuntu
   DOCKER_MIRROR: repository.mdh.quantum.com/
+  # Local Nexus raw repository for transient intra-run artifacts (the build
+  # tree handed from build-dev to the test-dev shards).  Keeps that traffic
+  # inside the self-hosted runner infra instead of GitHub's Azure-blob artifact
+  # storage; objects age out server-side, so jobs never delete.  Credentials
+  # come from the NEXUS_SCRATCH_USER / NEXUS_SCRATCH_PASSWORD secrets.
+  NEXUS_SCRATCH_URL: http://repository.mdh.quantum.com/repository/scratch
+  # Shared compiler cache: the build step backs its local ccache with an HTTP
+  # remote (Nexus raw repo, ccache http backend) so objects persist across CI
+  # runs.  The full URL -- including the upload credentials -- is kept in the
+  # CCACHE_REMOTE_STORAGE *repository secret* (never in this public repo) and
+  # injected into the build container below.  merge_group runs receive secrets;
+  # a context without it (e.g. a fork) just builds local-only.
 
 jobs:
   build-devcontainer:
-    name: Build devcontainer ${{ matrix.platform }}
+    name: Build devcontainer ${{ matrix.arch }}
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -71,7 +100,8 @@ jobs:
             DOCKER_MIRROR=${{ env.DOCKER_MIRROR }}
 
   build-ubuntu26:
-    name: Build ubuntu26 ${{ matrix.platform }}
+    name: Build ubuntu26 ${{ matrix.arch }}
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -112,7 +142,8 @@ jobs:
             DOCKER_MIRROR=${{ env.DOCKER_MIRROR }}
 
   build-ubuntu24:
-    name: Build ubuntu24 ${{ matrix.platform }}
+    name: Build ubuntu24 ${{ matrix.arch }}
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -153,7 +184,8 @@ jobs:
             DOCKER_MIRROR=${{ env.DOCKER_MIRROR }}
 
   build-ubuntu22:
-    name: Build ubuntu22 ${{ matrix.platform }}
+    name: Build ubuntu22 ${{ matrix.arch }}
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -194,7 +226,8 @@ jobs:
             DOCKER_MIRROR=${{ env.DOCKER_MIRROR }}
 
   build-rocky9:
-    name: Build rocky9 ${{ matrix.platform }}
+    name: Build rocky9 ${{ matrix.arch }}
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -234,7 +267,8 @@ jobs:
             DOCKER_MIRROR=${{ env.DOCKER_MIRROR }}
 
   build-rocky10:
-    name: Build rocky10 ${{ matrix.platform }}
+    name: Build rocky10 ${{ matrix.arch }}
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -273,9 +307,16 @@ jobs:
           build-args: |
             DOCKER_MIRROR=${{ env.DOCKER_MIRROR }}
 
-  test:
-    name: Test ${{ matrix.image_name }} ${{ matrix.platform }} ${{ matrix.build_type }}
+  # Distro build half (phase 2): compile the tree once per (image, build_type)
+  # and publish it to the local Nexus scratch repo for the matching `test` job
+  # to consume -- the same build/test split the devcontainer uses (build-dev /
+  # test-dev below).  Phase 3 (all test jobs + static analysis, in parallel)
+  # starts only once every phase-2 compile has finished (the build-complete
+  # barrier).
+  build-os:
+    name: Compile ${{ matrix.image_name }} ${{ matrix.arch }} ${{ matrix.build_type }}
     needs: [build-devcontainer, build-ubuntu26, build-ubuntu24, build-ubuntu22, build-rocky9, build-rocky10]
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -283,35 +324,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # devcontainer (amd64 + arm64)
-          - platform: linux/amd64
-            runner: arc-amd64
-            arch: amd64
-            build_type: Release
-            image_tag_prefix: repository.mdh.quantum.com:5004/cache/chimera-dev
-            image_name: devcontainer
-            cmake_extra: ""
-          - platform: linux/amd64
-            runner: arc-amd64
-            arch: amd64
-            build_type: Debug
-            image_tag_prefix: repository.mdh.quantum.com:5004/cache/chimera-dev
-            image_name: devcontainer
-            cmake_extra: ""
-          - platform: linux/arm64
-            runner: arc-arm64
-            arch: arm64
-            build_type: Release
-            image_tag_prefix: repository.mdh.quantum.com:5004/cache/chimera-dev
-            image_name: devcontainer
-            cmake_extra: ""
-          - platform: linux/arm64
-            runner: arc-arm64
-            arch: arm64
-            build_type: Debug
-            image_tag_prefix: repository.mdh.quantum.com:5004/cache/chimera-dev
-            image_name: devcontainer
-            cmake_extra: ""
+          # NOTE: the devcontainer is built and tested by the dedicated
+          # build-dev / test-dev jobs below (build once, then shard the tests by
+          # category); it is no longer part of this distro matrix.
           # ubuntu 26 (amd64 only on PR; arm64 runs in nightly)
           - platform: linux/amd64
             runner: arc-amd64
@@ -319,14 +334,14 @@ jobs:
             build_type: Release
             image_tag_prefix: repository.mdh.quantum.com:5004/cache/chimera-ubuntu26
             image_name: ubuntu26
-            cmake_extra: ""
+            cmake_extra: "-DKVM_TESTING=OFF"
           - platform: linux/amd64
             runner: arc-amd64
             arch: amd64
             build_type: Debug
             image_tag_prefix: repository.mdh.quantum.com:5004/cache/chimera-ubuntu26
             image_name: ubuntu26
-            cmake_extra: ""
+            cmake_extra: "-DKVM_TESTING=OFF"
           # ubuntu 24 (amd64 only on PR; arm64 runs in nightly)
           - platform: linux/amd64
             runner: arc-amd64
@@ -334,14 +349,14 @@ jobs:
             build_type: Release
             image_tag_prefix: repository.mdh.quantum.com:5004/cache/chimera-ubuntu24
             image_name: ubuntu24
-            cmake_extra: ""
+            cmake_extra: "-DKVM_TESTING=OFF"
           - platform: linux/amd64
             runner: arc-amd64
             arch: amd64
             build_type: Debug
             image_tag_prefix: repository.mdh.quantum.com:5004/cache/chimera-ubuntu24
             image_name: ubuntu24
-            cmake_extra: ""
+            cmake_extra: "-DKVM_TESTING=OFF"
           # ubuntu 22 (amd64 only on PR; arm64 runs in nightly)
           - platform: linux/amd64
             runner: arc-amd64
@@ -349,14 +364,14 @@ jobs:
             build_type: Release
             image_tag_prefix: repository.mdh.quantum.com:5004/cache/chimera-ubuntu22
             image_name: ubuntu22
-            cmake_extra: "-DIO_URING_ENABLED=OFF"
+            cmake_extra: "-DIO_URING_ENABLED=OFF -DKVM_TESTING=OFF"
           - platform: linux/amd64
             runner: arc-amd64
             arch: amd64
             build_type: Debug
             image_tag_prefix: repository.mdh.quantum.com:5004/cache/chimera-ubuntu22
             image_name: ubuntu22
-            cmake_extra: "-DIO_URING_ENABLED=OFF"
+            cmake_extra: "-DIO_URING_ENABLED=OFF -DKVM_TESTING=OFF"
           # rocky 9 (io_uring disabled: kernel 5.14 + ASAN causes timeouts, see #197)
           - platform: linux/amd64
             runner: arc-amd64
@@ -364,14 +379,14 @@ jobs:
             build_type: Release
             image_tag_prefix: repository.mdh.quantum.com:5004/cache/chimera-rocky9
             image_name: rocky9
-            cmake_extra: "-DIO_URING_ENABLED=OFF"
+            cmake_extra: "-DIO_URING_ENABLED=OFF -DKVM_TESTING=OFF"
           - platform: linux/amd64
             runner: arc-amd64
             arch: amd64
             build_type: Debug
             image_tag_prefix: repository.mdh.quantum.com:5004/cache/chimera-rocky9
             image_name: rocky9
-            cmake_extra: "-DIO_URING_ENABLED=OFF"
+            cmake_extra: "-DIO_URING_ENABLED=OFF -DKVM_TESTING=OFF"
           # rocky 10 (amd64 only on PR; arm64 runs in nightly)
           - platform: linux/amd64
             runner: arc-amd64
@@ -379,14 +394,14 @@ jobs:
             build_type: Release
             image_tag_prefix: repository.mdh.quantum.com:5004/cache/chimera-rocky10
             image_name: rocky10
-            cmake_extra: ""
+            cmake_extra: "-DKVM_TESTING=OFF"
           - platform: linux/amd64
             runner: arc-amd64
             arch: amd64
             build_type: Debug
             image_tag_prefix: repository.mdh.quantum.com:5004/cache/chimera-rocky10
             image_name: rocky10
-            cmake_extra: ""
+            cmake_extra: "-DKVM_TESTING=OFF"
 
     steps:
       - name: Checkout repository
@@ -394,7 +409,86 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Configure, build, and test inside the container
+      # KVM guest images are now pulled from GHCR (chimera-nas/kvm-test-base)
+      # with oras during the build, instead of being built via inner dind.
+      # Fetch the static oras binary on the runner and mount it into the
+      # build container.
+      - name: Fetch oras CLI
+        run: |
+          ORAS_VERSION=1.2.0
+          curl -sSL "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_${{ matrix.arch }}.tar.gz" \
+            | tar -xz -C "${{ github.workspace }}" oras
+          chmod +x "${{ github.workspace }}/oras"
+
+      - name: Configure and build inside the container
+        run: |
+          docker run --rm --privileged \
+            -e DOCKER_MIRROR=${{ env.DOCKER_MIRROR }} \
+            -e APT_MIRROR=${{ env.APT_MIRROR }} \
+            -e CCACHE_DIR=/build/ccache \
+            -e CCACHE_REMOTE_STORAGE="${{ secrets.CCACHE_REMOTE_STORAGE }}" \
+            -v "${{ github.workspace }}:/workspace" \
+            -v "${{ github.workspace }}/oras:/usr/local/bin/oras:ro" \
+            -v /build \
+            -w /build \
+            ${{ matrix.image_tag_prefix }}:${{ github.sha }}-${{ matrix.arch }} \
+            bash -euxc '
+              cmake -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DREQUIRE_NETNS_TESTS=ON -DKVM_IMAGE_REGISTRY=${{ env.KVM_IMAGE_REGISTRY }} -DPYNFS_JUNIT_DIR=/workspace/ctest-results/pynfs-junit -DSMBTORTURE_JUNIT_DIR=/workspace/ctest-results/smbtorture-junit ${{ matrix.cmake_extra }} /workspace
+              ninja
+              ccache --show-stats || true
+              tar -C /build --exclude=./ccache -czf /workspace/build-os.tar.gz .'
+
+      - name: Upload build tree to Nexus scratch
+        env:
+          NEXUS_USER: ${{ secrets.NEXUS_SCRATCH_USER }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_SCRATCH_PASSWORD }}
+        run: |
+          curl -sfS --retry 5 --retry-all-errors --retry-delay 5 \
+            -u "${NEXUS_USER}:${NEXUS_PASSWORD}" \
+            -T build-os.tar.gz \
+            "${{ env.NEXUS_SCRATCH_URL }}/chimera/build-${{ matrix.image_name }}-${{ github.run_id }}-${{ matrix.arch }}-${{ matrix.build_type }}.tar.gz"
+
+  # Distro test half (phase 3): pull the build tree from Nexus scratch and run
+  # this image's full ctest suite.  Gated on the build-complete barrier, so all
+  # test jobs (distro + devcontainer shards) and static analysis start together
+  # once every compile has finished.
+  test:
+    name: Test ${{ matrix.image_name }} ${{ matrix.arch }} ${{ matrix.build_type }}
+    needs: [build-complete]
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64]
+        build_type: [Release, Debug]
+        image_name: [ubuntu26, ubuntu24, ubuntu22, rocky9, rocky10]
+        include:
+          - { arch: amd64, runner: arc-amd64 }
+          - { image_name: ubuntu26, image_tag_prefix: "repository.mdh.quantum.com:5004/cache/chimera-ubuntu26" }
+          - { image_name: ubuntu24, image_tag_prefix: "repository.mdh.quantum.com:5004/cache/chimera-ubuntu24" }
+          - { image_name: ubuntu22, image_tag_prefix: "repository.mdh.quantum.com:5004/cache/chimera-ubuntu22" }
+          - { image_name: rocky9,   image_tag_prefix: "repository.mdh.quantum.com:5004/cache/chimera-rocky9" }
+          - { image_name: rocky10,  image_tag_prefix: "repository.mdh.quantum.com:5004/cache/chimera-rocky10" }
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Download build tree from Nexus scratch
+        env:
+          NEXUS_USER: ${{ secrets.NEXUS_SCRATCH_USER }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_SCRATCH_PASSWORD }}
+        run: |
+          curl -sfS --retry 5 --retry-all-errors --retry-delay 5 \
+            -u "${NEXUS_USER}:${NEXUS_PASSWORD}" \
+            -o build-os.tar.gz \
+            "${{ env.NEXUS_SCRATCH_URL }}/chimera/build-${{ matrix.image_name }}-${{ github.run_id }}-${{ matrix.arch }}-${{ matrix.build_type }}.tar.gz"
+
+      - name: Unpack and test inside the container
         run: |
           docker run --rm --privileged \
             -e DOCKER_MIRROR=${{ env.DOCKER_MIRROR }} \
@@ -403,17 +497,59 @@ jobs:
             -v /build \
             -w /build \
             ${{ matrix.image_tag_prefix }}:${{ github.sha }}-${{ matrix.arch }} \
-            bash -euxc '\
-              dockerd --storage-driver=vfs --registry-mirror=https://repository.mdh.quantum.com:5001 &>/dev/null &
-              sleep 2 && \
-              cmake -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DREQUIRE_NETNS_TESTS=ON -DKVM_IMAGE_CACHE_REGISTRY=${{ env.KVM_IMAGE_CACHE_REGISTRY }} ${{ matrix.cmake_extra }} /workspace && \
-              ninja && \
-              /workspace/scripts/cap_ctest_output.sh \
-              ctest --output-on-failure --test-output-size-failed 65536 --timeout 300 -j 32'
+            bash -euxc '
+              tar -C /build -xzf /workspace/build-os.tar.gz
+              mkdir -p /workspace/ctest-results
+              rm -f /workspace/flaky-rescued.log
+              start=$(date +%s)
+              rc=0
+              /workspace/scripts/cap_ctest_output.sh ctest --output-on-failure --test-output-size-failed 65536 --timeout 300 -j 32 --output-junit /workspace/ctest-results/results.xml || rc=$?
+              echo "$(( $(date +%s) - start ))" > /workspace/ctest-results/duration_seconds
+              if [ "$rc" -ne 0 ]; then
+                echo "ctest reported failures; rerunning previously-failed tests to distinguish flakes from real failures"
+                cp /build/Testing/Temporary/LastTestsFailed.log /workspace/flaky-candidates.log
+                if /workspace/scripts/cap_ctest_output.sh ctest --rerun-failed --output-on-failure --test-output-size-failed 65536 --timeout 300 -j 32; then
+                  echo "rerun of previously-failed tests passed: treating as flaky (gated for human review)"
+                  cp /workspace/flaky-candidates.log /workspace/flaky-rescued.log
+                  rc=0
+                else
+                  echo "rerun still failing: real failure"
+                fi
+              fi
+              exit $rc'
 
+      # Per-test results for the report: ctest --output-junit (one <testcase>
+      # per CTest test) + the pynfs per-code JUnit (the combined pynfs runs are a
+      # single CTest test, so their ~500 codes only show up in their own JUnit) +
+      # the ctest wall-clock.  if: always() so results publish even when the test
+      # step failed (which is exactly when they are most useful).
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: ctest-junit-${{ matrix.image_name }}-${{ matrix.arch }}-${{ matrix.build_type }}
+          path: ctest-results/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload flaky-test marker
+        if: ${{ hashFiles('flaky-rescued.log') != '' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: flaky-marker-${{ matrix.image_name }}-${{ matrix.arch }}-${{ matrix.build_type }}
+          path: flaky-rescued.log
+          retention-days: 14
+
+  # Phase 3 alongside the test jobs: scan-build does its own instrumented
+  # compile (it cannot reuse the Nexus build tree), but it is gated on the
+  # build-complete barrier so the analysis fleet spins up together with the
+  # tests instead of competing with the phase-2 compiles -- and so a
+  # scan-build finding never blocks tests from starting (it still gates
+  # ci-complete).
   static-analysis:
-    name: Static Analysis ${{ matrix.image_name }} ${{ matrix.platform }} ${{ matrix.build_type }}
-    needs: [build-devcontainer]
+    name: Analyze ${{ matrix.image_name }} ${{ matrix.arch }} ${{ matrix.build_type }}
+    needs: [build-complete]
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -483,3 +619,376 @@ jobs:
           path: scan-report/
           if-no-files-found: warn
           retention-days: 30
+
+  # Aggregate every test job's results into one report -- a per-run table (wall
+  # clock + summed test time + pass/fail counts) plus every failed test named --
+  # so a PR shows what broke without digging through the ~12k-line log of each
+  # matrix job.  Runs after the whole matrix (always, so a failing run still
+  # reports) and never fails the build: the test jobs stay the source of truth.
+  publish-test-results:
+    name: Report
+    needs: [test, test-dev]
+    if: ${{ always() && github.event_name != 'pull_request' }}
+    runs-on: arc-small
+    permissions:
+      pull-requests: write
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Download test-result artifacts
+        uses: actions/download-artifact@v6
+        with:
+          pattern: ctest-junit-*
+          path: results
+
+      # Render the report into the run summary (always) and, on a PR, into a
+      # single sticky PR comment.  Pure-Python + stdlib urllib -- no external
+      # action and no `gh` CLI (the self-hosted runners have neither).
+      - name: Render and publish report
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python3 scripts/ci_test_report.py results > report.md
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+          # The summary above is the primary output; the PR comment is
+          # best-effort (don't fail the job if the API call hiccups).
+          if [ -n "${PR_NUMBER:-}" ]; then
+            python3 scripts/ci_pr_comment.py "$GH_REPO" "$PR_NUMBER" report.md \
+              || echo "::warning::failed to post PR comment (report is in the run summary)"
+          fi
+
+  # Devcontainer build half: build the tree once per (arch, build_type) and
+  # publish it to the local Nexus scratch repo for the test-dev shards.  KVM guest
+  # images are NOT fetched here (KVM_FETCH_IMAGES=OFF, amd64 only) -- the kvm-*
+  # test shards fetch them on demand.  KVM is x86-only in the devcontainer, so
+  # arm64 builds with KVM off.
+  build-dev:
+    name: Compile devcontainer ${{ matrix.arch }} ${{ matrix.build_type }}
+    needs: [build-devcontainer]
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: amd64, runner: arc-amd64, build_type: Release, kvm_cmake: "-DKVM_TESTING=ON -DKVM_FETCH_IMAGES=OFF" }
+          - { arch: amd64, runner: arc-amd64, build_type: Debug,   kvm_cmake: "-DKVM_TESTING=ON -DKVM_FETCH_IMAGES=OFF" }
+          - { arch: arm64, runner: arc-arm64, build_type: Release, kvm_cmake: "-DKVM_TESTING=OFF" }
+          - { arch: arm64, runner: arc-arm64, build_type: Debug,   kvm_cmake: "-DKVM_TESTING=OFF" }
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      # oras is needed at configure time: KVM_TESTING=ON probes for it.
+      - name: Fetch oras CLI
+        run: |
+          ORAS_VERSION=1.2.0
+          curl -sSL "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_${{ matrix.arch }}.tar.gz" \
+            | tar -xz -C "${{ github.workspace }}" oras
+          chmod +x "${{ github.workspace }}/oras"
+
+      - name: Configure and build inside the container
+        run: |
+          docker run --rm --privileged \
+            -e DOCKER_MIRROR=${{ env.DOCKER_MIRROR }} \
+            -e APT_MIRROR=${{ env.APT_MIRROR }} \
+            -e CCACHE_DIR=/build/ccache \
+            -e CCACHE_REMOTE_STORAGE="${{ secrets.CCACHE_REMOTE_STORAGE }}" \
+            -v "${{ github.workspace }}:/workspace" \
+            -v "${{ github.workspace }}/oras:/usr/local/bin/oras:ro" \
+            -v /build \
+            -w /build \
+            ${{ env.DEV_IMAGE_TAG_PREFIX }}:${{ github.sha }}-${{ matrix.arch }} \
+            bash -euxc '
+              cmake -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DREQUIRE_NETNS_TESTS=ON -DKVM_IMAGE_REGISTRY=${{ env.KVM_IMAGE_REGISTRY }} -DPYNFS_JUNIT_DIR=/workspace/ctest-results/pynfs-junit -DSMBTORTURE_JUNIT_DIR=/workspace/ctest-results/smbtorture-junit ${{ matrix.kvm_cmake }} /workspace
+              ninja
+              ccache --show-stats || true
+              # Ship the build tree to the test shards (minus the local ccache;
+              # KVM guest images live under /kvm, outside /build, so they are
+              # already excluded).
+              tar -C /build --exclude=./ccache -czf /workspace/build-dev.tar.gz .'
+
+      # The build tree stays inside the self-hosted runner infra: push it to the
+      # local Nexus scratch repository rather than GitHub's artifact storage
+      # (whose Azure-blob upload leaves the network and has produced transient
+      # DNS failures that evict merge-queue runs).  run_id alone names the
+      # object -- unique per run, and shared across job re-run attempts so a
+      # re-run test shard still finds the original build (matching the old
+      # download-artifact semantics).  scratch ages objects out automatically,
+      # so nothing is deleted here.
+      - name: Upload build tree to Nexus scratch
+        env:
+          NEXUS_USER: ${{ secrets.NEXUS_SCRATCH_USER }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_SCRATCH_PASSWORD }}
+        run: |
+          curl -sfS --retry 5 --retry-all-errors --retry-delay 5 \
+            -u "${NEXUS_USER}:${NEXUS_PASSWORD}" \
+            -T build-dev.tar.gz \
+            "${{ env.NEXUS_SCRATCH_URL }}/chimera/build-dev-${{ github.run_id }}-${{ matrix.arch }}-${{ matrix.build_type }}.tar.gz"
+
+  # Phase-2 -> phase-3 barrier: every compile (devcontainer + distro) must
+  # finish before any test job or the static analysis starts.  Default
+  # needs-success semantics mean a failed build skips this, which in turn
+  # skips phase 3 entirely.
+  build-complete:
+    name: Compiles complete
+    needs: [build-dev, build-os]
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: arc-small
+    permissions:
+      contents: read
+    steps:
+      - name: Builds done
+        run: echo "All compile jobs passed; releasing test + analysis jobs."
+
+  # Devcontainer test half: one shard per category, each consuming the build
+  # artifact.  netns categories run on both arches; the kvm-* categories run on
+  # amd64 only (the devcontainer's qemu is x86-only) and fetch guest images on
+  # demand before running.
+  test-dev:
+    name: Test devcontainer ${{ matrix.arch }} ${{ matrix.build_type }} ${{ matrix.category }}
+    needs: [build-complete]
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+        build_type: [Release, Debug]
+        category: [pynfs, smbtorture, wpts, posix-client, pjdfstest, s3, ceph-s3, client, unit, kvm-cthon, kvm-xfsprogs, kvm-pnfs, kvm-nfstest]
+        include:
+          - { arch: amd64, runner: arc-amd64 }
+          - { arch: arm64, runner: arc-arm64 }
+        exclude:
+          # KVM is x86-only in the devcontainer, so it never runs on arm64.
+          - { arch: arm64, category: kvm-cthon }
+          - { arch: arm64, category: kvm-xfsprogs }
+          - { arch: arm64, category: kvm-pnfs }
+          - { arch: arm64, category: kvm-nfstest }
+          # WPTS (Microsoft Protocol Test Suite) is not supported on arm64 —
+          # the shard would only skip every test, so don't run it at all.
+          - { arch: arm64, category: wpts }
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Fetch oras CLI
+        run: |
+          ORAS_VERSION=1.2.0
+          curl -sSL "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_${{ matrix.arch }}.tar.gz" \
+            | tar -xz -C "${{ github.workspace }}" oras
+          chmod +x "${{ github.workspace }}/oras"
+
+      - name: Download build tree from Nexus scratch
+        env:
+          NEXUS_USER: ${{ secrets.NEXUS_SCRATCH_USER }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_SCRATCH_PASSWORD }}
+        run: |
+          curl -sfS --retry 5 --retry-all-errors --retry-delay 5 \
+            -u "${NEXUS_USER}:${NEXUS_PASSWORD}" \
+            -o build-dev.tar.gz \
+            "${{ env.NEXUS_SCRATCH_URL }}/chimera/build-dev-${{ github.run_id }}-${{ matrix.arch }}-${{ matrix.build_type }}.tar.gz"
+
+      - name: Unpack, fetch images if needed, and run the category
+        run: |
+          docker run --rm --privileged \
+            -e DOCKER_MIRROR=${{ env.DOCKER_MIRROR }} \
+            -e APT_MIRROR=${{ env.APT_MIRROR }} \
+            -e KVM_IMAGE_REGISTRY=${{ env.KVM_IMAGE_REGISTRY }} \
+            -e CATEGORY=${{ matrix.category }} \
+            -v "${{ github.workspace }}:/workspace" \
+            -v "${{ github.workspace }}/oras:/usr/local/bin/oras:ro" \
+            -v /build \
+            -w /build \
+            ${{ env.DEV_IMAGE_TAG_PREFIX }}:${{ github.sha }}-${{ matrix.arch }} \
+            bash -euxc '
+              tar -C /build -xzf /workspace/build-dev.tar.gz
+              NEED_KVM=
+              case "$CATEGORY" in
+                pynfs)        SEL="-L pynfs" ;;
+                smbtorture)   SEL="-L smbtorture" ;;
+                wpts)         SEL="-L wpts" ;;
+                posix-client) SEL="-L posix" ;;
+                pjdfstest)    SEL="-L pjdfstest" ;;
+                s3)           SEL="-L s3 -LE ceph-s3" ;;
+                ceph-s3)      SEL="-L ceph-s3" ;;
+                client)       SEL="-L client" ;;
+                unit)         SEL="-LE pynfs|smbtorture|wpts|posix|pjdfstest|s3|client|kvm" ;;
+                kvm-cthon)    SEL="-L kvm -R /cthon/";    NEED_KVM=1 ;;
+                kvm-xfsprogs) SEL="-L kvm -R /xfstests/"; NEED_KVM=1 ;;
+                kvm-pnfs)     SEL="-L pnfs";              NEED_KVM=1 ;;
+                kvm-nfstest)  SEL="-L kvm -R /nfstest/";  NEED_KVM=1 ;;
+              esac
+              if [ -n "$NEED_KVM" ]; then
+                ninja kvm_ubuntu2404_image kvm_ubuntu2404_hwe_image kvm_ubuntu2204_hwe_image
+              fi
+              mkdir -p /workspace/ctest-results
+              rm -f /workspace/flaky-rescued.log
+              start=$(date +%s)
+              rc=0
+              /workspace/scripts/cap_ctest_output.sh ctest $SEL --output-on-failure --test-output-size-failed 65536 --timeout 300 -j 32 --output-junit /workspace/ctest-results/results.xml || rc=$?
+              echo "$(( $(date +%s) - start ))" > /workspace/ctest-results/duration_seconds
+              if [ "$rc" -ne 0 ]; then
+                echo "ctest reported failures; rerunning previously-failed tests to distinguish flakes from real failures"
+                cp /build/Testing/Temporary/LastTestsFailed.log /workspace/flaky-candidates.log
+                if /workspace/scripts/cap_ctest_output.sh ctest --rerun-failed --output-on-failure --test-output-size-failed 65536 --timeout 300 -j 32; then
+                  echo "rerun of previously-failed tests passed: treating as flaky (gated for human review)"
+                  cp /workspace/flaky-candidates.log /workspace/flaky-rescued.log
+                  rc=0
+                else
+                  echo "rerun still failing: real failure"
+                fi
+              fi
+              exit $rc'
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: ctest-junit-devcontainer-${{ matrix.arch }}-${{ matrix.build_type }}-${{ matrix.category }}
+          path: ctest-results/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload flaky-test marker
+        if: ${{ hashFiles('flaky-rescued.log') != '' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: flaky-marker-devcontainer-${{ matrix.arch }}-${{ matrix.build_type }}-${{ matrix.category }}
+          path: flaky-rescued.log
+          retention-days: 14
+
+  # Gather the per-matrix flaky-test markers (uploaded only when a test failed
+  # on its first run but passed on --rerun-failed) into a single yes/no signal.
+  collect-flakes:
+    name: Collect flaky-test markers
+    needs: [test, test-dev]
+    if: ${{ always() }}
+    runs-on: arc-small
+    permissions:
+      contents: read
+      issues: write
+    outputs:
+      flaky: ${{ steps.detect.outputs.flaky }}
+    steps:
+      - name: Download flaky markers
+        uses: actions/download-artifact@v6
+        continue-on-error: true
+        with:
+          path: flaky-markers
+          pattern: flaky-marker-*
+
+      - name: Detect whether any test was flaky
+        id: detect
+        run: |
+          if compgen -G "flaky-markers/flaky-marker-*/*" > /dev/null; then
+            echo "flaky=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "flaky=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Record flaky tests on the tracking issue
+        if: ${{ steps.detect.outputs.flaky == 'true' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const dir = 'flaky-markers';
+            let details = '';
+            for (const sub of fs.readdirSync(dir)) {
+              const f = path.join(dir, sub, 'flaky-rescued.log');
+              if (fs.existsSync(f)) {
+                const matrix = sub.replace(/^flaky-marker-/, '');
+                details += `\n**${matrix}**\n\n\`\`\`\n${fs.readFileSync(f, 'utf8')}\n\`\`\`\n`;
+              }
+            }
+            const runUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+            const body = `Tests below failed once but passed on \`--rerun-failed\` in a merge_group run for \`${context.sha}\`. `
+              + `The merge was gated on human approval (\`flake-gate\`); please root-cause and fix these flakes.\n\n`
+              + `Run: ${runUrl}\n${details}`;
+            const title = 'Flaky tests observed in CI';
+            const label = 'flaky-test';
+            const { owner, repo } = context.repo;
+            try {
+              await github.rest.issues.createLabel({ owner, repo, name: label, color: 'd73a4a',
+                description: 'Test that needed a CI retry to pass' });
+            } catch (e) { /* label already exists */ }
+            const open = await github.rest.issues.listForRepo({ owner, repo, state: 'open', labels: label });
+            let number;
+            if (open.data.length > 0) {
+              number = open.data[0].number;
+            } else {
+              const created = await github.rest.issues.create({ owner, repo, title, labels: [label],
+                body: 'Rolling tracker for tests that needed a CI retry to pass. Each comment below is one observation from the merge queue.' });
+              number = created.data.number;
+            }
+            await github.rest.issues.createComment({ owner, repo, issue_number: number, body });
+
+  # Human-approval choke point for the merge queue: when a flake was rescued by
+  # retry, this job routes through the 'flake-review' environment (configured
+  # with required reviewers) and PAUSES the merge_group run until a reviewer
+  # approves. When no flake occurred, the environment expression is empty and
+  # the job passes immediately. Mark this job as a required status check.
+  flake-gate:
+    name: Flake review gate
+    needs: collect-flakes
+    if: ${{ always() }}
+    runs-on: arc-small
+    permissions:
+      contents: read
+    environment: ${{ needs.collect-flakes.outputs.flaky == 'true' && 'flake-review' || '' }}
+    steps:
+      - name: Report gate outcome
+        run: |
+          if [ "${{ needs.collect-flakes.outputs.flaky }}" = "true" ]; then
+            echo "Flaky tests were rescued by retry and a reviewer approved this merge."
+          else
+            echo "No flaky tests detected; nothing to review."
+          fi
+
+  # Single stable aggregate of the whole build/test matrix, so the merge
+  # queue's required-checks list is one name instead of every matrix cell
+  # (and survives matrix changes). Mark this job as a required status check.
+  ci-complete:
+    name: CI complete
+    needs:
+      - build-devcontainer
+      - build-ubuntu26
+      - build-ubuntu24
+      - build-ubuntu22
+      - build-rocky9
+      - build-rocky10
+      - build-os
+      - test
+      - build-dev
+      - test-dev
+      - static-analysis
+    if: ${{ always() }}
+    runs-on: arc-small
+    permissions:
+      contents: read
+    steps:
+      - name: Verify all build/test jobs passed
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "PR placeholder — the full build/test matrix runs in the merge queue (merge_group)."
+            exit 0
+          fi
+          if ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}; then
+            echo "One or more build/test jobs did not pass."
+            exit 1
+          fi
+          echo "All build/test jobs passed."

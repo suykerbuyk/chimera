@@ -26,13 +26,37 @@ add_executable(test_replay_slot
     ${CMAKE_CURRENT_SOURCE_DIR}/../nfs4_layout_table.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../nfs4_lease.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../nfs4_recovery.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/../nfs4_callback.c)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../nfs4_drc.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../nfs4_callback.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../nfs4_cb.c)
 target_include_directories(test_replay_slot PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/..
     ${CMAKE_SOURCE_DIR}/src
     ${NFS_COMMON_INCLUDE_DIR})
 target_link_libraries(test_replay_slot chimera_vfs chimera_common evpl evpl_rpc2 pthread uuid urcu-qsbr urcu-common)
 add_test(NAME chimera/server/nfs/replay_slot COMMAND test_replay_slot)
+
+# Cross-reboot persistence: record (de)serialization + cold-start session/slot
+# reconstruction.  Compiles the production source straight in (the persist /
+# reconstruct helpers are not SYMBOL_EXPORT'd), simulating a reboot in-process.
+add_executable(test_nfs_persist
+    test_nfs_persist.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../nfs4_session.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../nfs4_state.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../nfs4_layout_table.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../nfs4_lease.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../nfs4_recovery.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../nfs4_drc.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../nfs3_drc.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../nfs_drc_reply.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../nfs4_callback.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../nfs4_cb.c)
+target_include_directories(test_nfs_persist PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_SOURCE_DIR}/src
+    ${NFS_COMMON_INCLUDE_DIR})
+target_link_libraries(test_nfs_persist chimera_vfs chimera_common evpl evpl_rpc2 pthread uuid urcu-qsbr urcu-common)
+add_test(NAME chimera/server/nfs/nfs_persist COMMAND test_nfs_persist)
 
 add_executable(test_protocol_advertise test_protocol_advertise.c)
 target_include_directories(test_protocol_advertise PRIVATE
@@ -64,3 +88,10 @@ target_include_directories(test_access_xattr PRIVATE
     ${NFS_COMMON_INCLUDE_DIR})
 add_dependencies(test_access_xattr chimera_nfs_common)
 add_test(NAME chimera/server/nfs/access_xattr COMMAND test_access_xattr)
+
+# Tag every test registered above with the 'nfs' label so these NFS server unit
+# tests can be run independently via `ctest -L nfs`.
+get_property(_nfs_tests DIRECTORY PROPERTY TESTS)
+if(_nfs_tests)
+    set_property(TEST ${_nfs_tests} APPEND PROPERTY LABELS nfs)
+endif()

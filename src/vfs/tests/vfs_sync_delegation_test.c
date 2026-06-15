@@ -144,6 +144,7 @@ search_for_single_key(
         strlen(key),
         key,
         strlen(key),
+        0,
         search_keys_callback,
         search_keys_complete,
         ctx);
@@ -288,6 +289,7 @@ run_phase(
         1,
         "cairn",
         60,
+        0,                 /* num_rcu_reclaim_threads: 0 = one per CPU */
         metrics);
     assert(ctx.vfs != NULL);
 

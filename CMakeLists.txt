@@ -42,6 +42,23 @@ else()
     project(chimera LANGUAGES C)
 endif()
 
+# Use ccache as the compiler launcher when it is installed.  The cache location
+# is left to ccache's own CCACHE_DIR env var (not hardcoded here): the
+# devcontainer points it at the persistent /build/ccache volume so all worktrees
+# share one cache, and CI additionally sets an HTTP remote (CCACHE_REMOTE_STORAGE
+# -> the Nexus raw repo).  A plain local build with neither set falls back to
+# ccache's default (~/.cache/ccache).
+find_program(CCACHE_PROGRAM ccache)
+if(CCACHE_PROGRAM)
+    set(CMAKE_C_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+    if(CUDA_ENABLED)
+        set(CMAKE_CUDA_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+    endif()
+    message(STATUS "ccache enabled (${CCACHE_PROGRAM})")
+else()
+    message(STATUS "ccache not found; building without compiler cache")
+endif()
+
 set(CHIMERA_VERSION "0.1.0")
 
 execute_process(COMMAND ln -sf ${CMAKE_BINARY_DIR}/compile_commands.json ${CMAKE_SOURCE_DIR}/compile_commands.json)
@@ -162,57 +179,76 @@ else()
     message(STATUS "CAIRN disabled")
 endif()
 
-# KVM testing detection
-find_program(DOCKER_EXECUTABLE docker)
+# KVM testing.
+#
+# The KVM-based suites (cthon/xfstests/pnfs) boot a real guest kernel via
+# QEMU/KVM. Guest images are pulled (not built) from chimera-nas/kvm-test-base
+# as OCI artifacts, so running them needs `oras` to fetch the images, an
+# arch-appropriate qemu, /dev/kvm, and root.
+#
+# KVM_TESTING is tri-state:
+#   AUTO (default) - enable iff KVM is available and we are root, else skip
+#   ON             - require KVM testing; hard fail if it is not available
+#   OFF            - never register the KVM suites
+#
+# CI sets ON for the devcontainer image (where KVM must work, so a regression
+# in availability fails loudly) and OFF for the other images (which lack the
+# prerequisites and should not probe). When the flag is not supplied at all the
+# AUTO default makes normal users pick up KVM testing whenever their machine can
+# actually run it.
+set(KVM_TESTING "AUTO" CACHE STRING "KVM test suites: AUTO (enable iff available), ON (require), or OFF")
+set_property(CACHE KVM_TESTING PROPERTY STRINGS AUTO ON OFF)
+string(TOUPPER "${KVM_TESTING}" KVM_TESTING)
 
-# Find architecture-appropriate QEMU binary
-execute_process(COMMAND uname -m OUTPUT_VARIABLE HOST_ARCH OUTPUT_STRIP_TRAILING_WHITESPACE)
-if(HOST_ARCH STREQUAL "aarch64")
-    find_program(QEMU_EXECUTABLE qemu-system-aarch64)
+if(KVM_TESTING STREQUAL "OFF")
+    message(STATUS "KVM testing disabled (KVM_TESTING=OFF)")
 else()
-    find_program(QEMU_EXECUTABLE qemu-system-x86_64)
-endif()
+    # Probe the prerequisites and collect any that are missing.
+    find_program(ORAS_EXECUTABLE oras)
 
-set(KVM_TESTING_AVAILABLE FALSE)
-
-if(DOCKER_EXECUTABLE AND QEMU_EXECUTABLE)
-    execute_process(
-        COMMAND docker info
-        RESULT_VARIABLE DOCKER_INFO_RESULT
-        OUTPUT_QUIET
-        ERROR_QUIET
-    )
-    if(DOCKER_INFO_RESULT EQUAL 0)
-        set(DOCKER_FUNCTIONAL TRUE)
+    execute_process(COMMAND uname -m OUTPUT_VARIABLE HOST_ARCH OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if(HOST_ARCH STREQUAL "aarch64")
+        find_program(QEMU_EXECUTABLE qemu-system-aarch64)
     else()
-        set(DOCKER_FUNCTIONAL FALSE)
-        message(STATUS "KVM testing: docker found but not functional")
+        find_program(QEMU_EXECUTABLE qemu-system-x86_64)
     endif()
 
-    if(EXISTS "/dev/kvm")
-        set(KVM_AVAILABLE TRUE)
-    else()
-        set(KVM_AVAILABLE FALSE)
-        message(STATUS "KVM testing: /dev/kvm not found")
+    execute_process(COMMAND id -u OUTPUT_VARIABLE HOST_UID OUTPUT_STRIP_TRAILING_WHITESPACE)
+
+    set(KVM_TESTING_AVAILABLE TRUE)
+    set(KVM_UNAVAILABLE_REASON "")
+
+    if(NOT ORAS_EXECUTABLE)
+        set(KVM_TESTING_AVAILABLE FALSE)
+        string(APPEND KVM_UNAVAILABLE_REASON " oras not found;")
     endif()
 
-    if(DOCKER_FUNCTIONAL AND KVM_AVAILABLE)
-        set(KVM_TESTING_AVAILABLE TRUE)
-    endif()
-else()
-    if(NOT DOCKER_EXECUTABLE)
-        message(STATUS "KVM testing: docker not found")
-    endif()
     if(NOT QEMU_EXECUTABLE)
-        message(STATUS "KVM testing: QEMU not found for ${HOST_ARCH}")
+        set(KVM_TESTING_AVAILABLE FALSE)
+        string(APPEND KVM_UNAVAILABLE_REASON " qemu not found for ${HOST_ARCH};")
     endif()
-endif()
 
-if(KVM_TESTING_AVAILABLE)
-    message(STATUS "KVM testing enabled")
-    add_subdirectory(kvm)
-else()
-    message(STATUS "KVM testing disabled")
+    if(NOT EXISTS "/dev/kvm")
+        set(KVM_TESTING_AVAILABLE FALSE)
+        string(APPEND KVM_UNAVAILABLE_REASON " /dev/kvm not found;")
+    endif()
+
+    if(NOT HOST_UID EQUAL 0)
+        set(KVM_TESTING_AVAILABLE FALSE)
+        string(APPEND KVM_UNAVAILABLE_REASON " not running as root;")
+    endif()
+
+    if(KVM_TESTING_AVAILABLE)
+        message(STATUS "KVM testing enabled")
+        add_subdirectory(kvm)
+    elseif(KVM_TESTING STREQUAL "ON")
+        message(FATAL_ERROR
+            "KVM_TESTING=ON but KVM testing is not available:${KVM_UNAVAILABLE_REASON} "
+            "Provide the missing prerequisites or re-run with -DKVM_TESTING=AUTO/OFF.")
+    else()
+        message(STATUS "KVM testing disabled (KVM_TESTING=AUTO;${KVM_UNAVAILABLE_REASON}). "
+            "Pass -DKVM_TESTING=ON to make missing prerequisites fatal.")
+    endif()
 endif()
 
 # Network namespace testing detection.

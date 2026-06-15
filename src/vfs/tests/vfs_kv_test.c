@@ -19,10 +19,12 @@
 
 struct test_ctx {
     int                        done;
-    enum chimera_vfs_error status;
+    enum chimera_vfs_error     status;
     const void                *value;
     uint32_t                   value_len;
     int                        search_count;
+    char                       search_keys[16][64];
+    uint32_t                   search_key_lens[16];
     struct chimera_vfs        *vfs;
     struct chimera_vfs_thread *vfs_thread;
     struct evpl               *evpl;
@@ -75,6 +77,10 @@ search_keys_callback(
 {
     struct test_ctx *ctx = private_data;
 
+    if (ctx->search_count < 16 && key_len < sizeof(ctx->search_keys[0])) {
+        memcpy(ctx->search_keys[ctx->search_count], key, key_len);
+        ctx->search_key_lens[ctx->search_count] = key_len;
+    }
     ctx->search_count++;
     return 0; /* continue searching */
 } /* search_keys_callback */
@@ -242,7 +248,7 @@ test_search_keys(struct test_ctx *ctx)
         assert(ctx->status == CHIMERA_VFS_OK);
     }
 
-    /* Search for all keys in range */
+    /* Search the whole range; results must come back in sorted key order. */
     ctx->search_count = 0;
     chimera_vfs_search_keys(
         ctx->vfs_thread,
@@ -250,6 +256,7 @@ test_search_keys(struct test_ctx *ctx)
         strlen("search_aaa"),
         "search_zzz",
         strlen("search_zzz"),
+        0,
         search_keys_callback,
         search_keys_complete,
         ctx);
@@ -257,6 +264,91 @@ test_search_keys(struct test_ctx *ctx)
     wait_for_completion(ctx);
     assert(ctx->status == CHIMERA_VFS_OK);
     assert(ctx->search_count == num_keys);
+
+    for (int i = 0; i < num_keys; i++) {
+        assert(ctx->search_key_lens[i] == strlen(keys[i]));
+        assert(memcmp(ctx->search_keys[i], keys[i], ctx->search_key_lens[i]) == 0);
+    }
+
+    /* Inclusive end: a range ending exactly on "search_ccc" returns it. */
+    ctx->search_count = 0;
+    chimera_vfs_search_keys(
+        ctx->vfs_thread,
+        "search_aaa",
+        strlen("search_aaa"),
+        "search_ccc",
+        strlen("search_ccc"),
+        0,
+        search_keys_callback,
+        search_keys_complete,
+        ctx);
+
+    wait_for_completion(ctx);
+    assert(ctx->status == CHIMERA_VFS_OK);
+    assert(ctx->search_count == 3); /* aaa, bbb, ccc */
+
+    /* Exclusive end: the same range drops the key equal to the end bound. */
+    ctx->search_count = 0;
+    chimera_vfs_search_keys(
+        ctx->vfs_thread,
+        "search_aaa",
+        strlen("search_aaa"),
+        "search_ccc",
+        strlen("search_ccc"),
+        CHIMERA_VFS_SEARCH_KEYS_END_EXCLUSIVE,
+        search_keys_callback,
+        search_keys_complete,
+        ctx);
+
+    wait_for_completion(ctx);
+    assert(ctx->status == CHIMERA_VFS_OK);
+    assert(ctx->search_count == 2); /* aaa, bbb */
+    assert(ctx->search_key_lens[1] == strlen("search_bbb"));
+    assert(memcmp(ctx->search_keys[1], "search_bbb", strlen("search_bbb")) == 0);
+
+    /* Variable-length keys that share a prefix and are LONGER than a short end
+     * bound.  A prefix scan must return all of them: a stored key longer than
+     * the end key is past the range only if its shared prefix already sorts at
+     * or after the end (regression for a cairn end-key check that treated any
+     * longer key as past-end, dropping every match). */
+    const char *pkeys[]   = { "len_a", "len_ab", "len_abc" };
+    int         num_pkeys = sizeof(pkeys) / sizeof(pkeys[0]);
+
+    for (int i = 0; i < num_pkeys; i++) {
+        chimera_vfs_put_key(ctx->vfs_thread, pkeys[i], strlen(pkeys[i]),
+                            "v", 1, put_key_callback, ctx);
+        wait_for_completion(ctx);
+        assert(ctx->status == CHIMERA_VFS_OK);
+    }
+    /* A key just past the "len_" band (so the [ "len_", "len`" ) bound must
+     * exclude it while keeping the longer in-band keys). */
+    chimera_vfs_put_key(ctx->vfs_thread, "lenz", 4, "v", 1, put_key_callback, ctx);
+    wait_for_completion(ctx);
+
+    ctx->search_count = 0;
+    chimera_vfs_search_keys(
+        ctx->vfs_thread,
+        "len_", 4,
+        "len`", 4,               /* 0x60 = '_'(0x5f) + 1: bounds the "len_" band */
+        CHIMERA_VFS_SEARCH_KEYS_END_EXCLUSIVE,
+        search_keys_callback,
+        search_keys_complete,
+        ctx);
+    wait_for_completion(ctx);
+    assert(ctx->status == CHIMERA_VFS_OK);
+    assert(ctx->search_count == num_pkeys); /* all three "len_*" keys, not "lenz" */
+    for (int i = 0; i < num_pkeys; i++) {
+        assert(ctx->search_key_lens[i] == strlen(pkeys[i]));
+        assert(memcmp(ctx->search_keys[i], pkeys[i], ctx->search_key_lens[i]) == 0);
+    }
+
+    for (int i = 0; i < num_pkeys; i++) {
+        chimera_vfs_delete_key(ctx->vfs_thread, pkeys[i], strlen(pkeys[i]),
+                               delete_key_callback, ctx);
+        wait_for_completion(ctx);
+    }
+    chimera_vfs_delete_key(ctx->vfs_thread, "lenz", 4, delete_key_callback, ctx);
+    wait_for_completion(ctx);
 
     /* Cleanup */
     for (int i = 0; i < num_keys; i++) {
@@ -335,7 +427,9 @@ test_nonexistent_key(struct test_ctx *ctx)
     wait_for_completion(ctx);
     assert(ctx->status == CHIMERA_VFS_ENOENT);
 
-    /* Delete should also return ENOENT for nonexistent key */
+    /* Deleting a nonexistent key is idempotent: backends that track presence
+     * (memkv, sqlite) report ENOENT, while those whose delete is a blind
+     * tombstone (cairn/RocksDB) report OK.  Either is acceptable. */
     chimera_vfs_delete_key(
         ctx->vfs_thread,
         key,
@@ -344,9 +438,9 @@ test_nonexistent_key(struct test_ctx *ctx)
         ctx);
 
     wait_for_completion(ctx);
-    assert(ctx->status == CHIMERA_VFS_ENOENT);
+    assert(ctx->status == CHIMERA_VFS_ENOENT || ctx->status == CHIMERA_VFS_OK);
 
-    TEST_PASS("operations on nonexistent key return ENOENT");
+    TEST_PASS("operations on nonexistent key");
 } /* test_nonexistent_key */
 
 /* Run the full KV test suite against a single KV-only backend. */
@@ -377,6 +471,7 @@ run_suite(
         1,              /* num_modules */
         kv_name,        /* kv_module_name */
         60,             /* cache_ttl */
+        0,              /* num_rcu_reclaim_threads: 0 = one per CPU */
         metrics);
     assert(ctx.vfs != NULL);
 
@@ -436,6 +531,28 @@ main(
     (void) sqlite_cfg;
     (void) rmcmd;
 #endif /* ifdef CHIMERA_KV_TEST_SQLITE */
+
+#ifdef CHIMERA_KV_TEST_CAIRN
+    /* Persistent cairn (RocksDB) KV backend -- exercises the end-key range
+     * comparison the search test relies on. */
+    {
+        char  ctmpl[] = "/tmp/chimera_cairn_kv_test_XXXXXX";
+        char *cdir    = mkdtemp(ctmpl);
+        char  cairn_cfg[256];
+        char  crm[320];
+
+        assert(cdir != NULL);
+        snprintf(cairn_cfg, sizeof(cairn_cfg),
+                 "{\"initialize\":true,\"path\":\"%s\"}", cdir);
+
+        run_suite("cairn", cairn_cfg, metrics);
+
+        snprintf(crm, sizeof(crm), "rm -rf %s", cdir);
+        if (system(crm) != 0) {
+            fprintf(stderr, "warning: failed to remove %s\n", cdir);
+        }
+    }
+#endif /* ifdef CHIMERA_KV_TEST_CAIRN */
 
     fprintf(stderr, "All KV tests passed!\n");
 

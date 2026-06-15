@@ -6,12 +6,13 @@ name: Syntax Check
 
 on:
   pull_request:
+  merge_group:         # also gate the merge queue
   workflow_dispatch:   # allow manual runs
 
 jobs:
   syntax-check:
     name: Check code formatting with uncrustify
-    runs-on: arc-amd64
+    runs-on: arc-small
     
     steps:
       - name: Checkout repository

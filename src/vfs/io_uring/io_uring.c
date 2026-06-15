@@ -373,6 +373,18 @@ chimera_io_uring_reap(
 
                 } else {
                     request->status = chimera_linux_errno_to_status(-cqe->res);
+                    /* LOOKUP with a symlink current filehandle must report
+                     * NFS4ERR_SYMLINK, not NFS4ERR_NOTDIR (RFC 7530 16.15.5).
+                     * The statx of a name under the symlink fails ENOTDIR when
+                     * the cached parent handle is the symlink itself; distinguish
+                     * it by stat'ing the parent.  (See the matching linux fix.) */
+                    if (request->status == CHIMERA_VFS_ENOTDIR) {
+                        struct stat pst;
+                        if (fstat((int) request->lookup_at.handle->vfs_private,
+                                  &pst) == 0 && S_ISLNK(pst.st_mode)) {
+                            request->status = CHIMERA_VFS_ESYMLINK;
+                        }
+                    }
                 }
                 break;
             case CHIMERA_VFS_OP_GETATTR:
@@ -1201,7 +1213,9 @@ chimera_io_uring_open_fh(
     if (request->open_fh.flags & CHIMERA_VFS_OPEN_DIRECTORY) {
         flags |= O_DIRECTORY;
     }
-    if (request->open_fh.flags & (CHIMERA_VFS_OPEN_READ_ONLY | CHIMERA_VFS_OPEN_PATH | CHIMERA_VFS_OPEN_DIRECTORY)) {
+    if ((request->open_fh.flags & (CHIMERA_VFS_OPEN_PATH | CHIMERA_VFS_OPEN_DIRECTORY)) ||
+        ((request->open_fh.flags & CHIMERA_VFS_OPEN_READ_ONLY) &&
+         !(request->open_fh.flags & CHIMERA_VFS_OPEN_WRITE_ONLY))) {
         flags |= O_RDONLY;
     } else {
         flags |= O_RDWR;
@@ -1266,6 +1280,7 @@ chimera_io_uring_open_at(
     if (request->open_at.flags & (CHIMERA_VFS_OPEN_PATH | CHIMERA_VFS_OPEN_DIRECTORY)) {
         flags |= O_RDONLY;
     } else if ((request->open_at.flags & CHIMERA_VFS_OPEN_READ_ONLY) &&
+               !(request->open_at.flags & CHIMERA_VFS_OPEN_WRITE_ONLY) &&
                !(request->open_at.set_attr->va_set_mask & CHIMERA_VFS_ATTR_SIZE)) {
         flags |= O_RDONLY;
     } else {
@@ -1285,7 +1300,17 @@ chimera_io_uring_open_at(
     }
 
     if (request->open_at.flags & CHIMERA_VFS_OPEN_NOFOLLOW) {
-        flags = O_PATH | O_NOFOLLOW;
+        if (request->open_at.flags & CHIMERA_VFS_OPEN_PATH) {
+            /* Caller wants a handle on the symlink itself (e.g. SMB reparse):
+             * O_PATH|O_NOFOLLOW opens the link rather than following it. */
+            flags = O_PATH | O_NOFOLLOW;
+        } else {
+            /* A regular open with O_NOFOLLOW on a symlink target must fail
+             * ELOOP (pjd open/16); openat() returns that directly, so just add
+             * O_NOFOLLOW to the real open flags instead of degrading to O_PATH
+             * (which would succeed by opening the link). */
+            flags |= O_NOFOLLOW;
+        }
     }
 
     if (request->open_at.flags & CHIMERA_VFS_OPEN_EXCLUSIVE) {
@@ -1423,6 +1448,9 @@ chimera_io_uring_mknod_at(
     }
 
     if (request->mknod_at.set_attr->va_set_mask & CHIMERA_VFS_ATTR_RDEV) {
+        /* va_rdev is the canonical VFS encoding (major << 32 | minor), as
+         * produced by the NFS server from CREATE specdata and by statx getattr
+         * here.  Convert it back to a host dev_t for mknodat(). */
         dev = makedev(request->mknod_at.set_attr->va_rdev >> 32,
                       request->mknod_at.set_attr->va_rdev & 0xFFFFFFFF);
     }
@@ -1831,20 +1859,30 @@ chimera_io_uring_seek(
     result = lseek(fd, request->seek.offset, whence);
 
     if (result < 0) {
-        if (errno == ENXIO) {
-            request->seek.r_eof    = 1;
-            request->seek.r_offset = 0;
-            request->status        = CHIMERA_VFS_OK;
-        } else {
-            request->status = chimera_linux_errno_to_status(errno);
-        }
+        /* No matching data/hole at or after the offset (the offset is at or
+         * past EOF, or SEEK_DATA found no more data): host lseek sets ENXIO,
+         * which must propagate as NFS4ERR_NXIO / POSIX ENXIO -- not a silent
+         * success. */
+        request->status = (errno == ENXIO) ? CHIMERA_VFS_ENXIO
+                          : chimera_linux_errno_to_status(errno);
         request->complete(request);
         return;
     }
 
-    request->seek.r_eof    = 0;
     request->seek.r_offset = result;
-    request->status        = CHIMERA_VFS_OK;
+    request->seek.r_eof    = 0;
+
+    /* A SEEK_HOLE that lands at the logical size is the implicit hole at EOF;
+     * RFC 7862 §11.4.4 requires sr_eof TRUE there.  SEEK_DATA always lands
+     * before EOF, so its eof stays false. */
+    if (whence == SEEK_HOLE) {
+        struct stat st;
+        if (fstat(fd, &st) == 0 && (uint64_t) result >= (uint64_t) st.st_size) {
+            request->seek.r_eof = 1;
+        }
+    }
+
+    request->status = CHIMERA_VFS_OK;
     request->complete(request);
 
 } /* chimera_io_uring_seek */

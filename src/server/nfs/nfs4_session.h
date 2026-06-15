@@ -6,6 +6,7 @@
 
 #include <stdatomic.h>
 #include <stdbool.h>
+#include <time.h>
 #include <uthash.h>
 
 #include "nfs4_xdr.h"
@@ -56,10 +57,28 @@ struct nfs4_replay_slot {
     _Atomic uint64_t state_word;       /* (seqid << NFS4_SLOT_SEQID_SHIFT) | state */
     uint32_t         cached_len;       /* bytes in cached_buf (CACHED only) */
     void            *cached_buf;       /* RPC reply (header+body); malloc'd */
+    /* Diagnostics for a wedged compound: when the slot entered IN_PROGRESS
+     * and when a stuck-slot report was last logged for it.  Written only by
+     * the CAS winner / the retry path observing it, both monotonic-seconds;
+     * plain (non-atomic) is fine for a rate-limited log. */
+    time_t           in_progress_since;
+    time_t           last_stuck_report;
 };
 
 #define NFS4_SLOT_STATE_MASK  0x3u
 #define NFS4_SLOT_SEQID_SHIFT 2
+
+/* Coarse monotonic seconds for the slot-stuck diagnostics; off every hot
+ * comparison except the IN_PROGRESS transitions and the already-failing
+ * retry path. */
+static inline time_t
+nfs4_slot_now(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);
+    return ts.tv_sec;
+} /* nfs4_slot_now */
 
 static inline uint64_t
 nfs4_slot_word(
@@ -177,30 +196,30 @@ struct nfs4_exchange_id_result {
 
 struct nfs4_session {
     /* magic MUST be the first member -- see NFS4_SESSION_MAGIC comment. */
-    uint32_t                 magic;
+    uint32_t                          magic;
     /* Cached pointer to the owning client's unified state hierarchy.  Set
      * at session creation; cleared at table teardown (when the unified
      * client is destroyed).  Borrowed reference: lifetime matches the
      * nfs4_client this session belongs to. */
-    struct nfs_client       *client_unified;
-    _Atomic uint32_t         refcount;
-    _Atomic bool             destroyed;
-    uint8_t                  nfs4_session_id[NFS4_SESSIONID_SIZE];
-    uint64_t                 nfs4_session_clientid;
-    uint32_t                 nfs4_session_implicit;
-    struct nfs4_client      *nfs4_session_client;
-    struct channel_attrs4    nfs4_session_fore_attrs;
-    struct channel_attrs4    nfs4_session_back_attrs;
-    uint32_t                 nfs4_session_fore_attrs_rdma_ird;
-    uint32_t                 nfs4_session_back_attrs_rdma_ird;
+    struct nfs_client                *client_unified;
+    _Atomic uint32_t                  refcount;
+    _Atomic bool                      destroyed;
+    uint8_t                           nfs4_session_id[NFS4_SESSIONID_SIZE];
+    uint64_t                          nfs4_session_clientid;
+    uint32_t                          nfs4_session_implicit;
+    struct nfs4_client               *nfs4_session_client;
+    struct channel_attrs4             nfs4_session_fore_attrs;
+    struct channel_attrs4             nfs4_session_back_attrs;
+    uint32_t                          nfs4_session_fore_attrs_rdma_ird;
+    uint32_t                          nfs4_session_back_attrs_rdma_ird;
     /* NFS4.1 SEQUENCE replay cache (per-session slot table).  Distinct
      * mechanism from the 4.0 per-owner replay in nfs_open_owner.replay /
      * nfs_lock_owner.replay -- the two coexist by minor version.  Implicit
      * sessions (4.0 SETCLIENTID path) leave replay_max_slots = 0. */
-    uint32_t                 replay_max_slots;
-    uint32_t                 replay_maxresp_cached;
-    _Atomic size_t           replay_bytes_in_use;
-    struct nfs4_replay_slot *replay_slots;
+    uint32_t                          replay_max_slots;
+    uint32_t                          replay_maxresp_cached;
+    _Atomic size_t                    replay_bytes_in_use;
+    struct nfs4_replay_slot          *replay_slots;
     /* NFSv4.1 backchannel for delegation recalls (RFC 8881 §2.10.3.1).
      * Set at CREATE_SESSION when CREATE_SESSION4_FLAG_CONN_BACK_CHAN is
      * requested: cb_program is the client's callback program number and
@@ -208,9 +227,18 @@ struct nfs4_session {
      * which doubles as the server->client callback transport.  The conn is
      * a borrowed pointer kept live by the session<->conn binding; it is
      * cleared by nfs4_session_unbind_conn on disconnect. */
-    uint32_t                 nfs4_session_cb_program;
-    struct evpl_rpc2_conn   *nfs4_session_backchannel_conn;
-    struct UT_hash_handle    nfs4_session_hh;
+    uint32_t                          nfs4_session_cb_program;
+    struct evpl_rpc2_conn            *nfs4_session_backchannel_conn;
+    /* The thread that owns nfs4_session_backchannel_conn's evpl (set whenever
+     * the backchannel conn is (re)assigned, on that conn's own handler thread).
+     * Callbacks must be sent from this thread -- evpl sends are not cross-thread
+     * safe -- so cross-thread recalls marshal to it (nfs4_cb_recall_holder). */
+    struct chimera_server_nfs_thread *nfs4_session_backchannel_owner;
+    /* CREATE_SESSION4_FLAG_PERSIST was advertised for this session (server
+     * nfs4_drc on AND client requested it): the per-slot reply cache is
+     * written through to the KV store so retransmits replay across a restart. */
+    bool                              nfs4_session_persist;
+    struct UT_hash_handle             nfs4_session_hh;
 };
 
 struct nfs4_client_table {
@@ -407,7 +435,8 @@ nfs4_create_session(
     uint32_t                     replay_max_slots,
     uint32_t                     replay_maxresp_cached,
     const struct channel_attrs4 *fore_attrs,
-    const struct channel_attrs4 *back_attrs);
+    const struct channel_attrs4 *back_attrs,
+    const uint8_t               *restore_sessionid);
 
 /* SEQUENCE replay slot state machine.  See plan in
  * /root/.claude/plans/lets-plan-out-the-steady-steele.md for the full

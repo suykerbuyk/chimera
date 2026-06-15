@@ -335,18 +335,11 @@ chimera_smb_notify_send_interim(struct chimera_smb_notify_request *nr)
     smb2_len = (int) (p - buf - 4);
     chimera_smb_notify_set_netbios_len(buf, smb2_len);
 
-    if (nr->signed_session) {
-        chimera_smb_sign_message(nr->thread->signing_ctx,
-                                 nr->conn->dialect,
-                                 nr->conn->negotiated.signing_alg,
-                                 nr->signing_key,
-                                 buf + 4,
-                                 smb2_len);
-    }
-
+    /* Sign, or wrap in a TRANSFORM header on an encrypting session (the interim
+     * is a response and must be secured the same way -- MS-SMB2 §3.3.4.1.4).
+     * Consumes iov. */
     iov.length = (int) (p - buf);
-    evpl_sendv(nr->thread->evpl, nr->conn->bind, &iov, 1, iov.length,
-               EVPL_SEND_FLAG_TAKE_REF);
+    chimera_smb_secure_send(nr->conn, &iov, smb2_len, &nr->secure);
 } /* chimera_smb_notify_send_interim */
 
 /* ----------------------------------------------------------------
@@ -390,6 +383,51 @@ chimera_smb_notify_callback(
         evpl_ring_doorbell(&thread->notify_doorbell);
     }
 } /* chimera_smb_notify_callback */
+
+/* ----------------------------------------------------------------
+ * Queue the open's parked CHANGE_NOTIFY for a NOTIFY_CLEANUP completion
+ * on its owning thread.  Mirrors the callback's enqueue (state->lock outer,
+ * notify_ready_lock inner) so close/cancel observe a consistent
+ * (state->pending, on_ready_queue) pair, and rings the owning thread's
+ * doorbell.  The doorbell handler honors nr->cleanup and completes the
+ * request with STATUS_NOTIFY_CLEANUP rather than the event-delivery path.
+ * ---------------------------------------------------------------- */
+int
+chimera_smb_notify_queue_cleanup(struct chimera_smb_open_file *open_file)
+{
+    struct chimera_smb_notify_state   *state = open_file->notify_state;
+    struct chimera_smb_notify_request *nr;
+    struct chimera_server_smb_thread  *thread;
+    int                                wake = 0;
+
+    if (!state) {
+        return 0;
+    }
+
+    pthread_mutex_lock(&state->lock);
+
+    nr = state->pending;
+    if (nr && !nr->on_ready_queue) {
+        thread             = nr->thread;
+        nr->cleanup        = 1;
+        nr->on_ready_queue = 1;
+
+        pthread_mutex_lock(&thread->notify_ready_lock);
+        nr->ready_next       = thread->notify_ready;
+        thread->notify_ready = nr;
+        pthread_mutex_unlock(&thread->notify_ready_lock);
+
+        wake = 1;
+    }
+
+    pthread_mutex_unlock(&state->lock);
+
+    if (wake) {
+        evpl_ring_doorbell(&thread->notify_doorbell);
+    }
+
+    return wake;
+} /* chimera_smb_notify_queue_cleanup */
 
 /* ----------------------------------------------------------------
  * Build and send an async CHANGE_NOTIFY response with events.
@@ -639,18 +677,11 @@ chimera_smb_notify_do_send_response(
 
     chimera_smb_notify_set_netbios_len(buf, smb2_len);
 
-    if (nr->signed_session) {
-        chimera_smb_sign_message(nr->thread->signing_ctx,
-                                 nr->conn->dialect,
-                                 nr->conn->negotiated.signing_alg,
-                                 nr->signing_key,
-                                 buf + 4,
-                                 smb2_len);
-    }
-
+    /* Sign, or wrap in a TRANSFORM header on an encrypting session (every
+     * change-notify delivery is a response and must be secured -- MS-SMB2
+     * §3.3.4.1.4).  Consumes iov. */
     iov.length = (int) (p - buf);
-    evpl_sendv(nr->thread->evpl, nr->conn->bind, &iov, 1, iov.length,
-               EVPL_SEND_FLAG_TAKE_REF);
+    chimera_smb_secure_send(nr->conn, &iov, smb2_len, &nr->secure);
 
     chimera_smb_notify_unlink(nr);
     chimera_smb_notify_request_free(nr);
@@ -771,18 +802,10 @@ chimera_smb_notify_cancel(struct chimera_smb_notify_request *nr)
     smb2_len = (int) (p - buf - 4);
     chimera_smb_notify_set_netbios_len(buf, smb2_len);
 
-    if (nr->signed_session) {
-        chimera_smb_sign_message(nr->thread->signing_ctx,
-                                 nr->conn->dialect,
-                                 nr->conn->negotiated.signing_alg,
-                                 nr->signing_key,
-                                 buf + 4,
-                                 smb2_len);
-    }
-
+    /* Sign, or wrap in a TRANSFORM header on an encrypting session.  Consumes
+     * iov. */
     iov.length = (int) (p - buf);
-    evpl_sendv(nr->thread->evpl, nr->conn->bind, &iov, 1, iov.length,
-               EVPL_SEND_FLAG_TAKE_REF);
+    chimera_smb_secure_send(nr->conn, &iov, smb2_len, &nr->secure);
 
     chimera_smb_notify_request_free(nr);
 } /* chimera_smb_notify_cancel */
@@ -906,7 +929,17 @@ chimera_smb_notify_doorbell_callback(
     for (nr = ready; nr; nr = next) {
         next           = nr->ready_next;
         nr->ready_next = NULL;
-        chimera_smb_notify_send_response(nr);
+        if (nr->cleanup) {
+            /* Session closed under a still-live connection (PreviousSessionId
+             * reconnect): complete with STATUS_NOTIFY_CLEANUP.  The watch
+             * state stays attached to the open (the open is torn down later
+             * by its own connection); pass it explicitly. */
+            nr->on_ready_queue = 0;
+            chimera_smb_notify_complete_cleanup(nr,
+                                                nr->open_file ? nr->open_file->notify_state : NULL);
+        } else {
+            chimera_smb_notify_send_response(nr);
+        }
     }
 } /* chimera_smb_notify_doorbell_callback */
 

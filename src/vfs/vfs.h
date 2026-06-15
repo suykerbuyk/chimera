@@ -124,6 +124,10 @@ struct chimera_vfs_mount_options {
  * set_attr (used for the SMB OVERWRITE / OVERWRITE_IF / SUPERSEDE
  * dispositions).  Backends that do not honor it simply open the file. */
 #define CHIMERA_VFS_OPEN_TRUNCATE       (1U << 7)
+/* Access mode: READ_ONLY for O_RDONLY, WRITE_ONLY for O_WRONLY, neither for
+ * O_RDWR.  Read access is required unless WRITE_ONLY; write access is required
+ * unless READ_ONLY.  Used by the open path to authorize the requested access. */
+#define CHIMERA_VFS_OPEN_WRITE_ONLY     (1U << 8)
 
 /* Allocate flags */
 #define CHIMERA_VFS_ALLOCATE_DEALLOCATE 0x01
@@ -322,6 +326,15 @@ typedef void (*chimera_vfs_get_key_callback_t)(
 typedef void (*chimera_vfs_delete_key_callback_t)(
     enum chimera_vfs_error error_code,
     void                  *private_data);
+
+/* Flags for chimera_vfs_search_keys / chimera_vfs_search_keys_at.
+ *
+ * By default the range searched is [start_key, end_key] (both bounds
+ * inclusive).  END_EXCLUSIVE makes the end bound exclusive, i.e. the range
+ * becomes [start_key, end_key); a key byte-equal to end_key is not returned.
+ * The flag has no effect when no end key is supplied (the range is then
+ * open-ended). */
+#define CHIMERA_VFS_SEARCH_KEYS_END_EXCLUSIVE 0x00000001U
 
 /* Returns non-zero to abort the search */
 typedef int (*chimera_vfs_search_keys_callback_t)(
@@ -789,6 +802,11 @@ struct chimera_vfs_request {
             uint64_t                        name_hash;
             const uint8_t                  *child_fh;     /* Optional: child FH if known */
             int                             child_fh_len; /* 0 if child_fh not provided */
+            /* SMB3 directory-lease self-exemption (see link_at): spare the dir
+             * lease named by the deleting open's ParentLeaseKey from the
+             * FILE_REMOVED break on the parent.  NULL caller = break all. */
+            uint8_t                         parent_lease_skip[16];
+            uint8_t                         parent_lease_skip_valid;
             struct chimera_vfs_attrs        r_dir_pre_attr;
             struct chimera_vfs_attrs        r_dir_post_attr;
             struct chimera_vfs_attrs        r_removed_attr;
@@ -829,6 +847,11 @@ struct chimera_vfs_request {
             int                      target_fh_len; /* 0 if target_fh not provided */
             uint8_t                  source_fh[CHIMERA_VFS_FH_SIZE]; /* resolved source FH, for delegation recall */
             int                      source_fh_len; /* 0 if source FH could not be resolved */
+            /* SMB3 directory-lease self-exemption (see link_at): spare the dir
+             * lease named by the operating open's ParentLeaseKey from the RENAMED
+             * break on the source/dest parent.  NULL caller = no skip. */
+            uint8_t                  parent_lease_skip[16];
+            uint8_t                  parent_lease_skip_valid;
             struct chimera_vfs_attrs r_fromdir_pre_attr;
             struct chimera_vfs_attrs r_fromdir_post_attr;
             struct chimera_vfs_attrs r_todir_pre_attr;
@@ -843,6 +866,12 @@ struct chimera_vfs_request {
             int                      namelen;
             unsigned int             replace;
             uint64_t                 name_hash;
+            /* SMB3 directory-lease self-exemption: when this link/rename is
+             * issued through a handle that supplied a ParentLeaseKey, that
+             * directory lease must not be broken by the FILE_ADDED emit on the
+             * parent.  Copied from the caller (NULL = no skip, break all). */
+            uint8_t                  parent_lease_skip[16];
+            uint8_t                  parent_lease_skip_valid;
             struct chimera_vfs_attrs r_attr;
             struct chimera_vfs_attrs r_replaced_attr;
             struct chimera_vfs_attrs r_dir_pre_attr;
@@ -873,6 +902,7 @@ struct chimera_vfs_request {
             uint32_t                           start_key_len;
             const void                        *end_key;
             uint32_t                           end_key_len;
+            uint32_t                           flags;
             chimera_vfs_search_keys_callback_t callback;
         } search_keys;
 
@@ -1445,6 +1475,8 @@ struct chimera_vfs_thread {
      * pump runs on whatever thread released/broke a lease, but a request's
      * dispatch+reply must run on the thread that owns its connection iovecs). */
     struct chimera_vfs_request          *pending_io_resume;
+    /* Monotonic seconds of the last watchdog stuck-request report. */
+    time_t                               watchdog_last_report;
     struct evpl_doorbell                 doorbell;
     pthread_mutex_t                      lock;
     uint64_t                             anon_fh_key;
@@ -1466,6 +1498,7 @@ chimera_vfs_init(
     int                                  num_modules,
     const char                          *kv_module_name,
     int                                  cache_ttl,
+    int                                  num_rcu_reclaim_threads,
     struct prometheus_metrics           *metrics);
 
 void

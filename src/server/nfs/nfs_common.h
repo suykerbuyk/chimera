@@ -17,6 +17,7 @@
 #include "nfs4_state.h"
 #include "nfs4_layout_table.h"
 #include "nfs4_recovery.h"
+#include "nfs3_drc.h"
 #include "nfs_nlm_state.h"
 
 struct chimera_server_nfs_thread;
@@ -279,6 +280,7 @@ struct chimera_server_nfs_shared {
     struct prometheus_metrics          *metrics;
     struct nfs4_replay_metrics          replay_metrics;
     struct nfs4_v40_drc                 v40_drc;
+    struct nfs3_drc                     nfs3_drc;
 };
 
 /* Forward decl for the per-thread lease sweeper (defined in nfs4_lease.h). */
@@ -308,6 +310,14 @@ struct chimera_server_nfs_thread {
     struct evpl_doorbell              cb_doorbell;
     pthread_mutex_t                   cb_recall_lock;
     struct nfs_delegation            *cb_recall_queue; /* via deleg->recall_qnext */
+    /* Cross-thread pNFS CB_LAYOUTRECALL marshalling (same rationale as
+     * cb_recall_queue, but for layout holders).  Via layout->recall_qnext. */
+    struct nfs_layout_state          *cb_layoutrecall_queue;
+    /* Deferred-op resumes bounced back to their home thread: a layout recall
+     * completes (LAYOUTRETURN) on the backchannel owner thread, but the deferred
+     * op's request/iovecs are owned by the thread that received it.  See
+     * nfs4_cb_resume_bounce / nfs4_cb_drain_resume_queue in nfs4_cb.c. */
+    struct nfs4_cb_resume_ctx        *cb_resume_queue;
     /* Cross-thread CB_GETATTR work (request to the deleg holder's thread, and
      * the response back to the requester's thread).  Protected by
      * cb_recall_lock and drained by cb_doorbell.  See nfs4_callback.c. */

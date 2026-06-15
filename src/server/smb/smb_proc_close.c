@@ -106,6 +106,21 @@ chimera_smb_close_doc_open_parent_callback(
 
     request->close.parent_handle = oh;
 
+    /* Self-exempt a directory lease ONLY when the handle being closed here is the
+     * one that carried delete-on-close: its ParentLeaseKey names the directory
+     * lease whose cached view is coherent with the removal it caused, so spare it
+     * (dirlease.unlink_same_*).  When the last handle to close is NOT the one that
+     * set delete-on-close (a different open triggers the actual removal), the set
+     * and closing parent keys differ, so no lease is spared and ALL directory
+     * leases break (MS-SMB2; dirlease.unlink_different_*). */
+    const uint8_t *unlink_skip = NULL;
+
+    if (request->close.open_file &&
+        (request->close.open_file->flags &
+         CHIMERA_SMB_OPEN_FILE_FLAG_DELETE_ON_CLOSE)) {
+        unlink_skip = request->close.open_file->parent_lease_key;
+    }
+
     chimera_vfs_remove_at(
         vfs_thread,
         &request->close.doc_info.cred,
@@ -116,6 +131,7 @@ chimera_smb_close_doc_open_parent_callback(
         0,
         0,
         0,
+        unlink_skip,
         chimera_smb_close_doc_remove_callback,
         request);
 } /* chimera_smb_close_doc_open_parent_callback */
@@ -282,6 +298,29 @@ chimera_smb_close(struct chimera_smb_request *request)
         request->close.open_file->notify_state = NULL;
     }
 
+    /* Deferred directory-lease content break for a modified file: a write does
+     * not break the parent dir lease at write time (the file's directory-visible
+     * size/mtime settle only at close), so emit the break now.  Self-exempt the
+     * directory lease named by this handle's ParentLeaseKey -- a writer that
+     * holds the parent's lease keeps its cached view coherent (MS-SMB2;
+     * dirlease.v2_request "only the close on the modified file break[s] the
+     * directory lease", and the valid-parent-key write closes without a break). */
+    if ((request->close.open_file->flags & CHIMERA_SMB_OPEN_FILE_FLAG_MODIFIED) &&
+        request->close.open_file->parent_fh_len > 0) {
+        uint64_t skip_lo, skip_hi;
+        bool     has_skip = chimera_smb_parent_lease_skip(
+            request->close.open_file->parent_lease_key, &skip_lo, &skip_hi);
+
+        chimera_vfs_notify_emit_lease(thread->shared->vfs->vfs_notify,
+                                      request->close.open_file->parent_fh,
+                                      request->close.open_file->parent_fh_len,
+                                      CHIMERA_VFS_NOTIFY_FILE_MODIFIED,
+                                      request->close.open_file->name,
+                                      request->close.open_file->name_len,
+                                      NULL, 0,
+                                      skip_lo, skip_hi, has_skip);
+    }
+
     /* Release share mode entry for regular file opens */
     if (request->close.open_file->type == CHIMERA_SMB_OPEN_FILE_TYPE_FILE &&
         request->tree->share) {
@@ -352,10 +391,15 @@ chimera_smb_parse_close(
         return -1;
     }
 
-    evpl_iovec_cursor_get_uint16(request_cursor, &request->close.flags);
-    evpl_iovec_cursor_get_uint64(request_cursor, &request->close.file_id.pid);
-    evpl_iovec_cursor_get_uint64(request_cursor, &request->close.file_id.vid);
+    int prc = 0;
+    prc |= evpl_iovec_cursor_try_get_uint16(request_cursor, &request->close.flags);
+    prc |= evpl_iovec_cursor_try_get_uint64(request_cursor, &request->close.file_id.pid);
+    prc |= evpl_iovec_cursor_try_get_uint64(request_cursor, &request->close.file_id.vid);
 
+    if (unlikely(prc)) {
+        chimera_smb_error("Received SMB2 CLOSE request truncated in fixed body");
+        return chimera_smb_parse_reject(request, SMB2_STATUS_INVALID_PARAMETER);
+    }
 
     return 0;
 } /* chimera_smb_parse_close */

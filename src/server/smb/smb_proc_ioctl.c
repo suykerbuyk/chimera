@@ -183,6 +183,15 @@ chimera_smb_ioctl(struct chimera_smb_request *request)
                 return;
             }
 
+            /* MS-SMB2 §3.3.5.2.10: IOCTL is in the channel-sequence-checked set;
+             * a stale sequence is rejected with FILE_NOT_AVAILABLE. */
+            if (chimera_smb_channel_sequence_stale(open_file,
+                                                   request->channel_sequence, 1)) {
+                chimera_smb_open_file_release(request, open_file);
+                chimera_smb_complete_request(request, SMB2_STATUS_FILE_NOT_AVAILABLE);
+                return;
+            }
+
             if (request->ioctl.max_output_response < 64) {
                 chimera_smb_open_file_release(request, open_file);
                 chimera_smb_complete_request(request, SMB2_STATUS_BUFFER_TOO_SMALL);
@@ -207,6 +216,41 @@ chimera_smb_ioctl(struct chimera_smb_request *request)
                 memcpy(request->ioctl.oid_buffer + 32,
                        request->ioctl.oid_buffer, 16);
                 /* DomainId: zeroed (MS-FSCC: zero indicates no domain). */
+            }
+
+            chimera_smb_open_file_release(request, open_file);
+            chimera_smb_complete_request(request, SMB2_STATUS_SUCCESS);
+            break;
+
+        case SMB2_FSCTL_LMR_REQUEST_RESILIENCY:
+            /* MS-SMB2 3.3.5.15.9: grant handle resiliency on the open.  The
+             * requested Timeout (ms) is capped at a server maximum; a Timeout of
+             * 0 selects the server default.  Resiliency only applies to a
+             * disk-file open — a request against a pipe is invalid. */
+            open_file = chimera_smb_open_file_resolve(request, &request->ioctl.file_id);
+
+            if (unlikely(!open_file)) {
+                chimera_smb_complete_request(request, SMB2_STATUS_FILE_CLOSED);
+                return;
+            }
+
+            if (open_file->type != CHIMERA_SMB_OPEN_FILE_TYPE_FILE) {
+                chimera_smb_open_file_release(request, open_file);
+                chimera_smb_complete_request(request, SMB2_STATUS_INVALID_PARAMETER);
+                return;
+            }
+
+            {
+                uint64_t timeout_ms = request->ioctl.rr_timeout_ms;
+
+                if (timeout_ms == 0) {
+                    timeout_ms = CHIMERA_SMB_RESILIENCY_DEFAULT_TIMEOUT_MS;
+                } else if (timeout_ms > CHIMERA_SMB_RESILIENCY_MAX_TIMEOUT_MS) {
+                    timeout_ms = CHIMERA_SMB_RESILIENCY_MAX_TIMEOUT_MS;
+                }
+
+                open_file->resilient            = true;
+                open_file->resilient_timeout_ms = timeout_ms;
             }
 
             chimera_smb_open_file_release(request, open_file);
@@ -292,6 +336,7 @@ chimera_smb_ioctl_reply(
     } /* switch */
 
     evpl_iovec_cursor_append_uint16(reply_cursor, SMB2_IOCTL_REPLY_SIZE);
+    evpl_iovec_cursor_append_uint16(reply_cursor, 0); /* Reserved (MS-SMB2 2.2.32) */
     evpl_iovec_cursor_append_uint32(reply_cursor, request->ioctl.ctl_code);
     evpl_iovec_cursor_append_uint64(reply_cursor, 0xffffffffffffffffULL); /* file_id.pid */
     evpl_iovec_cursor_append_uint64(reply_cursor, 0xffffffffffffffffULL); /* file_id.vid */
@@ -314,10 +359,15 @@ chimera_smb_ioctl_reply(
             evpl_iovec_cursor_append_uint16(reply_cursor, request->ioctl.r_dialect);
             break;
         case SMB2_FSCTL_TRANSCEIVE_PIPE:
-            evpl_iovec_cursor_inject_unaligned(reply_cursor,
-                                               &request->ioctl.output_iov,
-                                               1,
-                                               request->ioctl.output_iov.length);
+            /* inject() (not inject_unaligned()) so the spliced output is added
+             * to cursor->consumed and thus counted in the reply length -- the
+             * raw variant leaves the bytes out of the transmitted message.  At
+             * this point consumed is 64 (SMB2 header) + 48 (IOCTL reply) = 0x70,
+             * already 8-aligned, so no padding is inserted before the output. */
+            evpl_iovec_cursor_inject(reply_cursor,
+                                     &request->ioctl.output_iov,
+                                     1,
+                                     request->ioctl.output_iov.length);
             break;
         case SMB2_FSCTL_QUERY_NETWORK_INTERFACE_INFO:
 
@@ -414,25 +464,43 @@ chimera_smb_parse_ioctl(
     }
 
 
-    evpl_iovec_cursor_get_uint32(request_cursor, &request->ioctl.ctl_code);
-    evpl_iovec_cursor_get_uint64(request_cursor, &request->ioctl.file_id.pid);
-    evpl_iovec_cursor_get_uint64(request_cursor, &request->ioctl.file_id.vid);
-    evpl_iovec_cursor_get_uint32(request_cursor, &request->ioctl.input_offset);
-    evpl_iovec_cursor_get_uint32(request_cursor, &request->ioctl.input_count);
-    evpl_iovec_cursor_get_uint32(request_cursor, &request->ioctl.max_input_response);
-    evpl_iovec_cursor_get_uint32(request_cursor, &request->ioctl.output_offset);
-    evpl_iovec_cursor_get_uint32(request_cursor, &request->ioctl.output_count);
-    evpl_iovec_cursor_get_uint32(request_cursor, &request->ioctl.max_output_response);
-    evpl_iovec_cursor_get_uint32(request_cursor, &request->ioctl.flags);
+    int prc = 0;
+    prc |= evpl_iovec_cursor_try_get_uint32(request_cursor, &request->ioctl.ctl_code);
+    prc |= evpl_iovec_cursor_try_get_uint64(request_cursor, &request->ioctl.file_id.pid);
+    prc |= evpl_iovec_cursor_try_get_uint64(request_cursor, &request->ioctl.file_id.vid);
+    prc |= evpl_iovec_cursor_try_get_uint32(request_cursor, &request->ioctl.input_offset);
+    prc |= evpl_iovec_cursor_try_get_uint32(request_cursor, &request->ioctl.input_count);
+    prc |= evpl_iovec_cursor_try_get_uint32(request_cursor, &request->ioctl.max_input_response);
+    prc |= evpl_iovec_cursor_try_get_uint32(request_cursor, &request->ioctl.output_offset);
+    prc |= evpl_iovec_cursor_try_get_uint32(request_cursor, &request->ioctl.output_count);
+    prc |= evpl_iovec_cursor_try_get_uint32(request_cursor, &request->ioctl.max_output_response);
+    prc |= evpl_iovec_cursor_try_get_uint32(request_cursor, &request->ioctl.flags);
+
+    if (unlikely(prc)) {
+        chimera_smb_error("Received SMB2 IOCTL request truncated in fixed body");
+        return chimera_smb_parse_reject(request, SMB2_STATUS_INVALID_PARAMETER);
+    }
 
     /* SET_SPARSE with no input buffer means SetSparse = TRUE. */
     request->ioctl.sp_set_sparse = 1;
 
+    /* Default: no COPYCHUNK limit body on the error reply (set only when an
+     * over-limit COPYCHUNK is rejected). */
+    request->ioctl.cc_limit_response = 0;
+
     /* Parse IOCTL-specific input data if present */
     if (request->ioctl.input_count > 0) {
-        /* Skip to the input data offset */
-        evpl_iovec_cursor_skip(request_cursor,
-                               request->ioctl.input_offset - evpl_iovec_cursor_consumed(request_cursor));
+        /* Seek to the client-declared input offset and fence the cursor to
+         * exactly input_count bytes.  Every reader below is then bounded by the
+         * declared input buffer: a field-length field that claims more than the
+         * buffer holds (a classic IOCTL abuse) rejects cleanly via the checked
+         * readers instead of reading out of bounds or aborting. */
+        if (unlikely(smb_cursor_seek_to(request_cursor, request->ioctl.input_offset) != 0 ||
+                     request->ioctl.input_count > (uint32_t) evpl_iovec_cursor_remaining(request_cursor))) {
+            chimera_smb_error("Received SMB2 IOCTL with input buffer out of range");
+            return chimera_smb_parse_reject(request, SMB2_STATUS_INVALID_PARAMETER);
+        }
+        evpl_iovec_cursor_set_limit(request_cursor, request->ioctl.input_count);
 
         switch (request->ioctl.ctl_code) {
             case SMB2_FSCTL_DFS_GET_REFERRALS:
@@ -521,7 +589,11 @@ chimera_smb_parse_ioctl(
                                 uint16_t                          utf16_buf[CHIMERA_VFS_PATH_MAX];
                                 struct chimera_server_smb_thread *thread = request->compound->thread;
 
-                                evpl_iovec_cursor_copy(request_cursor, utf16_buf, utf16_data_len);
+                                if (unlikely(evpl_iovec_cursor_try_copy(request_cursor, utf16_buf,
+                                                                        utf16_data_len) != 0)) {
+                                    chimera_smb_error("SET_REPARSE_POINT LNK: target runs past input buffer");
+                                    return chimera_smb_parse_reject(request, SMB2_STATUS_INVALID_PARAMETER);
+                                }
 
                                 utf8_len = chimera_smb_utf16le_to_utf8(
                                     &thread->iconv_ctx,
@@ -556,8 +628,13 @@ chimera_smb_parse_ioctl(
                                 request->status = SMB2_STATUS_INVALID_PARAMETER;
                                 return -1;
                             }
-                            evpl_iovec_cursor_get_uint32(request_cursor, &request->ioctl.rp_device_major);
-                            evpl_iovec_cursor_get_uint32(request_cursor, &request->ioctl.rp_device_minor);
+                            if (unlikely(evpl_iovec_cursor_try_get_uint32(request_cursor,
+                                                                          &request->ioctl.rp_device_major) ||
+                                         evpl_iovec_cursor_try_get_uint32(request_cursor,
+                                                                          &request->ioctl.rp_device_minor))) {
+                                chimera_smb_error("SET_REPARSE_POINT CHR/BLK: device numbers past input buffer");
+                                return chimera_smb_parse_reject(request, SMB2_STATUS_INVALID_PARAMETER);
+                            }
                             break;
                         case SMB2_NFS_SPECFILE_FIFO:
                         case SMB2_NFS_SPECFILE_SOCK:
@@ -583,11 +660,17 @@ chimera_smb_parse_ioctl(
                         return -1;
                     }
 
-                    evpl_iovec_cursor_get_uint16(request_cursor, &sub_name_offset);
-                    evpl_iovec_cursor_get_uint16(request_cursor, &sub_name_length);
-                    evpl_iovec_cursor_get_uint16(request_cursor, &print_name_offset);
-                    evpl_iovec_cursor_get_uint16(request_cursor, &print_name_length);
-                    evpl_iovec_cursor_get_uint32(request_cursor, &symlink_flags);
+                    int src = 0;
+                    src |= evpl_iovec_cursor_try_get_uint16(request_cursor, &sub_name_offset);
+                    src |= evpl_iovec_cursor_try_get_uint16(request_cursor, &sub_name_length);
+                    src |= evpl_iovec_cursor_try_get_uint16(request_cursor, &print_name_offset);
+                    src |= evpl_iovec_cursor_try_get_uint16(request_cursor, &print_name_length);
+                    src |= evpl_iovec_cursor_try_get_uint32(request_cursor, &symlink_flags);
+
+                    if (unlikely(src)) {
+                        chimera_smb_error("SET_REPARSE_POINT SYMLINK: header past input buffer");
+                        return chimera_smb_parse_reject(request, SMB2_STATUS_INVALID_PARAMETER);
+                    }
 
                     if (sub_name_length == 0 ||
                         sub_name_length > (CHIMERA_VFS_PATH_MAX - 1) * 2) {
@@ -599,14 +682,21 @@ chimera_smb_parse_ioctl(
 
                     /* Skip to SubstituteName within PathBuffer */
                     if (sub_name_offset > 0) {
-                        evpl_iovec_cursor_skip(request_cursor, sub_name_offset);
+                        if (unlikely(evpl_iovec_cursor_try_skip(request_cursor, sub_name_offset) != 0)) {
+                            chimera_smb_error("SET_REPARSE_POINT SYMLINK: name offset past input buffer");
+                            return chimera_smb_parse_reject(request, SMB2_STATUS_INVALID_PARAMETER);
+                        }
                     }
 
                     {
                         uint16_t                          utf16_buf[CHIMERA_VFS_PATH_MAX];
                         struct chimera_server_smb_thread *thread = request->compound->thread;
 
-                        evpl_iovec_cursor_copy(request_cursor, utf16_buf, sub_name_length);
+                        if (unlikely(evpl_iovec_cursor_try_copy(request_cursor, utf16_buf,
+                                                                sub_name_length) != 0)) {
+                            chimera_smb_error("SET_REPARSE_POINT SYMLINK: name runs past input buffer");
+                            return chimera_smb_parse_reject(request, SMB2_STATUS_INVALID_PARAMETER);
+                        }
 
                         utf8_len = chimera_smb_utf16le_to_utf8(
                             &thread->iconv_ctx,
@@ -702,6 +792,18 @@ chimera_smb_parse_ioctl(
                 }
                 break;
             }
+            case SMB2_FSCTL_LMR_REQUEST_RESILIENCY:
+                /* NETWORK_RESILIENCY_REQUEST (MS-SMB2 2.2.31.3): Timeout(4) +
+                 * Reserved(4). */
+                if (request->ioctl.input_count < 8) {
+                    chimera_smb_error("LMR_REQUEST_RESILIENCY input too small (%u < 8)",
+                                      request->ioctl.input_count);
+                    request->status = SMB2_STATUS_INVALID_PARAMETER;
+                    return -1;
+                }
+                evpl_iovec_cursor_get_uint32(request_cursor, &request->ioctl.rr_timeout_ms);
+                evpl_iovec_cursor_skip(request_cursor, 4); /* Reserved */
+                break;
             default:
                 /* Other IOCTLs don't need input parsing yet */
                 chimera_smb_info("Received IOCTL request with unhandled ctl_code 0x%08x, skipping input parsing",

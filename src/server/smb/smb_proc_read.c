@@ -89,6 +89,48 @@ chimera_smb_read_callback(
     chimera_smb_complete_request(private_data, SMB2_STATUS_SUCCESS);
 } /* chimera_smb_read_callback */
 
+/*
+ * DCE/RPC over a named pipe (ncacn_np), SMB2 READ leg: drain the response PDU a
+ * prior SMB2 WRITE stashed via chimera_smb_pipe_write.  Serves up to the
+ * requested length, advancing an offset so a client may read the response in
+ * several chunks; the stash is freed once fully drained.
+ */
+static void
+chimera_smb_pipe_read(struct chimera_smb_request *request)
+{
+    struct chimera_server_smb_thread *thread    = request->compound->thread;
+    struct evpl                      *evpl      = thread->evpl;
+    struct chimera_smb_open_file     *open_file = request->read.open_file;
+    uint32_t                          avail, n;
+
+    avail = open_file->rpc_resp_len - open_file->rpc_resp_off;
+    n     = request->read.length < avail ? request->read.length : avail;
+
+    if (n == 0) {
+        request->read.niov     = 0;
+        request->read.r_length = 0;
+        chimera_smb_open_file_release(request, open_file);
+        chimera_smb_complete_request(request, SMB2_STATUS_SUCCESS);
+        return;
+    }
+
+    request->read.niov = evpl_iovec_alloc(evpl, n, 8, 1, 0, request->read.iov);
+    memcpy(request->read.iov[0].data,
+           open_file->rpc_resp + open_file->rpc_resp_off, n);
+    request->read.r_length   = n;
+    open_file->rpc_resp_off += n;
+
+    if (open_file->rpc_resp_off >= open_file->rpc_resp_len) {
+        free(open_file->rpc_resp);
+        open_file->rpc_resp     = NULL;
+        open_file->rpc_resp_len = 0;
+        open_file->rpc_resp_off = 0;
+    }
+
+    chimera_smb_open_file_release(request, open_file);
+    chimera_smb_complete_request(request, SMB2_STATUS_SUCCESS);
+} /* chimera_smb_pipe_read */
+
 void
 chimera_smb_read(struct chimera_smb_request *request)
 {
@@ -98,6 +140,13 @@ chimera_smb_read(struct chimera_smb_request *request)
 
     if (unlikely(!request->read.open_file)) {
         chimera_smb_complete_request(request, SMB2_STATUS_FILE_CLOSED);
+        return;
+    }
+
+    /* Named-pipe FIDs carry no VFS handle; serve RPC reads from the stashed
+     * ncacn_np response before any handle-backed file logic. */
+    if (request->read.open_file->type == CHIMERA_SMB_OPEN_FILE_TYPE_PIPE) {
+        chimera_smb_pipe_read(request);
         return;
     }
 
@@ -137,6 +186,12 @@ chimera_smb_read(struct chimera_smb_request *request)
         chimera_smb_complete_request(request, SMB2_STATUS_INVALID_PARAMETER);
         return;
     }
+
+    /* MS-SMB2 §3.3.5.2.10: a READ is never rejected for a stale ChannelSequence,
+     * but it still advances the Open's tracked sequence (the third argument 0
+     * marks this as a non-mutating op). */
+    chimera_smb_channel_sequence_stale(request->read.open_file,
+                                       request->channel_sequence, 0);
 
     struct chimera_vfs_lease_owner io_owner = {
         .protocol   = CHIMERA_VFS_LEASE_PROTO_SMB2,
@@ -194,20 +249,30 @@ chimera_smb_parse_read(
      * below realigns to a 4-byte boundary, so a single byte read here would
      * capture Padding and silently skip the Flags field (which carries
      * SMB2_READFLAG_REQUEST_COMPRESSED). */
-    evpl_iovec_cursor_get_uint8(request_cursor, &padding);
-    evpl_iovec_cursor_get_uint8(request_cursor, &request->read.flags);
-    evpl_iovec_cursor_get_uint32(request_cursor, &request->read.length);
-    evpl_iovec_cursor_get_uint64(request_cursor, &request->read.offset);
-    evpl_iovec_cursor_get_uint64(request_cursor, &request->read.file_id.pid);
-    evpl_iovec_cursor_get_uint64(request_cursor, &request->read.file_id.vid);
-    evpl_iovec_cursor_get_uint32(request_cursor, &request->read.minimum);
-    evpl_iovec_cursor_get_uint32(request_cursor, &request->read.channel);
-    evpl_iovec_cursor_get_uint32(request_cursor, &request->read.remaining);
-    evpl_iovec_cursor_get_uint16(request_cursor, &blob_offset);
-    evpl_iovec_cursor_get_uint16(request_cursor, &blob_length);
+    int      prc = 0;
+
+    prc |= evpl_iovec_cursor_try_get_uint8(request_cursor, &padding);
+    prc |= evpl_iovec_cursor_try_get_uint8(request_cursor, &request->read.flags);
+    prc |= evpl_iovec_cursor_try_get_uint32(request_cursor, &request->read.length);
+    prc |= evpl_iovec_cursor_try_get_uint64(request_cursor, &request->read.offset);
+    prc |= evpl_iovec_cursor_try_get_uint64(request_cursor, &request->read.file_id.pid);
+    prc |= evpl_iovec_cursor_try_get_uint64(request_cursor, &request->read.file_id.vid);
+    prc |= evpl_iovec_cursor_try_get_uint32(request_cursor, &request->read.minimum);
+    prc |= evpl_iovec_cursor_try_get_uint32(request_cursor, &request->read.channel);
+    prc |= evpl_iovec_cursor_try_get_uint32(request_cursor, &request->read.remaining);
+    prc |= evpl_iovec_cursor_try_get_uint16(request_cursor, &blob_offset);
+    prc |= evpl_iovec_cursor_try_get_uint16(request_cursor, &blob_length);
+
+    if (unlikely(prc)) {
+        chimera_smb_error("Received SMB2 READ request truncated in fixed body");
+        return chimera_smb_parse_reject(request, SMB2_STATUS_INVALID_PARAMETER);
+    }
 
     if (request->read.channel == SMB2_CHANNEL_RDMA_V1) {
-        evpl_iovec_cursor_skip(request_cursor, blob_offset - evpl_iovec_cursor_consumed(request_cursor));
+        if (unlikely(smb_cursor_seek_to(request_cursor, blob_offset) != 0)) {
+            chimera_smb_error("Received SMB2 READ with RDMA channel offset out of range");
+            return chimera_smb_parse_reject(request, SMB2_STATUS_INVALID_PARAMETER);
+        }
 
         request->read.num_rdma_elements = blob_length >> 4;
 
@@ -218,9 +283,14 @@ chimera_smb_parse_read(
         }
 
         for (i = 0; i < request->read.num_rdma_elements; i++) {
-            evpl_iovec_cursor_get_uint64(request_cursor, &request->read.rdma_elements[i].offset);
-            evpl_iovec_cursor_get_uint32(request_cursor, &request->read.rdma_elements[i].token);
-            evpl_iovec_cursor_get_uint32(request_cursor, &request->read.rdma_elements[i].length);
+            prc |= evpl_iovec_cursor_try_get_uint64(request_cursor, &request->read.rdma_elements[i].offset);
+            prc |= evpl_iovec_cursor_try_get_uint32(request_cursor, &request->read.rdma_elements[i].token);
+            prc |= evpl_iovec_cursor_try_get_uint32(request_cursor, &request->read.rdma_elements[i].length);
+        }
+
+        if (unlikely(prc)) {
+            chimera_smb_error("Received SMB2 READ with RDMA descriptor list past message");
+            return chimera_smb_parse_reject(request, SMB2_STATUS_INVALID_PARAMETER);
         }
     }
 

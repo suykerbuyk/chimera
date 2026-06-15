@@ -23,20 +23,29 @@
  * intent log will replace; this is where on-disk durability hooks in.
  */
 
-#define SM_BLOCK_SHIFT       12
-#define SM_BLOCK_SIZE        (1ULL << SM_BLOCK_SHIFT)
-#define SM_BLOCK_MASK        (SM_BLOCK_SIZE - 1)
+#define SM_BLOCK_SHIFT            12
+#define SM_BLOCK_SIZE             (1ULL << SM_BLOCK_SHIFT)
+#define SM_BLOCK_MASK             (SM_BLOCK_SIZE - 1)
 
-#define SM_AG_SIZE_LOG2      30                             /* 1 GiB */
-#define SM_AG_SIZE           (1ULL << SM_AG_SIZE_LOG2)
-#define SM_AG_OFFSET_MASK    (SM_AG_SIZE - 1)
+#define SM_AG_SIZE_LOG2           30                        /* 1 GiB */
+#define SM_AG_SIZE                (1ULL << SM_AG_SIZE_LOG2)
+#define SM_AG_OFFSET_MASK         (SM_AG_SIZE - 1)
 
-#define SM_SUPERBLOCK_OFFSET 0
-#define SM_SUPERBLOCK_SIZE   4096
-#define SM_SUPERBLOCK_MAGIC  0x4D5346534B534944ULL          /* "DISKSFSM" */
-#define SM_FORMAT_VERSION    1
+#define SM_SUPERBLOCK_OFFSET      0
+#define SM_SUPERBLOCK_SIZE        4096
+#define SM_SUPERBLOCK_MAGIC       0x4D5346534B534944ULL     /* "DISKSFSM" */
+#define SM_FORMAT_VERSION         2
 
-#define SM_RESERVATION_MIN   (1ULL << 20)                   /* 1 MiB */
+/*
+ * Bootstrap inode blocks carved after AG 0's log on device 0 at format time:
+ * block_idx 1 is reserved (inum 1 invalid by convention), 2 is the root
+ * inode, and the next SM_BOOTSTRAP_ORPHAN_SLOTS blocks (inums 3..) are the
+ * sharded orphan-list inodes (diskfs spreads deleted-inode records across
+ * them so unlinks don't serialize on one inode's write lock).
+ */
+#define SM_BOOTSTRAP_ORPHAN_SLOTS 16
+
+#define SM_RESERVATION_MIN        (1ULL << 20)              /* 1 MiB */
 
 #define SM_ALIGN_UP(x) (((x) + SM_BLOCK_MASK) & ~SM_BLOCK_MASK)
 
@@ -53,16 +62,16 @@
  * 0 we reserve block_idx == 1 at format time so the very first allocation
  * lands at block_idx == 2 (= inum 2 = the root inode).
  */
-#define SM_INUM_INDEX_BITS   32
-#define SM_INUM_AG_BITS      24
-#define SM_INUM_DISK_BITS    8
+#define SM_INUM_INDEX_BITS        32
+#define SM_INUM_AG_BITS           24
+#define SM_INUM_DISK_BITS         8
 
-#define SM_INUM_INDEX_MASK   ((1ULL << SM_INUM_INDEX_BITS) - 1)
-#define SM_INUM_AG_MASK      ((1ULL << SM_INUM_AG_BITS)    - 1)
-#define SM_INUM_DISK_MASK    ((1ULL << SM_INUM_DISK_BITS)  - 1)
+#define SM_INUM_INDEX_MASK        ((1ULL << SM_INUM_INDEX_BITS) - 1)
+#define SM_INUM_AG_MASK           ((1ULL << SM_INUM_AG_BITS)    - 1)
+#define SM_INUM_DISK_MASK         ((1ULL << SM_INUM_DISK_BITS)  - 1)
 
-#define SM_INUM_AG_SHIFT     SM_INUM_INDEX_BITS
-#define SM_INUM_DISK_SHIFT   (SM_INUM_INDEX_BITS + SM_INUM_AG_BITS)
+#define SM_INUM_AG_SHIFT          SM_INUM_INDEX_BITS
+#define SM_INUM_DISK_SHIFT        (SM_INUM_INDEX_BITS + SM_INUM_AG_BITS)
 
 /*
  * Each AG carves a fixed prefix off the front of its data range for its
@@ -71,9 +80,14 @@
  * fragmentation of a 1 GiB AG with 4 KiB blocks (~2 MiB per snapshot) with
  * comfortable headroom.
  */
-#define SM_AG_LOG_SLOT_SIZE  (4ULL << 20)  /* 4 MiB */
-#define SM_AG_LOG_SLOT_COUNT 2
-#define SM_AG_LOG_SIZE       (SM_AG_LOG_SLOT_SIZE * SM_AG_LOG_SLOT_COUNT)
+#define SM_AG_LOG_SLOT_SIZE       (4ULL << 20) /* 4 MiB */
+#define SM_AG_LOG_SLOT_COUNT      2
+#define SM_AG_LOG_SIZE            (SM_AG_LOG_SLOT_SIZE * SM_AG_LOG_SLOT_COUNT)
+
+/* Free headroom (bytes) left in a slot's delta region when runtime
+ * condensation is triggered; new journaling parks behind the condense, so
+ * this is margin against the hard-full abort, not a budget that fills. */
+#define SM_AG_LOG_CONDENSE_MARGIN (64ULL << 10)
 
 /*
  * On-disk per-AG allocation log.  Each slot begins with this header, followed
@@ -87,10 +101,10 @@
  * no separate checksum -- a torn condensation simply leaves the older slot
  * live.
  */
-#define SM_AG_LOG_MAGIC      0x474F4C47414B5344ULL     /* "DSKAGLOG" */
+#define SM_AG_LOG_MAGIC           0x474F4C47414B5344ULL /* "DSKAGLOG" */
 
-#define SM_AG_LOG_OP_ALLOC   0u /* [offset,len) was handed out: remove from free */
-#define SM_AG_LOG_OP_FREE    1u /* [offset,len) was returned:   add to free */
+#define SM_AG_LOG_OP_ALLOC        0u /* [offset,len) was handed out: remove from free */
+#define SM_AG_LOG_OP_FREE         1u /* [offset,len) was returned:   add to free */
 
 struct sm_ag_log_header {
     uint64_t magic;
@@ -129,6 +143,20 @@ struct sm_journal {
         uint32_t device_id,
         uint64_t device_offset,
         int      is_new);
+    /* The AG's active log slot hit its high-water mark: schedule a runtime
+     * condensation (background; see space_map_condense_prepare/commit).
+     * Called once per condensation cycle, under the AG lock. */
+    void  (*ag_condense)(
+        void    *user,
+        uint32_t device_id,
+        uint32_t ag_index);
+    /* The AG is condensing: park the current operation's continuation; it is
+     * re-driven when the condensation commits.  Called under the AG lock
+     * (park on a caller-side list; do not call back into the space map). */
+    void  (*ag_park)(
+        void    *user,
+        uint32_t device_id,
+        uint32_t ag_index);
     void *user;
 };
 
@@ -209,6 +237,12 @@ struct sm_superblock {
     uint32_t remote_log_device;     /* device holding relocated logs (== 0) */
     uint64_t remote_log_offset;     /* region base on remote_log_device */
     uint64_t remote_log_size;       /* total region bytes */
+    /* Inode-generation floor: every generation ever issued by this filesystem
+     * is below this value, persisted with reserve-ahead so a crash can never
+     * re-issue a generation (which would let a stale file handle resolve to a
+     * reused inode block).  diskfs owns the semantics; see the gen allocator
+     * there. */
+    uint64_t gen_floor;
     /* Remainder of the 4 KiB block is implicit zero padding. */
 };
 
@@ -290,6 +324,11 @@ struct sm_ag {
     uint64_t        log_generation;  /* generation of the active slot */
     uint32_t        log_base_count;  /* condensed base extents in the active slot */
     uint32_t        log_delta_count; /* deltas appended since the last condense */
+
+    /* Runtime condensation gate (protected by lock): while set, every
+     * journaling operation parks (jnl->ag_park) until the background
+     * condense commits the inactive slot and flips. */
+    int             condensing;
 };
 
 struct sm_device {
@@ -309,8 +348,14 @@ struct space_map {
     struct sm_device *devices;
     uint32_t          num_devices;
     uint32_t          device_rotor;
-    uint64_t          total_capacity;
-    uint64_t          used_bytes;     /* atomic accounting for statfs */
+    uint64_t          total_capacity;  /* raw sum of device sizes */
+    uint64_t          usable_capacity; /* allocatable total (sum of AG data
+                                        * ranges, metadata excluded); constant
+                                        * after create.  Free/used for statfs are
+                                        * derived on demand from the AGs' live
+                                        * free counts -- see space_map_free_bytes
+                                        * -- so the alloc/free hot path keeps no
+                                        * running counter. */
     pthread_mutex_t   lock;           /* protects rotors and journaled writes */
 
     /* Relocated remote-AG-log region on device 0 (block mode); zero if no
@@ -348,11 +393,14 @@ space_map_destroy(
 #define SM_AGAIN 1
 
 /*
- * Ensure the thread's reservation cache holds at least min_bytes of contiguous
- * space, refilling (journals + may SM_AGAIN) if short.  Hands out nothing;
- * callers use it to front-load the journaling/suspension of a metadata op
- * before a non-suspendable section (e.g. a b+tree modify) so the subsequent
- * allocs are pure cache draws.  0 = covered, -1 = ENOSPC, SM_AGAIN = parked.
+ * Ensure the cache holds at least min_bytes of contiguous space, refilling
+ * (journals + may SM_AGAIN) if short.  Hands out nothing; callers use it to
+ * front-load the journaling/suspension of a metadata op before a non-suspendable
+ * section (e.g. a b+tree modify) so the subsequent allocs are pure cache draws.
+ * `floor` is the minimum reservation to grab when refilling (the over-reserve
+ * amount that batches future small allocs); pass SM_RESERVATION_MIN for the
+ * batched behaviour or 0 for an exact reservation (no retained tail).
+ * 0 = covered, -1 = ENOSPC, SM_AGAIN = parked.
  */
 int
 space_map_reserve(
@@ -360,11 +408,13 @@ space_map_reserve(
     struct sm_thread_cache  *cache,
     const struct sm_journal *jnl,
     uint32_t                 role,
-    uint64_t                 min_bytes);
+    uint64_t                 min_bytes,
+    uint64_t                 floor);
 
 /* `role` (SM_DEV_LOCAL/SM_DEV_REMOTE) restricts the allocation to devices of
  * that class: block mode places metadata on LOCAL and data on REMOTE devices.
- * With no remote devices everything is LOCAL (today's single-pool behavior). */
+ * With no remote devices everything is LOCAL (today's single-pool behavior).
+ * `floor` is the over-reserve minimum (see space_map_reserve). */
 int
 space_map_alloc(
     struct space_map        *sm,
@@ -372,6 +422,7 @@ space_map_alloc(
     const struct sm_journal *jnl,
     uint32_t                 role,
     uint64_t                 size,
+    uint64_t                 floor,
     uint32_t                *r_device_id,
     uint64_t                *r_device_offset);
 
@@ -413,6 +464,23 @@ space_map_thread_cache_return(
     struct sm_thread_cache  *cache);
 
 /*
+ * Format a complete superblock image (including CRC) into buf, which must be
+ * SM_SUPERBLOCK_SIZE bytes.  Used by space_map_write_superblock and by the
+ * runtime generation-floor extension, which writes the block through a live
+ * worker's block queue instead of the mount-time bridge.
+ */
+void
+space_map_fill_superblock(
+    struct space_map *sm,
+    void             *buf,
+    uint64_t          fsid,
+    uint64_t          flags,
+    uint64_t          root_inum,
+    uint32_t          root_gen,
+    uint64_t          log_seq,
+    uint64_t          gen_floor);
+
+/*
  * Write a stub superblock to offset 0 of device 0 through the mount-time
  * I/O bridge (async evpl_block, pumped to completion + flushed).  Done at
  * format/unmount time before worker threads exist.
@@ -425,7 +493,29 @@ space_map_write_superblock(
     uint64_t            flags,
     uint64_t            root_inum,
     uint32_t            root_gen,
-    uint64_t            log_seq);
+    uint64_t            log_seq,
+    uint64_t            gen_floor);
+
+/* Runtime AG-log condensation (see the implementation for the full
+ * protocol): prepare snapshots the free set as a new base image for the
+ * inactive slot; after the caller writes the image (header block last, FUA),
+ * commit flips the slot and re-opens journaling.  base_count comes from the
+ * image header. */
+int
+space_map_condense_prepare(
+    struct space_map *sm,
+    uint32_t          device_id,
+    uint32_t          ag_index,
+    void             *buf,
+    uint64_t         *r_slot_offset,
+    uint64_t         *r_payload);
+
+void
+space_map_condense_commit(
+    struct space_map *sm,
+    uint32_t          device_id,
+    uint32_t          ag_index,
+    uint32_t          base_count);
 
 /* Read + validate the superblock from device 0; 0 on success (fills *out),
  * -1 if absent/corrupt/wrong-version (caller should mkfs). */
@@ -458,10 +548,18 @@ space_map_total_capacity(const struct space_map *sm)
 } // space_map_total_capacity
 
 static inline uint64_t
-space_map_used_bytes(const struct space_map *sm)
+space_map_usable_capacity(const struct space_map *sm)
 {
-    return __atomic_load_n(&sm->used_bytes, __ATOMIC_RELAXED);
-} // space_map_used_bytes
+    return sm->usable_capacity;
+} // space_map_usable_capacity
+
+/* Live free byte count, summed from the allocation groups (cold path -- statfs
+ * only).  Computed on demand so the alloc/free fast path maintains no counter.
+ * Space held in a thread's reservation cache (carved from an AG but not yet
+ * handed to a file) reads as not-free, so the report is conservative. */
+uint64_t
+space_map_free_bytes(
+    struct space_map *sm);
 
 static inline uint64_t
 sm_inum_make(

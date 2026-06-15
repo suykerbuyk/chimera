@@ -12,6 +12,10 @@ if (SQLITE_ENABLED)
     target_link_libraries(vfs_kv_test chimera_vfs_sqlite)
     target_compile_definitions(vfs_kv_test PRIVATE CHIMERA_KV_TEST_SQLITE=1)
 endif()
+if (CAIRN_ENABLED)
+    target_link_libraries(vfs_kv_test chimera_vfs_cairn)
+    target_compile_definitions(vfs_kv_test PRIVATE CHIMERA_KV_TEST_CAIRN=1)
+endif()
 add_test(chimera/vfs/kv_test vfs_kv_test)
 
 add_executable(vfs_async_delegation_test vfs_async_delegation_test.c)
@@ -47,3 +51,14 @@ add_test(chimera/vfs/idmap_test vfs_idmap_test)
 add_executable(vfs_identity_test vfs_identity_test.c)
 target_link_libraries(vfs_identity_test chimera_vfs chimera_vfs_memfs evpl urcu-qsbr)
 add_test(chimera/vfs/identity_test vfs_identity_test)
+
+add_executable(vfs_statfs_mask_test vfs_statfs_mask_test.c)
+target_link_libraries(vfs_statfs_mask_test chimera_vfs chimera_vfs_memfs chimera_vfs_memkv evpl urcu-qsbr)
+add_test(chimera/vfs/statfs_mask_test vfs_statfs_mask_test)
+
+# Tag every test registered above with the 'vfs' label so the suite can be run
+# independently via `ctest -L vfs`.
+get_property(_vfs_tests DIRECTORY PROPERTY TESTS)
+if(_vfs_tests)
+    set_property(TEST ${_vfs_tests} APPEND PROPERTY LABELS vfs)
+endif()

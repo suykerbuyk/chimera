@@ -48,6 +48,7 @@ struct chimera_server_config {
     int                                   nfs_tcp_rdma_port;
     int                                   nfs_lockmgr_port;
     int                                   nfs_port;
+    int                                   s3_port;
     int                                   nfs_data_server;
     uint64_t                              nfs_server_scope;
     int                                   external_portmap;
@@ -60,8 +61,11 @@ struct chimera_server_config {
     int                                   async_delegation;
     int                                   async_delegation_threads;
     int                                   cache_ttl;
+    int                                   rcu_reclaim_threads;
     int                                   nfs4_session_slots;
     int                                   nfs4_delegations;
+    int                                   nfs4_drc;
+    int                                   nfs3_drc;
     uint32_t                              nfs4_lease_time_s;
     uint32_t                              nfs4_grace_time_s;
     uint32_t                              nfs4_courtesy_time_s;
@@ -73,10 +77,13 @@ struct chimera_server_config {
     int                                   smb_num_dialects;
     uint32_t                              smb_dialects[16];
     int                                   smb_persistent_handles;
+    int                                   smb_directory_leases;
     int                                   smb_named_streams;
     int                                   smb_signing_required;
     int                                   smb_encryption;
     int                                   smb_compression;
+    int                                   smb_leases;
+    int                                   smb_oplocks;
     int                                   smb_notify_disabled;
     int                                   smb_acl_inherited_canonicalize;
     int                                   smb_num_nic_info;
@@ -160,6 +167,12 @@ chimera_server_config_init(void)
      * opt-in feature gated by the "smb_persistent_handles" config flag. */
     config->smb_persistent_handles = 0;
 
+    /* SMB3 directory leases are off by default; they are an opt-in feature
+     * gated by the "smb_directory_leases" config flag.  When enabled the server
+     * advertises SMB2_GLOBAL_CAP_DIRECTORY_LEASING and grants R/H leases on
+     * directory opens (SMB 3.0+, RqLs v2 only). */
+    config->smb_directory_leases = 0;
+
     /* Named streams (SMB ADS) are off by default; opt-in via the
      * "smb_named_streams" config flag and only honored on backends that
      * advertise CHIMERA_VFS_CAP_NAMED_STREAMS. */
@@ -177,6 +190,14 @@ chimera_server_config_init(void)
     /* SMB3 transport compression is off by default; the "smb_compression" flag
      * enables (1) advertising/using it. */
     config->smb_compression = 0;
+
+    /* SMB2 leases (RqLs) and legacy SMB oplocks are off by default: the server
+     * grants neither, so clients run uncached (every op hits the server) and no
+     * lease/oplock break can stall a conflicting open.  Opt in via the
+     * "smb_leases" / "smb_oplocks" config flags; the smbtorture and WPTS test
+     * harnesses enable them to exercise the leasing/oplock suites. */
+    config->smb_leases  = 0;
+    config->smb_oplocks = 0;
 
     /* CHANGE_NOTIFY is enabled by default; the "smb_notify_disabled" flag makes
      * the server reject CHANGE_NOTIFY with STATUS_NOT_IMPLEMENTED. */
@@ -208,6 +229,7 @@ chimera_server_config_init(void)
     /* NFS service port (default 2049); data-server mode binds only the NFSv4
      * service so a pNFS data server can coexist with an MDS on one host. */
     config->nfs_port        = 2049;
+    config->s3_port         = 5000;
     config->nfs_data_server = 0;
 
     /* NFSv4.1 server identity (EXCHANGE_ID eir_server_scope).  Clients treat two
@@ -220,6 +242,14 @@ chimera_server_config_init(void)
     config->nfs_server_scope = 42;
 
     config->cache_ttl = 60;
+
+    /* Number of liburcu call_rcu reclaim worker threads.  0 (the default) means
+     * one worker per CPU (create_all_cpu_call_rcu_data) to keep RCU reclaim up
+     * with per-request cache churn under heavy load.  On a many-core host that
+     * spawns hundreds of threads, which is wasteful for short-lived or
+     * lightly-loaded instances (memory, and process-teardown cost); set a small
+     * positive value (e.g. the CI test daemons) to cap the worker count. */
+    config->rcu_reclaim_threads = 0;
 
     /* Default NFSv4.1 fore-channel session slots (server cap on the number
      * of concurrent SEQUENCE requests a client may have outstanding per
@@ -234,7 +264,22 @@ chimera_server_config_init(void)
      * default.  When off, every OPEN returns OPEN_DELEGATE_NONE and the
      * callback channel is never established.  Distinct from the VFS
      * sync_delegation/async_delegation thread-pool knobs above. */
-    config->nfs4_delegations     = 0;
+    config->nfs4_delegations = 0;
+
+    /* Persistent reply cache (DRC) is disabled by default.  When on, the
+     * NFSv4.1 per-session reply cache is written through to the KV store and
+     * the server advertises CREATE_SESSION4_FLAG_PERSIST, so a client's
+     * retransmit of a non-idempotent op replays its cached reply across a
+     * server restart.  Recovery-record persistence is independent and always
+     * on. */
+    config->nfs4_drc = 0;
+    /* NFSv3 duplicate-request cache.  Default off.  When enabled, the reply of
+     * a non-idempotent NFSv3 op is captured and (if kv_module is persistent)
+     * written through to the KV store keyed by {client, xid, proc, checksum},
+     * so a retransmit after a server restart replays the cached reply instead
+     * of re-executing.  There is no session and no on-wire advertisement -- the
+     * cache is transparent to the client. */
+    config->nfs3_drc             = 0;
     config->nfs4_lease_time_s    = NFS4_LEASE_TIME_DEFAULT_S;
     config->nfs4_grace_time_s    = NFS4_GRACE_TIME_DEFAULT_S;
     config->nfs4_courtesy_time_s = NFS4_COURTESY_TIME_DEFAULT_S;
@@ -332,6 +377,20 @@ chimera_server_config_get_smb_persistent_handles(const struct chimera_server_con
 } /* chimera_server_config_get_smb_persistent_handles */
 
 SYMBOL_EXPORT void
+chimera_server_config_set_smb_directory_leases(
+    struct chimera_server_config *config,
+    int                           enable)
+{
+    config->smb_directory_leases = enable;
+} /* chimera_server_config_set_smb_directory_leases */
+
+SYMBOL_EXPORT int
+chimera_server_config_get_smb_directory_leases(const struct chimera_server_config *config)
+{
+    return config->smb_directory_leases;
+} /* chimera_server_config_get_smb_directory_leases */
+
+SYMBOL_EXPORT void
 chimera_server_config_set_smb_named_streams(
     struct chimera_server_config *config,
     int                           enable)
@@ -386,6 +445,34 @@ chimera_server_config_get_smb_compression(const struct chimera_server_config *co
 {
     return config->smb_compression;
 } /* chimera_server_config_get_smb_compression */
+
+SYMBOL_EXPORT void
+chimera_server_config_set_smb_leases(
+    struct chimera_server_config *config,
+    int                           enabled)
+{
+    config->smb_leases = enabled;
+} /* chimera_server_config_set_smb_leases */
+
+SYMBOL_EXPORT int
+chimera_server_config_get_smb_leases(const struct chimera_server_config *config)
+{
+    return config->smb_leases;
+} /* chimera_server_config_get_smb_leases */
+
+SYMBOL_EXPORT void
+chimera_server_config_set_smb_oplocks(
+    struct chimera_server_config *config,
+    int                           enabled)
+{
+    config->smb_oplocks = enabled;
+} /* chimera_server_config_set_smb_oplocks */
+
+SYMBOL_EXPORT int
+chimera_server_config_get_smb_oplocks(const struct chimera_server_config *config)
+{
+    return config->smb_oplocks;
+} /* chimera_server_config_get_smb_oplocks */
 
 SYMBOL_EXPORT void
 chimera_server_config_set_smb_notify_disabled(
@@ -463,6 +550,14 @@ chimera_server_config_get_cache_ttl(const struct chimera_server_config *config)
 } /* chimera_server_config_get_cache_ttl */
 
 SYMBOL_EXPORT void
+chimera_server_config_set_rcu_reclaim_threads(
+    struct chimera_server_config *config,
+    int                           threads)
+{
+    config->rcu_reclaim_threads = threads;
+} /* chimera_server_config_set_rcu_reclaim_threads */
+
+SYMBOL_EXPORT void
 chimera_server_config_set_nfs4_session_slots(
     struct chimera_server_config *config,
     int                           slots)
@@ -489,6 +584,34 @@ chimera_server_config_get_nfs4_delegations(const struct chimera_server_config *c
 {
     return config->nfs4_delegations;
 } /* chimera_server_config_get_nfs4_delegations */
+
+SYMBOL_EXPORT void
+chimera_server_config_set_nfs4_drc(
+    struct chimera_server_config *config,
+    int                           enable)
+{
+    config->nfs4_drc = enable;
+} /* chimera_server_config_set_nfs4_drc */
+
+SYMBOL_EXPORT int
+chimera_server_config_get_nfs4_drc(const struct chimera_server_config *config)
+{
+    return config->nfs4_drc;
+} /* chimera_server_config_get_nfs4_drc */
+
+SYMBOL_EXPORT void
+chimera_server_config_set_nfs3_drc(
+    struct chimera_server_config *config,
+    int                           enable)
+{
+    config->nfs3_drc = enable;
+} /* chimera_server_config_set_nfs3_drc */
+
+SYMBOL_EXPORT int
+chimera_server_config_get_nfs3_drc(const struct chimera_server_config *config)
+{
+    return config->nfs3_drc;
+} /* chimera_server_config_get_nfs3_drc */
 
 SYMBOL_EXPORT void
 chimera_server_config_set_nfs4_lease_time(
@@ -610,6 +733,20 @@ chimera_server_config_get_nfs_port(const struct chimera_server_config *config)
 {
     return config->nfs_port;
 } /* chimera_server_config_get_nfs_port */
+
+SYMBOL_EXPORT void
+chimera_server_config_set_s3_port(
+    struct chimera_server_config *config,
+    int                           port)
+{
+    config->s3_port = port;
+} /* chimera_server_config_set_s3_port */
+
+SYMBOL_EXPORT int
+chimera_server_config_get_s3_port(const struct chimera_server_config *config)
+{
+    return config->s3_port;
+} /* chimera_server_config_get_s3_port */
 
 SYMBOL_EXPORT void
 chimera_server_config_set_nfs_data_server(
@@ -1467,6 +1604,20 @@ chimera_server_create_bucket(
 } /* chimera_server_create_bucket */
 
 SYMBOL_EXPORT int
+chimera_server_set_s3_bucket_root(
+    struct chimera_server *server,
+    const char            *bucket_root_path)
+{
+    if (!server->s3_shared) {
+        return -1;
+    }
+
+    chimera_s3_set_bucket_root(server->s3_shared, bucket_root_path);
+
+    return 0;
+} /* chimera_server_set_s3_bucket_root */
+
+SYMBOL_EXPORT int
 chimera_server_create_share(
     struct chimera_server *server,
     const char            *share_name,
@@ -1545,6 +1696,18 @@ chimera_server_thread_shutdown(
 
     chimera_rest_thread_destroy(thread->rest_thread);
 
+    /* Protocol thread_destroy can issue fresh VFS operations (e.g. the SMB
+     * durable/persistent handle drain releases parked opens, NFS releases
+     * state).  For a CAP_BLOCKING backend like cairn those are posted to a
+     * shared delegation thread and completed asynchronously back to *this*
+     * vfs_thread's doorbell.  Drain again so every such late request lands
+     * before we free the vfs_thread below -- otherwise the delegation thread
+     * rings (and writes to) an already-closed doorbell and dereferences the
+     * freed thread, aborting the server.  The delegation pool is still alive
+     * here; it is not torn down until chimera_vfs_destroy, after every protocol
+     * thread has joined. */
+    chimera_vfs_thread_drain(thread->vfs_thread);
+
     evpl_remove_timer(evpl, &thread->watchdog);
     chimera_vfs_thread_destroy(thread->vfs_thread);
     free(thread);
@@ -1599,6 +1762,7 @@ chimera_server_init(
                                    config->num_modules,
                                    config->kv_module,
                                    config->cache_ttl,
+                                   config->rcu_reclaim_threads,
                                    metrics);
 
     /* Propagate the common TCP flavor so VFS client modules (e.g. nfs)

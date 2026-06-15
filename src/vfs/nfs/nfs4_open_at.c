@@ -9,6 +9,8 @@
 struct chimera_nfs4_open_at_ctx {
     struct chimera_nfs_thread        *thread;
     struct chimera_nfs_client_server *server;
+    uint32_t                          attr_mask[2];
+    uint8_t                           attr_vals[128];
 };
 
 static void
@@ -34,7 +36,22 @@ chimera_nfs4_open_at_callback(
     }
 
     if (res->status != NFS4_OK) {
-        request->status = chimera_nfs4_status_to_errno(res->status);
+        /* OPEN of a symlink as the final component: the server rejects it with
+         * NFS4ERR_SYMLINK (there is no atomic O_NOFOLLOW on the wire, so the
+         * server cannot distinguish a data open of the link from a follow).
+         * When the caller asked for a *data* open with O_NOFOLLOW (not an
+         * O_PATH-style open of the link itself), POSIX open(2) must report ELOOP
+         * rather than the default EINVAL mapping (pjdfstest open/16).  This
+         * mirrors the NFS3 client open path.  A failing OPEN sets the whole
+         * COMPOUND's status to the op's error, so this must be handled here
+         * (before the generic mapping) rather than at the per-op check below. */
+        if (res->status == NFS4ERR_SYMLINK &&
+            (request->open_at.flags & CHIMERA_VFS_OPEN_NOFOLLOW) &&
+            !(request->open_at.flags & CHIMERA_VFS_OPEN_PATH)) {
+            request->status = CHIMERA_VFS_ELOOP;
+        } else {
+            request->status = chimera_nfs4_status_to_errno(res->status);
+        }
         request->complete(request);
         return;
     }
@@ -180,8 +197,10 @@ chimera_nfs4_open_at(
 
     open_args->seqid = 0; /* Sequence ID for open state - 0 for new opens */
 
-    /* Set share access based on flags */
-    if (request->open_at.flags & CHIMERA_VFS_OPEN_READ_ONLY) {
+    /* Set share access based on flags.  O_RDWR sets both READ_ONLY and
+     * WRITE_ONLY; only a pure read-only open requests READ share access. */
+    if ((request->open_at.flags & CHIMERA_VFS_OPEN_READ_ONLY) &&
+        !(request->open_at.flags & CHIMERA_VFS_OPEN_WRITE_ONLY)) {
         open_args->share_access = OPEN4_SHARE_ACCESS_READ;
     } else {
         open_args->share_access = OPEN4_SHARE_ACCESS_READ | OPEN4_SHARE_ACCESS_WRITE;
@@ -203,11 +222,25 @@ chimera_nfs4_open_at(
             open_args->openhow.how.mode = UNCHECKED4;
         }
 
-        /* Set create attributes */
-        open_args->openhow.how.createattrs.num_attrmask   = 0;
-        open_args->openhow.how.createattrs.attrmask       = NULL;
-        open_args->openhow.how.createattrs.attr_vals.len  = 0;
-        open_args->openhow.how.createattrs.attr_vals.data = NULL;
+        /* Set create attributes (mode/uid/gid) from the requested set_attr.
+         * For EXCLUSIVE4_1/EXCLUSIVE the verifier path is not used here; we
+         * pass the mode through GUARDED4/UNCHECKED4 createattrs. */
+        if (request->open_at.set_attr) {
+            int attr_len     = 0;
+            int num_attrmask = chimera_nfs4_marshall_createattrs(request->open_at.set_attr,
+                                                                 ctx->attr_mask,
+                                                                 ctx->attr_vals,
+                                                                 &attr_len);
+            open_args->openhow.how.createattrs.num_attrmask   = num_attrmask;
+            open_args->openhow.how.createattrs.attrmask       = num_attrmask ? ctx->attr_mask : NULL;
+            open_args->openhow.how.createattrs.attr_vals.len  = attr_len;
+            open_args->openhow.how.createattrs.attr_vals.data = attr_len ? ctx->attr_vals : NULL;
+        } else {
+            open_args->openhow.how.createattrs.num_attrmask   = 0;
+            open_args->openhow.how.createattrs.attrmask       = NULL;
+            open_args->openhow.how.createattrs.attr_vals.len  = 0;
+            open_args->openhow.how.createattrs.attr_vals.data = NULL;
+        }
     } else {
         open_args->openhow.opentype = OPEN4_NOCREATE;
     }

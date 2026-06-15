@@ -211,6 +211,22 @@ chimera_vfs_caching_grant_coalesce(
     struct chimera_vfs_lease_mode         want,
     int                                   upgrade_ok);
 
+/* Attempt a conflict-free in-place upgrade of `grant` to `want_granted`, for a
+ * DEFERRED open whose grant was capped by a holder that has since gone away (a
+ * CREATE parked on the ack-required break it triggered re-arbitrates here when
+ * the break resolves).  The upgrade is applied only when the grant is this
+ * deferred open's alone (refcount 1 — its capped state was never reported to
+ * the client, so no epoch bump or peer notification is owed), its lease is
+ * IDLE, `want_granted` is a strict superset of the current mode, and the larger
+ * mode is grantable without breaking any other owner's holder.  Returns the
+ * grant's resulting granted mode (upgraded or unchanged).  Caller must NOT
+ * hold file->lock. */
+uint8_t
+chimera_vfs_caching_grant_try_upgrade(
+    struct chimera_vfs_file_state    *file,
+    struct chimera_vfs_caching_grant *grant,
+    uint8_t                           want_granted);
+
 /* Link a freshly-created caching grant (whose embedded lease the caller has
  * already inserted via chimera_vfs_state_try_insert) into the per-file owner
  * index so later same-owner acquires coalesce onto it.  Caller must NOT hold
@@ -220,6 +236,15 @@ void
 chimera_vfs_caching_grant_link(
     struct chimera_vfs_file_state    *file,
     struct chimera_vfs_caching_grant *grant);
+
+/* Cap a fresh lease's requested mode to the largest subset grantable WITHOUT
+ * breaking another owner (MS-SMB2 3.3.5.9: granting a lease never recalls
+ * another lease).  Steps the candidate mode down W then H toward the R floor
+ * until it would be granted.  Caller must NOT hold file->lock. */
+uint8_t
+chimera_vfs_caching_grant_cap_mode(
+    struct chimera_vfs_file_state  *file,
+    const struct chimera_vfs_lease *lease);
 
 enum chimera_vfs_lease_result
 chimera_vfs_caching_grant_acquire(
@@ -472,6 +497,29 @@ chimera_vfs_state_break_on_write(
     uint8_t                               fh_len,
     uint64_t                              fh_hash,
     const struct chimera_vfs_lease_owner *writer);
+
+/* Break every SMB3 directory lease on the directory identified by (fh, fh_hash)
+* because the directory's contents changed (a child created / removed / renamed,
+* or a child's attributes changed).  A directory-lease content break is a single
+* RH -> "" downgrade to NONE (MS-SMB2): it strips handle caching too, so it is
+* ack-required and the lease stays BREAKING until the client acks (the normal
+* lease-break-ack path).  The client re-establishes its directory cache by
+* re-requesting the lease afterwards.
+*
+* `has_skip` + (`skip_lo`, `skip_hi`) name a lease owner key (an SMB LeaseKey)
+* to spare: the client that caused the change supplied a ParentLeaseKey naming a
+* directory lease whose cached view is coherent with the change, so it must not
+* be broken (MS-SMB2 directory-lease ParentLeaseKey self-exemption).  A leaseless
+* mutator (NFS/S3) passes has_skip == false and breaks every directory lease. */
+void
+chimera_vfs_state_dir_lease_break(
+    struct chimera_vfs_state *state,
+    const uint8_t            *fh,
+    uint8_t                   fh_len,
+    uint64_t                  fh_hash,
+    uint64_t                  skip_lo,
+    uint64_t                  skip_hi,
+    bool                      has_skip);
 
 /* Break-on-open: break caching leases held by a *different* owner on
  * (fh, fh_hash) when a conflicting open arrives.  `trigger_bits` selects which

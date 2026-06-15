@@ -11,6 +11,7 @@
 #include "vfs_rpl_cache.h"
 #include "vfs_mount_table.h"
 #include "vfs/vfs_procs.h"
+#include "vfs/vfs_state.h"
 #include "common/macros.h"
 
 /* ----------------------------------------------------------------
@@ -658,6 +659,22 @@ chimera_vfs_notify_watch_create(
     bucket  = &notify->buckets[bi];
 
     pthread_mutex_lock(&bucket->lock);
+    /* If this object was removed in the brief window before this watch was
+     * created (emit_delete ran first and found no watch to flag), inherit
+     * that deletion now so the first drain reports STATUS_DELETE_PENDING
+     * rather than parking forever.  The watch is not yet linked, so setting
+     * deleted without watch->lock is safe — no other thread can see it. */
+    for (int t = 0; t < CHIMERA_VFS_NOTIFY_TOMBSTONE_COUNT; t++) {
+        struct chimera_vfs_notify_tombstone *ts = &bucket->tombstones[t];
+
+        if (ts->stamp &&
+            ts->fh_len == dir_fh_len &&
+            memcmp(ts->fh, dir_fh, dir_fh_len) == 0 &&
+            chimera_vfs_elapsed_ns(ts->stamp) < CHIMERA_VFS_NOTIFY_TOMBSTONE_NS) {
+            watch->deleted = 1;
+            break;
+        }
+    }
     watch->next     = bucket->watches;
     bucket->watches = watch;
     pthread_mutex_unlock(&bucket->lock);
@@ -917,8 +934,8 @@ chimera_vfs_notify_watch_take_deleted(struct chimera_vfs_notify_watch *watch)
  *  inducing path is ever needed.
  */
 
-SYMBOL_EXPORT void
-chimera_vfs_notify_emit(
+static void
+chimera_vfs_notify_emit_body(
     struct chimera_vfs_notify *notify,
     const uint8_t             *dir_fh,
     uint16_t                   dir_fh_len,
@@ -1184,7 +1201,91 @@ chimera_vfs_notify_emit(
 
     /* Start the resolve chain */
     chimera_vfs_notify_resolve(pev);
+} /* chimera_vfs_notify_emit_body */
+
+/* A directory's contents/metadata just changed (a child added / removed /
+ * renamed, or a child's attributes set).  Break every SMB3 directory lease on
+ * that directory so a client caching its enumeration re-reads it — this is the
+ * cross-protocol coherency point: an NFS or S3 mutation breaks an SMB client's
+ * directory lease exactly as an SMB mutation does.  Run before taking any notify
+ * registry lock (the break brackets vfs_state's file lock entirely, so there is
+ * no nesting against bucket/mount locks — preserving the lock-order invariant
+ * documented above).  `has_skip` spares the lease named by a ParentLeaseKey the
+ * mutating client supplied (self-exemption); the no-skip wrapper breaks all. */
+static inline void
+chimera_vfs_notify_dir_lease_break(
+    struct chimera_vfs_notify *notify,
+    const uint8_t             *dir_fh,
+    uint16_t                   dir_fh_len,
+    uint64_t                   skip_lo,
+    uint64_t                   skip_hi,
+    bool                       has_skip)
+{
+    if (notify && notify->vfs && notify->vfs->vfs_state) {
+        chimera_vfs_state_dir_lease_break(notify->vfs->vfs_state,
+                                          dir_fh, dir_fh_len,
+                                          chimera_vfs_hash(dir_fh, dir_fh_len),
+                                          skip_lo, skip_hi, has_skip);
+    }
+} /* chimera_vfs_notify_dir_lease_break */
+
+SYMBOL_EXPORT void
+chimera_vfs_notify_emit(
+    struct chimera_vfs_notify *notify,
+    const uint8_t             *dir_fh,
+    uint16_t                   dir_fh_len,
+    uint32_t                   action,
+    const char                *name,
+    uint16_t                   name_len,
+    const char                *old_name,
+    uint16_t                   old_name_len)
+{
+    chimera_vfs_notify_dir_lease_break(notify, dir_fh, dir_fh_len, 0, 0, false);
+    chimera_vfs_notify_emit_body(notify, dir_fh, dir_fh_len, action,
+                                 name, name_len, old_name, old_name_len);
 } /* chimera_vfs_notify_emit */
+
+SYMBOL_EXPORT void
+chimera_vfs_notify_emit_lease(
+    struct chimera_vfs_notify *notify,
+    const uint8_t             *dir_fh,
+    uint16_t                   dir_fh_len,
+    uint32_t                   action,
+    const char                *name,
+    uint16_t                   name_len,
+    const char                *old_name,
+    uint16_t                   old_name_len,
+    uint64_t                   skip_lo,
+    uint64_t                   skip_hi,
+    bool                       has_skip)
+{
+    chimera_vfs_notify_dir_lease_break(notify, dir_fh, dir_fh_len,
+                                       skip_lo, skip_hi, has_skip);
+    chimera_vfs_notify_emit_body(notify, dir_fh, dir_fh_len, action,
+                                 name, name_len, old_name, old_name_len);
+} /* chimera_vfs_notify_emit_lease */
+
+SYMBOL_EXPORT void
+chimera_vfs_notify_emit_nobreak(
+    struct chimera_vfs_notify *notify,
+    const uint8_t             *dir_fh,
+    uint16_t                   dir_fh_len,
+    uint32_t                   action,
+    const char                *name,
+    uint16_t                   name_len,
+    const char                *old_name,
+    uint16_t                   old_name_len)
+{
+    /* Deliver the CHANGE_NOTIFY event WITHOUT breaking directory leases.  Used
+     * by the SMB create path when a create-capable disposition merely OPENED an
+     * existing file (no directory-content change): change-notify still emits the
+     * (conservative) FILE_ADDED, but a directory read lease must NOT break,
+     * because nothing in the directory actually changed (a re-open of an
+     * existing entry; smbtorture dirlease.rename re-opens the file before
+     * renaming it). */
+    chimera_vfs_notify_emit_body(notify, dir_fh, dir_fh_len, action,
+                                 name, name_len, old_name, old_name_len);
+} /* chimera_vfs_notify_emit_nobreak */
 
 SYMBOL_EXPORT void
 chimera_vfs_notify_emit_delete(
@@ -1223,6 +1324,23 @@ chimera_vfs_notify_emit_delete(
                 watch->callback(watch, watch->private_data);
             }
         }
+    }
+
+    /* Record a tombstone for this FH unconditionally — even when no watch
+     * currently matches.  A CHANGE_NOTIFY racing this delete may arm its
+     * watch a moment from now (the deleting client need not wait for the
+     * watcher's interim reply); watch_create consults these tombstones so
+     * that late-armed watch is born already-deleted instead of parking on
+     * an object that will never emit another event. */
+    {
+        struct chimera_vfs_notify_tombstone *ts =
+            &bucket->tombstones[bucket->tombstone_next];
+
+        memcpy(ts->fh, fh, fh_len);
+        ts->fh_len             = fh_len;
+        ts->stamp              = chimera_vfs_now_ticks();
+        bucket->tombstone_next =
+            (bucket->tombstone_next + 1) % CHIMERA_VFS_NOTIFY_TOMBSTONE_COUNT;
     }
 
     pthread_mutex_unlock(&bucket->lock);

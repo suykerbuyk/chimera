@@ -65,16 +65,24 @@ chimera_smb_write_callback(
          * stream's contents and size, so set the STREAM_WRITE/STREAM_SIZE
          * classes too — a watcher requesting only
          * FILE_NOTIFY_CHANGE_STREAM_{WRITE,SIZE} must still be notified
-         * (WPTS BVT_SMB2Basic_ChangeNotify_ChangeStream{Write,Size}). */
-        chimera_vfs_notify_emit(thread->shared->vfs->vfs_notify,
-                                request->write.open_file->parent_fh,
-                                request->write.open_file->parent_fh_len,
-                                CHIMERA_VFS_NOTIFY_FILE_MODIFIED |
-                                CHIMERA_VFS_NOTIFY_STREAM_WRITE |
-                                CHIMERA_VFS_NOTIFY_STREAM_SIZE,
-                                request->write.open_file->name,
-                                request->write.open_file->name_len,
-                                NULL, 0);
+         * (WPTS BVT_SMB2Basic_ChangeNotify_ChangeStream{Write,Size}).
+         *
+         * Deliver the change-notify event WITHOUT breaking the parent directory
+         * lease: a write's effect on the file's directory-visible metadata
+         * (size/mtime) is not observable until the handle closes, so the
+         * dir-lease content break is deferred to close (the open is flagged
+         * MODIFIED for chimera_smb_close to emit it).  MS-SMB2;
+         * dirlease.v2_request. */
+        chimera_vfs_notify_emit_nobreak(thread->shared->vfs->vfs_notify,
+                                        request->write.open_file->parent_fh,
+                                        request->write.open_file->parent_fh_len,
+                                        CHIMERA_VFS_NOTIFY_FILE_MODIFIED |
+                                        CHIMERA_VFS_NOTIFY_STREAM_WRITE |
+                                        CHIMERA_VFS_NOTIFY_STREAM_SIZE,
+                                        request->write.open_file->name,
+                                        request->write.open_file->name_len,
+                                        NULL, 0);
+        request->write.open_file->flags |= CHIMERA_SMB_OPEN_FILE_FLAG_MODIFIED;
     }
 
     /* A handle that explicitly set its write time has "taken control" of it:
@@ -164,6 +172,54 @@ chimera_smb_rdma_read_callback(
 
 
 
+/*
+ * DCE/RPC over a named pipe (ncacn_np), SMB2 WRITE leg: feed the written request
+ * PDU through the pipe's transceive handler and stash the response for the
+ * client's following SMB2 READ(s) to drain.  This is the WRITE/READ transport
+ * Windows and smbtorture use, distinct from the single-shot
+ * FSCTL_PIPE_TRANSCEIVE IOCTL transport.  A request PDU is assumed to arrive in
+ * one WRITE (true for the small LSARPC/SRVSVC calls in scope).
+ */
+static void
+chimera_smb_pipe_write(struct chimera_smb_request *request)
+{
+    struct chimera_server_smb_thread *thread    = request->compound->thread;
+    struct evpl                      *evpl      = thread->evpl;
+    struct chimera_smb_open_file     *open_file = request->write.open_file;
+    struct evpl_iovec                 output_iov;
+    int                               status;
+
+    evpl_iovec_alloc(evpl, 65535, 8, 1, 0, &output_iov);
+
+    status = open_file->pipe_transceive(request, request->write.iov,
+                                        request->write.niov, &output_iov);
+
+    evpl_iovecs_release(evpl, request->write.iov, request->write.niov);
+
+    if (unlikely(status != 0)) {
+        evpl_iovec_release(evpl, &output_iov);
+        chimera_smb_open_file_release(request, open_file);
+        chimera_smb_complete_request(request, SMB2_STATUS_INTERNAL_ERROR);
+        return;
+    }
+
+    /* Replace any still-undrained prior response, then copy the new PDU into a
+     * stable heap buffer (the evpl iovec is thread-local and released now). */
+    if (open_file->rpc_resp) {
+        free(open_file->rpc_resp);
+    }
+    open_file->rpc_resp_len = output_iov.length;
+    open_file->rpc_resp_off = 0;
+    open_file->rpc_resp     = malloc(output_iov.length ? output_iov.length : 1);
+    memcpy(open_file->rpc_resp, output_iov.data, output_iov.length);
+
+    evpl_iovec_release(evpl, &output_iov);
+    chimera_smb_open_file_release(request, open_file);
+
+    /* chimera_smb_write_reply reports request->write.length bytes accepted. */
+    chimera_smb_complete_request(request, SMB2_STATUS_SUCCESS);
+} /* chimera_smb_pipe_write */
+
 void
 chimera_smb_write(struct chimera_smb_request *request)
 {
@@ -181,6 +237,13 @@ chimera_smb_write(struct chimera_smb_request *request)
          * chimera_smb_write_callback is being skipped. */
         evpl_iovecs_release(evpl, request->write.iov, request->write.niov);
         chimera_smb_complete_request(request, SMB2_STATUS_FILE_CLOSED);
+        return;
+    }
+
+    /* Named-pipe FIDs carry no VFS handle; route RPC writes to the ncacn_np
+     * transport before any handle-backed file logic. */
+    if (request->write.open_file->type == CHIMERA_SMB_OPEN_FILE_TYPE_PIPE) {
+        chimera_smb_pipe_write(request);
         return;
     }
 
@@ -214,6 +277,17 @@ chimera_smb_write(struct chimera_smb_request *request)
         evpl_iovecs_release(evpl, request->write.iov, request->write.niov);
         chimera_smb_open_file_release(request, request->write.open_file);
         chimera_smb_complete_request(request, SMB2_STATUS_INVALID_PARAMETER);
+        return;
+    }
+
+    /* MS-SMB2 §3.3.5.2.10: a WRITE carrying a stale ChannelSequence (the client
+     * has since failed over to a higher sequence) must be rejected with
+     * FILE_NOT_AVAILABLE so a delayed retry cannot clobber newer data. */
+    if (chimera_smb_channel_sequence_stale(request->write.open_file,
+                                           request->channel_sequence, 1)) {
+        evpl_iovecs_release(evpl, request->write.iov, request->write.niov);
+        chimera_smb_open_file_release(request, request->write.open_file);
+        chimera_smb_complete_request(request, SMB2_STATUS_FILE_NOT_AVAILABLE);
         return;
     }
 
@@ -307,20 +381,30 @@ chimera_smb_parse_write(
     uint32_t     total_length;
     int          i;
 
-    evpl_iovec_cursor_get_uint16(request_cursor, &data_offset);
-    evpl_iovec_cursor_get_uint32(request_cursor, &request->write.length);
-    evpl_iovec_cursor_get_uint64(request_cursor, &request->write.offset);
-    evpl_iovec_cursor_get_uint64(request_cursor, &request->write.file_id.pid);
-    evpl_iovec_cursor_get_uint64(request_cursor, &request->write.file_id.vid);
-    evpl_iovec_cursor_get_uint32(request_cursor, &request->write.channel);
-    evpl_iovec_cursor_get_uint32(request_cursor, &request->write.remaining);
-    evpl_iovec_cursor_get_uint16(request_cursor, &blob_offset);
-    evpl_iovec_cursor_get_uint16(request_cursor, &blob_length);
-    evpl_iovec_cursor_get_uint32(request_cursor, &request->write.flags);
+    int          prc = 0;
+
+    prc |= evpl_iovec_cursor_try_get_uint16(request_cursor, &data_offset);
+    prc |= evpl_iovec_cursor_try_get_uint32(request_cursor, &request->write.length);
+    prc |= evpl_iovec_cursor_try_get_uint64(request_cursor, &request->write.offset);
+    prc |= evpl_iovec_cursor_try_get_uint64(request_cursor, &request->write.file_id.pid);
+    prc |= evpl_iovec_cursor_try_get_uint64(request_cursor, &request->write.file_id.vid);
+    prc |= evpl_iovec_cursor_try_get_uint32(request_cursor, &request->write.channel);
+    prc |= evpl_iovec_cursor_try_get_uint32(request_cursor, &request->write.remaining);
+    prc |= evpl_iovec_cursor_try_get_uint16(request_cursor, &blob_offset);
+    prc |= evpl_iovec_cursor_try_get_uint16(request_cursor, &blob_length);
+    prc |= evpl_iovec_cursor_try_get_uint32(request_cursor, &request->write.flags);
+
+    if (unlikely(prc)) {
+        chimera_smb_error("Received SMB2 WRITE request truncated in fixed body");
+        return chimera_smb_parse_reject(request, SMB2_STATUS_INVALID_PARAMETER);
+    }
 
     if (request->write.channel == SMB2_CHANNEL_RDMA_V1) {
 
-        evpl_iovec_cursor_skip(request_cursor, blob_offset - evpl_iovec_cursor_consumed(request_cursor));
+        if (unlikely(smb_cursor_seek_to(request_cursor, blob_offset) != 0)) {
+            chimera_smb_error("Received SMB2 WRITE with RDMA channel offset out of range");
+            return chimera_smb_parse_reject(request, SMB2_STATUS_INVALID_PARAMETER);
+        }
 
         request->write.num_rdma_elements = blob_length >> 4;
 
@@ -333,10 +417,15 @@ chimera_smb_parse_write(
         total_length = 0;
 
         for (i = 0; i < request->write.num_rdma_elements; i++) {
-            evpl_iovec_cursor_get_uint64(request_cursor, &request->write.rdma_elements[i].offset);
-            evpl_iovec_cursor_get_uint32(request_cursor, &request->write.rdma_elements[i].token);
-            evpl_iovec_cursor_get_uint32(request_cursor, &request->write.rdma_elements[i].length);
+            prc          |= evpl_iovec_cursor_try_get_uint64(request_cursor, &request->write.rdma_elements[i].offset);
+            prc          |= evpl_iovec_cursor_try_get_uint32(request_cursor, &request->write.rdma_elements[i].token);
+            prc          |= evpl_iovec_cursor_try_get_uint32(request_cursor, &request->write.rdma_elements[i].length);
             total_length += request->write.rdma_elements[i].length;
+        }
+
+        if (unlikely(prc)) {
+            chimera_smb_error("Received SMB2 WRITE with RDMA descriptor list past message");
+            return chimera_smb_parse_reject(request, SMB2_STATUS_INVALID_PARAMETER);
         }
 
         if (unlikely(total_length != request->write.remaining)) {
@@ -350,6 +439,16 @@ chimera_smb_parse_write(
         request->write.niov = evpl_iovec_alloc(evpl, request->write.length, 4096, 1, 0, request->write.iov);
 
     } else {
+        /* The payload sits at the client-declared DataOffset and must fit inside
+         * this request's window; otherwise the move would pull bytes from the
+         * next compound element or off the end of the received data. */
+        if (request->write.length > 0) {
+            if (unlikely(smb_cursor_seek_to(request_cursor, data_offset) != 0 ||
+                         request->write.length > (uint32_t) evpl_iovec_cursor_remaining(request_cursor))) {
+                chimera_smb_error("Received SMB2 WRITE with data offset/length out of range");
+                return chimera_smb_parse_reject(request, SMB2_STATUS_INVALID_PARAMETER);
+            }
+        }
         request->write.niov = evpl_iovec_cursor_move(request_cursor, request->write.iov, 256, request->write.length, 1);
     }
 
