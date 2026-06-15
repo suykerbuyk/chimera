@@ -131,6 +131,11 @@ chimera_smb_negotiate(struct chimera_smb_request *request)
     if (dialect >= 0x300 && shared->config.persistent_handles) {
         conn->capabilities |= SMB2_GLOBAL_CAP_PERSISTENT_HANDLES;
     }
+    /* Directory leasing is an SMB 3.0+ capability (MS-SMB2 §3.3.5.4); the
+     * server only grants R/H leases on directory opens when this is advertised. */
+    if (dialect >= 0x300 && shared->config.directory_leases) {
+        conn->capabilities |= SMB2_GLOBAL_CAP_DIRECTORY_LEASING;
+    }
     /* Encryption is advertised via SMB2_GLOBAL_CAP_ENCRYPTION for 3.0/3.0.2;
      * for 3.1.1 it is negotiated through the encryption-capabilities context
      * instead and the capability bit MUST NOT be set (MS-SMB2 §3.3.5.4). */
@@ -963,13 +968,13 @@ chimera_smb_select_negotiated_algorithms(
     if (conn->dialect == SMB2_DIALECT_3_1_1 &&
         conn->thread->shared->config.compression &&
         (request->negotiate.ctx_present_mask & CHIMERA_SMB_NEGOTIATE_CTX_COMPRESSION)) {
-        /* Algorithms Chimera implements (smb_compress.c).  Plain LZ77 is the
-         * primary codec; Pattern_V1 is only meaningful as a chained run-length
-         * payload but is supported so peers may send it.  LZ77+Huffman and LZNT1
-         * are not yet implemented and so not advertised — a peer can never select
-         * a codec we cannot decode. */
+        /* Algorithms Chimera implements (smb_compress.c).  LZ77, LZNT1 and
+         * LZ77+Huffman are full byte codecs; Pattern_V1 is only meaningful as a
+         * chained run-length payload but is supported so peers may send it. */
         static const uint16_t supported[] = {
             SMB2_COMPRESSION_LZ77,
+            SMB2_COMPRESSION_LZ77_HUFFMAN,
+            SMB2_COMPRESSION_LZNT1,
             SMB2_COMPRESSION_PATTERN_V1,
         };
         int                   i, j, n = 0;
@@ -1014,18 +1019,22 @@ chimera_smb_parse_negotiate(
         request->status = SMB2_STATUS_INVALID_PARAMETER;
         return -1;
     }
-    evpl_iovec_cursor_get_uint16(request_cursor, &request->negotiate.dialect_count);
-    {
-        uint16_t security_mode_wire;
-        evpl_iovec_cursor_get_uint16(request_cursor, &security_mode_wire);
-        request->negotiate.security_mode = (uint8_t) security_mode_wire;
+    int      prc = 0;
+    uint16_t security_mode_wire;
+    prc |= evpl_iovec_cursor_try_get_uint16(request_cursor, &request->negotiate.dialect_count);
+    prc |= evpl_iovec_cursor_try_get_uint16(request_cursor, &security_mode_wire);
+    prc |= evpl_iovec_cursor_try_skip(request_cursor, 2); /* Reserved */
+    prc |= evpl_iovec_cursor_try_get_uint32(request_cursor, &request->negotiate.capabilities);
+    prc |= evpl_iovec_cursor_try_copy(request_cursor, request->negotiate.client_guid, 16);
+    prc |= evpl_iovec_cursor_try_get_uint32(request_cursor, &request->negotiate.negotiate_context_offset);
+    prc |= evpl_iovec_cursor_try_get_uint16(request_cursor, &request->negotiate.negotiate_context_count);
+    prc |= evpl_iovec_cursor_try_skip(request_cursor, 2); /* Reserved2 */
+
+    if (unlikely(prc)) {
+        chimera_smb_error("Received SMB2 NEGOTIATE request truncated in fixed body");
+        return chimera_smb_parse_reject(request, SMB2_STATUS_INVALID_PARAMETER);
     }
-    evpl_iovec_cursor_skip(request_cursor, 2); /* Reserved */
-    evpl_iovec_cursor_get_uint32(request_cursor, &request->negotiate.capabilities);
-    evpl_iovec_cursor_copy(request_cursor, request->negotiate.client_guid, 16);
-    evpl_iovec_cursor_get_uint32(request_cursor, &request->negotiate.negotiate_context_offset);
-    evpl_iovec_cursor_get_uint16(request_cursor, &request->negotiate.negotiate_context_count);
-    evpl_iovec_cursor_skip(request_cursor, 2); /* Reserved2 */
+    request->negotiate.security_mode = (uint8_t) security_mode_wire;
 
     if (request->negotiate.dialect_count > SMB2_MAX_DIALECTS) {
         chimera_smb_error("Received SMB2 NEGOTIATE request with invalid dialect count (%u max %u)",
@@ -1036,36 +1045,40 @@ chimera_smb_parse_negotiate(
     }
 
     for (i = 0; i < request->negotiate.dialect_count; i++) {
-        evpl_iovec_cursor_get_uint16(request_cursor, &request->negotiate.dialects[i]);
+        prc |= evpl_iovec_cursor_try_get_uint16(request_cursor, &request->negotiate.dialects[i]);
+    }
+
+    if (unlikely(prc)) {
+        chimera_smb_error("Received SMB2 NEGOTIATE dialect array past message");
+        return chimera_smb_parse_reject(request, SMB2_STATUS_INVALID_PARAMETER);
     }
 
     request->negotiate.ctx_present_mask = 0;
 
     if (request->negotiate.negotiate_context_count) {
-        /* Reject a context list that starts before the bytes we've already
-         * consumed — without this, the uint32 subtraction below wraps and
-         * evpl_iovec_cursor_skip burns through the rest of the cursor. */
-        if (request->negotiate.negotiate_context_offset <
-            (uint32_t) evpl_iovec_cursor_consumed(request_cursor)) {
-            chimera_smb_error("Negotiate context offset %u precedes consumed bytes %d",
-                              request->negotiate.negotiate_context_offset,
-                              evpl_iovec_cursor_consumed(request_cursor));
-            request->status = SMB2_STATUS_INVALID_PARAMETER;
-            return -1;
+        /* Seek to the context list (validated forward and within the message);
+         * smb_cursor_seek_to subsumes the old precedes-consumed underflow guard. */
+        if (unlikely(smb_cursor_seek_to(request_cursor,
+                                        request->negotiate.negotiate_context_offset) != 0)) {
+            chimera_smb_error("Negotiate context offset %u out of range",
+                              request->negotiate.negotiate_context_offset);
+            return chimera_smb_parse_reject(request, SMB2_STATUS_INVALID_PARAMETER);
         }
-
-        evpl_iovec_cursor_skip(request_cursor,
-                               request->negotiate.negotiate_context_offset -
-                               evpl_iovec_cursor_consumed(request_cursor));
 
         for (i = 0; i < request->negotiate.negotiate_context_count; i++) {
             uint16_t type, length;
             uint8_t  data[512];
+            int      crc = 0;
 
-            evpl_iovec_cursor_align64(request_cursor);
-            evpl_iovec_cursor_get_uint16(request_cursor, &type);
-            evpl_iovec_cursor_get_uint16(request_cursor, &length);
-            evpl_iovec_cursor_skip(request_cursor, 4);  /* Reserved */
+            crc |= evpl_iovec_cursor_try_skip(request_cursor, (8 - (request_cursor->consumed & 7)) & 7);
+            crc |= evpl_iovec_cursor_try_get_uint16(request_cursor, &type);
+            crc |= evpl_iovec_cursor_try_get_uint16(request_cursor, &length);
+            crc |= evpl_iovec_cursor_try_skip(request_cursor, 4);  /* Reserved */
+
+            if (unlikely(crc)) {
+                chimera_smb_error("Negotiate context header truncated");
+                return chimera_smb_parse_reject(request, SMB2_STATUS_INVALID_PARAMETER);
+            }
 
             if (length > sizeof(data)) {
                 chimera_smb_error("Negotiate context length %u exceeds parser cap %zu",
@@ -1075,7 +1088,7 @@ chimera_smb_parse_negotiate(
             }
 
             if (length > 0) {
-                if (evpl_iovec_cursor_get_blob(request_cursor, data, length) != 0) {
+                if (evpl_iovec_cursor_try_copy(request_cursor, data, length) != 0) {
                     chimera_smb_error("Negotiate context body truncated (type=0x%04x len=%u)",
                                       type, length);
                     request->status = SMB2_STATUS_INVALID_PARAMETER;

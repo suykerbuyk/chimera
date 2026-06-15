@@ -403,14 +403,39 @@ main(
         }
     }
 
+    /* RCU reclaim worker count is also a VFS-level setting shared with the
+     * client; its canonical home is the "common" section. */
+    {
+        int rcu_threads = chimera_common_rcu_reclaim_threads(config);
+
+        if (rcu_threads >= 0) {
+            chimera_server_config_set_rcu_reclaim_threads(server_config, rcu_threads);
+        }
+    }
+
     json_value = json_object_get(server_params, "smb_persistent_handles");
     if (json_is_boolean(json_value)) {
         chimera_server_config_set_smb_persistent_handles(server_config, json_is_true(json_value));
     }
 
+    json_value = json_object_get(server_params, "smb_directory_leases");
+    if (json_is_boolean(json_value)) {
+        chimera_server_config_set_smb_directory_leases(server_config, json_is_true(json_value));
+    }
+
     json_value = json_object_get(server_params, "smb_named_streams");
     if (json_is_boolean(json_value)) {
         chimera_server_config_set_smb_named_streams(server_config, json_is_true(json_value));
+    }
+
+    json_value = json_object_get(server_params, "smb_leases");
+    if (json_is_boolean(json_value)) {
+        chimera_server_config_set_smb_leases(server_config, json_is_true(json_value));
+    }
+
+    json_value = json_object_get(server_params, "smb_oplocks");
+    if (json_is_boolean(json_value)) {
+        chimera_server_config_set_smb_oplocks(server_config, json_is_true(json_value));
     }
 
     /* smb_min_dialect: lowest SMB2 dialect to advertise ("2.0.2"|"2.1"|"3.0"|
@@ -485,6 +510,16 @@ main(
         chimera_server_config_set_nfs4_delegations(server_config, json_is_true(json_value));
     }
 
+    json_value = json_object_get(server_params, "nfs4_drc");
+    if (json_is_boolean(json_value)) {
+        chimera_server_config_set_nfs4_drc(server_config, json_is_true(json_value));
+    }
+
+    json_value = json_object_get(server_params, "nfs3_drc");
+    if (json_is_boolean(json_value)) {
+        chimera_server_config_set_nfs3_drc(server_config, json_is_true(json_value));
+    }
+
     json_value = json_object_get(server_params, "nfs4_lease_time");
     if (json_is_integer(json_value)) {
         int_value = json_integer_value(json_value);
@@ -555,6 +590,12 @@ main(
     if (json_is_integer(json_value)) {
         int_value = json_integer_value(json_value);
         chimera_server_config_set_nfs_port(server_config, int_value);
+    }
+
+    json_value = json_object_get(server_params, "s3_port");
+    if (json_is_integer(json_value)) {
+        int_value = json_integer_value(json_value);
+        chimera_server_config_set_s3_port(server_config, int_value);
     }
 
     /* NFSv4.1 server identity (EXCHANGE_ID server scope).  Set a distinct value
@@ -935,6 +976,33 @@ main(
             path = json_string_value(json_object_get(bucket, "path"));
             chimera_server_info("Adding S3 bucket %s -> %s", name, path);
             chimera_server_create_bucket(server, name, path);
+        }
+    }
+
+    /* The VFS path under which runtime CreateBucket requests materialize new
+     * bucket directories. Explicit "s3_bucket_root" wins; otherwise default to
+     * the first configured mount ("/<mount-name>"). Leave unset (runtime bucket
+     * creation disabled) if neither is available. */
+    {
+        const char *bucket_root = json_string_value(
+            json_object_get(config, "s3_bucket_root"));
+        char        default_root[256];
+
+        if (!bucket_root && mounts) {
+            const char *first_mount;
+            json_t     *mount_val;
+
+            json_object_foreach(mounts, first_mount, mount_val)
+            {
+                snprintf(default_root, sizeof(default_root), "/%s", first_mount);
+                bucket_root = default_root;
+                break;
+            }
+        }
+
+        if (bucket_root) {
+            chimera_server_info("S3 runtime bucket root: %s", bucket_root);
+            chimera_server_set_s3_bucket_root(server, bucket_root);
         }
     }
 

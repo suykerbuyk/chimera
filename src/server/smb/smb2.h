@@ -953,6 +953,21 @@ typedef uint8_t smb2_guid[SMB2_GUID_SIZE];
 #define SMB2_FILE_OPEN_NO_RECALL                    0x00400000
 #define SMB2_FILE_OPEN_FOR_FREE_SPACE_QUERY         0x00800000
 
+/* CreateOptions validation (MS-SMB2 2.2.13 / MS-FSA, matched against Windows;
+ * see smb2.create.gentest).  Bits 24-31 are undefined and rejected with
+ * STATUS_INVALID_PARAMETER; FILE_CREATE_TREE_CONNECTION (0x80, never sent by a
+ * client), FILE_OPEN_BY_FILE_ID and FILE_RESERVE_OPFILTER are defined but
+ * unsupported and rejected with STATUS_NOT_SUPPORTED. */
+#define SMB2_CREATE_OPTIONS_INVALID_MASK            0xff000000
+#define SMB2_CREATE_OPTIONS_UNSUPPORTED_MASK \
+        (0x00000080 | SMB2_FILE_OPEN_BY_FILE_ID | SMB2_FILE_RESERVE_OPFILTER)
+
+/* File attribute validation for CREATE (MS-FSCC 2.6; smb2.create.gentest).  The
+ * settable/valid attribute bits a CREATE may carry; any bit outside this set
+ * (e.g. FILE_ATTRIBUTE_VOLUME 0x08, FILE_ATTRIBUTE_DEVICE 0x40) is rejected with
+ * STATUS_INVALID_PARAMETER. */
+#define SMB2_CREATE_FILE_ATTR_VALID_MASK            0x00007fb7
+
 /* Create Action */
 #define SMB2_CREATE_ACTION_SUPERSEDED               0x00000000
 #define SMB2_CREATE_ACTION_OPENED                   0x00000001
@@ -1018,6 +1033,12 @@ typedef uint8_t smb2_guid[SMB2_GUID_SIZE];
 #define SMB2_FSCTL_SRV_COPYCHUNK_WRITE              0x001480F2
 #define SMB2_FSCTL_CREATE_OR_GET_OBJECT_ID          0x000900C0
 #define SMB2_FSCTL_SRV_ENUMERATE_SNAPSHOTS          0x00144064
+#define SMB2_FSCTL_LMR_REQUEST_RESILIENCY           0x001401D4
+
+/* Server policy for FSCTL_LMR_REQUEST_RESILIENCY: a Timeout of 0 selects the
+ * default; any larger request is capped at the maximum (MS-SMB2 3.3.5.15.9). */
+#define CHIMERA_SMB_RESILIENCY_DEFAULT_TIMEOUT_MS   120000U
+#define CHIMERA_SMB_RESILIENCY_MAX_TIMEOUT_MS       300000U
 
 #define SMB2_IO_REPARSE_TAG_NFS                     0x80000014
 #define SMB2_IO_REPARSE_TAG_SYMLINK                 0xA000000C
@@ -1082,7 +1103,15 @@ typedef uint8_t smb2_guid[SMB2_GUID_SIZE];
 #define SMB2_FILE_FS_SIZE_INFO                      3
 #define SMB2_FILE_FS_DEVICE_INFO                    4
 #define SMB2_FILE_FS_ATTRIBUTE_INFO                 5
+#define SMB2_FILE_FS_CONTROL_INFO                   6
 #define SMB2_FILE_FS_FULL_SIZE_INFO                 7
+#define SMB2_FILE_FS_OBJECTID_INFO                  8
+#define SMB2_FILE_FS_SECTOR_SIZE_INFO               11
+
+/* Fixed sizes for filesystem information classes (MS-FSCC 2.5) */
+#define SMB2_FILE_FS_CONTROL_INFO_SIZE              48
+#define SMB2_FILE_FS_OBJECTID_INFO_SIZE             64
+#define SMB2_FILE_FS_SECTOR_SIZE_INFO_SIZE          28
 
 /* FileFsAttributeInformation FileSystemAttributes flags */
 #define SMB2_FS_ATTR_CASE_SENSITIVE_SEARCH          0x00000001

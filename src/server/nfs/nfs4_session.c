@@ -10,6 +10,7 @@
 #include "nfs4_session.h"
 #include "nfs4_state.h"
 #include "nfs4_callback.h"
+#include "nfs4_drc.h"
 #include "nfs_internal.h"
 #include "nfs_nlm_state.h"
 #include "nfs_common.h"
@@ -913,7 +914,8 @@ nfs4_create_session(
     uint32_t                     replay_max_slots,
     uint32_t                     replay_maxresp_cached,
     const struct channel_attrs4 *fore_attrs,
-    const struct channel_attrs4 *back_attrs)
+    const struct channel_attrs4 *back_attrs,
+    const uint8_t               *restore_sessionid)
 {
     struct nfs4_client  *client  = NULL;
     struct nfs4_session *session = NULL;
@@ -935,7 +937,15 @@ nfs4_create_session(
         atomic_init(&session->refcount, 2);
         atomic_init(&session->destroyed, false);
 
-        uuid_generate(session->nfs4_session_id);
+        /* Cold-start reload reconstructs a session with its original id so a
+         * persistent client's retransmit on the old sessionid still resolves
+         * (see nfs4_drc_reload); the live path mints a fresh one. */
+        if (restore_sessionid) {
+            memcpy(session->nfs4_session_id, restore_sessionid,
+                   NFS4_SESSIONID_SIZE);
+        } else {
+            uuid_generate(session->nfs4_session_id);
+        }
 
         session->nfs4_session_implicit = implicit;
         session->nfs4_session_clientid = client_id;
@@ -1329,9 +1339,11 @@ nfs4_replay_slot_acquire(
                     memory_order_acq_rel, memory_order_acquire)) {
                 continue;  /* lost the race; re-read and re-evaluate */
             }
-            req->replay_slot    = slot;
-            req->replay_slot_id = slotid;
-            req->replay_action  = NFS4_REPLAY_ACTION_NEW;
+            req->replay_slot        = slot;
+            req->replay_slot_id     = slotid;
+            req->replay_action      = NFS4_REPLAY_ACTION_NEW;
+            slot->in_progress_since = nfs4_slot_now();
+            slot->last_stuck_report = 0;
             if (cachethis) {
                 nfs4_replay_arm_capture(req);
             }
@@ -1355,10 +1367,20 @@ nfs4_replay_slot_acquire(
                     slot->cached_len = 0;
                     atomic_fetch_sub_explicit(&session->replay_bytes_in_use,
                                               freed_bytes, memory_order_relaxed);
+                    /* The client acknowledged the prior seqid by advancing;
+                     * drop its persisted reply so the KV store keeps at most
+                     * one entry per slot (the in-memory invariant). */
+                    if (session->nfs4_session_persist && req->thread) {
+                        nfs4_drc_delete_reply(req->thread->vfs_thread,
+                                              session->nfs4_session_id,
+                                              slotid, cseq);
+                    }
                 }
-                req->replay_slot    = slot;
-                req->replay_slot_id = slotid;
-                req->replay_action  = NFS4_REPLAY_ACTION_NEW;
+                req->replay_slot        = slot;
+                req->replay_slot_id     = slotid;
+                req->replay_action      = NFS4_REPLAY_ACTION_NEW;
+                slot->in_progress_since = nfs4_slot_now();
+                slot->last_stuck_report = 0;
                 if (cachethis) {
                     nfs4_replay_arm_capture(req);
                 }
@@ -1384,6 +1406,27 @@ nfs4_replay_slot_acquire(
              * produce a reply yet.  Both paths return errors. */
             if (seqid == cseq) {
                 status = NFS4ERR_RETRY_UNCACHED_REP;
+                /* A retry landing on a slot that has been IN_PROGRESS for many
+                 * seconds means the original compound is wedged server-side;
+                 * the client will retry RETRY_UNCACHED_REP silently forever
+                 * (observed as fsstress writeback hanging in CI with 14k
+                 * errored WRITE RPCs and nothing in the server log).  Make the
+                 * wedge visible, rate-limited per slot. */
+                {
+                    time_t now = nfs4_slot_now();
+
+                    if (slot->in_progress_since &&
+                        now - slot->in_progress_since >= 5 &&
+                        now - slot->last_stuck_report >= 10) {
+                        slot->last_stuck_report = now;
+                        chimera_nfs_error(
+                            "nfs4 session slot %u seqid %u stuck IN_PROGRESS "
+                            "for %ld sec; replying RETRY_UNCACHED_REP "
+                            "(original compound has not completed)",
+                            slotid, seqid,
+                            (long) (now - slot->in_progress_since));
+                    }
+                }
             } else {
                 status = NFS4ERR_SEQ_MISORDERED;
             }
@@ -1438,10 +1481,23 @@ nfs4_replay_slot_finalize(struct nfs_request *req)
     if ((cur & NFS4_SLOT_STATE_MASK) == NFS4_SLOT_IN_PROGRESS) {
         enum nfs4_slot_state new_state = slot->cached_buf ?
             NFS4_SLOT_CACHED : NFS4_SLOT_COMPLETED;
+        uint32_t             fseqid = (uint32_t) (cur >> NFS4_SLOT_SEQID_SHIFT);
+
         atomic_store_explicit(&slot->state_word,
-                              nfs4_slot_word((uint32_t) (cur >> NFS4_SLOT_SEQID_SHIFT),
-                                             new_state),
+                              nfs4_slot_word(fseqid, new_state),
                               memory_order_release);
+
+        /* Write-through the cached reply to the KV store for a persistent
+         * session.  Write-only on the hot path: a copy of the bytes is handed
+         * to an async put; the in-memory slot stays authoritative for
+         * retransmit detection.  Cold start reloads these (nfs4_drc_reload).
+         * nfs4_session_persist is only set when nfs4_drc is enabled. */
+        if (new_state == NFS4_SLOT_CACHED && session->nfs4_session_persist &&
+            req->thread) {
+            nfs4_drc_persist_reply(req->thread->vfs_thread, session,
+                                   req->replay_slot_id, fseqid,
+                                   slot->cached_buf, slot->cached_len);
+        }
     }
 
     req->replay_slot = NULL;

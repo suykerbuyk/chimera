@@ -4,6 +4,9 @@
 
 set(CHIMERA_BINARY ${CMAKE_BINARY_DIR}/src/daemon/chimera)
 set(NFS_WRAPPER ${CMAKE_SOURCE_DIR}/kvm/kvm_nfs_test_wrapper.sh)
+set(NFS_REBOOT_WRAPPER ${CMAKE_SOURCE_DIR}/kvm/kvm_nfs_reboot_test_wrapper.sh)
+set(NFS3_DRC_REBOOT_WRAPPER ${CMAKE_SOURCE_DIR}/kvm/kvm_nfs3_drc_reboot_test_wrapper.sh)
+set(NFSTEST_WRAPPER ${CMAKE_SOURCE_DIR}/kvm/kvm_nfstest_test_wrapper.sh)
 set(SMB_WRAPPER ${CMAKE_SOURCE_DIR}/kvm/kvm_smb_test_wrapper.sh)
 set(PNFS_WRAPPER ${CMAKE_SOURCE_DIR}/kvm/kvm_pnfs_test_wrapper.sh)
 set(PNFS_BLOCK_WRAPPER ${CMAKE_SOURCE_DIR}/kvm/kvm_pnfs_block_test_wrapper.sh)
@@ -152,7 +155,22 @@ set(PNFS_PROXY_CMD_rw "mkdir -p /mnt/test && dd if=/dev/urandom of=/tmp/orig bs=
 # to the MDS, which recalls the layout from the proxy over its back channel; the
 # proxy fences DS I/O and the truncate completes.  The "RECALL_EXPECTED" token
 # tells the wrapper to additionally assert the proxy logged a CB_LAYOUTRECALL.
-set(PNFS_PROXY_CMD_recall_truncate ": RECALL_EXPECTED; mkdir -p /mnt/test && dd if=/dev/urandom of=/tmp/orig bs=1M count=8 2>/dev/null && cp /tmp/orig /mnt/test/f0 && sync && truncate -s 4194304 /mnt/test/f0 && (echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true) && head -c 4194304 /tmp/orig > /tmp/orig4 && cmp /tmp/orig4 /mnt/test/f0")
+#
+# The guest holds fd 9 open READ-WRITE on the file from before cp until after
+# the truncate.  The proxy returns its layout when its upstream open handle
+# closes (close-time LAYOUTCOMMIT + LAYOUTRETURN), so if that handle goes idle
+# between cp's CLOSE and the truncate's SETATTR the close-thread sweep (~100ms
+# idle) can reap it -- the MDS then has no holder to recall and the
+# CB_LAYOUTRECALL assertion flakes.  Two requirements make the pin effective,
+# both learned from real flakes:
+#   - It must be READ-WRITE: the proxy's open-handle cache is keyed by
+#     (fh, access_mode, cred), so a read-only fd pins a separate READ-class
+#     handle while the WRITE-class handle holding the layout idles out.
+#     An O_RDWR fd shares cp's RW class and pins the layout-holding handle.
+#   - It must be opened BEFORE cp: the `sync` after cp can run >100ms, long
+#     enough for the sweep to reap an unpinned handle before a later pin
+#     lands.  (`9<>` creates f0 empty; cp then overwrites it.)
+set(PNFS_PROXY_CMD_recall_truncate ": RECALL_EXPECTED; mkdir -p /mnt/test && dd if=/dev/urandom of=/tmp/orig bs=1M count=8 2>/dev/null && exec 9<>/mnt/test/f0 && cp /tmp/orig /mnt/test/f0 && sync && truncate -s 4194304 /mnt/test/f0 && exec 9<&- && (echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true) && head -c 4194304 /tmp/orig > /tmp/orig4 && cmp /tmp/orig4 /mnt/test/f0")
 
 # xfstests programs
 set(XFSTESTS_PROGRAMS fsstress fsx dirstress nametest fstest rewinddir)
@@ -168,6 +186,27 @@ foreach(image_spec ${KVM_IMAGES})
     string(REPLACE "|" ";" image_parts "${image_spec}")
     list(GET image_parts 0 IMAGE_NAME)
     set(IMAGE_DIR ${BUILD_ROOT}/kvm/${IMAGE_NAME})
+
+    # NFS cross-reboot persistence test (cairn-backed, NFSv4.1): create state,
+    # restart chimera against the same persistent store, verify the data and
+    # the recovery records survived.  Needs cairn (the persistent KV backend).
+    if(CAIRN_ENABLED)
+        add_test(NAME chimera/kvm/${IMAGE_NAME}/reboot/recovery_cairn_nfs4.1
+            COMMAND bash ${NFS_REBOOT_WRAPPER}
+                    ${IMAGE_DIR}/vmlinuz ${IMAGE_DIR}/rootfs.qcow2
+                    ${CHIMERA_BINARY} 4.1)
+        set_tests_properties(chimera/kvm/${IMAGE_NAME}/reboot/recovery_cairn_nfs4.1
+            PROPERTIES LABELS "kvm;${IMAGE_NAME}" PROCESSORS 2)
+
+        # NFSv3 DRC cross-reboot persistence: drive non-idempotent ops, restart
+        # against the same cairn store, verify the reply records reload.
+        add_test(NAME chimera/kvm/${IMAGE_NAME}/reboot/drc_cairn_nfs3
+            COMMAND bash ${NFS3_DRC_REBOOT_WRAPPER}
+                    ${IMAGE_DIR}/vmlinuz ${IMAGE_DIR}/rootfs.qcow2
+                    ${CHIMERA_BINARY})
+        set_tests_properties(chimera/kvm/${IMAGE_NAME}/reboot/drc_cairn_nfs3
+            PROPERTIES LABELS "kvm;${IMAGE_NAME}" PROCESSORS 2)
+    endif()
 
     # NFS cthon04 tests
     foreach(nfsver ${NFS_VERSIONS})
@@ -223,6 +262,63 @@ foreach(image_spec ${KVM_IMAGES})
                             "${XFSTESTS_CMD_${prog}}")
                 set_tests_properties(chimera/kvm/${IMAGE_NAME}/xfstests/${prog}_cairn_nfs${nfsver}
                     PROPERTIES LABELS "kvm;${IMAGE_NAME}" PROCESSORS 2)
+            endforeach()
+        endforeach()
+    endif()
+
+    # ----- Linux nfstest single-host suite (ubuntu2404 only) -----
+    # nfstest is a client-side conformance suite: it mounts the share itself (so
+    # this uses a dedicated no-pre-mount wrapper) and verifies on-the-wire
+    # behaviour with its own tcpdump-driven RPC dissector.  The nfstest tree and
+    # its in-guest deps (python3, tcpdump, a default route) ship in the
+    # kvm-test-base image (>= v1.2.0).  Matrix entries are "program|<space-
+    # separated NFS versions>"; nfstest_ssc is left unregistered for now (a
+    # server-side COPY gap).
+    if(IMAGE_NAME STREQUAL "ubuntu2404")
+        set(NFSTEST_MATRIX
+            "nfstest_posix|3 4.0 4.1 4.2"
+            "nfstest_interop|4.0"
+            "nfstest_alloc|4.2"
+            "nfstest_sparse|4.2"
+        )
+        set(NFSTEST_BACKENDS ${KVM_BACKENDS})
+        if(CAIRN_ENABLED)
+            list(APPEND NFSTEST_BACKENDS cairn)
+        endif()
+        foreach(entry ${NFSTEST_MATRIX})
+            string(REPLACE "|" ";" parts "${entry}")
+            list(GET parts 0 prog)
+            list(GET parts 1 vers_str)
+            string(REPLACE " " ";" vers "${vers_str}")
+            foreach(nfsver ${vers})
+                foreach(backend ${NFSTEST_BACKENDS})
+                    # nfstest_alloc fills the device to exercise ENOSPC, which
+                    # needs a bounded filesystem: memfs provides one via its
+                    # "size" config and diskfs via small backing devices (both
+                    # set by the wrapper).  The passthrough (linux/io_uring) and
+                    # cairn backends are unbounded host directories, so run alloc
+                    # on memfs + diskfs only.
+                    if(prog STREQUAL "nfstest_alloc" AND
+                       NOT (backend STREQUAL "memfs" OR backend MATCHES "diskfs"))
+                        continue()
+                    endif()
+                    # nfstest_posix asserts read() updates st_atime.  The
+                    # passthrough backends (linux/io_uring) defer atime to the
+                    # host filesystem's mount policy (relatime/noatime), which
+                    # the suite cannot control, so the assertion is unreliable
+                    # there; the chimera-native backends own atime and pass.
+                    # Run posix on the native backends only.
+                    if(prog STREQUAL "nfstest_posix" AND
+                       (backend STREQUAL "linux" OR backend STREQUAL "io_uring"))
+                        continue()
+                    endif()
+                    add_test(NAME chimera/kvm/${IMAGE_NAME}/nfstest/${prog}_${backend}_nfs${nfsver}
+                        COMMAND bash ${NFSTEST_WRAPPER}
+                                ${IMAGE_DIR}/vmlinuz ${IMAGE_DIR}/rootfs.qcow2
+                                ${CHIMERA_BINARY} ${backend} ${nfsver} ${prog})
+                    set_tests_properties(chimera/kvm/${IMAGE_NAME}/nfstest/${prog}_${backend}_nfs${nfsver}
+                        PROPERTIES LABELS "kvm;${IMAGE_NAME}" PROCESSORS 2)
+                endforeach()
             endforeach()
         endforeach()
     endif()

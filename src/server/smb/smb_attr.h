@@ -183,11 +183,20 @@ chimera_smb_marshal_standard_attrs(
     const struct chimera_vfs_attrs *attr,
     struct chimera_smb_attrs       *smb_attr)
 {
-    /* File size */
-    smb_attr->smb_alloc_size = attr->va_space_used;
+    /* File size.  A directory carries no data stream, so Windows reports both
+     * EndOfFile and AllocationSize as 0 for it -- in the CREATE response, the
+     * FileAllInformation/FileStandardInformation query, and directory listings
+     * alike (smb2.create.open expects out.size == 0 for a freshly-created dir).
+     * Backends store a non-zero internal directory size (e.g. memfs 4096), so
+     * normalize it here at the SMB boundary. */
+    if ((attr->va_mode & S_IFMT) == S_IFDIR) {
+        smb_attr->smb_alloc_size = 0;
+        smb_attr->smb_size       = 0;
+    } else {
+        smb_attr->smb_alloc_size = attr->va_space_used;
+        smb_attr->smb_size       = attr->va_size;
+    }
     smb_attr->smb_attr_mask |= SMB_ATTR_ALLOC_SIZE;
-
-    smb_attr->smb_size       = attr->va_size;
     smb_attr->smb_attr_mask |= SMB_ATTR_SIZE;
 
     /* Number of links */
@@ -221,8 +230,9 @@ chimera_smb_marshal_compression_attrs(
     const struct chimera_vfs_attrs *attr,
     struct chimera_smb_attrs       *smb_attr)
 {
-    /* File size for the compression info */
-    smb_attr->smb_size       = attr->va_size;
+    /* File size for the compression info (0 for a directory, as above). */
+    smb_attr->smb_size = ((attr->va_mode & S_IFMT) == S_IFDIR) ?
+        0 : attr->va_size;
     smb_attr->smb_attr_mask |= SMB_ATTR_SIZE;
 
     /* Compression (not tracked in VFS) */
@@ -336,6 +346,15 @@ chimera_smb_marshal_attribute_tag_info(
     smb_attr->smb_attr_mask = 0;
 
     chimera_smb_marshal_basic_attrs(attr, smb_attr);
+
+    /* marshal_basic_attrs only sets a reparse tag for special files; a
+     * regular file or directory is simply not a reparse point, so report
+     * ReparseTag 0 (MS-FSCC 2.4.6) rather than leaving the attribute unset
+     * and tripping the required-attribute assert at append time. */
+    if (!(smb_attr->smb_attr_mask & SMB_ATTR_REPARSE_TAG)) {
+        smb_attr->smb_reparse_tag = 0;
+        smb_attr->smb_attr_mask  |= SMB_ATTR_REPARSE_TAG;
+    }
 
     /* Clear the timestamp masks since we're not including them */
     smb_attr->smb_attr_mask &= ~(SMB_ATTR_CRTTIME | SMB_ATTR_ATIME |
@@ -462,57 +481,80 @@ chimera_smb_unmarshal_end_of_file_info(
     attr->va_set_mask |= CHIMERA_VFS_ATTR_SIZE;
 } // chimera_smb_unmarshal_end_of_file_info
 
-static inline void
+/* The parse_*_info helpers below read a client-supplied SET_INFO buffer.  They
+ * use the bounds-checked cursor readers and return -1 (without aborting) when
+ * the buffer is shorter than the information class requires, so the caller can
+ * answer STATUS_INFO_LENGTH_MISMATCH instead of crashing the server. */
+static inline int
 chimera_smb_parse_basic_info(
     struct evpl_iovec_cursor *cursor,
     struct chimera_smb_attrs *attrs)
 {
-    evpl_iovec_cursor_get_uint64(cursor, &attrs->smb_crttime);
-    evpl_iovec_cursor_get_uint64(cursor, &attrs->smb_atime);
-    evpl_iovec_cursor_get_uint64(cursor, &attrs->smb_mtime);
-    evpl_iovec_cursor_get_uint64(cursor, &attrs->smb_ctime);
-    evpl_iovec_cursor_get_uint32(cursor, &attrs->smb_attributes);
+    int rc = 0;
+
+    rc |= evpl_iovec_cursor_try_get_uint64(cursor, &attrs->smb_crttime);
+    rc |= evpl_iovec_cursor_try_get_uint64(cursor, &attrs->smb_atime);
+    rc |= evpl_iovec_cursor_try_get_uint64(cursor, &attrs->smb_mtime);
+    rc |= evpl_iovec_cursor_try_get_uint64(cursor, &attrs->smb_ctime);
+    rc |= evpl_iovec_cursor_try_get_uint32(cursor, &attrs->smb_attributes);
+
+    if (rc) {
+        return -1;
+    }
 
     attrs->smb_attr_mask |= SMB_ATTR_CRTTIME | SMB_ATTR_ATIME | SMB_ATTR_MTIME | SMB_ATTR_CTIME | SMB_ATTR_ATTRIBUTES;
+    return 0;
 } /* chimera_smb_parse_basic_info */
 
-static inline void
+static inline int
 chimera_smb_parse_disposition_info(
     struct evpl_iovec_cursor *cursor,
     struct chimera_smb_attrs *attrs)
 {
-    evpl_iovec_cursor_get_uint8(cursor, &attrs->smb_disposition);
+    if (evpl_iovec_cursor_try_get_uint8(cursor, &attrs->smb_disposition)) {
+        return -1;
+    }
     attrs->smb_attr_mask |= SMB_ATTR_DISPOSITION;
+    return 0;
 } /* chimera_smb_parse_disposition_info */
 
-static inline void
+static inline int
 chimera_smb_parse_disposition_info_ex(
     struct evpl_iovec_cursor *cursor,
     struct chimera_smb_attrs *attrs)
 {
     uint32_t flags;
 
-    evpl_iovec_cursor_get_uint32(cursor, &flags);
+    if (evpl_iovec_cursor_try_get_uint32(cursor, &flags)) {
+        return -1;
+    }
     attrs->smb_disposition = (flags & 0x01) ? 1 : 0;
     attrs->smb_attr_mask  |= SMB_ATTR_DISPOSITION;
+    return 0;
 } /* chimera_smb_parse_disposition_info_ex */
 
-static inline void
+static inline int
 chimera_smb_parse_position_info(
     struct evpl_iovec_cursor *cursor,
     struct chimera_smb_attrs *attrs)
 {
-    evpl_iovec_cursor_get_uint64(cursor, &attrs->smb_position);
+    if (evpl_iovec_cursor_try_get_uint64(cursor, &attrs->smb_position)) {
+        return -1;
+    }
     attrs->smb_attr_mask |= SMB_ATTR_POSITION;
+    return 0;
 } /* chimera_smb_parse_position_info */
 
-static inline void
+static inline int
 chimera_smb_parse_end_of_file_info(
     struct evpl_iovec_cursor *cursor,
     struct chimera_smb_attrs *attrs)
 {
-    evpl_iovec_cursor_get_uint64(cursor, &attrs->smb_size);
+    if (evpl_iovec_cursor_try_get_uint64(cursor, &attrs->smb_size)) {
+        return -1;
+    }
     attrs->smb_attr_mask |= SMB_ATTR_SIZE;
+    return 0;
 } /* chimera_smb_parse_end_of_file_info */
 
 
@@ -660,7 +702,9 @@ chimera_smb_append_all_info(
     chimera_smb_append_internal_info(cursor, attrs);
     chimera_smb_append_ea_info(cursor, attrs);
 
-    evpl_iovec_cursor_append_uint32(cursor, attrs->smb_access_flags);
+    /* FileAccessInformation: the access mask actually granted on this handle
+     * (smb2.getinfo.granted reads this from FileAllInformation). */
+    evpl_iovec_cursor_append_uint32(cursor, open_file->granted_access);
     evpl_iovec_cursor_append_uint64(cursor, open_file->position);
 
     /* Mode */

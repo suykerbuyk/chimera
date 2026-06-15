@@ -44,6 +44,36 @@ struct chimera_smb_file_id {
  * stream handle; stream_name + base_fh identify the stream for enumeration and
  * delete-on-close (which removes only the stream, not the base file). */
 #define CHIMERA_SMB_OPEN_FILE_FLAG_STREAM          0x00000040
+/* While this open sat disconnected (parked durable), its write-caching
+ * oplock/lease was forcibly revoked to admit a conflicting open: the
+ * disconnected handle has yielded (MS-SMB2 3.3.4.6/3.3.4.7 close a
+ * disconnected open whose batch oplock / write-caching lease breaks).  Had the
+ * conflicting open found it already parked it would have been purged outright
+ * (chimera_smb_create_purge_parked_writers); when the revoke wins that race
+ * instead, this flag makes a later durable reconnect fail with
+ * OBJECT_NAME_NOT_FOUND and leaves the carcass to the grace-timer sweep. */
+#define CHIMERA_SMB_OPEN_FILE_YIELDED              0x00000080
+/* This durable open is still eligible to be returned by a DH2Q create_guid
+ * replay (MS-SMB2 3.3.5.9.10 Open.IsReplayEligible).  Set when the durable open
+ * is granted or reclaimed; cleared the first time a non-replay request operates
+ * on the handle.  Once cleared, a replayed create that matches the live open is
+ * "ignored" and handled as a normal open (reports EXISTED, not the original
+ * CREATED): smb2.replay.replay-twice-durable. */
+#define CHIMERA_SMB_OPEN_FILE_REPLAY_ELIGIBLE      0x00000100
+/* This open's CREATE is still in flight: it parked waiting for a conflicting
+ * holder to acknowledge a lease/oplock break (MS-SMB2 3.3.5.9 pending open).
+ * The handle is already in the tree (so its durable create_guid is visible) but
+ * the open has not completed.  A replayed durable create whose create_guid
+ * matches a still-pending open must be answered STATUS_FILE_NOT_AVAILABLE
+ * rather than parking a second time and timing out (MS-SMB2 3.3.5.9.10):
+ * smb2.replay.dhv2-pending*. Cleared on resume / break-deadline. */
+#define CHIMERA_SMB_OPEN_FILE_CREATE_PENDING       0x00000200
+/* The file's data was modified through this open (a write occurred).  A write
+ * does NOT immediately break the parent directory lease -- the file's size/mtime
+ * become visible in the directory only at close -- so the parent dir-lease
+ * content break is deferred to this open's close (MS-SMB2; dirlease.v2_request
+ * "write ... only the close ... break the directory lease"). */
+#define CHIMERA_SMB_OPEN_FILE_FLAG_MODIFIED        0x00000400
 
 /* Bits identifying which CREATE contexts a client supplied on the open. Mirrored
  * from request->create.ctx_present_mask into the open file so later phases
@@ -80,6 +110,7 @@ enum chimera_smb_open_file_type {
 
 enum chimera_smb_pipe_magic {
     CHIMERA_SMB_OPEN_FILE_LSA_RPC,
+    CHIMERA_SMB_OPEN_FILE_SRV_RPC,
 };
 
 struct chimera_smb_request;
@@ -97,6 +128,13 @@ struct chimera_smb_open_file {
     enum chimera_smb_open_file_type   type;
     enum chimera_smb_pipe_magic       pipe_magic;
     chimera_smb_pipe_transceive_t     pipe_transceive;
+    /* DCE/RPC-over-named-pipe (ncacn_np) transport via SMB2 WRITE/READ: a WRITE
+     * runs the request PDU through pipe_transceive and stashes the response PDU
+     * here for one or more following READs to drain.  NULL when no response is
+     * pending.  (The IOCTL FSCTL_PIPE_TRANSCEIVE transport does not use this.) */
+    uint8_t                          *rpc_resp;
+    uint32_t                          rpc_resp_len;
+    uint32_t                          rpc_resp_off;
     struct UT_hash_handle             hh;
     struct chimera_smb_file_id        file_id;
     struct chimera_vfs_open_handle   *handle;
@@ -114,6 +152,16 @@ struct chimera_smb_open_file {
     uint64_t                          position;
     uint32_t                          parent_fh_len;
     uint32_t                          refcnt;
+    /* MS-SMB2 §3.3.5.2.10 channel-sequence tracking.  channel_sequence holds
+     * the highest ChannelSequence observed on this Open; a mutating op
+     * (WRITE/SET_INFO/IOCTL) carrying a stale sequence -- behind by
+     * [0x8000..0xFFFF] mod 0x10000 -- is rejected with FILE_NOT_AVAILABLE.
+     * READ never rejects but advances the value.  _valid gates the first op. */
+    uint16_t                          channel_sequence;
+    uint8_t                           channel_sequence_valid;
+    /* The CREATE Action reported when this handle was first opened
+     * (CREATED/OPENED/...); replayed verbatim on a DH2Q create_guid replay. */
+    uint32_t                          create_action;
     /* Phase-0 plumbing: fields populated by later phases. Zeroed on alloc. */
     uint32_t                          ctx_present_mask;
     uint8_t                           oplock_level;
@@ -127,6 +175,12 @@ struct chimera_smb_open_file {
     uint32_t                          lease_flags;
     uint32_t                          durable_flags;
     uint64_t                          durable_timeout_ms;
+    /* FSCTL_LMR_REQUEST_RESILIENCY (MS-SMB2 2.2.31.3 / 3.3.5.15.9): set once a
+     * client has been granted handle resiliency on this open.  resilient_timeout_ms
+     * is the (server-capped) duration the open survives a network disconnect for
+     * reclaim-by-reconnect. */
+    bool                              resilient;
+    uint64_t                          resilient_timeout_ms;
     uint8_t                           lease_key[16];
     uint8_t                           parent_lease_key[16];
     uint8_t                           create_guid[16];
@@ -243,6 +297,20 @@ struct chimera_smb_session {
      * authorized the session.  A later binding SESSION_SETUP on a connection
      * whose SupportsNotifications differs is rejected (3.1.1 only). */
     uint8_t                     supports_notifications;
+    /* Signing algorithm (SMB2_SIGNING_*) negotiated on the connection the
+     * session was established on.  A SESSION_SETUP response the client
+     * verifies against Session.SigningKey (binding interim/error legs and
+     * other non-final session-setup responses) must be signed with the
+     * SESSION's dialect+algorithm, not the receiving connection's: the
+     * client's session signing-key object carries the algorithm of the
+     * establishing connection (smbtorture smb2.session.bind_negative_smb3to2*,
+     * Samba bug 14512). */
+    uint16_t                    sign_alg;
+    /* Cipher (SMB2_ENCRYPTION_*) negotiated on the establishing connection,
+     * recorded whether or not encryption is active.  A binding connection
+     * whose negotiated cipher differs is rejected with
+     * STATUS_INVALID_PARAMETER (MS-SMB2 3.3.5.5). */
+    uint16_t                    conn_cipher_id;
     struct UT_hash_handle       hh;
     struct chimera_smb_session *prev;
     struct chimera_smb_session *next;

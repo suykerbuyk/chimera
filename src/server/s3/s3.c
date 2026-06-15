@@ -23,15 +23,50 @@
 #include "vfs/vfs.h"
 #include "vfs/vfs_procs.h"
 
-static inline void
-chimera_s3_sterilize_path(
-    struct chimera_s3_request *request,
-    const char                *prefix,
-    int                        prefix_len)
+static inline int
+chimera_s3_hexval(int c)
 {
-    request->path     = request->list.prefix;
-    request->path_len = request->list.prefix_len;
-} /* chimera_s3_sterilize_path */
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    } else if (c >= 'a' && c <= 'f') {
+        return c - 'a' + 10;
+    } else if (c >= 'A' && c <= 'F') {
+        return c - 'A' + 10;
+    }
+    return -1;
+} /* chimera_s3_hexval */
+
+/* Percent-decode an S3 query-string value (%XX escapes only; '+' is left
+ * intact because S3, unlike form encoding, does not treat it as a space).
+ * Writes a NUL-terminated result and returns its length. */
+static inline int
+chimera_s3_pct_decode(
+    char       *dst,
+    int         dstcap,
+    const char *src,
+    int         srclen)
+{
+    int o = 0, i = 0;
+
+    while (i < srclen && o < dstcap - 1) {
+        int c = (unsigned char) src[i];
+
+        if (c == '%' && i + 2 < srclen) {
+            int hi = chimera_s3_hexval((unsigned char) src[i + 1]);
+            int lo = chimera_s3_hexval((unsigned char) src[i + 2]);
+            if (hi >= 0 && lo >= 0) {
+                dst[o++] = (char) ((hi << 4) | lo);
+                i       += 3;
+                continue;
+            }
+        }
+        dst[o++] = (char) c;
+        i++;
+    }
+
+    dst[o] = '\0';
+    return o;
+} /* chimera_s3_pct_decode */
 
 /* expect range_str in the form: bytes=1000-1599 */
 static inline int
@@ -107,6 +142,19 @@ s3_server_respond(
     char              date_ts[64];
     time_t            now = time(NULL);
 
+    /* The response headers/status are emitted exactly once. Several paths can
+     * race to call this for the same request: for synchronous VFS backends
+     * (e.g. memfs) the VFS completion callback runs inline, so both it and the
+     * HTTP RECEIVE_COMPLETE notification observe the request ready to send.
+     * Responding twice duplicates the response headers and desyncs the
+     * connection, so dispatch the status line + headers only on the first
+     * call. (GET streams its body via later WANT_DATA notifications, which is
+     * why we cannot key this off vfs_state.) */
+    if (request->responded) {
+        return;
+    }
+    request->responded = 1;
+
     strftime(date_ts, sizeof(date_ts), "%a, %d %b %Y %H:%M:%S GMT", gmtime(&now));
 
     evpl_http_request_add_header(request->http_request, "Date", date_ts);
@@ -142,6 +190,14 @@ s3_server_respond(
         evpl_http_server_set_response_length(request->http_request, 0);
         evpl_http_server_dispatch_default(request->http_request, 204);
     } else {
+        if (request->status == CHIMERA_S3_STATUS_INVALID_RANGE) {
+            /* S3 echoes the object size on a 416 so the client can re-request a
+             * satisfiable range. */
+            snprintf(range_header, sizeof(range_header), "bytes */%ld",
+                     request->file_real_length);
+            evpl_http_request_add_header(request->http_request, "Content-Range", range_header);
+        }
+
         evpl_iovec_alloc(evpl, 1024, 0, 1, 0, &iov);
 
         error_response = (char *) evpl_iovec_data(&iov);
@@ -212,6 +268,10 @@ s3_server_notify(
                 chimera_s3_delete_objects_recv(evpl, s3_request);
             } else if (request_type == EVPL_HTTP_REQUEST_TYPE_POST) {
                 /* CreateMultipartUpload: body is empty in practice. */
+                s3_server_drain_body(evpl, s3_request);
+            } else if (s3_request->op_bucket) {
+                /* Bucket-level request (e.g. CreateBucket's optional
+                 * CreateBucketConfiguration body): discard the body. */
                 s3_server_drain_body(evpl, s3_request);
             }
             break;
@@ -297,6 +357,8 @@ chimera_s3_dispatch_callback(
                 chimera_s3_list_multipart_uploads(evpl, thread, s3_request);
             } else if (s3_request->has_upload_id) {
                 chimera_s3_list_parts(evpl, thread, s3_request);
+            } else if (s3_request->has_attributes) {
+                chimera_s3_get_object_attributes(evpl, thread, s3_request);
             } else if (s3_request->is_list) {
                 chimera_s3_list(evpl, thread, s3_request);
             } else {
@@ -310,12 +372,9 @@ chimera_s3_dispatch_callback(
 
             if (s3_request->has_upload_id && s3_request->has_part_number) {
                 if (copy_source) {
-                    /* UploadPartCopy (copying a byte range of an existing
-                     * object into an in-progress multipart upload) is not
-                     * implemented yet. Reject explicitly rather than treating
-                     * the (empty) body as the part contents. */
-                    s3_request->status    = CHIMERA_S3_STATUS_NOT_IMPLEMENTED;
-                    s3_request->vfs_state = CHIMERA_S3_VFS_STATE_COMPLETE;
+                    /* UploadPartCopy: copy a byte range of an existing object
+                     * into this in-progress multipart upload as part N. */
+                    chimera_s3_upload_part_copy(evpl, thread, s3_request);
                 } else {
                     chimera_s3_upload_part(evpl, thread, s3_request);
                 }
@@ -383,8 +442,12 @@ s3_server_dispatch(
     s3_request->has_uploads        = 0;
     s3_request->has_upload_id      = 0;
     s3_request->has_delete         = 0;
+    s3_request->has_versions       = 0;
     s3_request->has_part_number    = 0;
+    s3_request->op_bucket          = 0;
+    s3_request->has_attributes     = 0;
     s3_request->chunked            = 0;
+    s3_request->responded          = 0;
     s3_request->query_upload_idlen = 0;
     s3_request->query_part_number  = 0;
     s3_request->http_request       = request;
@@ -512,10 +575,38 @@ s3_server_dispatch(
             const char *p;
             int         key_len, value_len;
             /* Staging buffers; we don't know yet whether this is a LIST or a
-             * multipart request, and they share a union. */
-            char        prefix_buf[256];
-            int         prefix_len = 0;
-            int         max_keys   = 1000;
+             * multipart request, and they share a union. LIST values are
+             * percent-decoded since clients (e.g. the AWS CLI) encode prefix,
+             * delimiter and continuation tokens in the query string. */
+            char        prefix_buf[CHIMERA_S3_KEY_MAX];
+            char        delim_buf[CHIMERA_S3_DELIM_MAX];
+            char        marker_buf[CHIMERA_S3_KEY_MAX];
+            char        ctoken_buf[CHIMERA_S3_KEY_MAX];
+            char        startafter_buf[CHIMERA_S3_KEY_MAX];
+            int         prefix_len     = 0;
+            int         delim_len      = 0;
+            int         marker_len     = 0;
+            int         ctoken_len     = 0;
+            int         startafter_len = 0;
+            int         max_keys       = 1000;
+            int         list_type      = 1;
+            int         encoding_url   = 0;
+            int         fetch_owner    = 0;
+            int         bad_max_keys   = 0;
+            /* Multipart pagination parameters (ListParts /
+             * ListMultipartUploads), captured here since the parse loop runs
+             * before the request type is classified. */
+            int         max_parts          = 1000;
+            int         part_number_marker = 0;
+            int         max_uploads        = 1000;
+            char        upload_id_marker_buf[CHIMERA_S3_UPLOAD_ID_LEN + 1];
+            int         upload_id_marker_len = 0;
+            /* Set when the query carries a key we don't recognize as a list
+             * parameter or handled subresource: an unimplemented bucket/object
+             * subresource (acl/policy/tagging/cors/lifecycle/...). */
+            int         saw_unknown = 0;
+
+            upload_id_marker_buf[0] = '\0';
 
             p = qmark + 1;
 
@@ -540,6 +631,8 @@ s3_server_dispatch(
 
                 if (key_len == 7 && memcmp(key_start, "uploads", 7) == 0) {
                     s3_request->has_uploads = 1;
+                } else if (key_len == 8 && memcmp(key_start, "versions", 8) == 0) {
+                    s3_request->has_versions = 1;
                 } else if (key_len == 6 && memcmp(key_start, "delete", 6) == 0) {
                     s3_request->has_delete = 1;
                 } else if (key_len == 8 && memcmp(key_start, "uploadId", 8) == 0) {
@@ -554,15 +647,71 @@ s3_server_dispatch(
                 } else if (key_len == 10 && memcmp(key_start, "partNumber", 10) == 0) {
                     s3_request->query_part_number = atoi(value_start);
                     s3_request->has_part_number   = 1;
-                } else if (key_len == 6 && memcmp(key_start, "prefix", 6) == 0) {
-                    if (value_len > (int) sizeof(prefix_buf) - 1) {
-                        value_len = sizeof(prefix_buf) - 1;
+                } else if (key_len == 9 && memcmp(key_start, "max-parts", 9) == 0) {
+                    max_parts = atoi(value_start);
+                } else if (key_len == 18 && memcmp(key_start, "part-number-marker", 18) == 0) {
+                    part_number_marker = atoi(value_start);
+                } else if (key_len == 11 && memcmp(key_start, "max-uploads", 11) == 0) {
+                    max_uploads = atoi(value_start);
+                } else if (key_len == 16 && memcmp(key_start, "upload-id-marker", 16) == 0) {
+                    int copy = value_len;
+                    if (copy > CHIMERA_S3_UPLOAD_ID_LEN) {
+                        copy = CHIMERA_S3_UPLOAD_ID_LEN;
                     }
-                    memcpy(prefix_buf, value_start, value_len);
-                    prefix_buf[value_len] = '\0';
-                    prefix_len            = value_len;
+                    memcpy(upload_id_marker_buf, value_start, copy);
+                    upload_id_marker_buf[copy] = '\0';
+                    upload_id_marker_len       = copy;
+                } else if (key_len == 6 && memcmp(key_start, "prefix", 6) == 0) {
+                    prefix_len = chimera_s3_pct_decode(prefix_buf, sizeof(prefix_buf),
+                                                       value_start, value_len);
                 } else if (key_len == 8 && memcmp(key_start, "max-keys", 8) == 0) {
-                    max_keys = atoi(value_start);
+                    /* max-keys must be a non-negative integer; a non-numeric or
+                     * empty value is an InvalidArgument (400), not a silent 0. */
+                    int mk_valid = (value_len > 0);
+                    for (int mi = 0; mi < value_len; mi++) {
+                        if (value_start[mi] < '0' || value_start[mi] > '9') {
+                            mk_valid = 0;
+                            break;
+                        }
+                    }
+                    if (mk_valid) {
+                        max_keys = atoi(value_start);
+                    } else {
+                        bad_max_keys = 1;
+                    }
+                } else if (key_len == 10 && memcmp(key_start, "attributes", 10) == 0) {
+                    s3_request->has_attributes = 1;
+                } else if (key_len == 9 && memcmp(key_start, "list-type", 9) == 0) {
+                    list_type = atoi(value_start);
+                } else if (key_len == 9 && memcmp(key_start, "delimiter", 9) == 0) {
+                    delim_len = chimera_s3_pct_decode(delim_buf, sizeof(delim_buf),
+                                                      value_start, value_len);
+                } else if (key_len == 6 && memcmp(key_start, "marker", 6) == 0) {
+                    marker_len = chimera_s3_pct_decode(marker_buf, sizeof(marker_buf),
+                                                       value_start, value_len);
+                } else if (key_len == 10 && memcmp(key_start, "key-marker", 10) == 0) {
+                    /* ListObjectVersions pagination cursor; reuse the marker. */
+                    marker_len = chimera_s3_pct_decode(marker_buf, sizeof(marker_buf),
+                                                       value_start, value_len);
+                } else if (key_len == 18 && memcmp(key_start, "continuation-token", 18) == 0) {
+                    ctoken_len = chimera_s3_pct_decode(ctoken_buf, sizeof(ctoken_buf),
+                                                       value_start, value_len);
+                } else if (key_len == 11 && memcmp(key_start, "start-after", 11) == 0) {
+                    startafter_len = chimera_s3_pct_decode(startafter_buf, sizeof(startafter_buf),
+                                                           value_start, value_len);
+                } else if (key_len == 13 && memcmp(key_start, "encoding-type", 13) == 0) {
+                    if (value_len == 3 && strncasecmp(value_start, "url", 3) == 0) {
+                        encoding_url = 1;
+                    }
+                } else if (key_len == 11 && memcmp(key_start, "fetch-owner", 11) == 0) {
+                    /* V2: emit <Owner> in each <Contents> when true. */
+                    fetch_owner = (value_len == 4 &&
+                                   strncasecmp(value_start, "true", 4) == 0);
+                } else if (key_len == 17 && memcmp(key_start, "version-id-marker", 17) == 0) {
+                    /* Recognized list parameter we accept but don't act on. */
+                } else {
+                    /* Unrecognized query key: an unimplemented subresource. */
+                    saw_unknown = 1;
                 }
 
                 if (*p == '&') {
@@ -593,6 +742,25 @@ s3_server_dispatch(
                     s3_request->multipart.part_number =
                         s3_request->query_part_number;
                 }
+                /* Pagination parameters for ListParts / ListMultipartUploads.
+                 * Copy from the parse-loop staging vars into the multipart
+                 * union now that we know this is a multipart request. */
+                s3_request->multipart.max_parts =
+                    (max_parts > 0) ? max_parts : 1000;
+                s3_request->multipart.part_number_marker = part_number_marker;
+                s3_request->multipart.max_uploads        =
+                    (max_uploads > 0) ? max_uploads : 1000;
+
+                if (marker_len > (int) sizeof(s3_request->multipart.key_marker) - 1) {
+                    marker_len = sizeof(s3_request->multipart.key_marker) - 1;
+                }
+                memcpy(s3_request->multipart.key_marker, marker_buf, marker_len);
+                s3_request->multipart.key_marker[marker_len] = '\0';
+                s3_request->multipart.key_marker_len         = marker_len;
+
+                memcpy(s3_request->multipart.upload_id_marker,
+                       upload_id_marker_buf, upload_id_marker_len + 1);
+                s3_request->multipart.upload_id_marker_len = upload_id_marker_len;
             } else if (s3_request->has_delete) {
                 /* POST /bucket?delete: the keys to remove arrive in the
                  * request body, so there is no object key in the path.
@@ -611,17 +779,44 @@ s3_server_dispatch(
                 s3_request->del.cur      = 0;
                 s3_request->del.quiet    = 0;
             } else if (qmark == s3_request->path) {
-                /* Path starts with '?': bucket-level LIST query. */
-                s3_request->is_list         = 1;
-                s3_request->list.prefix_len = prefix_len;
-                if (prefix_len > 0) {
-                    memcpy(s3_request->list.prefix, prefix_buf, prefix_len);
-                    s3_request->list.prefix[prefix_len] = '\0';
+                if (saw_unknown && !s3_request->has_versions) {
+                    /* Path is "?<subresource>" we don't implement (acl, policy,
+                     * tagging, cors, lifecycle, versioning, website, ...). These
+                     * configure features that have no meaning for a filesystem-
+                     * backed bucket shared with NFS/SMB, so we accept and ignore
+                     * them with an empty 200 rather than (a) mis-listing or (b)
+                     * routing a PUT to an object write that would create a junk
+                     * "?subresource" key visible to every protocol. vfs_state
+                     * COMPLETE short-circuits the routing below.
+                     *
+                     * NOTE: this means security-relevant configs (bucket policy,
+                     * encryption, ACL) are silently NOT enforced. */
+                    s3_request->status           = CHIMERA_S3_STATUS_OK;
+                    s3_request->file_length      = 0;
+                    s3_request->file_real_length = 0;
+                    s3_request->file_offset      = 0;
+                    s3_request->vfs_state        = CHIMERA_S3_VFS_STATE_COMPLETE;
+                    s3_request->op_bucket        = 1;
+                } else if (bad_max_keys) {
+                    /* A non-numeric/empty max-keys is an InvalidArgument (400). */
+                    s3_request->status           = CHIMERA_S3_STATUS_BAD_REQUEST;
+                    s3_request->file_length      = 0;
+                    s3_request->file_real_length = 0;
+                    s3_request->file_offset      = 0;
+                    s3_request->vfs_state        = CHIMERA_S3_VFS_STATE_COMPLETE;
+                    s3_request->op_bucket        = 1;
+                } else {
+                    /* Bucket-level LIST query (ListObjects V1/V2 or
+                     * ListObjectVersions). */
+                    chimera_s3_list_setup(s3_request, list_type, max_keys, encoding_url,
+                                          prefix_buf, prefix_len,
+                                          delim_buf, delim_len,
+                                          marker_buf, marker_len,
+                                          ctoken_buf, ctoken_len,
+                                          startafter_buf, startafter_len);
+                    s3_request->list.versions    = s3_request->has_versions;
+                    s3_request->list.fetch_owner = fetch_owner;
                 }
-                s3_request->list.max_keys = max_keys;
-                chimera_s3_sterilize_path(s3_request,
-                                          s3_request->list.prefix,
-                                          s3_request->list.prefix_len);
             } else {
                 /* Path has '?' mid-string but no recognized subresource: strip
                  * the query suffix and treat as a regular object request. */
@@ -643,27 +838,86 @@ s3_server_dispatch(
     s3_request->file_cur_offset = s3_request->file_offset;
     chimera_s3_dump_request(s3_request);
 
-    bucket = s3_bucket_map_get(shared->bucket_map, s3_request->bucket_name, s3_request->bucket_namelen);
+    {
+        enum evpl_http_request_type method = evpl_http_request_type(request);
 
-    if (bucket == NULL) {
-        s3_request->status    = CHIMERA_S3_STATUS_NO_SUCH_BUCKET;
-        s3_request->vfs_state = CHIMERA_S3_VFS_STATE_COMPLETE;
+        /* The query parser already resolved this request (e.g. an unimplemented
+         * subresource); don't run the bucket/object routing over it. */
+        if (s3_request->vfs_state == CHIMERA_S3_VFS_STATE_COMPLETE) {
+            return;
+        }
+
+        /* Service-level request (no bucket in the path): GET / == ListBuckets. */
+        if (s3_request->bucket_namelen == 0) {
+            s3_request->op_bucket = 1;
+            if (method == EVPL_HTTP_REQUEST_TYPE_GET) {
+                chimera_s3_list_buckets(evpl, thread, s3_request);
+            } else {
+                s3_request->status    = CHIMERA_S3_STATUS_METHOD_NOT_ALLOWED;
+                s3_request->vfs_state = CHIMERA_S3_VFS_STATE_COMPLETE;
+            }
+            return;
+        }
+
+        /* CreateBucket: PUT /bucket with no object key. The target bucket does
+         * not exist yet, so this is handled before the bucket-map lookup. */
+        if (method == EVPL_HTTP_REQUEST_TYPE_PUT && s3_request->path_len == 0 &&
+            !s3_request->has_upload_id) {
+            s3_request->op_bucket = 1;
+            chimera_s3_create_bucket(evpl, thread, s3_request);
+            return;
+        }
+
+        bucket = s3_bucket_map_get(shared->bucket_map, s3_request->bucket_name, s3_request->bucket_namelen);
+
+        if (bucket == NULL) {
+            s3_request->status    = CHIMERA_S3_STATUS_NO_SUCH_BUCKET;
+            s3_request->vfs_state = CHIMERA_S3_VFS_STATE_COMPLETE;
+            s3_bucket_map_release(shared->bucket_map);
+            return;
+        }
+
+        /* Bucket-level operations on an existing bucket: empty object key with
+         * no object-style subresource query. */
+        if (s3_request->path_len == 0 && !s3_request->has_uploads &&
+            !s3_request->has_delete && !s3_request->has_upload_id &&
+            !s3_request->is_list) {
+
+            if (method == EVPL_HTTP_REQUEST_TYPE_DELETE) {
+                s3_request->op_bucket = 1;
+                /* Release the read lock before dispatching: DeleteBucket's VFS
+                 * remove can complete inline and then takes the map write lock
+                 * (s3_bucket_map_remove), which would self-deadlock if we still
+                 * held the read lock on this thread. */
+                s3_bucket_map_release(shared->bucket_map);
+                chimera_s3_delete_bucket(evpl, thread, s3_request);
+                return;
+            } else if (method == EVPL_HTTP_REQUEST_TYPE_HEAD) {
+                s3_request->op_bucket = 1;
+                s3_bucket_map_release(shared->bucket_map);
+                chimera_s3_head_bucket(evpl, thread, s3_request);
+                return;
+            } else if (method == EVPL_HTTP_REQUEST_TYPE_GET) {
+                /* GET /bucket with no object key == ListObjects (v1). */
+                s3_request->op_bucket = 1;
+                chimera_s3_list_setup(s3_request, 1, 1000, 0,
+                                      "", 0, "", 0, "", 0, "", 0, "", 0);
+            }
+        }
+
+        chimera_vfs_lookup(thread->vfs,
+                           &thread->shared->cred,
+                           shared->root_fh,
+                           shared->root_fh_len,
+                           bucket->path,
+                           strlen(bucket->path),
+                           CHIMERA_VFS_ATTR_FH,
+                           CHIMERA_VFS_LOOKUP_FOLLOW,
+                           chimera_s3_dispatch_callback,
+                           s3_request);
+
         s3_bucket_map_release(shared->bucket_map);
-        return;
     }
-
-    chimera_vfs_lookup(thread->vfs,
-                       &thread->shared->cred,
-                       shared->root_fh,
-                       shared->root_fh_len,
-                       bucket->path,
-                       strlen(bucket->path),
-                       CHIMERA_VFS_ATTR_FH,
-                       CHIMERA_VFS_LOOKUP_FOLLOW,
-                       chimera_s3_dispatch_callback,
-                       s3_request);
-
-    s3_bucket_map_release(shared->bucket_map);
 
 } /* s3_server_dispatch */
 
@@ -679,6 +933,23 @@ chimera_s3_add_bucket(
 
 } /* chimera_s3_add_bucket */
 
+
+SYMBOL_EXPORT void
+chimera_s3_set_bucket_root(
+    void       *s3_shared,
+    const char *path)
+{
+    struct chimera_server_s3_shared *shared = s3_shared;
+    int                              len    = strlen(path);
+
+    if (len >= (int) sizeof(shared->bucket_root_path)) {
+        len = sizeof(shared->bucket_root_path) - 1;
+    }
+
+    memcpy(shared->bucket_root_path, path, len);
+    shared->bucket_root_path[len] = '\0';
+    shared->bucket_root_pathlen   = len;
+} /* chimera_s3_set_bucket_root */
 
 SYMBOL_EXPORT int
 chimera_s3_remove_bucket(
@@ -773,7 +1044,7 @@ s3_server_init(
 
     shared->tcp_protocol = chimera_server_config_get_tcp_stream_protocol(config);
 
-    shared->config->port    = 5000;
+    shared->config->port    = chimera_server_config_get_s3_port(config);
     shared->config->io_size = 128 * 1024;
 
     shared->endpoint = evpl_endpoint_create("0.0.0.0", shared->config->port);

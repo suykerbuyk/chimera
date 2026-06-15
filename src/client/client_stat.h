@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <sys/sysmacros.h>
+
 #include "client_internal.h"
 
 static inline void
@@ -17,11 +19,13 @@ chimera_attrs_to_stat(
     st->st_nlink = attrs->va_nlink;
     st->st_uid   = attrs->va_uid;
     st->st_gid   = attrs->va_gid;
-    st->st_rdev  = attrs->va_rdev;
-    st->st_size  = attrs->va_size;
-    st->st_atim  = attrs->va_atime;
-    st->st_mtim  = attrs->va_mtime;
-    st->st_ctim  = attrs->va_ctime;
+    /* va_rdev is the canonical VFS encoding (major << 32 | minor); decode it
+     * back to a host dev_t for the caller's struct stat. */
+    st->st_rdev = makedev(attrs->va_rdev >> 32, attrs->va_rdev & 0xFFFFFFFF);
+    st->st_size = attrs->va_size;
+    st->st_atim = attrs->va_atime;
+    st->st_mtim = attrs->va_mtime;
+    st->st_ctim = attrs->va_ctime;
 } /* chimera_attrs_to_stat */
 
 static void chimera_stat_open_complete(
@@ -86,7 +90,7 @@ chimera_stat_open_complete(
 
     chimera_vfs_getattr(
         request->thread->vfs_thread,
-        &request->thread->client->cred,
+        chimera_client_req_cred(request),
         oh,
         CHIMERA_VFS_ATTR_MASK_STAT,
         chimera_stat_getattr_complete,
@@ -117,7 +121,7 @@ chimera_stat_lookup_complete(
 
     chimera_vfs_open_fh(
         request->thread->vfs_thread,
-        &request->thread->client->cred,
+        chimera_client_req_cred(request),
         request->fh,
         request->fh_len,
         CHIMERA_VFS_OPEN_PATH | CHIMERA_VFS_OPEN_INFERRED,
@@ -133,7 +137,7 @@ chimera_dispatch_stat(
 {
     chimera_vfs_lookup(
         thread->vfs_thread,
-        &thread->client->cred,
+        chimera_client_req_cred(request),
         thread->client->root_fh,
         thread->client->root_fh_len,
         request->stat.path,

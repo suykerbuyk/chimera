@@ -22,11 +22,18 @@ chimera_smb_parse_change_notify(
     uint32_t completion_filter;
 
     /* StructureSize (2 bytes) already consumed by the framework */
-    evpl_iovec_cursor_get_uint16(request_cursor, &flags);
-    evpl_iovec_cursor_get_uint32(request_cursor, &output_buffer_length);
-    evpl_iovec_cursor_get_uint64(request_cursor, &file_id_pid);
-    evpl_iovec_cursor_get_uint64(request_cursor, &file_id_vid);
-    evpl_iovec_cursor_get_uint32(request_cursor, &completion_filter);
+    int      prc = 0;
+
+    prc |= evpl_iovec_cursor_try_get_uint16(request_cursor, &flags);
+    prc |= evpl_iovec_cursor_try_get_uint32(request_cursor, &output_buffer_length);
+    prc |= evpl_iovec_cursor_try_get_uint64(request_cursor, &file_id_pid);
+    prc |= evpl_iovec_cursor_try_get_uint64(request_cursor, &file_id_vid);
+    prc |= evpl_iovec_cursor_try_get_uint32(request_cursor, &completion_filter);
+
+    if (unlikely(prc)) {
+        chimera_smb_error("Received SMB2 CHANGE_NOTIFY request truncated in fixed body");
+        return chimera_smb_parse_reject(request, SMB2_STATUS_INVALID_PARAMETER);
+    }
 
     request->change_notify.flags                = flags;
     request->change_notify.output_buffer_length = output_buffer_length;
@@ -144,6 +151,25 @@ chimera_smb_change_notify(struct chimera_smb_request *request)
 
     nevents = chimera_vfs_notify_drain(state->watch, events, 16, &overflowed);
 
+    /* The watched directory may already have been removed (rmdir / delete-
+     * on-close from another handle or connection) before this CHANGE_NOTIFY
+     * was armed.  chimera_vfs_notify_emit_delete records that on the watch
+     * via the deleted flag and fires the callback, but if that callback ran
+     * before we installed state->pending (a cross-connection race —
+     * smb2.notify.rmdir3/4 send the CHANGE_NOTIFY and the rmdir without
+     * waiting for the interim reply) the wakeup is lost and the request
+     * would park forever, never completing.  Check the flag here under
+     * state->lock — atomic against the callback, exactly as the async
+     * send_response path does — and complete immediately with
+     * STATUS_DELETE_PENDING.  DELETE takes precedence over any buffered
+     * events, matching MS-SMB2 3.3.4.4 and the send_response classification. */
+    if (chimera_vfs_notify_watch_take_deleted(state->watch)) {
+        pthread_mutex_unlock(&state->lock);
+        chimera_smb_open_file_release(request, open_file);
+        chimera_smb_complete_request(request, SMB2_STATUS_DELETE_PENDING);
+        return;
+    }
+
     /* Re-filter drained events against this request's filter — the
      * watch's mask may have been broader when these were enqueued
      * (see same logic in the async send_response path).  Done under
@@ -208,23 +234,29 @@ chimera_smb_change_notify(struct chimera_smb_request *request)
 
     /* No events — about to park the request.
      *
-     * Reject parking when this CHANGE_NOTIFY is inside a multi-command
-     * compound.  Async completion would force the compound reply
-     * builder to skip this slot (status STATUS_PENDING is dropped from
-     * the compound), and clients that match compound slots positionally
-     * may misparse the remaining replies.  Windows itself appears to
-     * cope (it matches by message_id), but the safe + portable answer
-     * is "don't allow it" — Windows never compounds CHANGE_NOTIFY with
-     * anything else in practice anyway.  The client can retry the
-     * CHANGE_NOTIFY as a standalone request.
+     * A CHANGE_NOTIFY that would go asynchronous inside a multi-command
+     * compound is governed by MS-SMB2 <159>/<162> (the Win7 compound
+     * behaviour the smb2.compound.interim* tests pin):
      *
-     * Synchronous completion (events were already pending) is fine —
-     * that slot's reply lands in the compound normally and we never
-     * reach this check. */
-    if (request->compound->num_requests > 1) {
+     *   - If it is NOT the last request in the compound, the server fails
+     *     it with STATUS_INTERNAL_ERROR (the other, synchronous, requests
+     *     in the compound still succeed) -- interim2.
+     *
+     *   - If it IS the last request, the server is allowed to split it off
+     *     and let it go async: the interim STATUS_PENDING is sent as a
+     *     standalone async message (just as for a non-compounded notify)
+     *     and this slot is dropped from the compound reply.  The parked
+     *     request can then be cancelled (interim1) or completed later
+     *     (interim3).
+     *
+     * Synchronous completion (events were already pending) is fine for any
+     * position -- that slot's reply lands in the compound normally and we
+     * never reach this check. */
+    if (request->compound->num_requests > 1 &&
+        request != request->compound->requests[request->compound->num_requests - 1]) {
         pthread_mutex_unlock(&state->lock);
         chimera_smb_open_file_release(request, open_file);
-        chimera_smb_complete_request(request, SMB2_STATUS_INVALID_PARAMETER);
+        chimera_smb_complete_request(request, SMB2_STATUS_INTERNAL_ERROR);
         return;
     }
 
@@ -258,17 +290,12 @@ chimera_smb_change_notify(struct chimera_smb_request *request)
     nr->completion_filter    = request->change_notify.completion_filter;
     nr->watch_tree           = request->change_notify.watch_tree;
 
-    /* Capture signing state so the deferred async responses can be
-     * signed.  An unsigned async reply on a signed session is rejected
-     * by Windows clients with SEC_E_INCOMPLETE_MESSAGE, breaking the
-     * watcher. */
-    if ((request->smb2_hdr.flags & SMB2_FLAGS_SIGNED) &&
-        request->session_handle) {
-        nr->signed_session = 1;
-        memcpy(nr->signing_key, request->session_handle->signing_key, 16);
-    } else {
-        nr->signed_session = 0;
-    }
+    /* Capture signing/encryption state so the deferred async responses can be
+     * secured.  An unsigned async reply on a signed session is rejected by
+     * Windows clients with SEC_E_INCOMPLETE_MESSAGE, and on an encrypting
+     * session every response must be wrapped in a TRANSFORM header -- either
+     * way breaks the watcher if we send it in the clear. */
+    chimera_smb_secure_send_snapshot(request, &nr->secure);
 
     state->pending = nr;
     pthread_mutex_unlock(&state->lock);

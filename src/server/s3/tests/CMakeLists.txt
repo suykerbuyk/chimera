@@ -48,6 +48,7 @@ if(BOTO3_FOUND)
                         --chimera ${CHIMERA_DAEMON}
             )
             set_tests_properties(chimera/server/s3/boto3_${sigver}_${backend}_${testname} PROPERTIES
+                LABELS "s3"
                 ENVIRONMENT "PYTHONUNBUFFERED=1"
                 TIMEOUT 300
             )
@@ -133,6 +134,9 @@ if(BOTO3_FOUND)
 
     # ==================== V2 Signature Tests ====================
     # V2 tests use memfs backend to verify V2 signing works
+
+    # ceph/s3-tests S3 compatibility suite (registered separately).
+    add_subdirectory(ceph)
 
     add_s3_test_sigver(put memfs v2)
     add_s3_test_sigver(get memfs v2)

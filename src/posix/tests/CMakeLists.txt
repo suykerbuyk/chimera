@@ -105,6 +105,34 @@ generate_posix_backend_tests(cairn CAIRN_ENABLED)
 generate_posix_backend_tests(linux "")
 generate_posix_backend_tests(io_uring CHIMERA_VFS_IO_URING)
 
+# diskfs-only cache-eviction / cold-remount stress (not part of the
+# all-backend matrix: it shrinks the diskfs caches and remounts the devices)
+add_posix_testprog(test_diskfs_evict)
+if(CHIMERA_NETNS_TESTING)
+    if(IO_URING_ENABLED)
+        add_posix_test(diskfs_evict_diskfs_io_uring test_diskfs_evict diskfs_io_uring)
+        set_tests_properties(chimera/posix/diskfs_evict_diskfs_io_uring PROPERTIES TIMEOUT 900)
+    endif()
+    if(HAVE_LIBAIO)
+        add_posix_test(diskfs_evict_diskfs_aio test_diskfs_evict diskfs_aio)
+        set_tests_properties(chimera/posix/diskfs_evict_diskfs_aio PROPERTIES TIMEOUT 900)
+    endif()
+endif()
+
+# diskfs-only space-reclaim + AG-log condensation test (statfs convergence
+# over delete churn, unlink-while-open, reclaim backlog across remount)
+add_posix_testprog(test_diskfs_reclaim)
+if(CHIMERA_NETNS_TESTING)
+    if(IO_URING_ENABLED)
+        add_posix_test(diskfs_reclaim_diskfs_io_uring test_diskfs_reclaim diskfs_io_uring)
+        set_tests_properties(chimera/posix/diskfs_reclaim_diskfs_io_uring PROPERTIES TIMEOUT 600)
+    endif()
+    if(HAVE_LIBAIO)
+        add_posix_test(diskfs_reclaim_diskfs_aio test_diskfs_reclaim diskfs_aio)
+        set_tests_properties(chimera/posix/diskfs_reclaim_diskfs_aio PROPERTIES TIMEOUT 600)
+    endif()
+endif()
+
 # ============================================================================
 # NFS3 Backend Tests
 # These tests run the POSIX tests through the Chimera NFS client,
@@ -273,9 +301,20 @@ macro(add_fsx_test backend)
             COMMAND ${NETNS_WRAPPER} ${FSX_WRAPPER} -b ${backend} -N ${FSX_NUM_OPS} -l ${FSX_MAX_LEN} -q
             WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
         )
+        # fsx does 10000 randomized ops over RocksDB/diskfs-backed VFS under
+        # ASan.  The slowest variants (cairn, diskfs_io_uring) run ~10-15s on an
+        # idle host but all four cairn variants are scheduled together as the
+        # longest tests in the posix-client shard, which CI runs heavily
+        # oversubscribed (`-j 32` on shared, ephemeral ARC pods).  Under that
+        # contention their wall time scales ~5-8x (measured 14s -> 85-104s at
+        # j64 locally) with no underlying data error -- they complete A-OK, just
+        # slowly.  A flat 300s timeout left too little headroom, so the whole
+        # cairn fsx cluster intermittently tripped the timeout and was rescued
+        # on rerun (issue #733).  Give them the same generous budget as the
+        # other heavy posix tests (diskfs_evict/reclaim use 600-900).
         set_tests_properties(chimera/posix/fsx_${backend} PROPERTIES
             ENVIRONMENT "BUILD_DIR=${CMAKE_BINARY_DIR}"
-            TIMEOUT 300
+            TIMEOUT 600
         )
     endif()
 endmacro()
@@ -946,3 +985,217 @@ foreach(prog test_fcntl test_lockf)
     add_posix_nfs3_test_myuser(${test_name}     ${prog} linux)
     add_posix_nfs3rdma_test_myuser(${test_name} ${prog} linux)
 endforeach()
+
+# pjdfstest POSIX conformance ports (one program per upstream .t file).
+# Each lives under pjd/<category>/NN.c and shares pjd_common.h.  Registered on
+# memfs first; widen the backend list per category as it greens.
+# ============================================================================
+set(PJD_TESTS
+    open/00
+    open/01
+    open/02
+    open/03
+    open/04
+    open/05
+    open/06
+    open/07
+    open/08
+    open/12
+    open/13
+    open/16
+    open/22
+    open/26
+    chmod/00
+    chmod/01
+    chmod/02
+    chmod/03
+    chmod/04
+    chmod/05
+    chmod/06
+    chmod/07
+    chown/00
+    chown/01
+    chown/02
+    chown/03
+    chown/04
+    chown/05
+    chown/06
+    chown/07
+    truncate/00
+    truncate/01
+    truncate/02
+    truncate/03
+    truncate/04
+    truncate/05
+    truncate/06
+    truncate/07
+    truncate/09
+    truncate/13
+    ftruncate/00
+    ftruncate/13
+    mkdir/00
+    mkdir/01
+    mkdir/02
+    mkdir/03
+    mkdir/04
+    mkdir/05
+    mkdir/06
+    mkdir/07
+    mkdir/10
+    rmdir/00
+    rmdir/01
+    rmdir/02
+    rmdir/03
+    rmdir/04
+    rmdir/05
+    rmdir/06
+    rmdir/07
+    rmdir/08
+    rmdir/11
+    rmdir/12
+    mkfifo/00
+    mkfifo/01
+    mkfifo/02
+    mkfifo/03
+    mkfifo/04
+    mkfifo/05
+    mkfifo/06
+    mkfifo/07
+    mkfifo/09
+    mknod/00
+    mknod/01
+    mknod/02
+    mknod/03
+    mknod/04
+    mknod/05
+    mknod/06
+    mknod/07
+    mknod/08
+    mknod/11
+    symlink/00
+    symlink/01
+    symlink/02
+    symlink/03
+    symlink/04
+    symlink/05
+    symlink/06
+    symlink/07
+    symlink/08
+    unlink/00
+    unlink/01
+    unlink/02
+    unlink/03
+    unlink/04
+    unlink/05
+    unlink/06
+    unlink/07
+    unlink/08
+    unlink/11
+    unlink/14
+    link/00
+    link/01
+    link/02
+    link/03
+    link/04
+    link/06
+    link/07
+    link/08
+    link/09
+    link/10
+    link/11
+    rename/00
+    rename/01
+    rename/02
+    rename/03
+    rename/04
+    rename/05
+    rename/11
+    rename/12
+    rename/13
+    rename/14
+    rename/18
+    rename/19
+    rename/20
+    rename/22
+    utimensat/00
+    utimensat/01
+    utimensat/02
+    utimensat/04
+    utimensat/08
+    utimensat/06
+    utimensat/07
+    utimensat/09
+)
+
+macro(add_pjd_testprog path)
+    string(REPLACE "/" "_" _pjd_flat ${path})
+    add_executable(posix_pjd_${_pjd_flat} pjd/${path}.c)
+    target_link_libraries(posix_pjd_${_pjd_flat} chimera_posix chimera_client chimera_server jansson)
+    set_target_properties(posix_pjd_${_pjd_flat} PROPERTIES
+        TEST_FILE "${CMAKE_CURRENT_SOURCE_DIR}/pjd/${path}.c")
+endmacro()
+
+macro(add_pjd_test path backend)
+    if(CHIMERA_NETNS_TESTING)
+        string(REPLACE "/" "_" _pjd_flat ${path})
+        add_test(NAME chimera/posix/pjd/${path}/${backend}
+            COMMAND ${NETNS_WRAPPER} ${CMAKE_CURRENT_BINARY_DIR}/posix_pjd_${_pjd_flat} -b ${backend})
+        get_target_property(_pjd_tf posix_pjd_${_pjd_flat} TEST_FILE)
+        set_tests_properties(chimera/posix/pjd/${path}/${backend} PROPERTIES
+            ENVIRONMENT "TEST_FILE=${_pjd_tf}"
+            SKIP_RETURN_CODE 77)
+        # Track pjd tests so they can be labelled as their own CI shard
+        # (LABELS pjdfstest) and kept out of the broader 'posix' label.
+        list(APPEND _pjd_test_names chimera/posix/pjd/${path}/${backend})
+    endif()
+endmacro()
+
+# Backends the pjd suite is green on are registered here.  memfs and cairn pass
+# 134/134; diskfs/passthrough/NFS are widened by follow-up PRs as they green.
+set(_pjd_test_names "")
+foreach(t ${PJD_TESTS})
+    add_pjd_testprog(${t})
+    add_pjd_test(${t} memfs)
+    if(CAIRN_ENABLED)
+        add_pjd_test(${t} cairn)
+    endif()
+    if(IO_URING_ENABLED)
+        add_pjd_test(${t} diskfs_io_uring)
+    endif()
+    if(HAVE_LIBAIO)
+        add_pjd_test(${t} diskfs_aio)
+    endif()
+    add_pjd_test(${t} linux)
+    if(CHIMERA_VFS_IO_URING)
+        add_pjd_test(${t} io_uring)
+    endif()
+endforeach()
+
+# Tag the non-pjd tests with the 'posix' label so that suite can be run
+# independently via `ctest -L posix`.  The pjdfstest ports are tagged separately
+# with 'pjdfstest' so they run as their own CI shard (alongside pynfs, s3, etc.)
+# instead of riding along in the broad posix-client shard.  Both are collected
+# from the directory TESTS property so new tests are covered automatically.
+#
+# Additionally tag each test with the VFS backend encoded in its name so an
+# entire backend can be run across every suite via e.g. `ctest -L linux`.  The
+# backend list is checked longest-name-first so diskfs_io_uring wins over the
+# io_uring substring; the boundary "($|_)" keeps the match to a whole token and
+# still catches a trailing "_myuser".  Tests with no backend in their name keep
+# only the suite label.
+get_property(_posix_tests DIRECTORY PROPERTY TESTS)
+if(_posix_tests)
+    foreach(_t IN LISTS _posix_tests)
+        if(_t IN_LIST _pjd_test_names)
+            set_property(TEST ${_t} APPEND PROPERTY LABELS pjdfstest)
+        else()
+            set_property(TEST ${_t} APPEND PROPERTY LABELS posix)
+        endif()
+        foreach(_be diskfs_io_uring diskfs_aio io_uring memfs linux cairn)
+            if(_t MATCHES "_${_be}($|_)")
+                set_property(TEST ${_t} APPEND PROPERTY LABELS ${_be})
+                break()
+            endif()
+        endforeach()
+    endforeach()
+endif()

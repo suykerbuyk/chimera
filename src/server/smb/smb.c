@@ -147,15 +147,22 @@ chimera_smb_server_init(
 
     shared->config.soft_fail_bad_req          = chimera_server_config_get_soft_fail_bad_req(config);
     shared->config.persistent_handles         = chimera_server_config_get_smb_persistent_handles(config);
+    shared->config.directory_leases           = chimera_server_config_get_smb_directory_leases(config);
     shared->config.named_streams              = chimera_server_config_get_smb_named_streams(config);
     shared->config.signing_required           = chimera_server_config_get_smb_signing_required(config);
     shared->config.encryption                 = chimera_server_config_get_smb_encryption(config);
     shared->config.compression                = chimera_server_config_get_smb_compression(config);
+    shared->config.leases                     = chimera_server_config_get_smb_leases(config);
+    shared->config.oplocks                    = chimera_server_config_get_smb_oplocks(config);
     shared->config.notify_disabled            = chimera_server_config_get_smb_notify_disabled(config);
     shared->config.acl_inherited_canonicalize = chimera_server_config_get_smb_acl_inherited_canonicalize(config);
 
     if (shared->config.persistent_handles) {
         chimera_smb_info("SMB3 durable/persistent handles enabled (in-memory state)");
+    }
+
+    if (shared->config.directory_leases) {
+        chimera_smb_info("SMB3 directory leases enabled");
     }
 
     if (shared->config.named_streams) {
@@ -292,6 +299,18 @@ chimera_smb_compound_reply(struct chimera_smb_compound *compound)
     int                               i, rc, chunk_niov;
     int                               reply_hdr_len, reply_payload_length, left, chunk;
 
+    /* The connection may have been torn down (and its pooled conn/bind
+     * possibly recycled for a NEW connection) while this compound's VFS work
+     * was still in flight.  Sending now would write a stale reply into
+     * whatever connection currently owns the recycled bind, corrupting its
+     * stream from the first message (seen as a fresh smbtorture connection
+     * failing NEGOTIATE with NT_STATUS_INVALID_NETWORK_RESPONSE).  The client
+     * this reply was for is gone; drop it and just release the compound. */
+    if (unlikely(conn->generation != compound->conn_generation)) {
+        chimera_smb_compound_free(thread, compound);
+        return;
+    }
+
     smb_dump_compound_reply(compound);
 
     evpl_iovec_alloc(evpl, 8192, 8, 1, 0, &reply_iov[0]);
@@ -325,28 +344,24 @@ chimera_smb_compound_reply(struct chimera_smb_compound *compound)
             request->flags |= CHIMERA_SMB_REQUEST_FLAG_SIGN;
         }
 
-        /* The final SESSION_SETUP response that establishes an authenticated
-         * session MUST be signed once a signing key exists, even when signing
-         * is only enabled (not required). SMB 3.x clients verify this response
-         * to confirm the server holds the session key; for SMB 3.1.1 it also
-         * binds the preauth-integrity hash. */
+        /* Every SESSION_SETUP response that involves an AUTHORIZED session is
+         * signed once a signing key exists, even when signing is only enabled
+         * (not required):
+         *   - the final response that establishes the session — SMB 3.x
+         *     clients verify it to confirm the server holds the session key,
+         *     and for 3.1.1 it binds the preauth-integrity hash;
+         *   - every leg of a channel bind (MS-SMB2 3.3.5.5.3): the client
+         *     signs the binding request with the existing session key and
+         *     requires interim, error and final responses signed —
+         *     session_handle->signing_key holds the session key on
+         *     interim/error legs and the newly derived per-channel key on the
+         *     final SUCCESS leg (an unsigned response is treated as
+         *     STATUS_ACCESS_DENIED);
+         *   - every leg of a re-authentication on a live session, which the
+         *     client likewise verifies with the unchanged session key.
+         * An initial authentication's interim legs are excluded because the
+         * session is only authorized once its final leg succeeds. */
         if (request->smb2_hdr.command == SMB2_SESSION_SETUP &&
-            request->status == SMB2_STATUS_SUCCESS &&
-            request->session_handle &&
-            (request->session_handle->session->flags & CHIMERA_SMB_SESSION_AUTHORIZED)) {
-            request->flags |= CHIMERA_SMB_REQUEST_FLAG_SIGN;
-        }
-
-        /* SMB3 multichannel session binding (MS-SMB2 3.3.5.5.3): the client
-         * signs the binding SESSION_SETUP request with the existing session key
-         * and requires every response on that exchange -- interim, final, or
-         * error -- to be signed.  Sign with session_handle->signing_key, which
-         * holds the established session's key on the interim/error legs and the
-         * newly derived per-channel key on the final SUCCESS leg.  Without this
-         * the client rejects the bind (an unsigned response is treated as
-         * STATUS_ACCESS_DENIED). */
-        if (request->smb2_hdr.command == SMB2_SESSION_SETUP &&
-            (request->session_setup.flags & SMB2_SESSION_FLAG_BINDING) &&
             request->session_handle &&
             (request->session_handle->session->flags & CHIMERA_SMB_SESSION_AUTHORIZED)) {
             request->flags |= CHIMERA_SMB_REQUEST_FLAG_SIGN;
@@ -390,7 +405,15 @@ chimera_smb_compound_reply(struct chimera_smb_compound *compound)
 
         memset(reply_hdr->signature, 0, sizeof(reply_hdr->signature));
 
-        if (chimera_smb_is_error_status(request->status)) {
+        /* An over-limit FSCTL_SRV_COPYCHUNK is rejected with
+         * STATUS_INVALID_PARAMETER, but the reply is still a full IOCTL Response
+         * whose 12-byte output buffer carries a SRV_COPYCHUNK_RESPONSE
+         * advertising the server limits, so the client resubmits within them
+         * (MS-SMB2 2.2.32.1 / 3.3.5.15.6).  All other errors get the generic
+         * SMB2 ERROR Response. */
+        if (chimera_smb_is_error_status(request->status) &&
+            !(request->smb2_hdr.command == SMB2_IOCTL &&
+              request->ioctl.cc_limit_response)) {
             evpl_iovec_cursor_append_uint16(&reply_cursor, SMB2_ERROR_REPLY_SIZE);
             evpl_iovec_cursor_append_uint16(&reply_cursor, 0);
             evpl_iovec_cursor_append_uint16(&reply_cursor, 0);
@@ -466,9 +489,18 @@ chimera_smb_compound_reply(struct chimera_smb_compound *compound)
          * response's header is aligned. NEGOTIATE and SESSION_SETUP are never
          * compounded and feed the SMB 3.1.1 preauth-integrity hash, which the
          * client computes over the message *as received* (no trailing pad):
-         * emit them in canonical form so our hash matches the client's. */
+         * emit them in canonical form so our hash matches the client's.
+         *
+         * The over-limit FSCTL_SRV_COPYCHUNK error response is also emitted
+         * unpadded: smbtorture's smb2_ioctl_is_failure() only parses the
+         * SRV_COPYCHUNK_RESPONSE on a STATUS_INVALID_PARAMETER reply when the
+         * dynamic data size is exactly sizeof(srv_copychunk_rsp) (12 bytes), so
+         * trailing alignment padding would hide the limit body.  Such a reply is
+         * never compounded after. */
         if (request->smb2_hdr.command != SMB2_NEGOTIATE &&
-            request->smb2_hdr.command != SMB2_SESSION_SETUP) {
+            request->smb2_hdr.command != SMB2_SESSION_SETUP &&
+            !(request->smb2_hdr.command == SMB2_IOCTL &&
+              request->ioctl.cc_limit_response)) {
             evpl_iovec_cursor_zero(&reply_cursor, (8 - (evpl_iovec_cursor_consumed(&reply_cursor) & 7)) & 7);
         }
 
@@ -509,6 +541,16 @@ chimera_smb_compound_reply(struct chimera_smb_compound *compound)
     if (compound->num_requests > 0 &&
         (compound->requests[0]->smb2_hdr.command == SMB2_NEGOTIATE ||
          compound->requests[0]->smb2_hdr.command == SMB2_SESSION_SETUP)) {
+
+        /* Track whether a multi-leg SESSION_SETUP exchange is in flight: the
+         * next SESSION_SETUP that arrives with this clear starts a NEW
+         * authentication exchange and restarts the preauth-integrity hash from
+         * the post-NEGOTIATE baseline (see the request-fold path).  Only an
+         * interim MORE_PROCESSING_REQUIRED leg leaves the exchange open. */
+        if (compound->requests[0]->smb2_hdr.command == SMB2_SESSION_SETUP) {
+            conn->session_setup_in_progress =
+                (compound->requests[0]->status == SMB2_STATUS_MORE_PROCESSING_REQUIRED);
+        }
 
         /* A SESSION_SETUP that completes with a hard error contributes nothing
          * to the preauth-integrity hash: the client folds a SESSION_SETUP
@@ -559,19 +601,28 @@ chimera_smb_compound_reply(struct chimera_smb_compound *compound)
     }
 
     /* SMB3 transport compression applicability (MS-SMB2 §3.3.5.12).  When the
-     * connection negotiated Plain LZ77 and a single READ asked for a compressed
-     * response (SMB2_READFLAG_REQUEST_COMPRESSED), comp_buf_off marks the data
-     * offset within the message; only that data buffer is compressed (the SMB2
-     * headers stay as the transform's uncompressed prefix), mirroring Windows.
-     * The actual compression happens either inline (plaintext send) below or, for
-     * an encrypted reply, in the compress-then-encrypt path further down. */
-    int comp_lz77 = 0, comp_pattern = 0, comp_chained = 0, comp_buf_off = -1, k;
+     * connection negotiated a full-message codec and a single READ asked for a
+     * compressed response (SMB2_READFLAG_REQUEST_COMPRESSED), comp_buf_off marks
+     * the data offset within the message; only that data buffer is compressed
+     * (the SMB2 headers stay as the transform's uncompressed prefix), mirroring
+     * Windows.  The codec is the client's most-preferred full byte codec from
+     * the negotiated set (the list is in client order); Pattern_V1 / NONE are
+     * chained sub-payload encodings, not standalone codecs, so they only flag
+     * chaining support.  The actual compression happens either inline (plaintext
+     * send) below or, for an encrypted reply, in the compress-then-encrypt path
+     * further down. */
+    int      comp_pattern = 0, comp_chained = 0, comp_buf_off = -1, k;
+    uint16_t comp_alg = 0;
 
     for (k = 0; k < conn->negotiated.compression_alg_count; k++) {
-        if (conn->negotiated.compression_algs[k] == SMB2_COMPRESSION_LZ77) {
-            comp_lz77 = 1;
-        } else if (conn->negotiated.compression_algs[k] == SMB2_COMPRESSION_PATTERN_V1) {
+        uint16_t a = conn->negotiated.compression_algs[k];
+
+        if (a == SMB2_COMPRESSION_PATTERN_V1) {
             comp_pattern = 1;
+        } else if (comp_alg == 0 &&
+                   (a == SMB2_COMPRESSION_LZ77 || a == SMB2_COMPRESSION_LZNT1 ||
+                    a == SMB2_COMPRESSION_LZ77_HUFFMAN)) {
+            comp_alg = a;
         }
     }
 
@@ -587,7 +638,7 @@ chimera_smb_compound_reply(struct chimera_smb_compound *compound)
     comp_chained = comp_pattern &&
         (conn->negotiated.compression_flags & SMB2_COMPRESSION_FLAG_CHAINED);
 
-    int comp_applicable = comp_lz77 && comp_buf_off > 0 &&
+    int comp_applicable = comp_alg != 0 && comp_buf_off > 0 &&
         conn->protocol != EVPL_DATAGRAM_RDMACM_RC;
 
     if (!will_encrypt && comp_applicable) {
@@ -595,7 +646,7 @@ chimera_smb_compound_reply(struct chimera_smb_compound *compound)
         int               comp_total;
 
         rc = chimera_smb_compress_message(thread->compress_ctx, evpl,
-                                          SMB2_COMPRESSION_LZ77, comp_chained, comp_buf_off,
+                                          comp_alg, comp_chained, comp_buf_off,
                                           reply_iov, reply_niov,
                                           reply_payload_length, reply_hdr_len,
                                           &comp_iov, &comp_total);
@@ -663,7 +714,7 @@ chimera_smb_compound_reply(struct chimera_smb_compound *compound)
                     int comp_total;
 
                     if (chimera_smb_compress_message(thread->compress_ctx, evpl,
-                                                     SMB2_COMPRESSION_LZ77, comp_chained,
+                                                     comp_alg, comp_chained,
                                                      comp_buf_off, reply_iov, reply_niov,
                                                      reply_payload_length, reply_hdr_len,
                                                      &comp_iov, &comp_total) == 0) {
@@ -777,6 +828,24 @@ chimera_smb_compound_reply(struct chimera_smb_compound *compound)
                    EVPL_SEND_FLAG_TAKE_REF);
     }
 
+    /* This compound's reply has now been queued on the connection.  Drop the
+     * in-flight count and flush any dir-lease break notifications that were
+     * queued while processing it: they go out AFTER the reply above (same bind,
+     * so TCP delivers reply-then-break), which is the order the client needs to
+     * defer its break ack correctly (MS-SMB2; smbtorture dirlease rename/unlink).
+     * Cross-connection / reaper breaks (queued with no in-flight compound) were
+     * sent via the doorbell instead and are unaffected. */
+    pthread_mutex_lock(&thread->lease_break_lock);
+    if (thread->active_compounds > 0) {
+        thread->active_compounds--;
+    }
+    if (conn->in_compound > 0) {
+        conn->in_compound--;
+    }
+    pthread_mutex_unlock(&thread->lease_break_lock);
+
+    chimera_smb_lease_break_flush(thread);
+
     chimera_smb_compound_free(thread, compound);
 } /* chimera_smb_compound_reply */
 
@@ -857,6 +926,29 @@ chimera_smb_compound_advance(struct chimera_smb_compound *compound)
         if (unlikely(!request->session_handle)) {
             chimera_smb_complete_request(request, SMB2_STATUS_INVALID_PARAMETER);
             return;
+        }
+
+        /* MS-SMB2 3.3.5.2.7.2: a related request inherits the FileId of the
+         * preceding request (FileId 0xFFFF.../0xFFFF...).  When that preceding
+         * request was a CREATE that failed, no Open was established, so the
+         * inherited handle is unavailable.  In that case the server fails the
+         * related request with the *preceding request's* error status rather
+         * than the generic STATUS_FILE_CLOSED an unresolved handle would yield
+         * (Windows/Samba: related4/related7 inherit ACCESS_DENIED, related8
+         * inherits OBJECT_NAME_NOT_FOUND).  Detect "no Open established" via the
+         * saved FileId still being UINT64_MAX: a successful CREATE anywhere in
+         * the chain populates it, so a later failing op (e.g. a read-only
+         * handle's WRITE in related6) leaves the handle resolvable and does NOT
+         * poison the rest of the chain. */
+        if (unlikely(compound->complete_requests > 0 &&
+                     compound->saved_file_id.pid == UINT64_MAX)) {
+            struct chimera_smb_request *prev =
+                compound->requests[compound->complete_requests - 1];
+
+            if (chimera_smb_is_error_status(prev->status)) {
+                chimera_smb_complete_request(request, prev->status);
+                return;
+            }
         }
     } else {
         /* An unrelated request breaks the related chain: clear the saved
@@ -1044,8 +1136,9 @@ chimera_smb_server_handle_smb2(
 
     compound = chimera_smb_compound_alloc(thread);
 
-    compound->thread = thread;
-    compound->conn   = conn;
+    compound->thread          = thread;
+    compound->conn            = conn;
+    compound->conn_generation = conn->generation;
 
     compound->saved_session_id     = UINT64_MAX;
     compound->saved_tree_id        = UINT64_MAX;
@@ -1080,7 +1173,25 @@ chimera_smb_server_handle_smb2(
             return;
         }
 
+        /* The compound request array is fixed-size; a chain that would overflow
+         * it is hostile.  Every loop iteration appends exactly one request, so
+         * checking here guards all of the requests[num_requests++] sites below. */
+        if (unlikely(compound->num_requests >= CHIMERA_SMB_COMPOUND_MAX_REQUESTS)) {
+            chimera_smb_error(
+                "SMB2 compound exceeds %d chained requests; closing connection",
+                CHIMERA_SMB_COMPOUND_MAX_REQUESTS);
+            chimera_smb_compound_free(thread, compound);
+            evpl_close(evpl, conn->bind);
+            return;
+        }
+
         evpl_iovec_cursor_reset_consumed(request_cursor);
+
+        /* Fence the cursor's checked readers to this element's bytes.  `left`
+         * still counts from this element's header start (the -= below has not
+         * run yet), so this caps reads at the end of the received compound; once
+         * NextCommand is validated we tighten it to this element's own window. */
+        evpl_iovec_cursor_set_limit(request_cursor, left);
 
         request = chimera_smb_request_alloc(thread);
 
@@ -1089,6 +1200,12 @@ chimera_smb_server_handle_smb2(
         evpl_iovec_cursor_copy(request_cursor, &request->smb2_hdr, sizeof(request->smb2_hdr));
 
         left -= sizeof(request->smb2_hdr);
+
+        /* Capture the per-request ChannelSequence (low 16 bits of the field the
+         * header struct calls "status" on a request) and the replay flag for
+         * MS-SMB2 §3.3.5.2.10 stale-write detection and create-context replay. */
+        request->channel_sequence = (uint16_t) (request->smb2_hdr.status & 0xFFFF);
+        request->is_replay        = (request->smb2_hdr.flags & SMB2_FLAGS_REPLAY_OPERATION) ? 1 : 0;
 
         signature_cursor = *request_cursor;
 
@@ -1111,6 +1228,34 @@ chimera_smb_server_handle_smb2(
                                &request->request_struct_size,
                                sizeof(request->request_struct_size));
 
+        /* Validate the compound chain link before anything trusts it -- the
+         * per-element cursor window, the signing payload length, and the skip to
+         * the next element all derive from NextCommand.  When present it must be
+         * 8-byte aligned (MS-SMB2 2.2.1.2), point past this header, and stay
+         * within the bytes actually received (`left` + the header we consumed).
+         * A bogus value is rejected cleanly and terminates the chain rather than
+         * driving an out-of-bounds skip. */
+        if (request->smb2_hdr.next_command != 0) {
+            uint32_t nc = request->smb2_hdr.next_command;
+
+            if (unlikely(nc < sizeof(request->smb2_hdr) ||
+                         (nc & 7) != 0 ||
+                         nc > (uint32_t) left + sizeof(request->smb2_hdr))) {
+                chimera_smb_error("Received SMB2 compound with invalid NextCommand %u", nc);
+                request->smb2_hdr.next_command               = 0;
+                request->status                              = SMB2_STATUS_INVALID_PARAMETER;
+                request->flags                              |= CHIMERA_SMB_REQUEST_FLAG_PARSE_FAILED;
+                compound->requests[compound->num_requests++] = request;
+                goto next_compound_request;
+            }
+
+            /* Tighten the window to exactly this element: limit becomes the
+             * absolute NextCommand offset (set_limit is relative to the current
+             * consumed position). */
+            evpl_iovec_cursor_set_limit(request_cursor,
+                                        nc - evpl_iovec_cursor_consumed(request_cursor));
+        }
+
         /* Compound related requests inherit session/tree from previous request */
         if (request->smb2_hdr.flags & SMB2_FLAGS_RELATED_OPERATIONS) {
             request->session_handle = NULL;
@@ -1126,7 +1271,20 @@ chimera_smb_server_handle_smb2(
                     request->session_handle = session_handle;
                 } else {
 
-                    session = chimera_smb_session_lookup(thread->shared, request->smb2_hdr.session_id);
+                    /* Only a SESSION_SETUP (a channel bind, or a re-auth /
+                     * reconnect probe the handler answers per MS-SMB2) may
+                     * adopt a session from the GLOBAL table onto this
+                     * connection: the attached handle carries the session's
+                     * signing key so the exchange's responses can be signed
+                     * (Samba bug 14512).  Any other command referencing a
+                     * session with no channel on this connection is answered
+                     * USER_SESSION_DELETED without taking a session reference
+                     * — a parasitic reference here would keep a dying
+                     * session's opens alive after its real channels are gone
+                     * (smb2.session.bind2). */
+                    session = request->smb2_hdr.command == SMB2_SESSION_SETUP ?
+                        chimera_smb_session_lookup(thread->shared, request->smb2_hdr.session_id) :
+                        NULL;
 
                     if (session) {
                         session_handle = chimera_smb_session_handle_alloc(thread);
@@ -1179,6 +1337,23 @@ chimera_smb_server_handle_smb2(
         if (unlikely(request->session_handle &&
                      (request->session_handle->session->flags &
                       CHIMERA_SMB_SESSION_DELETED))) {
+            request->session_handle                      = NULL;
+            request->status                              = SMB2_STATUS_USER_SESSION_DELETED;
+            request->flags                              |= CHIMERA_SMB_REQUEST_FLAG_PARSE_FAILED;
+            compound->requests[compound->num_requests++] = request;
+            goto next_compound_request;
+        }
+
+        /* A session that exists globally but has no channel on THIS connection
+         * (the handle was attached by the global-session lookup above, e.g.
+         * for a channel bind in progress or one that failed) may only be
+         * referenced by SESSION_SETUP.  Any other command through such a
+         * handle is answered STATUS_USER_SESSION_DELETED without touching the
+         * session (MS-SMB2 3.3.5.2.9; Samba bug 14512 / smbtorture
+         * smb2.session.bind_invalid_auth's "unlink on invalid channel"). */
+        if (unlikely(request->session_handle &&
+                     !request->session_handle->is_channel &&
+                     request->smb2_hdr.command != SMB2_SESSION_SETUP)) {
             request->session_handle                      = NULL;
             request->status                              = SMB2_STATUS_USER_SESSION_DELETED;
             request->flags                              |= CHIMERA_SMB_REQUEST_FLAG_PARSE_FAILED;
@@ -1270,10 +1445,22 @@ chimera_smb_server_handle_smb2(
                      (request->smb2_hdr.command != SMB2_NEGOTIATE &&
                       request->smb2_hdr.command != SMB2_SESSION_SETUP &&
                       request->smb2_hdr.command != SMB2_ECHO))) {
-            chimera_smb_error("Received SMB2 message with invalid command and no session");
-            chimera_smb_complete_request(request, SMB2_STATUS_NO_SUCH_LOGON_SESSION);
-            chimera_smb_request_free(thread, request);
-            return;
+            /* A session-requiring command whose header carries SessionId 0 --
+             * e.g. smbtorture's sessionless FSCTL_SMBTORTURE transport-block
+             * IOCTL (smb2.replay.dhv2-pending3*, smb2.oplock.batch22b,
+             * smb2.multichannel.*).  Per MS-SMB2 3.3.5.2.9 this is answered
+             * with USER_SESSION_DELETED.  Defer the failure exactly like the
+             * invalid-session-id case above: the request was not yet added to
+             * the compound, so completing it inline would advance
+             * complete_requests against a compound that does not contain it
+             * (tripping the compound_advance accounting abort) and, mid-chain,
+             * would complete requests out of order. */
+            chimera_smb_error("Received session-requiring SMB2 command %u with no session",
+                              request->smb2_hdr.command);
+            request->status                              = SMB2_STATUS_USER_SESSION_DELETED;
+            request->flags                              |= CHIMERA_SMB_REQUEST_FLAG_PARSE_FAILED;
+            compound->requests[compound->num_requests++] = request;
+            goto next_compound_request;
         }
 
         if (request->session_handle &&
@@ -1368,8 +1555,19 @@ chimera_smb_server_handle_smb2(
         more_requests = request->smb2_hdr.next_command != 0;
 
         if (more_requests) {
-            evpl_iovec_cursor_skip(request_cursor,
-                                   request->smb2_hdr.next_command - evpl_iovec_cursor_consumed(request_cursor));
+            /* A per-command parser may have tightened the cursor limit to fence a
+             * sub-buffer (SET_INFO / IOCTL), which would otherwise make the skip
+             * to the next compound header spuriously fail.  NextCommand was
+             * validated above (aligned, forward, within the received data), so
+             * restore the element boundary as the limit before skipping to it. */
+            evpl_iovec_cursor_set_limit(request_cursor,
+                                        request->smb2_hdr.next_command -
+                                        evpl_iovec_cursor_consumed(request_cursor));
+            if (unlikely(smb_cursor_seek_to(request_cursor, request->smb2_hdr.next_command) != 0)) {
+                chimera_smb_error("SMB2 compound NextCommand skip out of range; closing connection");
+                evpl_close(evpl, conn->bind);
+                return;
+            }
         }
 
         left -= evpl_iovec_cursor_consumed(request_cursor) - sizeof(request->smb2_hdr);
@@ -1387,19 +1585,24 @@ chimera_smb_server_handle_smb2(
      * handler derives the signing key over a hash that includes this request.
      * Maintained unconditionally for these commands; only consumed at 3.1.1.
      *
-     * A SESSION_SETUP whose header SessionId is 0 starts a brand-new
-     * authentication (the first leg of a new session, including a re-auth
-     * after LOGOFF on the same connection).  Per MS-SMB2 3.3.5.5.3 that
-     * session's preauth hash restarts from the post-NEGOTIATE baseline, not
-     * from whatever earlier sessions accumulated -- otherwise the signing key
-     * is derived over the wrong hash and the client rejects the session. */
+     * A SESSION_SETUP that is not a continuation leg of an in-flight exchange
+     * starts a brand-new authentication: the first leg of a new session
+     * (header SessionId 0, including a re-auth after LOGOFF on the same
+     * connection), and equally the first leg of a channel bind or of a
+     * re-authentication, which carry the EXISTING session's id.  Per MS-SMB2
+     * 3.3.5.5.3 that exchange's preauth hash restarts from the post-NEGOTIATE
+     * baseline, not from whatever earlier exchanges accumulated -- otherwise
+     * the signing key is derived over the wrong hash and the client rejects
+     * the session (a bound channel's signing key would chain over the
+     * connection's previous session setups, which the client never folds). */
     if (compound->num_requests > 0 &&
         (compound->requests[0]->smb2_hdr.command == SMB2_NEGOTIATE ||
          compound->requests[0]->smb2_hdr.command == SMB2_SESSION_SETUP)) {
         uint8_t *msg = malloc(length);
         if (msg) {
             if (compound->requests[0]->smb2_hdr.command == SMB2_SESSION_SETUP &&
-                compound->requests[0]->smb2_hdr.session_id == 0) {
+                (compound->requests[0]->smb2_hdr.session_id == 0 ||
+                 !conn->session_setup_in_progress)) {
                 memcpy(conn->preauth_hash, conn->negotiate_preauth_hash,
                        sizeof(conn->preauth_hash));
             }
@@ -1414,6 +1617,17 @@ chimera_smb_server_handle_smb2(
             free(msg);
         }
     }
+
+    /* Mark a compound in flight on this thread (and connection) so a dir-lease
+     * break triggered while processing it skips the doorbell and is instead
+     * flushed after this compound's reply (chimera_smb_compound_reply) —
+     * reply-before-break.  The per-connection count distinguishes a self-break
+     * (holder conn mid-compound -> defer) from a cross-connection break (holder
+     * conn idle -> fire now, else a parking conflicting open deadlocks). */
+    pthread_mutex_lock(&thread->lease_break_lock);
+    thread->active_compounds++;
+    compound->conn->in_compound++;
+    pthread_mutex_unlock(&thread->lease_break_lock);
 
     chimera_smb_compound_advance(compound);
 
@@ -1525,8 +1739,9 @@ chimera_smb_server_handle_smb1(
 
     compound = chimera_smb_compound_alloc(thread);
 
-    compound->thread = thread;
-    compound->conn   = conn;
+    compound->thread          = thread;
+    compound->conn            = conn;
+    compound->conn_generation = conn->generation;
 
     compound->saved_session_id     = UINT64_MAX;
     compound->saved_tree_id        = UINT64_MAX;
@@ -1572,6 +1787,12 @@ chimera_smb_server_handle_smb1(
     compound->requests[compound->num_requests++] = request;
 
     smb_dump_compound_request(compound);
+
+    /* Balance the decrement in chimera_smb_compound_reply (see the SMB2 path). */
+    pthread_mutex_lock(&thread->lease_break_lock);
+    thread->active_compounds++;
+    compound->conn->in_compound++;
+    pthread_mutex_unlock(&thread->lease_break_lock);
 
     chimera_smb_compound_advance(compound);
 
@@ -1848,6 +2069,25 @@ chimera_smb_server_notify(
             chimera_smb_info("Disconnected %s SMB connection from %s to %s, handled %lu requests",
                              conn->protocol == EVPL_DATAGRAM_RDMACM_RC ? "RDMA" : "TCP",
                              conn->remote_addr, conn->local_addr, conn->requests_completed);
+            /* Test hook: delay disconnect processing to deterministically widen
+             * the window between a client's TCP close and the server-side
+             * teardown that parks its durable handles.  A request racing into
+             * that window on another connection exercises the
+             * disconnect-vs-conflicting-open paths (close-not-park, yielded
+             * reclaim, parked-CREATE re-arbitration) that otherwise only a
+             * loaded CI machine hits.  Inert unless the environment variable is
+             * set; used by the smbtorture durable-open ctest entries. */
+            {
+                static int delay_ms = -1;
+
+                if (delay_ms < 0) {
+                    const char *d = getenv("CHIMERA_SMB_TEST_DISCONNECT_DELAY_MS");
+                    delay_ms = d ? atoi(d) : 0;
+                }
+                if (delay_ms > 0) {
+                    usleep(delay_ms * 1000);
+                }
+            }
             chimera_smb_conn_free(thread, conn);
             break;
         case EVPL_NOTIFY_RECV_MSG:
@@ -1929,13 +2169,15 @@ chimera_smb_server_accept(
     /* SMB 3.1.1 preauth-integrity hash starts at zero for each connection. */
     memset(conn->preauth_hash, 0, sizeof(conn->preauth_hash));
     memset(conn->negotiate_preauth_hash, 0, sizeof(conn->negotiate_preauth_hash));
-    conn->rdma_niov   = 0;
-    conn->rdma_length = 0;
+    conn->session_setup_in_progress = 0;
+    conn->rdma_niov                 = 0;
+    conn->rdma_length               = 0;
     /* Conns are pooled; clear per-connection negotiate state so the
     * "NEGOTIATE after NEGOTIATE" guard (MS-SMB2 3.3.5.4) does not trip on
     * a dialect inherited from a previously torn-down connection. */
-    conn->dialect = 0;
-    conn->flags   = 0;
+    conn->dialect            = 0;
+    conn->flags              = 0;
+    conn->requests_completed = 0;
 
     evpl_bind_get_local_address(bind, conn->local_addr, sizeof(conn->local_addr));
     evpl_bind_get_remote_address(bind, conn->remote_addr, sizeof(conn->remote_addr));

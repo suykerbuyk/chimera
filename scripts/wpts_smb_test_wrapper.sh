@@ -3,7 +3,14 @@
 #
 # SPDX-License-Identifier: Unlicense
 
-# Usage: wpts_smb_test_wrapper.sh <chimera_binary> <backend> <test_filter>
+# Usage: wpts_smb_test_wrapper.sh <chimera_binary> <backend> <test_list>
+#
+#   <test_list>  comma-separated vstest test-name list (passed to `--Tests`).
+#                A whole config-group's allowlist is run in ONE vstest
+#                invocation against a single chimera server -- the per-case
+#                .NET host + daemon bringup dominated, so batching is ~10x
+#                faster.  (`--Tests` scales past the `--TestCaseFilter` OR-chain
+#                grammar limit that trips on long `Name=A|Name=B|...` filters.)
 #
 # Runs Microsoft's Windows Protocol Test Suites (WPTS) File Server / MS-SMB2
 # server test suite against a standalone chimera SMB server. Unlike the KVM
@@ -15,7 +22,7 @@
 # 2. Creates a network namespace with the SUT IP (10.0.0.1)
 # 3. Starts the chimera daemon in the netns (SMB on 10.0.0.1:445)
 # 4. Stages our pinned .ptfconfig files into the WPTS Bin dir
-# 5. Runs `dotnet vstest` with the requested TestCategory filter
+# 5. Runs `dotnet vstest --Tests:<list>` to execute the requested test names
 # 6. Captures the TRX result + vstest exit code and cleans up
 #
 # Required environment:
@@ -85,6 +92,9 @@ cleanup() {
     done
     timeout 2s ip netns delete "${NETNS_NAME}" 2>/dev/null || true
     rm -rf "$SESSION_DIR"
+    # The Bin-dir shadow may live outside SESSION_DIR (on the Bin dir's own
+    # filesystem, so it can be hardlinked); clean it up explicitly.
+    [ -n "${WPTS_STAGE_DIR:-}" ] && rm -rf "$WPTS_STAGE_DIR"
 }
 trap cleanup EXIT
 
@@ -163,6 +173,8 @@ generate_config() {
         ${multichannel_line}
         ${encryption_line}
         "smb_named_streams": true,
+        "smb_leases": true,
+        "smb_oplocks": true,
         "threads": 4,
         "delegation_threads": 4,
         "external_portmap": false
@@ -234,17 +246,55 @@ if [ "$ready" != "1" ]; then
     exit 1
 fi
 
-# Stage our pinned ptfconfig fixtures into the WPTS Bin dir. WPTS auto-loads
-# the *.deployment.ptfconfig files sitting next to the test DLL.
-cp -f "${WPTS_PTFCONFIG_DIR}/CommonTestSuite.deployment.ptfconfig" \
-      "${WPTS_PTFCONFIG_DIR}/MS-SMB2_ServerTestSuite.deployment.ptfconfig" \
-      "${WPTS_BIN_DIR}/"
+# Stage a per-session shadow of the WPTS Bin dir.  PTF auto-loads the
+# *.deployment.ptfconfig files sitting next to the test DLL and also writes its
+# logs there, so running the suite straight out of the shared Bin dir would
+# force every WPTS test to serialize on it.  Each session instead gets its own
+# materialised copy of the Bin dir and runs vstest out of that.
+#
+# It must be a *real* directory of files, NOT a symlink farm: .NET resolves a
+# symlinked assembly back to its real path, so PTF would look for the
+# ptfconfig next to the original DLL (in the shared Bin dir) and the per-config
+# overrides would never take effect.  Hardlinks (and copies) have no such
+# resolution, so the staged DLL's real path is the shadow and PTF reads our
+# staged ptfconfig.  Hardlinking is near-free but only works within a single
+# filesystem, so the shadow is created on the Bin dir's own filesystem when a
+# writable same-device location exists, falling back to a full copy otherwise.
+WPTS_BIN_ABS=$(cd "${WPTS_BIN_DIR}" && pwd)
+_bin_dev=$(stat -c %d "${WPTS_BIN_ABS}")
+_shadow_parent="${SESSION_DIR}"
+for _cand in "${WPTS_SHADOW_ROOT:-}" "$(dirname "${WPTS_BIN_ABS}")" "${TMPDIR:-/tmp}" /var/tmp; do
+    [ -n "${_cand}" ] && [ -d "${_cand}" ] && [ -w "${_cand}" ] || continue
+    if [ "$(stat -c %d "${_cand}" 2>/dev/null)" = "${_bin_dev}" ]; then
+        _shadow_parent="${_cand}"
+        break
+    fi
+done
+WPTS_STAGE_DIR=$(mktemp -d "${_shadow_parent}/wpts_bin_XXXXXX")
+if [ "$(stat -c %d "${WPTS_STAGE_DIR}")" = "${_bin_dev}" ]; then
+    cp -al "${WPTS_BIN_ABS}/." "${WPTS_STAGE_DIR}/"
+else
+    cp -a "${WPTS_BIN_ABS}/." "${WPTS_STAGE_DIR}/"
+fi
+
+# Swap in our per-config ptfconfig fixtures as PRIVATE copies.  rm first: in
+# the hardlink case the staged file still shares the shared Bin dir's inode, so
+# editing it in place would corrupt the original.  Likewise drop any PTF/vstest
+# scratch outputs carried over from the source so each session writes its own
+# (the '.\TestLog' dir name is a literal backslash on Linux).
+rm -f "${WPTS_STAGE_DIR}/CommonTestSuite.deployment.ptfconfig" \
+      "${WPTS_STAGE_DIR}/MS-SMB2_ServerTestSuite.deployment.ptfconfig" \
+      "${WPTS_STAGE_DIR}/PTFApplicationLog.txt"
+rm -rf "${WPTS_STAGE_DIR}/TestResults" "${WPTS_STAGE_DIR}/.\\TestLog"
+cp "${WPTS_PTFCONFIG_DIR}/CommonTestSuite.deployment.ptfconfig" \
+   "${WPTS_PTFCONFIG_DIR}/MS-SMB2_ServerTestSuite.deployment.ptfconfig" \
+   "${WPTS_STAGE_DIR}/"
 
 # When persistent handles are enabled, advertise the matching capability +
 # CA-share to the test driver so the DurableHandleV2 / PersistentHandle cases
 # become applicable (otherwise they are Inconclusive/skipped).
 if [ "${CHIMERA_SMB_PERSISTENT:-0}" = "1" ]; then
-    staged="${WPTS_BIN_DIR}/CommonTestSuite.deployment.ptfconfig"
+    staged="${WPTS_STAGE_DIR}/CommonTestSuite.deployment.ptfconfig"
     sed -i \
         -e 's#<Property name="IsPersistentHandlesSupported" value="false"/>#<Property name="IsPersistentHandlesSupported" value="true"/>#' \
         -e 's#<Property name="CAShareName" value=""/>#<Property name="CAShareName" value="FileShare"/>#' \
@@ -256,11 +306,11 @@ fi
 # a compressed share so the SMB2Compression cases become applicable. Chimera
 # implements Plain LZ77 and the chained Pattern_V1 run-length payload.
 if [ "${CHIMERA_SMB_COMPRESSION:-0}" = "1" ]; then
-    staged="${WPTS_BIN_DIR}/CommonTestSuite.deployment.ptfconfig"
+    staged="${WPTS_STAGE_DIR}/CommonTestSuite.deployment.ptfconfig"
     sed -i \
         -e 's#<Property name="CompressedFileShare" value=""/>#<Property name="CompressedFileShare" value="SMBBasic"/>#' \
         -e 's#<Property name="IsChainedCompressionSupported" value="false"/>#<Property name="IsChainedCompressionSupported" value="true"/>#' \
-        -e 's#<Property name="SupportedCompressionAlgorithms" value=""/>#<Property name="SupportedCompressionAlgorithms" value="LZ77;Pattern_V1"/>#' \
+        -e 's#<Property name="SupportedCompressionAlgorithms" value=""/>#<Property name="SupportedCompressionAlgorithms" value="LZ77;LZ77Huffman;LZNT1;Pattern_V1"/>#' \
         "$staged"
 fi
 
@@ -269,8 +319,8 @@ fi
 # applicable (they assert serverIps.Count > 1 and the IsMultiChannelCapable
 # capability; otherwise they are Inconclusive/skipped).
 if [ "${CHIMERA_SMB_MULTICHANNEL:-0}" = "1" ]; then
-    staged_common="${WPTS_BIN_DIR}/CommonTestSuite.deployment.ptfconfig"
-    staged_smb2="${WPTS_BIN_DIR}/MS-SMB2_ServerTestSuite.deployment.ptfconfig"
+    staged_common="${WPTS_STAGE_DIR}/CommonTestSuite.deployment.ptfconfig"
+    staged_smb2="${WPTS_STAGE_DIR}/MS-SMB2_ServerTestSuite.deployment.ptfconfig"
     sed -i \
         -e 's#<Property name="IsMultiChannelCapable" value="false"/>#<Property name="IsMultiChannelCapable" value="true"/>#' \
         -e "s#<Property name=\"ClientNic2IPAddress\" value=\"\"/>#<Property name=\"ClientNic2IPAddress\" value=\"${SUT_IP2}\"/>#" \
@@ -289,7 +339,7 @@ fi
 # know the cipher set to validate the echoed Connection.CipherId
 # (BVT_Negotiate_SMB311).
 if [ "${CHIMERA_SMB_ENCRYPTION:-0}" = "1" ]; then
-    staged="${WPTS_BIN_DIR}/CommonTestSuite.deployment.ptfconfig"
+    staged="${WPTS_STAGE_DIR}/CommonTestSuite.deployment.ptfconfig"
     sed -i \
         -e 's#<Property name="IsEncryptionSupported" value="false"/>#<Property name="IsEncryptionSupported" value="true"/>#' \
         -e 's#<Property name="IsGlobalEncryptDataEnabled" value="false"/>#<Property name="IsGlobalEncryptDataEnabled" value="true"/>#' \
@@ -301,7 +351,17 @@ mkdir -p "$RESULT_DIR"
 
 FILTER_ARGS=()
 if [ -n "${TEST_FILTER}" ]; then
-    FILTER_ARGS=(--TestCaseFilter:"${TEST_FILTER}")
+    # TEST_FILTER is a comma-separated test-name list (a whole config-group's
+    # allowlist).  Build an exact-match --TestCaseFilter ("Name=A|Name=B|...") so
+    # we run EXACTLY the curated allowlist: vstest --Tests does *substring*
+    # matching and would pull in non-allowlisted name variants.
+    _wpts_filter=""
+    IFS=',' read -ra _wpts_names <<< "${TEST_FILTER}"
+    for _wpts_name in "${_wpts_names[@]}"; do
+        [ -n "${_wpts_filter}" ] && _wpts_filter="${_wpts_filter}|"
+        _wpts_filter="${_wpts_filter}Name=${_wpts_name}"
+    done
+    FILTER_ARGS=(--TestCaseFilter:"${_wpts_filter}")
 fi
 
 # Run the suite from inside the netns so it can reach the SUT IP.
@@ -313,7 +373,7 @@ ip netns exec "${NETNS_NAME}" env \
     DOTNET_NOLOGO=1 \
     DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1 \
     HOME="${SESSION_DIR}" \
-    "$DOTNET" vstest "${WPTS_BIN_DIR}/MS-SMB2_ServerTestSuite.dll" \
+    "$DOTNET" vstest "${WPTS_STAGE_DIR}/MS-SMB2_ServerTestSuite.dll" \
         "${FILTER_ARGS[@]}" \
         --logger:"trx;LogFileName=SMB2TestResult.trx" \
         --ResultsDirectory:"${RESULT_DIR}"

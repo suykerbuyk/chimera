@@ -35,6 +35,22 @@ enum chimera_s3_http_state {
 
 #define CHIMERA_S3_UPLOAD_ID_LEN 32
 
+/* S3 keys are limited to 1024 bytes; delimiters are normally a single
+ * character but we allow a small amount of slack. */
+#define CHIMERA_S3_KEY_MAX       1024
+#define CHIMERA_S3_DELIM_MAX     16
+
+/* A single collected listing element: either an object (is_prefix == 0) or a
+ * rolled-up CommonPrefix (is_prefix == 1). Objects carry the attributes needed
+ * to render <Contents>; the key string is heap-allocated and NUL-terminated. */
+struct chimera_s3_list_entry {
+    int             is_prefix;
+    uint64_t        size;
+    uint64_t        etag[2];
+    struct timespec mtime;
+    char           *key;
+};
+
 struct chimera_server_s3_thread;
 struct chimera_s3_multipart_table;
 struct chimera_s3_multipart_upload;
@@ -75,8 +91,18 @@ struct chimera_s3_request {
     int                              has_uploads;
     int                              has_upload_id;
     int                              has_delete;
+    int                              has_versions;
     int                              has_part_number;
+    /* Set when the request targets a bucket itself (Create/Delete/Head/List
+     * bucket, ListBuckets) rather than an object; tells the body notifier to
+     * drain any request body instead of treating it as object data. */
+    int                              op_bucket;
+    int                              has_attributes;
     int                              chunked;
+    /* Set once the response status/headers have been dispatched, so the
+     * several paths that can observe a request ready to send only emit it
+     * once (see s3_server_respond). */
+    int                              responded;
     int                              query_upload_idlen;
     int                              query_part_number;
     char                             query_upload_id[CHIMERA_S3_UPLOAD_ID_LEN + 1];
@@ -109,16 +135,29 @@ struct chimera_s3_request {
         } put;
 
         struct {
-            int               prefix_len;
-            int               base_path_len;
-            int               filter_len;
-            int               max_keys;
-            char             *rp;
-            struct evpl_iovec response;
-            uint8_t           root_fh[CHIMERA_VFS_FH_SIZE];
-            char              prefix[256];
-            char              base_path[256];
-            char              filter[256];
+            int                           list_type;     /* 1 (V1) or 2 (V2) */
+            int                           max_keys;
+            int                           encoding_url;  /* encoding-type=url */
+            int                           versions;      /* emit ListVersionsResult */
+            int                           prefix_len;
+            int                           delimiter_len;
+            int                           enumdir_len;   /* prefix up to last delimiter */
+            int                           has_start;     /* skip past 'start' (exclusive) */
+            int                           start_len;
+            int                           marker_len;     /* V1 marker echo */
+            int                           ctoken_len;     /* V2 continuation-token echo */
+            int                           startafter_len; /* V2 start-after echo */
+            int                           fetch_owner;    /* V2 fetch-owner=true */
+            int                           n_entries;
+            int                           cap_entries;
+            struct chimera_s3_list_entry *entries;
+            char                          delimiter[CHIMERA_S3_DELIM_MAX];
+            char                          prefix[CHIMERA_S3_KEY_MAX];
+            char                          enumdir[CHIMERA_S3_KEY_MAX];
+            char                          start[CHIMERA_S3_KEY_MAX];
+            char                          marker[CHIMERA_S3_KEY_MAX];
+            char                          ctoken[CHIMERA_S3_KEY_MAX];
+            char                          startafter[CHIMERA_S3_KEY_MAX];
         } list;
 
         struct {
@@ -132,6 +171,20 @@ struct chimera_s3_request {
             char                               *body_buf;
             int                                 body_len;
             int                                 body_cap;
+            /* ListParts / ListMultipartUploads pagination parameters,
+             * captured from the query string. */
+            int                                 max_parts;        /* ListParts max-parts (default 1000) */
+            int                                 part_number_marker; /* ListParts part-number-marker */
+            int                                 max_uploads;      /* ListMultipartUploads max-uploads (default 1000) */
+            int                                 key_marker_len;
+            int                                 upload_id_marker_len;
+            char                                key_marker[CHIMERA_S3_KEY_MAX];
+            char                                upload_id_marker[CHIMERA_S3_UPLOAD_ID_LEN + 1];
+            /* UploadPartCopy: source byte range from x-amz-copy-source-range. */
+            int                                 is_copy;        /* 1 => emit CopyPartResult */
+            int                                 has_copy_range;
+            int64_t                             copy_range_first;
+            int64_t                             copy_range_last;
             char                                upload_id[CHIMERA_S3_UPLOAD_ID_LEN + 1];
             char                                tmp_name[64];
             char                                path_buf[1024];
@@ -182,6 +235,11 @@ struct chimera_server_s3_shared {
     struct chimera_vfs_cred            cred;
     uint32_t                           root_fh_len;
     uint8_t                            root_fh[CHIMERA_VFS_FH_SIZE];
+    /* VFS path (relative to root_fh) under which dynamically created buckets
+     * are materialized as directories. Empty if runtime bucket creation is
+     * disabled (no bucket root configured). */
+    int                                bucket_root_pathlen;
+    char                               bucket_root_path[256];
 };
 
 static inline struct chimera_s3_io *
