@@ -16,6 +16,8 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <sys/ioctl.h>
+#include <linux/fs.h>
 #include <uthash.h>
 #include <jansson.h>
 #include <linux/version.h>
@@ -237,7 +239,8 @@ snfs_set_attrs(
     }
 
 
-    if (set_mask & CHIMERA_VFS_ATTR_BTIME) {
+    if ((set_mask & CHIMERA_VFS_ATTR_BTIME) &&
+        attr->va_btime.tv_nsec != CHIMERA_VFS_TIME_OMIT) {
         rc = snfs_cvapi_set_btime(dirfd, path, &attr->va_btime);
 
         if (rc) {
@@ -253,12 +256,17 @@ snfs_set_attrs(
 
     if (set_mask & (CHIMERA_VFS_ATTR_ATIME | CHIMERA_VFS_ATTR_MTIME)) {
         struct timespec times[2];
+        int             have_any = 0;
 
         if (set_mask & CHIMERA_VFS_ATTR_ATIME) {
             if (attr->va_atime.tv_nsec == CHIMERA_VFS_TIME_NOW) {
                 times[0].tv_nsec = UTIME_NOW;
+                have_any         = 1;
+            } else if (attr->va_atime.tv_nsec == CHIMERA_VFS_TIME_OMIT) {
+                times[0].tv_nsec = UTIME_OMIT;
             } else {
                 times[0] = attr->va_atime;
+                have_any = 1;
             }
 
             attr->va_set_mask |= CHIMERA_VFS_ATTR_ATIME;
@@ -269,8 +277,12 @@ snfs_set_attrs(
         if (set_mask & CHIMERA_VFS_ATTR_MTIME) {
             if (attr->va_mtime.tv_nsec == CHIMERA_VFS_TIME_NOW) {
                 times[1].tv_nsec = UTIME_NOW;
+                have_any         = 1;
+            } else if (attr->va_mtime.tv_nsec == CHIMERA_VFS_TIME_OMIT) {
+                times[1].tv_nsec = UTIME_OMIT;
             } else {
                 times[1] = attr->va_mtime;
+                have_any = 1;
             }
 
             attr->va_set_mask |= CHIMERA_VFS_ATTR_MTIME;
@@ -278,13 +290,15 @@ snfs_set_attrs(
             times[1].tv_nsec = UTIME_OMIT;
         }
 
-        rc = utimensat(dirfd, path, times, AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH);
+        if (have_any) {
+            rc = utimensat(dirfd, path, times, AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH);
 
-        if (rc) {
-            snfs_error("snfs_setattr: utimensat() failed: %s",
-                       strerror(errno));
+            if (rc) {
+                snfs_error("snfs_setattr: utimensat() failed: %s",
+                           strerror(errno));
 
-            return -errno;
+                return -errno;
+            }
         }
     }
 
@@ -1069,6 +1083,281 @@ snfs_allocate(
 
 } /* snfs_allocate */
 
+#define SNFS_COPY_RANGE_BUFSZ (1024 * 1024)
+
+/* Copy one buffered chunk: fill the buffer from the source range, then
+ * write it out.  Reading the whole chunk before writing makes a single
+ * chunk safe even when source and destination ranges overlap in the
+ * same file.  Returns bytes copied, or -1 with errno set.  A return
+ * shorter than @p chunk means the source hit EOF. */
+static ssize_t
+snfs_copy_range_chunk(
+    int      src_fd,
+    int      dst_fd,
+    void    *buf,
+    size_t   chunk,
+    uint64_t src_off,
+    uint64_t dst_off)
+{
+    ssize_t nread, nwritten;
+    size_t  fill = 0, woff = 0;
+
+    while (fill < chunk) {
+        nread = pread(src_fd, (char *) buf + fill, chunk - fill, src_off + fill);
+
+        if (nread < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+
+        if (nread == 0) {
+            /* EOF on source */
+            break;
+        }
+
+        fill += (size_t) nread;
+    }
+
+    while (woff < fill) {
+        nwritten = pwrite(dst_fd, (char *) buf + woff, fill - woff,
+                          dst_off + woff);
+
+        if (nwritten < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+
+        woff += (size_t) nwritten;
+    }
+
+    return (ssize_t) fill;
+} /* snfs_copy_range_chunk */
+
+/* The StorNext kernel module implements neither copy_file_range(2) nor
+ * the splice file ops the kernel's generic fallback path requires, so
+ * the syscall fails with EINVAL on cvfs.  Emulate the copy with a
+ * buffered pread/pwrite loop, short-copying at source EOF.
+ *
+ * Unlike copy_file_range(2), overlapping ranges within the same file
+ * are copied correctly (memmove-style) rather than rejected: SMB
+ * COPYCHUNK requires same-file overlapping copies to succeed
+ * (smbtorture smb2.ioctl.copy_chunk_src_is_dest_overlap).  When the
+ * destination range starts above the source the chunks are processed
+ * back to front so no chunk reads bytes an earlier chunk wrote. */
+static void
+snfs_copy_range_emulate(
+    struct chimera_vfs_request *request,
+    int                         src_fd,
+    int                         dst_fd)
+{
+    struct stat src_st, dst_st;
+    uint64_t    src_off   = request->copy_range.src_offset;
+    uint64_t    dst_off   = request->copy_range.dst_offset;
+    uint64_t    remaining = request->copy_range.length;
+    uint64_t    copied    = 0;
+    void       *buf;
+    size_t      chunk;
+    ssize_t     rc;
+
+    if (fstat(src_fd, &src_st) < 0 || fstat(dst_fd, &dst_st) < 0) {
+        request->status = snfs_errno_to_status(errno);
+        request->complete(request);
+        return;
+    }
+
+    buf = malloc(SNFS_COPY_RANGE_BUFSZ);
+
+    if (!buf) {
+        request->status = snfs_errno_to_status(ENOMEM);
+        request->complete(request);
+        return;
+    }
+
+    if (src_st.st_dev == dst_st.st_dev &&
+        src_st.st_ino == dst_st.st_ino &&
+        src_off < dst_off + remaining &&
+        dst_off < src_off + remaining &&
+        dst_off > src_off) {
+        /* Overlap with the destination above the source: copy chunks
+         * back to front.  Clamp to the source EOF first since the EOF
+         * cannot be discovered as we go in reverse order. */
+        uint64_t avail = 0;
+
+        if ((uint64_t) src_st.st_size > src_off) {
+            avail = (uint64_t) src_st.st_size - src_off;
+            if (avail > remaining) {
+                avail = remaining;
+            }
+        }
+
+        while (copied < avail) {
+            uint64_t left = avail - copied;
+
+            chunk = left < SNFS_COPY_RANGE_BUFSZ ?
+                left : SNFS_COPY_RANGE_BUFSZ;
+
+            rc = snfs_copy_range_chunk(src_fd, dst_fd, buf, chunk,
+                                       src_off + left - chunk,
+                                       dst_off + left - chunk);
+
+            if (rc < 0) {
+                free(buf);
+                request->status = snfs_errno_to_status(errno);
+                request->complete(request);
+                return;
+            }
+
+            if ((size_t) rc != chunk) {
+                /* Concurrent truncation below the pre-computed EOF */
+                free(buf);
+                request->status = CHIMERA_VFS_EIO;
+                request->complete(request);
+                return;
+            }
+
+            copied += chunk;
+        }
+    } else {
+        while (remaining > 0) {
+            chunk = remaining < SNFS_COPY_RANGE_BUFSZ ?
+                remaining : SNFS_COPY_RANGE_BUFSZ;
+
+            rc = snfs_copy_range_chunk(src_fd, dst_fd, buf, chunk,
+                                       src_off + copied,
+                                       dst_off + copied);
+
+            if (rc < 0) {
+                free(buf);
+                request->status = snfs_errno_to_status(errno);
+                request->complete(request);
+                return;
+            }
+
+            copied    += (uint64_t) rc;
+            remaining -= (uint64_t) rc;
+
+            if ((size_t) rc < chunk) {
+                /* EOF on source */
+                break;
+            }
+        }
+    }
+
+    free(buf);
+
+    snfs_map_attrs(CHIMERA_VFS_FH_MAGIC_SNFS,
+                   &request->copy_range.r_post_attr,
+                   dst_fd);
+
+    request->copy_range.r_length = copied;
+    request->status              = CHIMERA_VFS_OK;
+    request->complete(request);
+} /* snfs_copy_range_emulate */
+
+static void
+snfs_copy_range(
+    struct chimera_vfs_request *request,
+    void                       *private_data)
+{
+    int      src_fd, dst_fd;
+    loff_t   src_off, dst_off;
+    uint64_t remaining;
+    uint64_t copied = 0;
+    ssize_t  rc;
+
+    if (request->copy_range.src_handle->vfs_module !=
+        request->copy_range.dst_handle->vfs_module) {
+        request->status = CHIMERA_VFS_ENOTSUP;
+        request->complete(request);
+        return;
+    }
+
+    src_fd    = (int) request->copy_range.src_handle->vfs_private;
+    dst_fd    = (int) request->copy_range.dst_handle->vfs_private;
+    src_off   = (loff_t) request->copy_range.src_offset;
+    dst_off   = (loff_t) request->copy_range.dst_offset;
+    remaining = request->copy_range.length;
+
+    while (remaining > 0) {
+        rc = copy_file_range(src_fd, &src_off, dst_fd, &dst_off, remaining, 0);
+
+        if (rc < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (copied == 0 &&
+                (errno == EINVAL || errno == EXDEV ||
+                 errno == ENOSYS || errno == EOPNOTSUPP)) {
+                snfs_copy_range_emulate(request, src_fd, dst_fd);
+                return;
+            }
+            request->status = snfs_errno_to_status(errno);
+            request->complete(request);
+            return;
+        }
+
+        if (rc == 0) {
+            /* EOF on source */
+            break;
+        }
+
+        copied    += (uint64_t) rc;
+        remaining -= (uint64_t) rc;
+    }
+
+    snfs_map_attrs(CHIMERA_VFS_FH_MAGIC_SNFS,
+                   &request->copy_range.r_post_attr,
+                   dst_fd);
+
+    request->copy_range.r_length = copied;
+    request->status              = CHIMERA_VFS_OK;
+    request->complete(request);
+} /* snfs_copy_range */
+
+static void
+snfs_clone_range(
+    struct chimera_vfs_request *request,
+    void                       *private_data)
+{
+    int                     src_fd, dst_fd;
+    struct file_clone_range args;
+    int                     rc;
+
+    if (request->clone_range.src_handle->vfs_module !=
+        request->clone_range.dst_handle->vfs_module) {
+        request->status = CHIMERA_VFS_ENOTSUP;
+        request->complete(request);
+        return;
+    }
+
+    src_fd = (int) request->clone_range.src_handle->vfs_private;
+    dst_fd = (int) request->clone_range.dst_handle->vfs_private;
+
+    args.src_fd      = src_fd;
+    args.src_offset  = request->clone_range.src_offset;
+    args.src_length  = request->clone_range.length;
+    args.dest_offset = request->clone_range.dst_offset;
+
+    rc = ioctl(dst_fd, FICLONERANGE, &args);
+
+    if (rc < 0) {
+        request->status = snfs_errno_to_status(errno);
+        request->complete(request);
+        return;
+    }
+
+    snfs_map_attrs(CHIMERA_VFS_FH_MAGIC_SNFS,
+                   &request->clone_range.r_post_attr,
+                   dst_fd);
+
+    request->status = CHIMERA_VFS_OK;
+    request->complete(request);
+} /* snfs_clone_range */
+
 static void
 snfs_seek(
     struct chimera_vfs_request *request,
@@ -1454,6 +1743,12 @@ snfs_dispatch(
         case CHIMERA_VFS_OP_ALLOCATE:
             snfs_allocate(request, private_data);
             break;
+        case CHIMERA_VFS_OP_COPY_RANGE:
+            snfs_copy_range(request, private_data);
+            break;
+        case CHIMERA_VFS_OP_CLONE_RANGE:
+            snfs_clone_range(request, private_data);
+            break;
         case CHIMERA_VFS_OP_SEEK:
             snfs_seek(request, private_data);
             break;
@@ -1474,7 +1769,8 @@ SYMBOL_EXPORT struct chimera_vfs_module vfs_snfs = {
     .fh_magic     = CHIMERA_VFS_FH_MAGIC_SNFS,
     .capabilities = CHIMERA_VFS_CAP_BLOCKING | CHIMERA_VFS_CAP_OPEN_PATH_REQUIRED | CHIMERA_VFS_CAP_OPEN_FILE_REQUIRED |
         CHIMERA_VFS_CAP_FS | CHIMERA_VFS_CAP_FS_RELATIVE_OP | CHIMERA_VFS_CAP_FS_PATH_OP |
-        CHIMERA_VFS_CAP_FS_LOCK
+        CHIMERA_VFS_CAP_FS_LOCK |
+        CHIMERA_VFS_CAP_COPY_RANGE | CHIMERA_VFS_CAP_CLONE_RANGE
     ,
     .init           = snfs_init,
     .destroy        = snfs_destroy,

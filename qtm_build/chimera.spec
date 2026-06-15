@@ -1,6 +1,6 @@
 Name: quantum-chimera-server
-Version: __VERSION__
-Release: __REVISION__
+Version: %{version}
+Release: %{release}
 
 Summary: Quantum Chimera NAS server
 License: Quantum Corporation

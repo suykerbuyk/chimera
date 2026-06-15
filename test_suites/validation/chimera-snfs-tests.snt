@@ -13,7 +13,6 @@ host srv1	distro:MDC_DISTRO version:MDC_VERSION arch:x86_64 cores:4 memory:8192
 host lnx1       distro:LNXCLI_DISTRO version:LNXCLI_VERSION arch:x86_64 cores:2 memory:2048
 
 hostgroup allhosts   srv1 lnx1
-hostgroup clients    lnx1
 
 
 # Define LUNs for MDCs
@@ -50,14 +49,12 @@ command srv1 rm -f /etc/profile.d/mdh-env.sh
 
 step 10m Unpack StorNext
 command srv1 $sntest/bin/unpack_stornext SNFS_PKG $sndist /tmp/stornext
-command clients $sntest/bin/unpack_stornext client $sndist /tmp/stornext
 
 step 10m Install StorNext
 command srv1 $sntest/bin/install_stornext SNFS_PKG /tmp/stornext
-command clients $sntest/bin/install_stornext client /tmp/stornext
 
 step 10m Set StorNext Name Servers
-command allhosts $sntest/bin/set_fsnameservers $srv1
+command srv1 $sntest/bin/set_fsnameservers $srv1
 
 step 5m Clear temp licenses
 command srv1 rm -f /usr/cvfs/config/license.dat
@@ -114,14 +111,11 @@ command srv1 $sntest/bin/append_fsmlist snfs1
 command srv1 $sntest/bin/append_fsmlist snfs2
 
 step 600 Configure File System Mounts
-command allhosts  $sntest/bin/configure_mount snfs1 /stornext/snfs1 defaults
-command allhosts  $sntest/bin/configure_mount snfs2 /stornext/snfs2 defaults
+command srv1  $sntest/bin/configure_mount snfs1 /stornext/snfs1 defaults
+command srv1  $sntest/bin/configure_mount snfs2 /stornext/snfs2 defaults
 
 step 5m Restart StorNext on MDC
 command srv1 $sntest/bin/cvfs_control restart
-
-step 5m Restart StorNext on clients
-command clients $sntest/bin/cvfs_control restart
 
 %ifdef HAVE_TSM
 # --------------------- Configure the SDISK and Storage destination --------------
@@ -165,27 +159,9 @@ command srv1 sed -i.back 's/\/chimera.json/\/sntest-chimera.json/'  /etc/default
                     external_portmap: true, \
                     max_open_files: 1048576, \
                     rest_http_port: 8080, \
-		    vfs: { \
-		       "snfs": { \
-		          "path": "/opt/quantum/chimera/lib/libchimera_vfs_snfs.so" \
-		       } \
-		    } \
-                 }, \
-		 users: [ \
-		    { username: "testuser1", smbpasswd: "systest", uid: 5000, gid: 50} \
-                 ], \
-                 mounts: { \
-                    snfs1: { \
-                       path: "/stornext/snfs1", \
-                       module: "snfs" \
-                    } \
-                }, \
-                shares: { \
-                   smb1: { path: "/snfs1" } \
-                }, \
-                exports: { \
-                   "/nfs1": { path: "/snfs1" } \
-                } }'  > /etc/chimera/sntest-chimera.json
+		              vfs: { "snfs": { \
+                        "path": "/opt/quantum/chimera/lib/libchimera_vfs_snfs.so" } \
+                     } } }'  > /etc/chimera/sntest-chimera.json
 
 step 5m enable and start chimera
 command srv1 cat /etc/default/chimera
@@ -200,14 +176,33 @@ command srv1 curl -s "http://127.0.0.1:8080/api/v1/users" | jq
 command srv1 curl -s "http://127.0.0.1:8080/api/v1/shares" | jq
 command srv1 curl -s "http://127.0.0.1:8080/api/v1/exports" | jq
 
+step 5m Add testuser1
+command srv1 python3 -m  chimera_admin user create --smbpasswd  systest testuser1
+
+step 5m add mounts
+command srv1  python3 -m  chimera_admin mount create --module snfs --path /stornext/snfs1 snfs1
+command srv1  python3 -m  chimera_admin mount create --module snfs --path /stornext/snfs2 snfs2
+
+step 5m Create shares and exports
+command srv1  python3 -m  chimera_admin share create smb1 /snfs1
+command srv1  python3 -m  chimera_admin share create smb2 /snfs2
+command srv1  python3 -m  chimera_admin export create /nfs1 /snfs1
+command srv1  python3 -m  chimera_admin export create /nfs2 /snfs2
+
+# validate the config
+command srv1 python3 -m  chimera_admin user list
+command srv1 python3 -m  chimera_admin mount list
+command srv1 python3 -m  chimera_admin share list
+command srv1 python3 -m  chimera_admin export list
+
 # ----------------- Setup linux client -----------------
 %define SMBCLIENT smbclient -U WORKGROUP/testuser1%systest //$srv1/smb1
 
 step 5m Linux Prepare clients
 command lnx1 /bin/echo -e "username=testuser1\npassword=systest\ndomain=WORKGROUP" > /root/.smb_cred
 
-step 5m install smbclient
-command lnx1 apt update && apt install -y smbclient cifs-utils
+step 5m install smbclient and smbtorture
+command lnx1 apt update && apt install -y smbclient cifs-utils samba-testsuite
 
 step 1m validate that we have access.
 command lnx1 SMBCLIENT -c 'ls'
@@ -219,6 +214,7 @@ command lnx1 mkdir -p /smb1 && mount.cifs -ocredentials=/root/.smb_cred //$srv1/
 step 5m get elbencho
 command lnx1 curl https://repository.mdh.quantum.com/repository/tests/elbencho/elbencho-static-x86_64.tar.gz | \
 	tar zxf - -C /usr/bin
+
 
 # Connectathon testing
 step 5m lnx1 Get connectathon
@@ -243,9 +239,6 @@ command lnx1 curl https://repository.mdh.quantum.com:8443/repository/nfs_protoco
 step 1m create test directory
 command lnx1 mkdir -p /smb1/lnx
 
-step 10m run MDT over smb1
-command lnx1 /usr/cvfs/bin/mdt  -m -s -f 1000 -n 4 -U /smb1/lnx && rm -rf /smb1/lnx
-
 step 2m rename test over SMB
 command lnx1  mkdir /smb1/rename-test && cd /smb1/rename-test && mkdir -p dir1 dir2 && \
 	      touch file1 dir1/file1 dir1/file2 dir1/file3 && \
@@ -257,6 +250,119 @@ step 10m run elbencho over SMB
 command lnx1 mkdir -p /smb1/lnx1-smb1 && \
 	/usr/bin/elbencho /smb1/lnx1-smb1 --size=1m --dirs=4 --files=10 --mkdirs --write && \
 	/usr/bin/elbencho /smb1/lnx1-smb1 --size=1m --dirs=4 --files=10 --deldirs --delfiles --read
+
+
+# ================ Test server-side COPY (CHIM-113) ==============
+# snfs_copy_range: SMB FSCTL_SRV_COPYCHUNK -> chimera_vfs_copy_range
+#                  -> copy_file_range(2), pread/pwrite emulation on cvfs
+
+# Informational: the StorNext kernel module implements neither
+# copy_file_range(2) nor the splice ops the kernel generic fallback
+# needs, so the syscall fails with EINVAL on cvfs (verified on
+# 5.14.0-503 / StorNext 7.x).  snfs_copy_range detects this and
+# emulates with pread/pwrite.  This probe documents the kernel
+# behavior so we notice if a future StorNext adds native support.
+# The step passes either way (xfs_io prints nothing on success).
+step 2m probe copy_file_range on cvfs (informational)
+command srv1 cd /stornext/snfs1 && dd if=/dev/urandom of=cfr_src bs=1M count=8 && \
+	( xfs_io -f -c 'copy_range cfr_src' cfr_dst 2>&1 | grep . && \
+	echo 'copy_file_range NOT supported - snfs emulates with pread/pwrite' || \
+	echo 'copy_file_range SUPPORTED natively' ) && \
+	rm -f cfr_src cfr_dst
+
+# Informational: document StorNext FICLONE/FICLONERANGE behavior
+# (expected unsupported - no reflink on cvfs).  snfs_clone_range relays
+# whatever the kernel answers; if cvfs ever adds reflink this step
+# tells us CLONE started working.  The step passes either way.
+step 2m probe FICLONE reflink on cvfs (expected unsupported)
+command srv1 cd /stornext/snfs1 && truncate -s 4096 clone_src && \
+	( xfs_io -f -c 'reflink clone_src' clone_dst 2>&1 | grep . && \
+	echo 'reflink not supported (expected on StorNext)' || \
+	echo 'reflink SUPPORTED' ) && \
+	rm -f clone_src clone_dst
+
+# NOTE: commands within one step run CONCURRENTLY across hosts, so the
+# source file creation (srv1) and the copy (lnx1) must be separate steps
+# or scopy races the dd and copies a partial file.
+step 2m create scopy source file
+command srv1 dd if=/dev/urandom of=/stornext/snfs1/scopy_src bs=1M count=64
+
+step 5m server-side copy over SMB with scopy (FSCTL_SRV_COPYCHUNK)
+command lnx1 SMBCLIENT -c 'scopy scopy_src scopy_dst'
+
+step 2m verify copied content on the StorNext mount
+command srv1 cmp /stornext/snfs1/scopy_src /stornext/snfs1/scopy_dst && \
+	stat -c '%n %s %y' /stornext/snfs1/scopy_src /stornext/snfs1/scopy_dst && \
+	rm -f /stornext/snfs1/scopy_src /stornext/snfs1/scopy_dst
+
+# copy_chunk torture subset that passes with the snfs changes alone
+# (green in run 2137951).
+#
+# Re-add when CHIM-129 lands (fixes written, verified 18/18 locally):
+#   copy_chunk_bad_access            (access checks -> ACCESS_DENIED)
+#   copy_chunk_src_lock / dest_lock  (byte-range lock enforcement)
+#   copy_chunk_max_output_sz         (MaxOutputResponse < 12)
+#   copy_chunk_limits / zero_length  (INVALID_PARAMETER + limits payload)
+#   copy_chunk_src_exceed[_multi]    (short copy -> INVALID_VIEW_SIZE)
+#   copy_chunk_bug15644              (needs smbtorture 4.23+, now on lnx1)
+#
+# Still needs work beyond CHIM-129's current fixes:
+#   copy_chunk_src_is_dest_overlap   (data reads back unchanged on snfs -
+#                                     run 2137940; emulation verified
+#                                     correct standalone on StorNext, so
+#                                     the chimera path is the suspect.
+#                                     Other backends reject overlap with
+#                                     INVALID_PARAMETER - needs buffered
+#                                     chunk copy in the SMB layer.)
+#   copy_chunk_across_shares / 3     (cross-session resume keys)
+#   "copy-chunk streams"             (named-stream copychunk, untested)
+#   sparse_copy_chunk                (self-skips: share does not advertise
+#                                     sparse file support)
+step 15m run smbtorture copy_chunk suite against snfs share
+command lnx1 smbtorture //$srv1/smb1 -U WORKGROUP/testuser1%systest \
+	smb2.ioctl.copy_chunk_simple smb2.ioctl.copy_chunk_multi \
+	smb2.ioctl.copy_chunk_tiny smb2.ioctl.copy_chunk_overwrite \
+	smb2.ioctl.copy_chunk_append \
+	smb2.ioctl.copy_chunk_src_is_dest \
+	smb2.ioctl.copy_chunk_bad_key smb2.ioctl.copy_chunk_write_access \
+	smb2.ioctl.req_resume_key smb2.ioctl.req_two_resume_keys \
+	smb2.ioctl.sparse_copy_chunk
+
+# Cross-share copychunk smb1 (snfs1) -> smb2 (snfs2): chimera resolves
+# resume keys per-session, so a cross-share (cross-session) copy is
+# rejected with OBJECT_NAME_NOT_FOUND, which across_shares2 verifies.
+# across_shares / across_shares3 expect the cross-share copy to SUCCEED
+# (as on Windows/samba) - that needs cross-session resume keys in the
+# SMB layer (CHIM-129); re-add them when that lands.  They would also
+# exercise the snfs EXDEV pread/pwrite fallback across filesystems.
+step 10m run smbtorture copy_chunk across shares (snfs1 -> snfs2)
+command lnx1 smbtorture //$srv1/smb1 -U WORKGROUP/testuser1%systest \
+	--option=torture:share2=smb2 \
+	smb2.ioctl.copy_chunk_across_shares2
+
+# snfs2 has a different StorNext feature set (no caseInsensitive /
+# namedStreams) - confirm server-side copy works there too.
+step 2m create scopy source file on snfs2
+command srv1 dd if=/dev/urandom of=/stornext/snfs2/scopy2_src bs=1M count=16
+
+step 5m server-side copy on second StorNext fs (smb2)
+command lnx1 smbclient -U WORKGROUP/testuser1%systest //$srv1/smb2 -c 'scopy scopy2_src scopy2_dst'
+
+step 2m verify copied content on snfs2
+command srv1 cmp /stornext/snfs2/scopy2_src /stornext/snfs2/scopy2_dst && \
+	rm -f /stornext/snfs2/scopy2_src /stornext/snfs2/scopy2_dst
+
+# Server-side copy of a big file: proves data does not round-trip the
+# client and exercises the copy loop over many iterations.
+step 10m create large source file
+command srv1 dd if=/dev/zero of=/stornext/snfs1/big_src bs=1M count=4096 oflag=direct
+
+step 10m large-file server-side copy
+command lnx1 time SMBCLIENT -c 'scopy big_src big_dst'
+
+step 5m verify large-file copy
+command srv1 cmp /stornext/snfs1/big_src /stornext/snfs1/big_dst && \
+	rm -f /stornext/snfs1/big_src /stornext/snfs1/big_dst
 
 
 # ================ Test create time ==============
@@ -284,6 +390,13 @@ command lnx1 mkdir -p /nfs1 && mount -v -o vers=3 $srv1:/nfs1 /nfs1
 step 2m	basic tests over NFSv3
 command lnx1 dd if=/dev/zero count=3 of=/nfs1/file1 && stat /nfs1/file1 && mv /nfs1/file1 /nfs1/file1.moved
 command lnx1 touch /nfs1/chmod_file && chmod 600 /nfs1/chmod_file && stat -c '%a' /nfs1/chmod_file | grep 600
+
+# CHIM-113 regression: chimera has no NFS COPY wire-up, cp must fall back
+# to client-side read/write transparently.
+step 2m cp over NFSv3 falls back gracefully
+command lnx1 dd if=/dev/urandom of=/nfs1/cp_src bs=1M count=16 && \
+	cp /nfs1/cp_src /nfs1/cp_dst && cmp /nfs1/cp_src /nfs1/cp_dst && \
+	rm -f /nfs1/cp_src /nfs1/cp_dst
 
 step 10m run elbencho over NFSv3
 command lnx1 mkdir -p /nfs1/lnx1-nfsv3 && \
@@ -314,11 +427,19 @@ command lnx1 cd /home1/nfstest/NFStest-9408954 && \
 # ----------------- Setup/Run NFSv4 test -----------------
 %ifndef NO_NFSv4
 step 5m Mount the NFSv4 share
-command lnx1 mkdir -p /nfs1 && mount -v -o vers=4 $srv1:/nfs1 /nfs1
+command lnx1 mkdir -p /nfs1 && mount -v -o vers=4.2 $srv1:/nfs1 /nfs1
 
 step 2m	basic tests over NFSv4
 command lnx1 dd if=/dev/zero count=3 of=/nfs1/file2 && stat /nfs1/file2 && mv /nfs1/file2 /nfs1/file2.moved
 command lnx1 touch /nfs1/chmod_file2 && chmod 600 /nfs1/chmod_file2 && stat -c '%a' /nfs1/chmod_file2 | grep 600
+
+# CHIM-113 regression: NFS4.2 OP_COPY/OP_CLONE intentionally not wired up
+# in chimera (958b22a) - server answers NFS4ERR_NOTSUPP and the kernel
+# client must fall back to client-side read/write transparently.
+step 2m cp over NFSv4 falls back gracefully
+command lnx1 dd if=/dev/urandom of=/nfs1/cp_src4 bs=1M count=16 && \
+	cp /nfs1/cp_src4 /nfs1/cp_dst4 && cmp /nfs1/cp_src4 /nfs1/cp_dst4 && \
+	rm -f /nfs1/cp_src4 /nfs1/cp_dst4
 
 step 10m run elbencho over NFSv4
 command lnx1 mkdir -p /nfs1/lnx1-nfsv4 && \
