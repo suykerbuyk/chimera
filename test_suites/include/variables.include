@@ -47,12 +47,12 @@
 %endif
 
 %ifndef LNXCLI_VERSION
-%define LNXCLI_VERSION 24.04.3
+%define LNXCLI_VERSION 26.04
 %endif
 
 
 %ifndef CHIM_OS
-%define CHIM_OS 24
+%define CHIM_OS 26
 %endif
 
 # Ubuntu 26
