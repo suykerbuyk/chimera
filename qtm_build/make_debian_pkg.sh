@@ -6,12 +6,67 @@ ARCH=$3
 
 PKG_DIR="$(basename $PWD)"
 
+INSTALL_ROOT="$PWD"
+LIBDIR="${INSTALL_ROOT}/opt/quantum/chimera/lib"
+
 mkdir -p ./DEBIAN
 cp -r /context/qtm_build/debian/* ./DEBIAN/
+# control.tmpl is only an input template; do not ship it inside the package.
+rm -f ./DEBIAN/control.tmpl
+
+# Compute the shared-library dependencies automatically. This is the Debian
+# equivalent of RPM's automatic dependency generation: dpkg-deb --build does
+# not run dpkg-shlibdeps, so we invoke it directly against the installed ELF
+# objects. Generating the list per build keeps it correct across Ubuntu
+# releases, including the 64-bit time_t package renames (e.g. libssl3 ->
+# libssl3t64, liburcu8 -> liburcu8t64), which a hardcoded list cannot track.
+ELF_MAGIC=$(printf '\177ELF')
+OBJS=()
+while IFS= read -r f; do
+    [ "$(dd if="$f" bs=1 count=4 2>/dev/null)" = "$ELF_MAGIC" ] && OBJS+=("$f")
+done < <(find "${INSTALL_ROOT}/opt/quantum/chimera/lib" \
+              "${INSTALL_ROOT}/opt/quantum/chimera/bin" \
+              "${INSTALL_ROOT}/opt/quantum/chimera/sbin" -type f 2>/dev/null)
+
+if [ "${#OBJS[@]}" -eq 0 ]; then
+    echo "ERROR: no ELF objects found under ${INSTALL_ROOT}/opt/quantum/chimera" >&2
+    exit 1
+fi
+
+# dpkg-shlibdeps reads debian/control (lowercase); provide a minimal one in a
+# scratch directory so it does not collide with the DEBIAN/ control area.
+WORK="$(mktemp -d)"
+mkdir -p "${WORK}/debian"
+cat > "${WORK}/debian/control" <<EOF
+Source: quantum-chimera-server
+
+Package: quantum-chimera-server
+Architecture: ${ARCH}
+EOF
+# -l adds the bundled lib dir so the chimera/evpl private libs resolve, and
+# --ignore-missing-info skips them (they have no dpkg shlibs info) instead of
+# failing, leaving only system-package dependencies. Capture the raw output
+# first (not through a pipe) so a dpkg-shlibdeps failure aborts under set -e
+# rather than being masked by the following sed.
+RAW_DEPS="$(cd "${WORK}" && \
+    dpkg-shlibdeps -O --ignore-missing-info -l"${LIBDIR}" "${OBJS[@]}")"
+rm -rf "${WORK}"
+SHLIB_DEPS="$(printf '%s\n' "${RAW_DEPS}" | sed -n 's/^shlibs:Depends=//p')"
+
+if [ -z "${SHLIB_DEPS}" ]; then
+    echo "ERROR: dpkg-shlibdeps produced no shared-library dependencies" >&2
+    exit 1
+fi
+
+# Non-ELF runtime dependencies that dpkg-shlibdeps cannot detect.
+EXTRA_DEPS="python3, python3-requests"
+DEPENDS="${SHLIB_DEPS:+${SHLIB_DEPS}, }${EXTRA_DEPS}"
+
 sed -e "s/__VERSION__/${VERSION}/" \
     -e "s/__REVISION__/${REVISION}/" \
     -e "s/__ARCH__/${ARCH}/" \
-    ./DEBIAN/control.tmpl > ./DEBIAN/control
+    -e "s|__DEPENDS__|${DEPENDS}|" \
+    /context/qtm_build/debian/control.tmpl > ./DEBIAN/control
 mkdir -p etc/ld.so.conf.d/
 echo "/opt/quantum/chimera/lib" > etc/ld.so.conf.d/chimera.conf
 
