@@ -40,7 +40,7 @@ rpmbuild -ba \
 # Create a repo with prereq RPM.
 cp /build/rpmbuild/RPMS/x86_64/*.rpm /repo
 cp /build/rpmbuild/RPMS/noarch/*.rpm /repo
-dnf download xxhash-libs libunwind liburing --arch  ${ARCH} --destdir /repo
+dnf download xxhash-libs libunwind --arch  ${ARCH} --destdir /repo
 cd /repo
 tar cvfz /dist/repo-chimera.tar.gz .
 

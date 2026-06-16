@@ -156,16 +156,16 @@ dev_branch:
   script:
     - >-
       qb image copy --path ${QB_PROJECT}/builder_ubuntu22 --old ${QB_TAG} --new ${CI_COMMIT_REF_SLUG}
-      -U $publish_username -P $publish_password -I $publish_docker_source -O $publish_docker_dest_development
+      -U $publish_username -P $publish_password -I $publish_docker_source -O $publish_docker_dest_internal
     - >-
       qb image copy --path ${QB_PROJECT}/builder_ubuntu24 --old ${QB_TAG} --new ${CI_COMMIT_REF_SLUG}
-      -U $publish_username -P $publish_password -I $publish_docker_source -O $publish_docker_dest_development
+      -U $publish_username -P $publish_password -I $publish_docker_source -O $publish_docker_dest_internal
     - >-
       qb image copy --path ${QB_PROJECT}/builder_rocky9 --old ${QB_TAG} --new ${CI_COMMIT_REF_SLUG}
-      -U $publish_username -P $publish_password -I $publish_docker_source -O $publish_docker_dest_development
+      -U $publish_username -P $publish_password -I $publish_docker_source -O $publish_docker_dest_internal
     - >-
       qb image copy --path ${QB_PROJECT}/chimera-dev --old ${QB_TAG} --new ${CI_COMMIT_REF_SLUG}
-      -U $publish_username -P $publish_password -I $publish_docker_source -O $publish_docker_dest_development
+      -U $publish_username -P $publish_password -I $publish_docker_source -O $publish_docker_dest_internal
     - >-
       qb assets copy --path ${QB_PROJECT} --tag ${QB_TAG} --out-revision ${CI_PIPELINE_IID} --dest-tag ${CI_COMMIT_BRANCH}
-      -U $publish_username -P $publish_password -I $publish_raw_source -O $publish_raw_dest_development
+      -U $publish_username -P $publish_password -I $publish_raw_source -O $publish_raw_dest_internal

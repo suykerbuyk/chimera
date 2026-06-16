@@ -14,14 +14,22 @@ Requires: redhat-release >= 9
 Requires: redhat-release < 10
 Requires: xxhash-libs
 Requires: libunwind
-Requires: liburing
-Requires: openssl
 Requires: python3
 Requires: python3-requests
 
 %description
 Quantum build of the Chimera NAS server for
 the StorNext Filesystem (SNFS)
+
+%package -n quantum-chimera-snfs-module
+Summary: Quantum Chimera StorNext (SNFS) VFS module
+Requires: quantum-chimera-server = %{version}-%{release}
+
+%description -n quantum-chimera-snfs-module
+StorNext (SNFS) VFS backend module for the Quantum Chimera NAS server.
+This module links against the StorNext External API (libcvextapi) and
+therefore requires StorNext (cvfs) to be installed. Packaging it separately
+lets quantum-chimera-server install on nodes that do not have cvfs.
 
 
 %build
@@ -56,7 +64,14 @@ exit 0
 /opt/quantum/chimera/bin
 /opt/quantum/chimera/include
 /opt/quantum/chimera/lib
+%exclude /opt/quantum/chimera/lib/libchimera_vfs_snfs.so
 /opt/quantum/chimera/sbin
 %doc /opt/quantum/chimera/share/*
+%exclude /opt/quantum/chimera/share/examples/chimera-snfs.json
 %config(noreplace) /opt/quantum/chimera/etc/chimera.json
 %ghost /etc/chimera/chimera.json
+
+%files -n quantum-chimera-snfs-module
+%defattr(-,root,root)
+/opt/quantum/chimera/lib/libchimera_vfs_snfs.so
+%doc /opt/quantum/chimera/share/examples/chimera-snfs.json
