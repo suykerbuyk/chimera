@@ -335,7 +335,7 @@ tasks:
       - >
         cmake -G Ninja -DCMAKE_BUILD_TYPE=Release
         -DREQUIRE_NETNS_TESTS=ON
-        -DKVM_IMAGE_CACHE_REGISTRY=repository.mdh.quantum.com:5004/cache
+        -DKVM_TESTING=OFF
         -S /context -B /build
       - ninja
       - ctest --output-on-failure --test-output-size-failed 65536 --timeout 300 -j 12 -L pynfs -E diskfs_
@@ -358,7 +358,7 @@ tasks:
       - >
         cmake -G Ninja -DCMAKE_BUILD_TYPE=Release
         -DREQUIRE_NETNS_TESTS=ON
-        -DKVM_IMAGE_CACHE_REGISTRY=repository.mdh.quantum.com:5004/cache
+        -DKVM_TESTING=OFF
         -S /context -B /build
       - ninja
       - ctest --output-on-failure --test-output-size-failed 65536 --timeout 300 -j 12 -LE pynfs
@@ -381,7 +381,7 @@ tasks:
       - >
         cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug
         -DREQUIRE_NETNS_TESTS=ON
-        -DKVM_IMAGE_CACHE_REGISTRY=repository.mdh.quantum.com:5004/cache
+        -DKVM_TESTING=OFF
         -S /context -B /build
       - ninja
       - ctest --output-on-failure --test-output-size-failed 65536 --timeout 300 -j 12 -L pynfs -E diskfs_
@@ -404,7 +404,7 @@ tasks:
       - >
         cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug
         -DREQUIRE_NETNS_TESTS=ON
-        -DKVM_IMAGE_CACHE_REGISTRY=repository.mdh.quantum.com:5004/cache
+        -DKVM_TESTING=OFF
         -S /context -B /build
       - ninja
       - ctest --output-on-failure --test-output-size-failed 65536 --timeout 300 -j 12 -LE pynfs

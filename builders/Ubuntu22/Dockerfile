@@ -13,7 +13,7 @@ RUN apt-get -y update && \
             make libcurl4-openssl-dev libnfs-dev libs3-dev iproute2 \
 	        python3 python3-pip python3-venv python3-requests pkg-config \
 	        dh-python build-essential pybuild-plugin-pyproject debhelper-compat \
-	        libwbclient-dev
+	        libwbclient-dev libcrypt-dev libaio-dev
 
 # install uncrustify version 0.78
 RUN curl -o /usr/local/bin/uncrustify  ${asset:uncrustify:Ubuntu22/$arch/uncrustify} && \
