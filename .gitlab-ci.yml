@@ -7,6 +7,61 @@ variables:
   QB_PROJECT: chimera
   RUN_QB: qb --plain -o ${QB_TAG} -i ${QB_PROJECT}/${QB_TAG} -b ${CI_PIPELINE_IID} --pod-running-timeout=10m
 
+# Control which pipelines get created at all.  Merge trains are enabled in the
+# project settings (Settings -> Merge requests: "Merged results pipelines" +
+# "Merge trains" + "Pipelines must succeed").  These rules are the CI-side half:
+# allow MR pipelines (detached / merged-result per push, and the merge train),
+# the post-merge develop pipeline, the nightly schedule, and release tags.
+workflow:
+  rules:
+    # Tags matching X.Y.Z[-suffix]: build + publish only (no tests).  Any other
+    # tag creates no pipeline at all.
+    - if: '$CI_COMMIT_TAG =~ /^[0-9]+\.[0-9]+\.[0-9]+(-.+)?$/'
+    # Nightly / scheduled full-suite run (add a pipeline schedule on 'develop').
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    # MR pipelines: detached + merged-result (per push) and the merge train.
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    # Post-merge pipeline on develop: build + publish only (no re-test).
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+    # Any other branch push gets no pipeline -- CI runs through its MR instead.
+
+# Shared rule sets (YAML anchors), one per behaviour:
+#
+#   rules_fast  -- quick feedback on every MR push (detached / merged-result),
+#                  plus the train and nightly.  Used by syntax + static_analysis.
+#   rules_build -- compile + publishable assets: in the train (pre-merge check),
+#                  on develop and tags (publish) and nightly.  NOT on per-push MR
+#                  pipelines, so review-time CI stays fast.
+#   rules_full  -- the gate: runs automatically in the merge train (which tests
+#                  the merged result) and nightly, and is available as an opt-in
+#                  (manual) job on an MR push.  Used by ctest.
+#
+# chimera-dev has its own rules (below): it is both a test dependency (MR push,
+# train, nightly) AND the image published on develop, so it also runs on the
+# develop pipeline.
+#
+# Tags get NO testing -- just builders + builds + publish -- and only for tags
+# matching X.Y.Z[-suffix]; any other tag creates no pipeline at all.
+#
+# NOTE: the KVM conformance suite (ctest_kvm) is intentionally not wired in yet;
+# add it back (job + its own rules) once the KVM tests are implemented.
+.rules_fast: &rules_fast
+  - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+  - if: '$CI_PIPELINE_SOURCE == "schedule"'
+
+.rules_build: &rules_build
+  - if: '$CI_MERGE_REQUEST_EVENT_TYPE == "merge_train"'
+  - if: '$CI_COMMIT_BRANCH == "develop"'
+  - if: '$CI_PIPELINE_SOURCE == "schedule"'
+  - if: '$CI_COMMIT_TAG'
+
+.rules_full: &rules_full
+  - if: '$CI_MERGE_REQUEST_EVENT_TYPE == "merge_train"'
+  - if: '$CI_PIPELINE_SOURCE == "schedule"'
+  - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    when: manual
+    allow_failure: true
+
 stages:
   - builders
   - build
@@ -15,86 +70,107 @@ stages:
 
 chimera-dev:
   stage: builders
+  # Test dependency (MR push, train, nightly) AND the image we publish on
+  # develop, so it spans the fast set plus the develop pipeline.  Not on tags
+  # (tag publish copies assets only, not this image).
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_COMMIT_BRANCH == "develop"'
   script:
     - ${RUN_QB} chimera-dev
 
 builder_Ubuntu24:
   stage: builders
+  rules: *rules_build
   script:
     - ${RUN_QB} builder_Ubuntu24
 
 builder_Ubuntu26:
   stage: builders
+  rules: *rules_build
   script:
     - ${RUN_QB} builder_Ubuntu26
 
 builder_Ubuntu22:
   stage: builders
+  rules: *rules_build
   script:
     - ${RUN_QB} builder_Ubuntu22
 
 builder_Rocky9:
   stage: builders
+  rules: *rules_build
   script:
     - ${RUN_QB} builder_Rocky9
 
 build_release_Ubuntu22:
   stage: build
   needs: [ builder_Ubuntu22 ]
+  rules: *rules_build
   script:
     - ${RUN_QB} build_release_Ubuntu22
 
 build_debug_Ubuntu22:
   stage: build
   needs: [ builder_Ubuntu22 ]
+  rules: *rules_build
   script:
     - ${RUN_QB} build_debug_Ubuntu22
 
 build_release_Ubuntu24:
   stage: build
   needs: [ builder_Ubuntu24 ]
+  rules: *rules_build
   script:
     - ${RUN_QB} build_release_Ubuntu24
 
 build_debug_Ubuntu24:
   stage: build
   needs: [ builder_Ubuntu24 ]
+  rules: *rules_build
   script:
     - ${RUN_QB} build_debug_Ubuntu24
 
 build_release_Ubuntu26:
   stage: build
   needs: [ builder_Ubuntu26 ]
+  rules: *rules_build
   script:
     - ${RUN_QB} build_release_Ubuntu26
 
 build_debug_Ubuntu26:
   stage: build
   needs: [ builder_Ubuntu26 ]
+  rules: *rules_build
   script:
     - ${RUN_QB} build_debug_Ubuntu26
 
 build_release_Rocky9:
   stage: build
   needs: [ builder_Rocky9 ]
+  rules: *rules_build
   script:
     - ${RUN_QB} build_release_Rocky9
 
 build_debug_Rocky9:
   stage: build
   needs: [ builder_Rocky9 ]
+  rules: *rules_build
   script:
     - ${RUN_QB} build_debug_Rocky9
 
 syntax:
   stage: check
   needs: [ chimera-dev ]
+  rules: *rules_fast
   script:
     - ${RUN_QB} syntax
 
 static_analysis:
   stage: check
   needs: [ chimera-dev ]
+  rules: *rules_fast
   parallel:
     matrix:
       - MODE: [ release, debug ]
@@ -117,6 +193,7 @@ static_analysis:
 ctest:
   stage: check
   needs: [ chimera-dev ]
+  rules: *rules_full
   retry:
     max: 1
     when:
@@ -138,7 +215,6 @@ ctest:
       - ctest_${MODE}_${GROUP}_${ARCH}.log
     expire_in: 1 week
 
-
 release:
   stage: publish
   rules:
@@ -150,9 +226,10 @@ release:
 
 dev_branch:
   stage: publish
-  only:
-    - develop
-  except: [ schedules, tags ]
+  # Publish only on a real push/merge to develop -- not on the nightly schedule
+  # (which only tests) and not on tag pipelines (the release job handles those).
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop" && $CI_PIPELINE_SOURCE == "push"'
   script:
     - >-
       qb image copy --path ${QB_PROJECT}/builder_ubuntu22 --old ${QB_TAG} --new ${CI_COMMIT_REF_SLUG}
