@@ -42,6 +42,11 @@ struct chimera_server_config_smb_auth {
     char kerberos_realm[256];
 };
 
+struct chimera_server_config_nfs_auth {
+    int  kerberos_enabled;       /* enable RPCSEC_GSS (sec=krb5) on the NFS server */
+    char kerberos_keytab[256];   /* keytab path; empty => KRB5_KTNAME default */
+};
+
 struct chimera_server_config {
     int                                   nfs_rdma;
     int                                   nfs_rdma_port;
@@ -62,6 +67,8 @@ struct chimera_server_config {
     int                                   async_delegation;
     int                                   async_delegation_threads;
     int                                   cache_ttl;
+    int                                   attr_cache_enabled;
+    int                                   name_cache_enabled;
     int                                   rcu_reclaim_threads;
     int                                   nfs4_session_slots;
     int                                   nfs4_delegations;
@@ -93,6 +100,8 @@ struct chimera_server_config {
     int                                   smb_num_nic_info;
     uint32_t                              anonuid;
     uint32_t                              anongid;
+    int                                   nfs_fh_sign;       /* sign wire file handles (default on) */
+    char                                  nfs_fh_key[33];    /* optional 32-hex-char (128-bit) signing key */
     enum chimera_tcp_flavor               tcp_flavor;
     char                                  nfs_rdma_hostname[256];
     char                                  kv_module[64];
@@ -102,6 +111,7 @@ struct chimera_server_config {
     struct chimera_vfs_module_cfg         modules[CHIMERA_SERVER_MAX_MODULES];
     struct chimera_server_config_smb_nic  smb_nic_info[16];
     struct chimera_server_config_smb_auth smb_auth;
+    struct chimera_server_config_nfs_auth nfs_auth;
     int                                   pnfs_enabled;
     int                                   pnfs_num_ds;
     struct chimera_server_config_pnfs_ds {
@@ -227,9 +237,16 @@ chimera_server_config_init(void)
     config->smb_auth.winbind_domain[0]  = '\0';
     config->smb_auth.kerberos_keytab[0] = '\0';
     config->smb_auth.kerberos_realm[0]  = '\0';
+    config->nfs_auth.kerberos_enabled   = 0;
+    config->nfs_auth.kerberos_keytab[0] = '\0';
 
     config->anonuid = 65534;
     config->anongid = 65534;
+
+    /* Sign NFS wire file handles by default (unforgeable handles); the key is
+     * generated/persisted at NFS init unless nfs_fh_key is configured. */
+    config->nfs_fh_sign   = 1;
+    config->nfs_fh_key[0] = '\0';
 
     /* pNFS layouts are disabled by default. */
     config->pnfs_enabled = 0;
@@ -252,13 +269,27 @@ chimera_server_config_init(void)
 
     config->cache_ttl = 60;
 
-    /* Number of liburcu call_rcu reclaim worker threads.  0 (the default) means
-     * one worker per CPU (create_all_cpu_call_rcu_data) to keep RCU reclaim up
-     * with per-request cache churn under heavy load.  On a many-core host that
-     * spawns hundreds of threads, which is wasteful for short-lived or
-     * lightly-loaded instances (memory, and process-teardown cost); set a small
-     * positive value (e.g. the CI test daemons) to cap the worker count. */
-    config->rcu_reclaim_threads = 0;
+    /* The VFS attribute cache is on by default (common.attr_cache). */
+    config->attr_cache_enabled = 1;
+
+    /* The VFS name (lookup) cache is on by default (common.name_cache). */
+    config->name_cache_enabled = 1;
+
+    /* Number of liburcu call_rcu reclaim worker threads.  0 means one worker
+     * per CPU (create_all_cpu_call_rcu_data) to keep RCU reclaim up with
+     * per-request cache churn under heavy load.  On a many-core host that
+     * spawns hundreds of threads per server instance, which is wasteful for
+     * short-lived or lightly-loaded instances (memory, process-teardown cost)
+     * AND is a correctness hazard: liburcu's call_rcu_data_init does NOT retry
+     * pthread_create and abort()s the whole process on a transient EAGAIN
+     * ("Unrecoverable error: Resource temporarily unavailable").  Spawning
+     * hundreds of RCU threads at once -- as many in-process server instances do
+     * in parallel under a -j CI run -- makes that EAGAIN abort likely, which is
+     * the root cause of the intermittent lockf/fcntl NFS3 test flakes.  Default
+     * to a small cap (matching the chimera client default) so the common case
+     * stays well clear of the thread-exhaustion abort; a real server with a
+     * heavy workload can raise it via common.rcu_reclaim_threads. */
+    config->rcu_reclaim_threads = 4;
 
     /* Default NFSv4.1 fore-channel session slots (server cap on the number
      * of concurrent SEQUENCE requests a client may have outstanding per
@@ -575,6 +606,22 @@ chimera_server_config_get_cache_ttl(const struct chimera_server_config *config)
 {
     return config->cache_ttl;
 } /* chimera_server_config_get_cache_ttl */
+
+SYMBOL_EXPORT void
+chimera_server_config_set_attr_cache_enabled(
+    struct chimera_server_config *config,
+    int                           enabled)
+{
+    config->attr_cache_enabled = enabled;
+} /* chimera_server_config_set_attr_cache_enabled */
+
+SYMBOL_EXPORT void
+chimera_server_config_set_name_cache_enabled(
+    struct chimera_server_config *config,
+    int                           enabled)
+{
+    config->name_cache_enabled = enabled;
+} /* chimera_server_config_set_name_cache_enabled */
 
 SYMBOL_EXPORT void
 chimera_server_config_set_rcu_reclaim_threads(
@@ -1171,6 +1218,34 @@ chimera_server_config_get_anongid(const struct chimera_server_config *config)
 {
     return config->anongid;
 } /* chimera_server_config_get_anongid */
+
+SYMBOL_EXPORT void
+chimera_server_config_set_nfs_fh_sign(
+    struct chimera_server_config *config,
+    int                           enable)
+{
+    config->nfs_fh_sign = enable;
+} /* chimera_server_config_set_nfs_fh_sign */
+
+SYMBOL_EXPORT int
+chimera_server_config_get_nfs_fh_sign(const struct chimera_server_config *config)
+{
+    return config->nfs_fh_sign;
+} /* chimera_server_config_get_nfs_fh_sign */
+
+SYMBOL_EXPORT void
+chimera_server_config_set_nfs_fh_key(
+    struct chimera_server_config *config,
+    const char                   *hexkey)
+{
+    snprintf(config->nfs_fh_key, sizeof(config->nfs_fh_key), "%s", hexkey);
+} /* chimera_server_config_set_nfs_fh_key */
+
+SYMBOL_EXPORT const char *
+chimera_server_config_get_nfs_fh_key(const struct chimera_server_config *config)
+{
+    return config->nfs_fh_key;
+} /* chimera_server_config_get_nfs_fh_key */
 
 SYMBOL_EXPORT void
 chimera_server_config_set_soft_fail_bad_req(
@@ -1807,6 +1882,156 @@ chimera_server_seed_symlinks(
     return ctx.status == CHIMERA_VFS_OK ? 0 : -1;
 } /* chimera_server_seed_symlinks */
 
+/* ---- test-only MS-FSA fixture seeding -------------------------------------
+ * The WPTS MS-FSA suite opens two fixtures it expects to pre-exist on the share:
+ *   <root>/ExistingFolder    (a directory)
+ *   <root>/ExistingFile.txt  (a regular file)
+ * Seed them at startup (memfs shares one tree across mounts), gated by env
+ * CHIMERA_SMB_SEED_FSA naming the backend module.  Best-effort; reuses the
+ * symlink seed's transient-mount/evpl_continue drive loop. */
+
+static void
+chimera_seed_fsa_fileopen_cb(
+    enum chimera_vfs_error          error_code,
+    struct chimera_vfs_open_handle *oh,
+    struct chimera_vfs_attrs       *set_attr,
+    struct chimera_vfs_attrs       *attr,
+    struct chimera_vfs_attrs       *dir_pre_attr,
+    struct chimera_vfs_attrs       *dir_post_attr,
+    void                           *private_data)
+{
+    struct chimera_seed_ctx *ctx = private_data;
+
+    if (oh) {
+        chimera_vfs_release(ctx->thread, oh);
+    }
+    chimera_seed_finish(ctx, (error_code == CHIMERA_VFS_OK ||
+                              error_code == CHIMERA_VFS_EEXIST) ?
+                        CHIMERA_VFS_OK : error_code);
+} /* chimera_seed_fsa_fileopen_cb */
+
+static void
+chimera_seed_fsa_mkdir_cb(
+    enum chimera_vfs_error    error_code,
+    struct chimera_vfs_attrs *set_attr,
+    struct chimera_vfs_attrs *attr,
+    struct chimera_vfs_attrs *dir_pre_attr,
+    struct chimera_vfs_attrs *dir_post_attr,
+    void                     *private_data)
+{
+    struct chimera_seed_ctx *ctx = private_data;
+    struct chimera_vfs_attrs file_attr;
+
+    if (error_code != CHIMERA_VFS_OK && error_code != CHIMERA_VFS_EEXIST) {
+        chimera_seed_finish(ctx, error_code);
+        return;
+    }
+
+    memset(&file_attr, 0, sizeof(file_attr));
+    file_attr.va_set_mask = CHIMERA_VFS_ATTR_MODE | CHIMERA_VFS_ATTR_UID |
+        CHIMERA_VFS_ATTR_GID;
+    file_attr.va_mode = S_IFREG | 0644;
+    file_attr.va_uid  = 0;
+    file_attr.va_gid  = 0;
+
+    chimera_vfs_open_at(ctx->thread, chimera_vfs_get_server_cred(), ctx->root_oh,
+                        "ExistingFile.txt", 16,
+                        CHIMERA_VFS_OPEN_CREATE, &file_attr,
+                        CHIMERA_VFS_ATTR_FH, 0, 0,
+                        chimera_seed_fsa_fileopen_cb, ctx);
+} /* chimera_seed_fsa_mkdir_cb */
+
+static void
+chimera_seed_fsa_rootopen_cb(
+    enum chimera_vfs_error          error_code,
+    struct chimera_vfs_open_handle *oh,
+    void                           *private_data)
+{
+    struct chimera_seed_ctx *ctx = private_data;
+    struct chimera_vfs_attrs set_attr;
+
+    if (error_code != CHIMERA_VFS_OK) {
+        chimera_seed_finish(ctx, error_code);
+        return;
+    }
+
+    ctx->root_oh = oh;
+
+    memset(&set_attr, 0, sizeof(set_attr));
+    set_attr.va_set_mask = CHIMERA_VFS_ATTR_MODE | CHIMERA_VFS_ATTR_UID |
+        CHIMERA_VFS_ATTR_GID;
+    set_attr.va_mode = S_IFDIR | 0755;
+    set_attr.va_uid  = 0;
+    set_attr.va_gid  = 0;
+
+    chimera_vfs_mkdir_at(ctx->thread, chimera_vfs_get_server_cred(), ctx->root_oh,
+                         "ExistingFolder", 14, &set_attr,
+                         CHIMERA_VFS_ATTR_FH, 0, 0,
+                         chimera_seed_fsa_mkdir_cb, ctx);
+} /* chimera_seed_fsa_rootopen_cb */
+
+static void
+chimera_seed_fsa_mounted_cb(
+    struct chimera_vfs_thread *thread,
+    enum chimera_vfs_error     status,
+    void                      *private_data)
+{
+    struct chimera_seed_ctx  *ctx = private_data;
+    struct chimera_vfs_mount *m;
+
+    if (status != CHIMERA_VFS_OK) {
+        ctx->status = status;
+        ctx->done   = 1;
+        return;
+    }
+
+    m = chimera_vfs_mount_table_find_by_path(ctx->vfs->mount_table,
+                                             CHIMERA_SEED_TMP_NAME,
+                                             strlen(CHIMERA_SEED_TMP_NAME));
+    if (!m) {
+        chimera_seed_finish(ctx, CHIMERA_VFS_EIO);
+        return;
+    }
+
+    chimera_vfs_open_fh(thread, chimera_vfs_get_server_cred(),
+                        m->root_fh, m->root_fh_len,
+                        CHIMERA_VFS_OPEN_DIRECTORY | CHIMERA_VFS_OPEN_PATH,
+                        chimera_seed_fsa_rootopen_cb, ctx);
+} /* chimera_seed_fsa_mounted_cb */
+
+SYMBOL_EXPORT int
+chimera_server_seed_fsa(
+    struct chimera_server *server,
+    const char            *module_name)
+{
+    struct evpl            *evpl;
+    struct chimera_seed_ctx ctx;
+
+    if (!module_name) {
+        return -1;
+    }
+
+    memset(&ctx, 0, sizeof(ctx));
+
+    evpl       = evpl_create(NULL);
+    ctx.vfs    = server->vfs;
+    ctx.thread = chimera_vfs_thread_init(evpl, server->vfs);
+    ctx.status = CHIMERA_VFS_OK;
+
+    chimera_vfs_mount(ctx.thread, chimera_vfs_get_server_cred(),
+                      CHIMERA_SEED_TMP_NAME, module_name, "/", NULL,
+                      chimera_seed_fsa_mounted_cb, &ctx);
+
+    while (!ctx.done) {
+        evpl_continue(evpl);
+    }
+
+    chimera_vfs_thread_destroy(ctx.thread);
+    evpl_destroy(evpl);
+
+    return ctx.status == CHIMERA_VFS_OK ? 0 : -1;
+} /* chimera_server_seed_fsa */
+
 static void
 chimera_server_umount_callback(
     struct chimera_vfs_thread *thread,
@@ -1967,6 +2192,19 @@ chimera_server_share_set_encrypt_data(
 } /* chimera_server_share_set_encrypt_data */
 
 SYMBOL_EXPORT int
+chimera_server_share_set_force_level2_oplock(
+    struct chimera_server *server,
+    const char            *share_name)
+{
+    if (!server->smb_shared) {
+        return -1;
+    }
+
+    return chimera_smb_share_set_force_level2_oplock(server->smb_shared,
+                                                     share_name);
+} /* chimera_server_share_set_force_level2_oplock */
+
+SYMBOL_EXPORT int
 chimera_server_create_export(
     struct chimera_server *server,
     const char            *name,
@@ -1980,6 +2218,36 @@ chimera_server_create_export(
 
     return 0;
 } /* chimera_server_create_export */
+
+SYMBOL_EXPORT int
+chimera_server_export_set_options(
+    struct chimera_server *server,
+    const char            *name,
+    uint32_t               options,
+    uint32_t               squash,
+    uint32_t               anonuid,
+    uint32_t               anongid)
+{
+    if (!server->nfs_shared) {
+        return -1;
+    }
+
+    return chimera_nfs_export_set_options(server->nfs_shared, name, options,
+                                          squash, anonuid, anongid);
+} /* chimera_server_export_set_options */
+
+SYMBOL_EXPORT int
+chimera_server_export_set_sec(
+    struct chimera_server *server,
+    const char            *name,
+    uint32_t               sec_allowed)
+{
+    if (!server->nfs_shared) {
+        return -1;
+    }
+
+    return chimera_nfs_export_set_sec(server->nfs_shared, name, sec_allowed);
+} /* chimera_server_export_set_sec */
 
 static void
 chimera_server_thread_shutdown(
@@ -2068,6 +2336,8 @@ chimera_server_init(
                                    config->num_modules,
                                    config->kv_module,
                                    config->cache_ttl,
+                                   config->attr_cache_enabled,
+                                   config->name_cache_enabled,
                                    config->rcu_reclaim_threads,
                                    metrics);
 
@@ -2536,6 +2806,35 @@ chimera_server_config_get_smb_kerberos_keytab(const struct chimera_server_config
 {
     return config->smb_auth.kerberos_keytab;
 } /* chimera_server_config_get_smb_kerberos_keytab */
+
+SYMBOL_EXPORT void
+chimera_server_config_set_nfs_kerberos_enabled(
+    struct chimera_server_config *config,
+    int                           enabled)
+{
+    config->nfs_auth.kerberos_enabled = enabled;
+} /* chimera_server_config_set_nfs_kerberos_enabled */
+
+SYMBOL_EXPORT int
+chimera_server_config_get_nfs_kerberos_enabled(const struct chimera_server_config *config)
+{
+    return config->nfs_auth.kerberos_enabled;
+} /* chimera_server_config_get_nfs_kerberos_enabled */
+
+SYMBOL_EXPORT void
+chimera_server_config_set_nfs_kerberos_keytab(
+    struct chimera_server_config *config,
+    const char                   *keytab)
+{
+    strncpy(config->nfs_auth.kerberos_keytab, keytab,
+            sizeof(config->nfs_auth.kerberos_keytab) - 1);
+} /* chimera_server_config_set_nfs_kerberos_keytab */
+
+SYMBOL_EXPORT const char *
+chimera_server_config_get_nfs_kerberos_keytab(const struct chimera_server_config *config)
+{
+    return config->nfs_auth.kerberos_keytab;
+} /* chimera_server_config_get_nfs_kerberos_keytab */
 
 SYMBOL_EXPORT void
 chimera_server_config_set_smb_kerberos_realm(

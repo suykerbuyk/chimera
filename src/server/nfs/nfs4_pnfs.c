@@ -111,7 +111,9 @@ chimera_nfs4_encode_ff_device_addr(
      * (NFSv3 or NFSv4.x), loosely coupled. */
     pnfs_put_u32(&p, 1);
     pnfs_put_u32(&p, version);                /* ffdv_version          */
-    pnfs_put_u32(&p, minorversion);           /* ffdv_minorversion     */
+    /* RFC 8435 §4.1: if ffdv_version == 3 the server MUST set ffdv_minorversion
+     * to 0 (and ffdv_tightly_coupled to false, hardcoded below). */
+    pnfs_put_u32(&p, version == 3 ? 0 : minorversion); /* ffdv_minorversion */
     pnfs_put_u32(&p, NFS4_PNFS_STRIPE_UNIT);  /* ffdv_rsize            */
     pnfs_put_u32(&p, NFS4_PNFS_STRIPE_UNIT);  /* ffdv_wsize            */
     pnfs_put_u32(&p, 0);                      /* ffdv_tightly_coupled=false */
@@ -208,20 +210,36 @@ chimera_nfs4_getdeviceinfo(
                 break;
         } /* switch */
     } else {
+        /* Known layout type but unrecognized device id => NFS4ERR_NOENT so the
+         * client can distinguish a stale deviceid from a malformed request
+         * (RFC 8881 §18.40.3); an unsupported layout type => UNKNOWN_LAYOUTTYPE. */
         res->gdir_status = (args->gdia_layout_type != LAYOUT4_FLEX_FILES &&
                             args->gdia_layout_type != LAYOUT4_BLOCK_VOLUME &&
                             args->gdia_layout_type != LAYOUT4_SCSI)
-                           ? NFS4ERR_UNKNOWN_LAYOUTTYPE : NFS4ERR_INVAL;
+                           ? NFS4ERR_UNKNOWN_LAYOUTTYPE : NFS4ERR_NOENT;
         chimera_nfs4_compound_complete(req, res->gdir_status);
         return;
     }
 
-    /* gdia_maxcount bounds the bytes the client will accept for the
-     * da_addr_body (RFC 8881 §18.40.3); signal TOOSMALL with the required
-     * size if it cannot fit. */
-    if (args->gdia_maxcount < body_len) {
+    /* gdia_maxcount bounds the bytes the client will accept for the da_addr_body
+     * (RFC 8881 §18.40.3).  A maxcount of 0 is the defined way for a client to
+     * validate a device id or (de)register notifications: TOOSMALL MUST NOT be
+     * returned and the reply's da_addr_body is zero length.  Otherwise signal
+     * TOOSMALL with the required size when the body cannot fit. */
+    /* gdia_maxcount bounds the entire GETDEVICEINFO4resok, including XDR
+     * overhead, not just the da_addr_body (RFC 8881 §18.40.3).  Beyond the
+     * body the resok carries da_layout_type (4), the da_addr_body opaque
+     * length prefix (4, with the body padded to a 4-byte boundary) and the
+     * gdir_notification bitmap count (4).  Compare maxcount against -- and
+     * report gdir_mincount as -- that full size, so a client that retries at
+     * exactly gdir_mincount does not TOOSMALL again. */
+    uint32_t resok_len = 4 + 4 + ((body_len + 3) & ~3u) + 4;
+
+    if (args->gdia_maxcount == 0) {
+        body_len = 0;
+    } else if (args->gdia_maxcount < resok_len) {
         res->gdir_status   = NFS4ERR_TOOSMALL;
-        res->gdir_mincount = body_len;
+        res->gdir_mincount = resok_len;
         chimera_nfs4_compound_complete(req, res->gdir_status);
         return;
     }
@@ -534,6 +552,8 @@ ff_lg_emit(struct ff_layoutget_ctx *ctx)
     uint32_t                 body_len;
     struct layout4          *lo;
     int                      rc;
+    uint8_t                  ds_fhwire[CHIMERA_NFS_FH_MAX];
+    int                      ds_fhwire_len;
 
     if (!client) {
         ff_lg_fail(ctx, NFS4ERR_LAYOUTUNAVAILABLE);
@@ -556,9 +576,21 @@ ff_lg_emit(struct ff_layoutget_ctx *ctx)
         chimera_vfs_pnfs_find_device(req->thread->shared->vfs, deviceid);
 
     if (ds && ds->backing_local) {
-        native_fh     = backing_fh;
-        native_fh_len = backing_fh_len;
+        /* Local DS (this server, local mount): backing_fh is a raw VFS handle,
+        * so wrap it into the on-wire form the DS's NFS decode expects.  The DS
+        * is this same server, so it shares the signing key and verifies it. */
+        chimera_nfs_fh_wrap(ds_fhwire, &ds_fhwire_len, req->export_id,
+                            backing_fh, backing_fh_len,
+                            req->thread->shared->fh_key, req->thread->shared->fh_sign);
+        native_fh     = ds_fhwire;
+        native_fh_len = ds_fhwire_len;
     } else {
+        /* Remote DS reached through the nfs proxy: the proxy already holds the
+         * DS's on-wire handle (signed by the DS itself), so strip the proxy's
+         * mount wrapper and pass it through unchanged.  Re-wrapping here would
+         * double-wrap it and the DS would fail to decode.  (A split-DS cluster
+         * must share one nfs_fh_key so the DS-minted handle verifies after the
+         * round-trip through the client.) */
         native_fh     = backing_fh + FF_BLOB_FH_SKIP;
         native_fh_len = backing_fh_len - FF_BLOB_FH_SKIP;
     }
@@ -569,7 +601,7 @@ ff_lg_emit(struct ff_layoutget_ctx *ctx)
     if (layout) {
         nfs_layout_state_bump(layout, client_short_id, &res->logr_resok4.logr_stateid);
     } else {
-        nfs_layout_state_create(client, req->fh, req->fhlen, args->loga_iomode,
+        nfs_layout_state_create(client, req->fh, req->fhlen, req->export_id, args->loga_iomode,
                                 client_short_id, table,
                                 &req->thread->shared->nfs4_layout_table,
                                 &res->logr_resok4.logr_stateid);
@@ -801,7 +833,7 @@ lg_sourced_cb(
     if (layout) {
         nfs_layout_state_bump(layout, client_short_id, &res->logr_resok4.logr_stateid);
     } else {
-        nfs_layout_state_create(client, req->fh, req->fhlen, args->loga_iomode,
+        nfs_layout_state_create(client, req->fh, req->fhlen, req->export_id, args->loga_iomode,
                                 client_short_id, table,
                                 &req->thread->shared->nfs4_layout_table,
                                 &res->logr_resok4.logr_stateid);
@@ -1028,12 +1060,22 @@ chimera_nfs4_layoutreturn(
             uint32_t in_seqid =
                 args->lora_layoutreturn.lr_layout.lrf_stateid.seqid;
 
+            /* RFC 8881 §18.44.3: for LAYOUTRETURN4_FILE the layout stateid's
+             * seqid MUST NOT be zero -- unlike the anonymous/current special
+             * stateids used elsewhere, a zero seqid here is rejected with
+             * NFS4ERR_BAD_STATEID rather than treated as a wildcard. */
+            if (in_seqid == 0) {
+                res->lorr_status = NFS4ERR_BAD_STATEID;
+                chimera_nfs4_compound_complete(req, res->lorr_status);
+                return;
+            }
+
             /* RFC 8881 §12.5.3: the layout stateid carried by LAYOUTRETURN must
              * match the server's current seqid for this layout.  A stale seqid
-             * is OLD_STATEID, a future one BAD_STATEID; seqid 0 is the wildcard
-             * "current" and always matches.  (LAYOUTGET, by contrast, tolerates
-             * an old seqid -- the client may race two LAYOUTGETs.) */
-            if (in_seqid != 0 && in_seqid < layout->seqid) {
+             * is OLD_STATEID, a future one BAD_STATEID.  (LAYOUTGET, by
+             * contrast, tolerates an old seqid -- the client may race two
+             * LAYOUTGETs.) */
+            if (in_seqid < layout->seqid) {
                 res->lorr_status = NFS4ERR_OLD_STATEID;
                 chimera_nfs4_compound_complete(req, res->lorr_status);
                 return;
@@ -1139,6 +1181,9 @@ chimera_nfs4_layoutcommit_setattr_complete(
     (void) pre_attr;
     (void) set_attr;
 
+    chimera_nfs_info("LAYOUTCOMMIT req=%p setattr complete err=%d -> reply",
+                     req, error_code);
+
     if (req->handle) {
         chimera_vfs_release(req->thread->vfs_thread, req->handle);
         req->handle = NULL;
@@ -1180,6 +1225,8 @@ chimera_nfs4_layoutcommit_open_callback(
 
     /* No new high-water byte reported: nothing to sync to the MDS. */
     if (!args->loca_last_write_offset.no_newoffset) {
+        chimera_nfs_info("LAYOUTCOMMIT req=%p open ok, no new offset (no MDS size sync) -> reply",
+                         req);
         chimera_vfs_release(req->thread->vfs_thread, req->handle);
         req->handle                                  = NULL;
         res->locr_resok4.locr_newsize.ns_sizechanged = 0;
@@ -1202,6 +1249,9 @@ chimera_nfs4_layoutcommit_open_callback(
         set_attr->va_mtime.tv_nsec = args->loca_time_modify.nt_time.nseconds;
     }
 
+    chimera_nfs_info("LAYOUTCOMMIT req=%p open ok -> setattr size=%llu mtime_chg=%d",
+                     req, (unsigned long long) set_attr->va_size,
+                     args->loca_time_modify.nt_timechanged);
     chimera_vfs_setattr(req->thread->vfs_thread, &req->cred, handle,
                         set_attr, 0, CHIMERA_VFS_ATTR_SIZE,
                         chimera_nfs4_layoutcommit_setattr_complete, req);
@@ -1233,6 +1283,8 @@ chimera_nfs4_layoutcommit(
     /* Open the MDS file to apply the client-reported size/mtime.  Data lives
      * on the DS; with COMMIT_THRU_MDS the client reports the new high-water
      * mark here so MDS metadata catches up. */
+    chimera_nfs_info("LAYOUTCOMMIT enter req=%p fhlen=%u -> opening MDS file",
+                     req, req->fhlen);
     chimera_vfs_open_fh(thread->vfs_thread, &req->cred,
                         req->fh, req->fhlen,
                         CHIMERA_VFS_OPEN_INFERRED,

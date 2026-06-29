@@ -102,10 +102,23 @@ nfs4_client_table_free(struct nfs4_client_table *table)
 
     /* HASH_DEL blows clangs mind so we disable this block under analyzer */
 
-    HASH_ITER(nfs4_client_hh_by_id, table->nfs4_ct_clients_by_id, cur, tmp)
+    /* A client record is always present in the by-id table but only
+     * *optionally* in the by-owner table: an unconfirmed SETCLIENTID reboot
+     * record (nfs4_client_new_locked with add_to_owner=false) and a superseded
+     * record both live in by-id only.  Unhashing every by-id record from
+     * by-owner would therefore HASH_DELETE records that were never added there,
+     * corrupting the by-owner table (NULL-head deref / SEGV).  Drain by-owner
+     * with its own iterator first -- freeing nothing -- then free every record
+     * via the by-id table. */
+    HASH_ITER(nfs4_client_hh_by_owner, table->nfs4_ct_clients_by_owner,
+              cur, tmp)
     {
         HASH_DELETE(nfs4_client_hh_by_owner, table->nfs4_ct_clients_by_owner,
                     cur);
+    }
+
+    HASH_ITER(nfs4_client_hh_by_id, table->nfs4_ct_clients_by_id, cur, tmp)
+    {
         HASH_DELETE(nfs4_client_hh_by_id, table->nfs4_ct_clients_by_id, cur);
         free(cur);
     }
@@ -217,6 +230,26 @@ nfs4_principal_matches(
            memcmp(c->nfs4_client_princ_mach, p->machinename,
                   p->machinename_len) == 0;
 } /* nfs4_principal_matches */
+
+/*
+ * SP4_MACH_CRED enforcement (RFC 8881 §2.10.8.3): a state-management operation
+ * on a client that negotiated SP4_MACH_CRED must be issued with the same
+ * (machine) credential that established the client at EXCHANGE_ID.  Returns 1
+ * if the operation is permitted (client absent, or SP4_NONE, or the principal
+ * matches), 0 if it must be rejected with NFS4ERR_WRONG_CRED.  SP4_SSV is never
+ * negotiated (EXCHANGE_ID declines it -- see nfs4_set_state_protect), so the
+ * only modes a client record can carry here are SP4_NONE and SP4_MACH_CRED.
+ */
+SYMBOL_EXPORT int
+nfs4_client_mach_cred_ok(
+    const struct nfs4_client           *c,
+    const struct nfs4_client_principal *p)
+{
+    if (!c || c->nfs4_client_sp_how != SP4_MACH_CRED) {
+        return 1;
+    }
+    return nfs4_principal_matches(c, p);
+} /* nfs4_client_mach_cred_ok */
 
 /* Caller must hold table->nfs4_ct_lock.  Allocates a fresh (unconfirmed)
  * client record, brings up its unified state hierarchy, and inserts it into
@@ -565,8 +598,10 @@ nfs4_client_setclientid_confirm(
     if (!r->nfs4_client_scid_confirm_valid ||
         memcmp(confirm, r->nfs4_client_scid_confirm, NFS4_VERIFIER_SIZE) != 0) {
         /* The (clientid, verifier) pair does not name a record awaiting
-         * confirmation (RFC 7530 §16.34.5). */
-        status = NFS4ERR_STALE_STATEID;
+         * confirmation.  SETCLIENTID_CONFIRM's error set (RFC 7530 §13 / §16.34.5)
+         * specifies NFS4ERR_STALE_CLIENTID here; NFS4ERR_STALE_STATEID is only
+         * valid for stateid operations. */
+        status = NFS4ERR_STALE_CLIENTID;
         goto out_unlock;
     }
 

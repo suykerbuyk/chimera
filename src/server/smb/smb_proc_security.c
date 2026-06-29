@@ -25,6 +25,8 @@
 #define OWNER_SECURITY_INFORMATION 0x00000001
 #define GROUP_SECURITY_INFORMATION 0x00000002
 #define DACL_SECURITY_INFORMATION  0x00000004
+#define SACL_SECURITY_INFORMATION  0x00000008
+#define LABEL_SECURITY_INFORMATION 0x00000010
 
 /* Security descriptor control flags */
 #define SE_SELF_RELATIVE           0x8000
@@ -541,6 +543,31 @@ chimera_smb_acl_to_sd(
     }
     memset(out, 0, SD_HEADER_SIZE);
 
+    /* Emit the body in canonical order: owner SID, group SID, SACL, DACL.
+     * MS-DTYP 2.4.6 lets the self-relative offsets place these blocks anywhere,
+     * but Windows and real clients (Linux cifs, pike) decode the body in this
+     * fixed order and only consult OffsetXxx as a present/absent flag -- a
+     * DACL-first layout is then misparsed (the DACL bytes are read as the owner
+     * SID), so the owner/group SIDs must precede the DACL here. */
+    if (has_owner) {
+        int n = chimera_smb_emit_owner_sid(&out[offset], cap - offset, vfs, uid);
+
+        if (n < 0) {
+            return -1;
+        }
+        owner_off = offset;
+        offset   += n;
+    }
+
+    if (has_group) {
+        if (offset + SID_UNIX_SIZE > cap) {
+            return -1;
+        }
+        group_off = offset;
+        write_unix_sid(&out[offset], 2, gid);
+        offset += SID_UNIX_SIZE;
+    }
+
     if (has_dacl) {
         uint32_t acl_hdr   = offset;
         uint16_t ace_count = 0;
@@ -642,25 +669,6 @@ chimera_smb_acl_to_sd(
 
         dacl_off = acl_hdr;
         offset   = ace_pos;
-    }
-
-    if (has_owner) {
-        int n = chimera_smb_emit_owner_sid(&out[offset], cap - offset, vfs, uid);
-
-        if (n < 0) {
-            return -1;
-        }
-        owner_off = offset;
-        offset   += n;
-    }
-
-    if (has_group) {
-        if (offset + SID_UNIX_SIZE > cap) {
-            return -1;
-        }
-        group_off = offset;
-        write_unix_sid(&out[offset], 2, gid);
-        offset += SID_UNIX_SIZE;
     }
 
     out[0]  = 1; /* revision */
@@ -894,9 +902,49 @@ chimera_smb_set_resolve_cb(
 void
 chimera_smb_set_security(struct chimera_smb_request *request)
 {
-    struct chimera_vfs_thread *thread = request->compound->thread->vfs_thread;
-    struct smb_unres_sids      unres  = { .count = 0 };
+    struct chimera_vfs_thread *thread    = request->compound->thread->vfs_thread;
+    struct smb_unres_sids      unres     = { .count = 0 };
+    uint32_t                   addl_info = request->set_info.addl_info;
+    uint32_t                   granted   = request->set_info.open_file->granted_access;
+    uint32_t                   required  = 0;
     int                        i;
+
+    /* MS-FSA 2.1.5.16 (Server Requests Setting of Security Information): the
+     * handle's GrantedAccess must permit each SecurityInformation component
+     * being set, else the whole SET fails with STATUS_ACCESS_DENIED and no part
+     * of the descriptor is applied (WPTS MS-FSAModel SetSecurityInformation):
+     *   OWNER/GROUP/LABEL -> WRITE_OWNER
+     *   DACL              -> WRITE_DAC
+     *   SACL              -> ACCESS_SYSTEM_SECURITY
+     * A specific-bits open keeps the exact rights it requested; a
+     * MAXIMUM_ALLOWED/owner open whose ACL evaluation yields full control
+     * already carries WRITE_DAC/WRITE_OWNER, so legitimate owner/admin SD
+     * changes are unaffected.  chimera never grants ACCESS_SYSTEM_SECURITY, so
+     * a SACL set is always denied -- matching the model (no case expects a SACL
+     * set to succeed). */
+    if (addl_info & (OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION |
+                     LABEL_SECURITY_INFORMATION)) {
+        required |= SMB2_WRITE_OWNER;
+    }
+    if (addl_info & DACL_SECURITY_INFORMATION) {
+        required |= SMB2_WRITE_DACL;
+    }
+    if (addl_info & SACL_SECURITY_INFORMATION) {
+        /* The SACL is normally gated by ACCESS_SYSTEM_SECURITY (SeSecurityPrivilege).
+         * chimera does not model that privilege separately and never grants the
+         * bit, so use WRITE_DAC as the proxy: a handle privileged enough to
+         * change the DACL is treated as able to change the SACL too.  This lets
+         * a full-control/owner handle set the SACL (smb2.basic ChangeSecurity)
+         * while a handle without WRITE_DAC (e.g. GENERIC_WRITE) is still denied
+         * (FSAModel SetSecurityInformation SACL cases). */
+        required |= SMB2_WRITE_DACL;
+    }
+
+    if ((granted & required) != required) {
+        chimera_smb_open_file_release(request, request->set_info.open_file);
+        chimera_smb_complete_request(request, SMB2_STATUS_ACCESS_DENIED);
+        return;
+    }
 
     chimera_smb_set_decode_sd(request, &unres);
 
@@ -956,8 +1004,11 @@ chimera_smb_query_emit_sd(
 
     /* MS-SMB2 3.3.5.20.3: if the security descriptor does not fit in the
      * client-supplied OutputBufferLength, fail with STATUS_BUFFER_TOO_SMALL
-     * (smb2.getinfo.qsec_buffercheck). */
+     * (smb2.getinfo.qsec_buffercheck).  The error reply carries the minimum
+     * required length so the client can resize and retry (MS-SMB2 2.2.2 /
+     * 3.3.4.4); stash it in output_length, which the error-reply path emits. */
     if (request->query_info.max_response_size < (uint32_t) sd_len) {
+        request->query_info.output_length = (uint32_t) sd_len;
         chimera_smb_complete_request(request, SMB2_STATUS_BUFFER_TOO_SMALL);
         return;
     }

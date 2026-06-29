@@ -45,6 +45,20 @@ TEST_FILTER="$1"; shift || true
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WPTS_PTFCONFIG_DIR="${WPTS_PTFCONFIG_DIR:-${SCRIPT_DIR}/../src/server/smb/tests/wpts}"
 
+# Which WPTS suite to drive.  Defaults to MS-SMB2 (the original behavior); set
+# WPTS_SUITE=MS-FSA to run the File System Algorithms suite, or MS-FSAModel for
+# its model-based variant, against the same daemon.  The suite DLL, its
+# deployment ptfconfig, and the TRX name follow.
+WPTS_SUITE="${WPTS_SUITE:-MS-SMB2}"
+case "$WPTS_SUITE" in
+    MS-SMB2)     WPTS_SUITE_DLL="MS-SMB2_ServerTestSuite.dll";     WPTS_TRX="SMB2TestResult.trx" ;;
+    MS-FSA)      WPTS_SUITE_DLL="MS-FSA_ServerTestSuite.dll";      WPTS_TRX="FSATestResult.trx" ;;
+    MS-FSAModel) WPTS_SUITE_DLL="MS-FSAModel_ServerTestSuite.dll"; WPTS_TRX="FSAModelTestResult.trx" ;;
+    MS-SMB2Model) WPTS_SUITE_DLL="MS-SMB2Model_ServerTestSuite.dll"; WPTS_TRX="SMB2ModelTestResult.trx" ;;
+    *) echo "unknown WPTS_SUITE: $WPTS_SUITE" >&2; exit 2 ;;
+esac
+WPTS_SUITE_PTFCONFIG="${WPTS_SUITE}_ServerTestSuite.deployment.ptfconfig"
+
 SUT_IP="10.0.0.1"
 # Second SUT IP for SMB3 multichannel (a redundant "NIC"). Only wired up when
 # CHIMERA_SMB_MULTICHANNEL=1; the WPTS MultipleChannel cases establish the
@@ -68,6 +82,14 @@ CHIMERA_PID=""
 # WPTS-required share names. Each gets its own VFS mount so the share root
 # exists and is isolated (mirrors how the KVM config mounts at /share).
 SHARES=(SMBBasic SMBEncrypted FileShare ShareForceLevel2)
+
+# The MS-SMB2Model AppInstanceId model needs two extra shares: one whose local
+# path DIFFERS from SMBBasic (its own mount) and one whose local path is the
+# SAME as SMBBasic (a second share name over the SMBBasic mount, added in
+# generate_config below).
+if [ "$WPTS_SUITE" = "MS-SMB2Model" ]; then
+    SHARES+=(DifferentFromSMBBasic)
+fi
 
 cleanup() {
     if [ -n "$CHIMERA_PID" ]; then
@@ -141,10 +163,25 @@ generate_config() {
            [ "$share" = "SMBEncrypted" ]; then
             share_enc=', "encrypt_data": true'
         fi
-        shares="${shares}${sep}\"${share}\": {\"path\": \"/${share}\"${share_ca}${share_enc}}"
+        # ShareForceLevel2 is the designated FORCE_LEVELII_OPLOCK share (matches
+        # the ForceLevel2 share name in the ptfconfig): flag it so TREE_CONNECT
+        # advertises SMB2_SHAREFLAG_FORCE_LEVELII_OPLOCK and oplock/lease grants
+        # there are capped to LEVEL_II (WPTS OplockOnShareWithForceLevel2).
+        local share_fl2=""
+        if [ "$share" = "ShareForceLevel2" ]; then
+            share_fl2=', "force_level2_oplock": true'
+        fi
+        shares="${shares}${sep}\"${share}\": {\"path\": \"/${share}\"${share_ca}${share_enc}${share_fl2}}"
         sep=",
         "
     done
+
+    # AppInstanceId model (MS-SMB2Model): a second share NAME mapping to the SAME
+    # local path as SMBBasic.  It shares SMBBasic's mount, so it is a share entry
+    # only (no extra mount).
+    if [ "$WPTS_SUITE" = "MS-SMB2Model" ]; then
+        shares="${shares}${sep}\"SameWithSMBBasic\": {\"path\": \"/SMBBasic\"}"
+    fi
 
     # Enable SMB3 durable/persistent handles when requested (the durable/
     # persistent WPTS cases need the feature on; default off keeps the rest of
@@ -218,6 +255,12 @@ generate_config() {
             "smbpasswd": "Password01!",
             "uid": 0,
             "gid": 0
+        },
+        {
+            "username": "nonadmin",
+            "smbpasswd": "Password01!",
+            "uid": 1000,
+            "gid": 1000
         }
     ]
 }
@@ -253,6 +296,12 @@ ip netns exec "${NETNS_NAME}" ip link set "${DUMMY_IF}" up
 # in the staging section.
 if [ "${CHIMERA_SMB_SYMLINK:-0}" = "1" ]; then
     export CHIMERA_SMB_SEED_SYMLINKS="$BACKEND"
+fi
+
+# The MS-FSA / MS-FSAModel suites open fixtures (ExistingFolder + ExistingFile.txt)
+# they expect to pre-exist on the share; have the daemon seed them at startup.
+if [ "$WPTS_SUITE" = "MS-FSA" ] || [ "$WPTS_SUITE" = "MS-FSAModel" ]; then
+    export CHIMERA_SMB_SEED_FSA="$BACKEND"
 fi
 
 # Start the chimera daemon inside the netns
@@ -320,12 +369,20 @@ fi
 # scratch outputs carried over from the source so each session writes its own
 # (the '.\TestLog' dir name is a literal backslash on Linux).
 rm -f "${WPTS_STAGE_DIR}/CommonTestSuite.deployment.ptfconfig" \
-      "${WPTS_STAGE_DIR}/MS-SMB2_ServerTestSuite.deployment.ptfconfig" \
+      "${WPTS_STAGE_DIR}/${WPTS_SUITE_PTFCONFIG}" \
       "${WPTS_STAGE_DIR}/PTFApplicationLog.txt"
 rm -rf "${WPTS_STAGE_DIR}/TestResults" "${WPTS_STAGE_DIR}/.\\TestLog"
 cp "${WPTS_PTFCONFIG_DIR}/CommonTestSuite.deployment.ptfconfig" \
-   "${WPTS_PTFCONFIG_DIR}/MS-SMB2_ServerTestSuite.deployment.ptfconfig" \
+   "${WPTS_PTFCONFIG_DIR}/${WPTS_SUITE_PTFCONFIG}" \
    "${WPTS_STAGE_DIR}/"
+
+# Advertise the second (non-administrator) local account the daemon serves
+# (uid 1000, same PasswordForAllUsers). Cases that reconnect a durable/resilient
+# handle as a different user (MS-SMB2 3.3.5.9.7 step 9 -> STATUS_ACCESS_DENIED)
+# need a NonAdminUserName; without it the driver reports them Inconclusive.
+sed -i \
+    -e 's#<Property name="NonAdminUserName" value=""/>#<Property name="NonAdminUserName" value="nonadmin"/>#' \
+    "${WPTS_STAGE_DIR}/CommonTestSuite.deployment.ptfconfig"
 
 # When persistent handles are enabled, advertise the matching capability +
 # CA-share to the test driver so the DurableHandleV2 / PersistentHandle cases
@@ -483,9 +540,9 @@ ip netns exec "${NETNS_NAME}" env \
     DOTNET_NOLOGO=1 \
     DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1 \
     HOME="${SESSION_DIR}" \
-    "$DOTNET" vstest "${WPTS_STAGE_DIR}/MS-SMB2_ServerTestSuite.dll" \
+    "$DOTNET" vstest "${WPTS_STAGE_DIR}/${WPTS_SUITE_DLL}" \
         "${FILTER_ARGS[@]}" \
-        --logger:"trx;LogFileName=SMB2TestResult.trx" \
+        --logger:"trx;LogFileName=${WPTS_TRX}" \
         --ResultsDirectory:"${RESULT_DIR}"
 VSTEST_RC=$?
 
@@ -495,7 +552,7 @@ echo "=== vstest exit code: ${VSTEST_RC} ==="
 # convert the TRX into a per-case JUnit (the smbtorture-style hook) when the
 # caller asks.  Non-fatal -- a conversion failure must not fail the run.
 if [ -n "${WPTS_JUNIT_FILE:-}" ] && [ -n "${WPTS_JUNIT_CONVERTER:-}" ]; then
-    python3 "${WPTS_JUNIT_CONVERTER}" "${RESULT_DIR}/SMB2TestResult.trx" \
+    python3 "${WPTS_JUNIT_CONVERTER}" "${RESULT_DIR}/${WPTS_TRX}" \
         "${WPTS_JUNIT_FILE}" 2>/dev/null \
         || echo "WPTS JUnit conversion failed (non-fatal)"
 fi

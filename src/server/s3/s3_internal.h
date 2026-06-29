@@ -54,6 +54,7 @@ struct chimera_s3_list_entry {
 struct chimera_server_s3_thread;
 struct chimera_s3_multipart_table;
 struct chimera_s3_multipart_upload;
+struct chimera_s3_tagging_ctx;
 
 /* One <Object> entry from a DeleteObjects (POST /bucket?delete) request.
  * key points into the accumulated request body (unescaped in place). */
@@ -93,6 +94,8 @@ struct chimera_s3_request {
     int                              has_delete;
     int                              has_versions;
     int                              has_part_number;
+    /* ?tagging subresource (object/bucket tag get/put/delete). */
+    int                              has_tagging;
     /* Set when the request targets a bucket itself (Create/Delete/Head/List
      * bucket, ListBuckets) rather than an object; tells the body notifier to
      * drain any request body instead of treating it as object data. */
@@ -103,6 +106,7 @@ struct chimera_s3_request {
      * several paths that can observe a request ready to send only emit it
      * once (see s3_server_respond). */
     int                              responded;
+    int                              have_content_type;
     int                              query_upload_idlen;
     int                              query_part_number;
     char                             query_upload_id[CHIMERA_S3_UPLOAD_ID_LEN + 1];
@@ -212,6 +216,11 @@ struct chimera_s3_request {
             int                             resp_cap;
         } del;
     };
+
+    /* Tagging working state. Heap-allocated only for ?tagging requests or PUTs
+     * carrying an x-amz-tagging header; kept outside the union above because a
+     * multipart-completion PUT needs both the multipart and tagging state. */
+    struct chimera_s3_tagging_ctx *tagging;
 };
 
 struct chimera_server_s3_thread {

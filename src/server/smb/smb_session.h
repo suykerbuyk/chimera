@@ -74,6 +74,15 @@ struct chimera_smb_file_id {
  * content break is deferred to this open's close (MS-SMB2; dirlease.v2_request
  * "write ... only the close ... break the directory lease"). */
 #define CHIMERA_SMB_OPEN_FILE_FLAG_MODIFIED        0x00000400
+/* A CREATE_PENDING open whose originating connection disconnected while it was
+ * still parked on a break ack: chimera_smb_async_interim_drain dropped the parked
+ * request without a resume, so the open's CREATE can never complete.  It is left
+ * hashed + CREATE_PENDING so a replayed durable create with this create_guid still
+ * answers FILE_NOT_AVAILABLE -- until the break it waited on settles (the holder
+ * closed/acked), at which point chimera_smb_create_guid_replay lazy-evicts the
+ * resolved zombie and a replay falls through to a fresh open
+ * (smb2.replay.dhv2-pending2*-vs-{lease,oplock}-sane). */
+#define CHIMERA_SMB_OPEN_FILE_PENDING_ORPHANED     0x00000800
 
 /* Bits identifying which CREATE contexts a client supplied on the open. Mirrored
  * from request->create.ctx_present_mask into the open file so later phases
@@ -186,6 +195,12 @@ struct chimera_smb_open_file {
     uint8_t                           lease_key[16];
     uint8_t                           parent_lease_key[16];
     uint8_t                           create_guid[16];
+    /* The ClientGuid of the connection that created this open.  Retained so a
+     * conflicting CREATE can compare clients even after this open is parked (its
+     * create_conn is cleared at disconnect) -- e.g. the AppInstanceId same-client
+     * rule must not failover-displace a parked persistent handle of its own
+     * client (pike appinstanceid test_appinstanceid_reconnect_same_clientguid). */
+    uint8_t                           client_guid[16];
     /* SMB2_CREATE_APP_INSTANCE_ID / *_VERSION (MS-SMB2 2.2.13.2.13/14).
      * Recorded when the open carried an AppInstanceId so a later CREATE on a
      * different connection can match it and apply the version-gated
@@ -389,6 +404,13 @@ struct chimera_smb_session {
     _Atomic uint64_t            enc_nonce_counter;
 
     struct chimera_vfs_cred     cred;
+
+    /* Kerberos principal that ESTABLISHED the session, captured on the first
+     * (authorizing) leg.  A multichannel bind over Kerberos compares the binding
+     * connection's authenticated principal against this to enforce that the
+     * binding user is the session owner (MS-SMB2 3.3.5.5.3); empty for an
+     * NTLM-established session (which is matched by uid instead). */
+    char                        principal[256];
 };
 
 /* Derive the stable per-client lease owner key from a 16-byte ClientGuid.

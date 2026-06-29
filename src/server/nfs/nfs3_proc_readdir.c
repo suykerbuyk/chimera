@@ -81,6 +81,10 @@ chimera_nfs3_readdir_complete(
         res->resok.reply.eof     = !!eof;
         res->resok.reply.entries = cursor->entries;
         memcpy(res->resok.cookieverf, &verifier, sizeof(res->resok.cookieverf));
+    } else {
+        /* The encoder serializes resfail.dir_attributes on error; initialize it
+         * so a recycled request slot does not leak stale attribute bytes. */
+        chimera_nfs3_set_post_op_attr(&res->resfail.dir_attributes, dir_attr);
     }
 
     rc = shared->nfs_v3.send_reply_NFSPROC3_READDIR(evpl, NULL, res, req->encoding);
@@ -117,13 +121,15 @@ chimera_nfs3_readdir_open_callback(
                             args->cookie,
                             cookieverf,
                             CHIMERA_VFS_READDIR_EMIT_DOT,
+                            NULL, 0, /* no search-pattern filter */
                             chimera_nfs3_readdir_callback,
                             chimera_nfs3_readdir_complete,
                             req);
 
     } else {
         res->status = chimera_vfs_error_to_nfsstat3(error_code);
-        rc          = shared->nfs_v3.send_reply_NFSPROC3_READDIR(evpl, NULL, res, req->encoding);
+        chimera_nfs3_set_post_op_attr(&res->resfail.dir_attributes, NULL);
+        rc = shared->nfs_v3.send_reply_NFSPROC3_READDIR(evpl, NULL, res, req->encoding);
         chimera_nfs_abort_if(rc, "Failed to send RPC2 reply");
         nfs_request_free(thread, req);
     }
@@ -144,7 +150,7 @@ chimera_nfs3_readdir(
     struct nfs_nfs3_readdir_cursor   *cursor;
 
     req = nfs_request_alloc(thread, conn, encoding);
-    chimera_nfs_map_cred(&req->cred, cred);
+    chimera_nfs_map_cred_req(req, cred);
 
     nfs3_dump_readdir(req, args);
 
@@ -159,9 +165,21 @@ chimera_nfs3_readdir(
 
     res->resok.reply.entries = NULL;
 
+    res->status = chimera_nfs3_decode_fh(req, args->dir.data.data, args->dir.data.len);
+    if (res->status != NFS3_OK) {
+        int      rc;
+        nfsstat3 fh_status = res->status;
+        memset(res, 0, sizeof(*res));
+        res->status = fh_status;
+        rc          = thread->shared->nfs_v3.send_reply_NFSPROC3_READDIR(evpl, NULL, res, req->encoding);
+        chimera_nfs_abort_if(rc, "Failed to send RPC2 reply");
+        nfs_request_free(thread, req);
+        return;
+    }
+
     chimera_vfs_open_fh(thread->vfs_thread, &req->cred,
-                        args->dir.data.data,
-                        args->dir.data.len,
+                        req->fh,
+                        req->fhlen,
                         CHIMERA_VFS_OPEN_INFERRED | CHIMERA_VFS_OPEN_PATH | CHIMERA_VFS_OPEN_DIRECTORY,
                         chimera_nfs3_readdir_open_callback,
                         req);

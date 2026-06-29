@@ -627,12 +627,18 @@ chimera_smb_close(struct chimera_smb_request *request)
                                   chimera_smb_close_durable_delete_callback, NULL);
     }
 
-    if (request->close.flags & SMB2_CLOSE_FLAG_POSTQUERY_ATTRIB) {
+    if ((request->close.flags & SMB2_CLOSE_FLAG_POSTQUERY_ATTRIB) &&
+        request->close.open_file->handle) {
 
+        /* Named-pipe FIDs carry handle==NULL; fall through to the zero-attrs
+         * path rather than dereferencing NULL in getattr (MS-SMB2 3.3.5.10). */
+        /* The POSTQUERY response is FILE_NETWORK_OPEN_INFORMATION whose first
+         * field is CreationTime (BTIME).  MASK_STAT deliberately omits BTIME, so
+         * request it explicitly or CreationTime is emitted as 0 (issue #1117). */
         chimera_vfs_getattr(thread->vfs_thread,
                             &request->session_handle->session->cred,
                             request->close.open_file->handle,
-                            CHIMERA_VFS_ATTR_MASK_STAT,
+                            CHIMERA_VFS_ATTR_MASK_STAT | CHIMERA_VFS_ATTR_BTIME,
                             chimera_smb_close_getattr_callback,
                             request);
 
@@ -650,7 +656,10 @@ chimera_smb_close_reply(
 {
 
     evpl_iovec_cursor_append_uint16(reply_cursor, SMB2_CLOSE_REPLY_SIZE);
-    evpl_iovec_cursor_append_uint16(reply_cursor, request->close.flags);
+    /* Emit only the defined POSTQUERY_ATTRIB bit; do not reflect reserved client
+     * Flags bits (MS-SMB2 3.3.5.10 / 2.2.16). */
+    evpl_iovec_cursor_append_uint16(reply_cursor,
+                                    request->close.flags & SMB2_CLOSE_FLAG_POSTQUERY_ATTRIB);
 
     if (request->close.flags & SMB2_CLOSE_FLAG_POSTQUERY_ATTRIB) {
         chimera_smb_append_network_open_info(reply_cursor, &request->close.r_attrs);

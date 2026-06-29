@@ -82,7 +82,7 @@ target_link_libraries(test_protocol_advertise chimera_vfs chimera_common evpl ev
 add_dependencies(test_protocol_advertise chimera_nfs_common)
 add_test(NAME chimera/server/nfs/protocol_advertise COMMAND test_protocol_advertise)
 
-# Unit test for the RFC 8276 xattr name translation helpers (nfs4_xattr.h).
+# Unit test for the shared xattr name translation helpers (vfs/vfs_xattr_name.h).
 add_executable(test_xattr_name test_xattr_name.c)
 target_include_directories(test_xattr_name PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/..
@@ -101,6 +101,18 @@ target_include_directories(test_access_xattr PRIVATE
     ${NFS_COMMON_INCLUDE_DIR})
 add_dependencies(test_access_xattr chimera_nfs_common)
 add_test(NAME chimera/server/nfs/access_xattr COMMAND test_access_xattr)
+
+# Unit test for the secure wire file-handle wrapping (nfs_fh_wrap.h) and the
+# per-export credential squashing (nfs_common.h).  Header-logic only, but it
+# pulls in nfs_common.h which needs the generated nfs4_xdr.h, so depend on
+# chimera_nfs_common.
+add_executable(test_fh_security test_fh_security.c)
+target_include_directories(test_fh_security PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_SOURCE_DIR}/src
+    ${NFS_COMMON_INCLUDE_DIR})
+add_dependencies(test_fh_security chimera_nfs_common)
+add_test(NAME chimera/server/nfs/fh_security COMMAND test_fh_security)
 
 # Tag every test registered above with the 'nfs' label so these NFS server unit
 # tests can be run independently via `ctest -L nfs`.

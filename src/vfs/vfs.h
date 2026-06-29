@@ -711,6 +711,14 @@ struct chimera_vfs_request {
             int                             bounce_offset;
             chimera_vfs_readdir_callback_t  orig_callback;
             void                           *orig_private_data;
+            /* Optional SMB-style wildcard filter applied in the VFS core so the
+             * backend stays oblivious: only entries matching match_pattern are
+             * forwarded to inner_callback (the path's real per-entry callback).
+             * match_pattern == NULL disables filtering. */
+            const char                     *match_pattern;
+            int                             match_pattern_len;
+            chimera_vfs_readdir_callback_t  inner_callback;
+            void                           *inner_arg;
         } readdir;
 
         struct {
@@ -836,6 +844,19 @@ struct chimera_vfs_request {
             uint64_t                        name_hash;
             const uint8_t                  *child_fh;     /* Optional: child FH if known */
             int                             child_fh_len; /* 0 if child_fh not provided */
+            /* Inode-scoped removal: when set (with child_fh), the backend MUST
+             * only unlink the name while it still resolves to child_fh -- if the
+             * original object was removed and a new one created with the same
+             * name, the name is left intact.  Used by delete-on-close so an
+             * async unlink cannot destroy an unrelated file another opener
+             * created at the same path.  Default 0 = unconditional by-name
+             * remove (every existing caller's behaviour is unchanged). */
+            uint8_t                         match_child_fh;
+            /* Backend-set: the match_child_fh guard found the name resolving to
+             * a different object and left it intact, so NO unlink happened.
+             * The op still completes OK, but the post-removal bookkeeping
+             * (negative name-cache entry, FILE_REMOVED notify) must be skipped. */
+            uint8_t                         r_unmatched;
             /* SMB3 directory-lease self-exemption (see link_at): spare the dir
              * lease named by the deleting open's ParentLeaseKey from the
              * FILE_REMOVED break on the parent.  NULL caller = break all. */
@@ -1329,6 +1350,14 @@ struct chimera_vfs_handle_state {
  * ENOTSUP.  Currently only memfs advertises it. */
 #define CHIMERA_VFS_CAP_NAMED_STREAMS         (1U << 22)
 
+/* If set, the module supplies a native change attribute: a monotonically
+ * increasing per-object version counter returned via va_change /
+ * CHIMERA_VFS_ATTR_CHANGE, bumped on every data or metadata mutation.  This
+ * lets the NFS server return the counter as fattr4_change and report
+ * change_attr_type NFS4_CHANGE_TYPE_IS_MONOTONIC_INCR.  Modules that leave this
+ * unset have change derived from ctime (change_attr_type TIME_METADATA). */
+#define CHIMERA_VFS_CAP_CHANGE                (1U << 24)
+
 struct chimera_vfs_module {
     /* Required
      * Short name for the module to be used in creating shares
@@ -1555,6 +1584,8 @@ chimera_vfs_init(
     int                                  num_modules,
     const char                          *kv_module_name,
     int                                  cache_ttl,
+    int                                  attr_cache_enabled,
+    int                                  name_cache_enabled,
     int                                  num_rcu_reclaim_threads,
     struct prometheus_metrics           *metrics);
 

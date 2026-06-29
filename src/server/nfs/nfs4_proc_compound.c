@@ -394,7 +394,8 @@ chimera_nfs4_compound(
 
     req = nfs_request_alloc(thread, conn, encoding);
 
-    chimera_nfs_map_cred(&req->cred, cred);
+    chimera_nfs_map_cred_req(req, cred);
+    req->export_id = 0;
 
     /* Capture the RPC principal for EXCHANGE_ID record-matching. */
     if (cred && cred->flavor == EVPL_RPC2_AUTH_SYS) {
@@ -404,6 +405,16 @@ chimera_nfs4_compound(
         req->principal_machinename     = cred->authsys.machinename;
         req->principal_machinename_len = cred->authsys.machinename_len > 0 ?
             (uint32_t) cred->authsys.machinename_len : 0;
+    } else if (cred && cred->flavor == EVPL_RPC2_AUTH_RPCSEC_GSS &&
+               cred->gss.principal) {
+        /* For RPCSEC_GSS the "machine credential" identity is the GSS principal
+         * name; carry it as the machinename so EXCHANGE_ID can bind it for
+         * SP4_MACH_CRED and per-op enforcement can compare against it. */
+        req->principal_flavor          = cred->flavor;
+        req->principal_uid             = 0;
+        req->principal_gid             = 0;
+        req->principal_machinename     = cred->gss.principal;
+        req->principal_machinename_len = (uint32_t) strlen(cred->gss.principal);
     } else {
         req->principal_flavor          = cred ? cred->flavor : EVPL_RPC2_AUTH_NONE;
         req->principal_uid             = 0;

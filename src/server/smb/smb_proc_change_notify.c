@@ -21,8 +21,22 @@ chimera_smb_parse_change_notify(
     uint64_t file_id_vid;
     uint32_t completion_filter;
 
-    /* StructureSize (2 bytes) already consumed by the framework */
-    int      prc = 0;
+    /* StructureSize (2 bytes) already consumed by the framework; MS-SMB2 §2.2.35
+     * requires it to equal 32, else fail with STATUS_INVALID_PARAMETER (§3.3.5.2.6). */
+    if (unlikely(request->request_struct_size != SMB2_CHANGE_NOTIFY_REQUEST_SIZE)) {
+        request->status = SMB2_STATUS_INVALID_PARAMETER;
+        return -1;
+    }
+
+    int prc = 0;
+
+    /* MS-SMB2 3.3.5.19 / 2.2.35: a CHANGE_NOTIFY StructureSize that is not
+     * exactly 32 is a per-request STATUS_INVALID_PARAMETER. */
+    if (unlikely(request->request_struct_size != SMB2_CHANGE_NOTIFY_REQUEST_SIZE)) {
+        chimera_smb_error("Received SMB2 CHANGE_NOTIFY request with invalid struct size (%u expected %u)",
+                          request->request_struct_size, SMB2_CHANGE_NOTIFY_REQUEST_SIZE);
+        return chimera_smb_parse_reject(request, SMB2_STATUS_INVALID_PARAMETER);
+    }
 
     prc |= evpl_iovec_cursor_try_get_uint16(request_cursor, &flags);
     prc |= evpl_iovec_cursor_try_get_uint32(request_cursor, &output_buffer_length);
@@ -188,6 +202,8 @@ chimera_smb_change_notify(struct chimera_smb_request *request)
         nevents = j;
     }
 
+    nevents = chimera_smb_notify_coalesce_events(events, nevents);
+
     if (nevents > 0 || overflowed) {
         pthread_mutex_unlock(&state->lock);
 
@@ -214,6 +230,15 @@ chimera_smb_change_notify(struct chimera_smb_request *request)
             if (consumed < nevents) {
                 overflowed = 1;
                 nevents    = 0;
+
+                /* Events dropped for not fitting the client's non-zero
+                 * OutputBufferLength: make the next CHANGE_NOTIFY on this
+                 * handle report overflow too, until the client rescans
+                 * (smb2.notify.valid-req).  Buffer == 0 is a poll and does
+                 * not stick. */
+                if (request->change_notify.output_buffer_length > 0) {
+                    chimera_vfs_notify_mark_overflow(state->watch);
+                }
             }
         }
 

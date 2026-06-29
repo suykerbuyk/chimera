@@ -40,6 +40,13 @@ chimera_nfs4_open_acquire_share(
     uint8_t                         granted = 0;
     uint8_t                         denied  = 0;
 
+    /* share_access MUST request at least one of READ or WRITE (RFC 7530
+     * §16.16.5 / §9.9); a value with neither base mode is invalid. */
+    if ((args->share_access &
+         (OPEN4_SHARE_ACCESS_READ | OPEN4_SHARE_ACCESS_WRITE)) == 0) {
+        return NFS4ERR_INVAL;
+    }
+
     if (args->share_access & OPEN4_SHARE_ACCESS_READ) {
         granted |= CHIMERA_VFS_LEASE_MODE_R;
     }
@@ -127,8 +134,9 @@ chimera_nfs4_open_acquire_share(
  */
 static bool
 chimera_nfs4_open_grant_delegation(
-    struct nfs_request *req,
-    struct OPEN4res    *res)
+    struct nfs_request             *req,
+    struct OPEN4res                *res,
+    const struct chimera_vfs_attrs *file_attr)
 {
     struct chimera_server_nfs_thread *thread    = req->thread;
     struct OPEN4args                 *args      = &req->args_compound->argarray[req->index].opopen;
@@ -222,6 +230,7 @@ chimera_nfs4_open_grant_delegation(
 
     deleg = nfs_delegation_create(client, deleg_type,
                                   req->fh, req->fhlen, fh_hash,
+                                  req->export_id,
                                   &thread->shared->nfs4_state_table,
                                   &deleg_stateid);
 
@@ -263,6 +272,22 @@ chimera_nfs4_open_grant_delegation(
         return false;
     }
     deleg->lease_held = true;
+
+    /* RFC 7530/8881 §10.4.3: cache the file's change attribute at grant (sc).
+     * Only meaningful for a write delegation (the holder can modify locally);
+     * captured when the OPEN path supplied the change-derivation attrs.  If they
+     * are absent (e.g. CLAIM_FH, or a probe-deferred resume), combine_valid
+     * stays false and the first peer CB_GETATTR captures sc lazily. */
+    if (deleg_type == OPEN_DELEGATE_WRITE && file_attr &&
+        (file_attr->va_set_mask &
+         (CHIMERA_VFS_ATTR_CHANGE | CHIMERA_VFS_ATTR_CTIME))) {
+        uint64_t sc = chimera_nfs4_change_from_attrs(file_attr);
+        pthread_mutex_lock(&deleg->combine_lock);
+        deleg->combine_sc    = sc;
+        deleg->combine_last  = sc;
+        deleg->combine_valid = true;
+        pthread_mutex_unlock(&deleg->combine_lock);
+    }
 
     res->resok4.delegation.delegation_type = deleg_type;
 
@@ -479,7 +504,9 @@ chimera_nfs4_open_resume_after_probe(struct nfs_request *req)
     struct OPEN4res *res = &req->res_compound.resarray[req->index].opopen;
     bool             deferred;
 
-    deferred = chimera_nfs4_open_grant_delegation(req, res);
+    /* No file attrs available on the probe-deferred resume; sc is captured
+     * lazily on the first peer CB_GETATTR (combine_valid stays false). */
+    deferred = chimera_nfs4_open_grant_delegation(req, res, NULL);
     chimera_nfs_abort_if(deferred,
                          "OPEN resume after probe re-deferred");
     chimera_nfs4_open_complete(req, NFS4_OK);
@@ -564,7 +591,7 @@ chimera_nfs4_open_exclusive_verify(
     * defer path (which returns without completing the OPEN) does not leak
     * it -- the resume callback only knows how to call open_complete. */
     chimera_vfs_release(req->thread->vfs_thread, parent_handle);
-    if (chimera_nfs4_open_grant_delegation(req, res)) {
+    if (chimera_nfs4_open_grant_delegation(req, res, attr)) {
         return; /* parked; resume from nfs4_cb_null_complete */
     }
     chimera_nfs4_open_complete(req, NFS4_OK);
@@ -679,7 +706,7 @@ chimera_nfs4_open_at_complete(
     * defer path (which returns without completing the OPEN) does not leak
     * it -- the resume callback only knows how to call open_complete. */
     chimera_vfs_release(req->thread->vfs_thread, parent_handle);
-    if (chimera_nfs4_open_grant_delegation(req, res)) {
+    if (chimera_nfs4_open_grant_delegation(req, res, attr)) {
         return; /* parked; resume from nfs4_cb_null_complete */
     }
 
@@ -739,7 +766,8 @@ chimera_nfs4_open_lookup_regular_complete(
                         ctx->namelen,
                         ctx->flags,
                         ctx->attr,
-                        CHIMERA_VFS_ATTR_FH | CHIMERA_VFS_ATTR_MODE,
+                        CHIMERA_VFS_ATTR_FH | CHIMERA_VFS_ATTR_MODE |
+                        CHIMERA_VFS_ATTR_CHANGE | CHIMERA_VFS_ATTR_CTIME,
                         CHIMERA_VFS_ATTR_MTIME,
                         CHIMERA_VFS_ATTR_MTIME,
                         chimera_nfs4_open_at_complete,
@@ -785,7 +813,8 @@ chimera_nfs4_open_unchecked_lookup_complete(
                         ctx->namelen,
                         ctx->flags,
                         ctx->attr,
-                        CHIMERA_VFS_ATTR_FH | CHIMERA_VFS_ATTR_MODE,
+                        CHIMERA_VFS_ATTR_FH | CHIMERA_VFS_ATTR_MODE |
+                        CHIMERA_VFS_ATTR_CHANGE | CHIMERA_VFS_ATTR_CTIME,
                         CHIMERA_VFS_ATTR_MTIME,
                         CHIMERA_VFS_ATTR_MTIME,
                         chimera_nfs4_open_at_complete,
@@ -842,7 +871,9 @@ chimera_nfs4_open_claim_fh_complete(
     * defer path (which returns without completing the OPEN) does not leak
     * it -- the resume callback only knows how to call open_complete. */
     chimera_vfs_release(req->thread->vfs_thread, parent_handle);
-    if (chimera_nfs4_open_grant_delegation(req, res)) {
+    /* CLAIM_FH/CLAIM_PREVIOUS does not getattr the file; sc is captured lazily
+     * on the first peer CB_GETATTR (combine_valid stays false). */
+    if (chimera_nfs4_open_grant_delegation(req, res, NULL)) {
         return; /* parked; resume from nfs4_cb_null_complete */
     }
     chimera_nfs4_open_complete(req, NFS4_OK);
@@ -1036,7 +1067,8 @@ chimera_nfs4_open_parent_complete(
                                 args->claim.file.len,
                                 flags,
                                 attr,
-                                CHIMERA_VFS_ATTR_FH | CHIMERA_VFS_ATTR_MODE,
+                                CHIMERA_VFS_ATTR_FH | CHIMERA_VFS_ATTR_MODE |
+                                CHIMERA_VFS_ATTR_CHANGE | CHIMERA_VFS_ATTR_CTIME,
                                 CHIMERA_VFS_ATTR_MTIME,
                                 CHIMERA_VFS_ATTR_MTIME,
                                 chimera_nfs4_open_at_complete,
@@ -1106,7 +1138,8 @@ chimera_nfs4_open_parent_complete(
                                 args->claim.delegate_cur_info.file.len,
                                 flags,
                                 attr,
-                                CHIMERA_VFS_ATTR_FH | CHIMERA_VFS_ATTR_MODE,
+                                CHIMERA_VFS_ATTR_FH | CHIMERA_VFS_ATTR_MODE |
+                                CHIMERA_VFS_ATTR_CHANGE | CHIMERA_VFS_ATTR_CTIME,
                                 CHIMERA_VFS_ATTR_MTIME,
                                 CHIMERA_VFS_ATTR_MTIME,
                                 chimera_nfs4_open_at_complete,
@@ -1247,9 +1280,9 @@ chimera_nfs4_open(
      *
      *   1. Server-reboot grace window (nfs_recovery_open_check): non-reclaim
      *      OPENs are refused while in_grace, and CLAIM_PREVIOUS reclaims are
-     *      refused outside it.  Persistence is stubbed so in_grace is false in
-     *      practice today, leaving only the reclaim-outside-grace NO_GRACE leg
-     *      live.
+     *      refused outside it.  Recovery records are persisted to the KV store
+     *      (nfs4_recovery.c), so in_grace reflects a real post-restart grace
+     *      period.
      *
      *   2. Per-client reclaim completion (RFC 8881 §18.51.3): once a 4.1+
      *      client establishes a new client ID it MUST send RECLAIM_COMPLETE

@@ -8,6 +8,8 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
+#include <fcntl.h>
+#include <errno.h>
 #include <unistd.h>
 #include <jansson.h>
 #include <openssl/pem.h>
@@ -108,11 +110,39 @@ generate_self_signed_cert(
         goto cleanup;
     }
 
-    /* Write private key */
-    fp = fopen(key_path, "w");
-    if (!fp) {
-        chimera_server_error("Failed to open key file: %s", key_path);
-        goto cleanup;
+    /*
+     * Write the private key with owner-only (0600) permissions.  The daemon
+     * runs with umask(0) (so client file modes on the data path apply
+     * verbatim), which means fopen("w") would create this control-plane RSA
+     * private key world-readable AND world-writable (mode 0666) -- CWE-276
+     * (Incorrect Default Permissions).  Create the file explicitly with
+     * O_CREAT|O_EXCL|0600 so the mode is enforced regardless of umask and so a
+     * pre-existing (potentially attacker-planted) file in the world-writable
+     * /tmp path is rejected rather than overwritten (CWE-377).
+     */
+    {
+        int key_fd = open(key_path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+
+        if (key_fd < 0) {
+            chimera_server_error("Failed to open key file: %s (%s)",
+                                 key_path, strerror(errno));
+            goto cleanup;
+        }
+
+        /* Belt-and-suspenders: enforce 0600 explicitly (defense in depth). */
+        if (fchmod(key_fd, 0600) < 0) {
+            chimera_server_error("Failed to set key file permissions: %s (%s)",
+                                 key_path, strerror(errno));
+            close(key_fd);
+            goto cleanup;
+        }
+
+        fp = fdopen(key_fd, "w");
+        if (!fp) {
+            chimera_server_error("Failed to open key file stream: %s", key_path);
+            close(key_fd);
+            goto cleanup;
+        }
     }
     PEM_write_PrivateKey(fp, pkey, NULL, NULL, 0, NULL, NULL);
     fclose(fp);
@@ -412,6 +442,16 @@ main(
             chimera_server_config_set_rcu_reclaim_threads(server_config, rcu_threads);
         }
     }
+
+    /* The VFS attribute cache (common.attr_cache) is a VFS-level facility shared
+     * with the client; on by default. */
+    chimera_server_config_set_attr_cache_enabled(server_config,
+                                                 chimera_common_attr_cache_enabled(config));
+
+    /* The VFS name (lookup) cache (common.name_cache) is likewise shared with
+     * the client; on by default. */
+    chimera_server_config_set_name_cache_enabled(server_config,
+                                                 chimera_common_name_cache_enabled(config));
 
     json_value = json_object_get(server_params, "smb_persistent_handles");
     if (json_is_boolean(json_value)) {
@@ -717,6 +757,19 @@ main(
         chimera_server_config_set_state_dir(server_config, json_string_value(json_value));
     }
 
+    /* nfs_fh_sign: sign wire file handles (default true).  nfs_fh_key: optional
+     * 32-hex-char (128-bit) signing key, required when multiple nodes must mint
+     * interchangeable handles. */
+    json_value = json_object_get(server_params, "nfs_fh_sign");
+    if (json_value) {
+        chimera_server_config_set_nfs_fh_sign(server_config,
+                                              json_is_true(json_value) ? 1 : 0);
+    }
+    json_value = json_object_get(server_params, "nfs_fh_key");
+    if (json_is_string(json_value)) {
+        chimera_server_config_set_nfs_fh_key(server_config, json_string_value(json_value));
+    }
+
     json_t *rest_http_port_value = json_object_get(server_params, "rest_http_port");
     if (rest_http_port_value && json_is_integer(rest_http_port_value)) {
         int rest_http_port = json_integer_value(rest_http_port_value);
@@ -785,6 +838,21 @@ main(
         if (kerberos_realm && json_is_string(kerberos_realm)) {
             chimera_server_config_set_smb_kerberos_realm(server_config,
                                                          json_string_value(kerberos_realm));
+        }
+    }
+
+    // Parse NFS auth configuration (RPCSEC_GSS / Kerberos)
+    json_t *nfs_auth = json_object_get(server_params, "nfs_auth");
+    if (nfs_auth && json_is_object(nfs_auth)) {
+        json_t *kerberos_enabled = json_object_get(nfs_auth, "kerberos_enabled");
+        if (kerberos_enabled && json_is_true(kerberos_enabled)) {
+            chimera_server_config_set_nfs_kerberos_enabled(server_config, 1);
+        }
+
+        json_t *kerberos_keytab = json_object_get(nfs_auth, "kerberos_keytab");
+        if (kerberos_keytab && json_is_string(kerberos_keytab)) {
+            chimera_server_config_set_nfs_kerberos_keytab(server_config,
+                                                          json_string_value(kerberos_keytab));
         }
     }
 
@@ -966,6 +1034,7 @@ main(
         {
             json_t *ca  = json_object_get(share, "continuous_availability");
             json_t *enc = json_object_get(share, "encrypt_data");
+            json_t *fl2 = json_object_get(share, "force_level2_oplock");
 
             path = json_string_value(json_object_get(share, "path"));
             chimera_server_info("Adding SMB share %s -> %s", name, path);
@@ -974,6 +1043,10 @@ main(
 
             if (json_is_true(enc)) {
                 chimera_server_share_set_encrypt_data(server, name);
+            }
+
+            if (json_is_true(fl2)) {
+                chimera_server_share_set_force_level2_oplock(server, name);
             }
         }
     }
@@ -993,14 +1066,126 @@ main(
         }
     }
 
+    /* Likewise seed the MS-FSA suite's fixtures (a directory + a regular file)
+     * when CHIMERA_SMB_SEED_FSA names the backend module. */
+    const char *seed_fsa_module = getenv("CHIMERA_SMB_SEED_FSA");
+
+    if (seed_fsa_module && seed_fsa_module[0]) {
+        if (chimera_server_seed_fsa(server, seed_fsa_module) != 0) {
+            chimera_server_error("Failed to seed FSA fixtures on module %s",
+                                 seed_fsa_module);
+        } else {
+            chimera_server_info("Seeded FSA fixtures on module %s", seed_fsa_module);
+        }
+    }
+
     exports = json_object_get(config, "exports");
 
     if (exports) {
         json_object_foreach(exports, name, export)
         {
+            json_t     *opt_j     = json_object_get(export, "options");
+            json_t     *squash_j  = json_object_get(export, "squash");
+            json_t     *rsq_j     = json_object_get(export, "root_squash");
+            json_t     *norsq_j   = json_object_get(export, "no_root_squash");
+            json_t     *allsq_j   = json_object_get(export, "all_squash");
+            json_t     *anonuid_j = json_object_get(export, "anonuid");
+            json_t     *anongid_j = json_object_get(export, "anongid");
+            const char *opt_s     = json_string_value(opt_j);
+            const char *squash_s  = json_string_value(squash_j);
+            uint32_t    options   = CHIMERA_NFS_EXPORT_OPT_RW;
+            uint32_t    squash    = CHIMERA_NFS_SQUASH_NONE;
+            uint32_t    anonuid   = chimera_server_config_get_anonuid(server_config);
+            uint32_t    anongid   = chimera_server_config_get_anongid(server_config);
+
             path = json_string_value(json_object_get(export, "path"));
-            chimera_server_info("Adding NFS export %s -> %s", name, path);
+
+            /* Access mode: "ro" | "rw" (default rw). */
+            if (opt_s) {
+                if (strcasecmp(opt_s, "ro") == 0) {
+                    options = CHIMERA_NFS_EXPORT_OPT_RO;
+                } else if (strcasecmp(opt_s, "rw") == 0) {
+                    options = CHIMERA_NFS_EXPORT_OPT_RW;
+                } else {
+                    chimera_server_error("Invalid export '%s' options value '%s' "
+                                         "(expected ro/rw)", name, opt_s);
+                }
+            }
+
+            /* Squash policy.  Default is no squashing.  An explicit "squash"
+             * string takes precedence; otherwise the all_squash / root_squash /
+             * no_root_squash booleans act as aliases. */
+            if (squash_s) {
+                if (strcasecmp(squash_s, "none") == 0 ||
+                    strcasecmp(squash_s, "no_root_squash") == 0) {
+                    squash = CHIMERA_NFS_SQUASH_NONE;
+                } else if (strcasecmp(squash_s, "root") == 0 ||
+                           strcasecmp(squash_s, "root_squash") == 0) {
+                    squash = CHIMERA_NFS_SQUASH_ROOT;
+                } else if (strcasecmp(squash_s, "all") == 0 ||
+                           strcasecmp(squash_s, "all_squash") == 0) {
+                    squash = CHIMERA_NFS_SQUASH_ALL;
+                } else {
+                    chimera_server_error("Invalid export '%s' squash value '%s' "
+                                         "(expected none/root/all)", name, squash_s);
+                }
+            } else if (allsq_j && json_is_true(allsq_j)) {
+                squash = CHIMERA_NFS_SQUASH_ALL;
+            } else if (rsq_j && json_is_true(rsq_j)) {
+                squash = CHIMERA_NFS_SQUASH_ROOT;
+            } else if (norsq_j && json_is_true(norsq_j)) {
+                squash = CHIMERA_NFS_SQUASH_NONE;
+            }
+
+            if (anonuid_j) {
+                anonuid = (uint32_t) json_integer_value(anonuid_j);
+            }
+            if (anongid_j) {
+                anongid = (uint32_t) json_integer_value(anongid_j);
+            }
+
+            /* Allowed security flavors: an optional array of
+             * "sys"/"krb5"/"krb5i"/"krb5p".  Absent (mask 0) permits any
+             * flavor, preserving historical behavior; a non-empty list
+             * restricts the export and rejects others with NFS4ERR_WRONGSEC. */
+            json_t  *sec_j    = json_object_get(export, "sec");
+            uint32_t sec_mask = 0;
+            if (sec_j && json_is_array(sec_j)) {
+                size_t  si;
+                json_t *flavor_j;
+                json_array_foreach(sec_j, si, flavor_j)
+                {
+                    const char *f = json_string_value(flavor_j);
+
+                    if (!f) {
+                        continue;
+                    }
+                    if (strcasecmp(f, "sys") == 0 || strcasecmp(f, "auth_sys") == 0) {
+                        sec_mask |= CHIMERA_NFS_SEC_SYS;
+                    } else if (strcasecmp(f, "krb5") == 0) {
+                        sec_mask |= CHIMERA_NFS_SEC_KRB5;
+                    } else if (strcasecmp(f, "krb5i") == 0) {
+                        sec_mask |= CHIMERA_NFS_SEC_KRB5I;
+                    } else if (strcasecmp(f, "krb5p") == 0) {
+                        sec_mask |= CHIMERA_NFS_SEC_KRB5P;
+                    } else {
+                        chimera_server_error("Invalid export '%s' sec flavor '%s' "
+                                             "(expected sys/krb5/krb5i/krb5p)", name, f);
+                    }
+                }
+            }
+
+            chimera_server_info("Adding NFS export %s -> %s (%s, %s)", name, path,
+                                options & CHIMERA_NFS_EXPORT_OPT_RO ? "ro" : "rw",
+                                squash == CHIMERA_NFS_SQUASH_ALL ? "all_squash" :
+                                squash == CHIMERA_NFS_SQUASH_NONE ? "no_root_squash" :
+                                "root_squash");
             chimera_server_create_export(server, name, path);
+            chimera_server_export_set_options(server, name, options, squash,
+                                              anonuid, anongid);
+            if (sec_mask) {
+                chimera_server_export_set_sec(server, name, sec_mask);
+            }
         }
     }
 

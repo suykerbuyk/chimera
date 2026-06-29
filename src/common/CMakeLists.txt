@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: LGPL-2.1-only
 
 add_library(chimera_common SHARED
-    logging.c snprintf.c
+    logging.c snprintf.c pthread_create_interpose.c
 )
 
 target_link_libraries(chimera_common unwind pthread dl)

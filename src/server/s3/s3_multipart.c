@@ -22,6 +22,7 @@
 #include "s3_etag.h"
 #include "s3_procs.h"
 #include "s3.h"
+#include "s3_tagging.h"
 
 static _Atomic uint64_t chimera_s3_multipart_id_counter;
 
@@ -61,6 +62,7 @@ chimera_s3_multipart_upload_free_now(struct chimera_s3_multipart_upload *upload)
 {
     free(upload->bucket_name);
     free(upload->object_key);
+    free(upload->tagging);
     pthread_mutex_destroy(&upload->lock);
     free(upload);
 } /* chimera_s3_multipart_upload_free_now */
@@ -457,7 +459,16 @@ chimera_s3_create_multipart_upload(
         request->path,
         request->path_len);
 
-    (void) upload;
+    /* Remember an x-amz-tagging header so the tags are applied to the assembled
+     * object on CompleteMultipartUpload. */
+    {
+        const char *tagging_hdr = evpl_http_request_header(
+            request->http_request, "x-amz-tagging");
+
+        if (tagging_hdr && tagging_hdr[0]) {
+            upload->tagging = strdup(tagging_hdr);
+        }
+    }
 
     evpl_iovec_alloc(evpl, 4096, 0, 1, 0, &request->multipart.response);
 
@@ -1993,6 +2004,18 @@ chimera_s3_complete_send_response(
     chimera_s3_mp_send_response(evpl, request, body_start, bp);
 } /* chimera_s3_complete_send_response */
 
+/* Deferred response after object tags were applied (store-by-path callback).
+* Part count + combined etag were stashed on the request by finish_common. */
+static void
+chimera_s3_complete_send_response_deferred(
+    struct evpl               *evpl,
+    struct chimera_s3_request *request)
+{
+    uint64_t etag[2] = { request->etag[0], request->etag[1] };
+
+    chimera_s3_complete_send_response(evpl, request, request->multipart.part_number, etag);
+} /* chimera_s3_complete_send_response_deferred */
+
 enum chimera_s3_assemble_mode {
     CHIMERA_S3_ASSEMBLE_MOVE,
     CHIMERA_S3_ASSEMBLE_COPY,
@@ -2011,7 +2034,29 @@ struct chimera_s3_complete_ctx {
     enum chimera_s3_assemble_mode       assemble_mode;
     int                                 rw_niov;
     struct evpl_iovec                   rw_iov[CHIMERA_S3_IOV_MAX];
+    /* Bounded retry of the destination parent-dir create. The linux backend
+     * can transiently return ESTALE from open_by_handle_at when a cached
+     * directory handle is being recycled under concurrent load; re-walking the
+     * create from the (re-resolved) bucket handle clears it. */
+    int                                 create_retries;
+    int                                 dirpathlen;
+    char                                dirpath[CHIMERA_S3_KEY_MAX];
+    /* One-shot timer used to back off between destination parent-dir create
+     * retries so a concurrent open-handle-cache eviction (the source of the
+     * transient ESTALE/ENOENT, see chimera_s3_complete_create_root_callback)
+     * has time to drain before we re-walk. */
+    struct evpl_timer                   create_retry_timer;
 };
+
+#define CHIMERA_S3_COMPLETE_CREATE_MAX_RETRIES      32
+/* Back-off between create retries. The transient ESTALE/ENOENT is caused by a
+ * directory handle being recycled by the VFS close-sweep thread under load; the
+ * earlier immediate (same-event-loop) re-walks could all race the same eviction
+ * window and exhaust the bound while the sweep was still in flight. Yielding for
+ * a short interval between attempts lets the sweep drain so the re-walk resolves
+ * a fresh handle. 1ms * 32 retries = up to ~32ms, comfortably longer than the
+ * eviction window while still well inside the client's request timeout. */
+#define CHIMERA_S3_COMPLETE_CREATE_RETRY_BACKOFF_US 1000
 
 static void chimera_s3_complete_assemble_next(
     struct chimera_s3_complete_ctx *ctx);
@@ -2022,6 +2067,13 @@ static void chimera_s3_complete_finalize(
 static void chimera_s3_complete_finish_common(
     enum chimera_vfs_error error_code,
     void                  *private_data);
+
+static void chimera_s3_complete_create_dir(
+    struct chimera_s3_complete_ctx *ctx);
+
+static int chimera_s3_complete_create_retry(
+    struct chimera_s3_complete_ctx *ctx,
+    enum chimera_vfs_error          error_code);
 
 /* ----- Assembly: walk parts list, copy/move/rw each part into dest ----- */
 
@@ -2259,6 +2311,7 @@ chimera_s3_complete_finish_common(
     struct evpl                     *evpl    = thread->evpl;
     int                              count   = ctx->part_count;
     uint64_t                         etag[2];
+    char                            *tagging = NULL;
 
     etag[0] = ctx->combined_etag[0];
     etag[1] = ctx->combined_etag[1];
@@ -2272,9 +2325,43 @@ chimera_s3_complete_finish_common(
         request->file_handle = NULL;
     }
 
-    /* Drop our hold on the upload. Async part cleanup (release file handles
-     * + unlink any tmp-file parts) fires when refcount hits zero. */
+    /* Capture any x-amz-tagging set at CreateMultipartUpload before dropping
+     * the upload (which owns the string). */
+    if (!error_code && ctx->upload && ctx->upload->tagging) {
+        tagging = strdup(ctx->upload->tagging);
+    }
+
+    /* Stash the part count + etag for the deferred response. */
+    request->multipart.part_number = count;
+    request->etag[0]               = etag[0];
+    request->etag[1]               = etag[1];
+
+    /* Dispose of the upload. The upload was intentionally left in the table
+     * during assembly (marked `completing`) so a retried CompleteMultipartUpload
+     * remained resolvable and idempotent. ctx->upload holds the lookup ref.
+     *
+     *  - On success: detach (unlinks from the table + marks removed), then drop
+     *    BOTH the now-orphaned table ref and our ctx ref, freeing the upload and
+     *    triggering async part cleanup.
+     *  - On failure: clear `completing` and drop only our ctx ref, leaving the
+     *    upload in the table so the client can retry Complete (or Abort).
+     */
     if (ctx->upload) {
+        struct chimera_server_s3_shared *shared = thread->shared;
+
+        if (!error_code) {
+            chimera_s3_multipart_table_detach(shared->multipart_table,
+                                              request->multipart.upload_id,
+                                              request->multipart.upload_idlen);
+            /* Drop the table's implicit (insert) ref now that it is unlinked. */
+            chimera_s3_multipart_upload_release(thread, ctx->upload);
+        } else {
+            pthread_mutex_lock(&ctx->upload->lock);
+            ctx->upload->completing = 0;
+            pthread_mutex_unlock(&ctx->upload->lock);
+        }
+        /* Drop our (ctx) ref. On success this is the last ref -> free + async
+         * part cleanup. On failure the table's ref remains, keeping it alive. */
         chimera_s3_multipart_upload_release(thread, ctx->upload);
         ctx->upload = NULL;
     }
@@ -2295,6 +2382,29 @@ chimera_s3_complete_finish_common(
         }
         return;
     }
+
+    /* Apply the object tags (if any) before emitting the success response. The
+    * multipart.response iovec used by the response builder must not be
+    * allocated until tagging is done, so we defer it to the store callback. */
+    if (tagging) {
+        struct chimera_s3_tagging_ctx *tctx = calloc(1, sizeof(*tctx));
+
+        request->tagging = tctx;
+
+        if (chimera_s3_tagging_parse_header(tctx, tagging) == 0 &&
+            tctx->n_tags > 0) {
+            free(tagging);
+            chimera_s3_tagging_store_by_path(evpl, thread, request,
+                                             chimera_s3_complete_send_response_deferred);
+            return;
+        }
+
+        /* Empty/invalid tagging: ignore and fall through to the response. */
+        free(request->tagging);
+        request->tagging = NULL;
+    }
+
+    free(tagging);
 
     chimera_s3_complete_send_response(evpl, request, count, etag);
 } /* chimera_s3_complete_finish_common */
@@ -2453,6 +2563,13 @@ chimera_s3_complete_open_dir_callback(
     struct chimera_vfs_module       *module;
 
     if (error_code) {
+        /* Same transient ESTALE/ENOENT window as create_root_callback: the just
+         * -created dir's handle can be recycled before this open resolves it.
+         * Re-walk the create (after a back-off) rather than failing the whole
+         * Complete. */
+        if (chimera_s3_complete_create_retry(ctx, error_code)) {
+            return;
+        }
         chimera_s3_complete_finish_common(error_code, ctx);
         return;
     }
@@ -2508,6 +2625,15 @@ chimera_s3_complete_create_root_callback(
     struct chimera_server_s3_thread *thread = ctx->request->thread;
 
     if (error_code) {
+        /* The linux backend can transiently return ESTALE (and, while a parent
+         * directory is being recycled, ENOENT) from open_by_handle_at when a
+         * cached directory handle is being evicted concurrently. Re-walking the
+         * create from the bucket handle (after a back-off so the concurrent
+         * eviction drains) resolves a fresh handle and succeeds. Bound the
+         * retries so a genuinely missing parent still errors out. */
+        if (chimera_s3_complete_create_retry(ctx, error_code)) {
+            return;
+        }
         chimera_s3_complete_finish_common(error_code, ctx);
         return;
     }
@@ -2521,6 +2647,85 @@ chimera_s3_complete_create_root_callback(
         chimera_s3_complete_open_dir_callback,
         ctx);
 } /* chimera_s3_complete_create_root_callback */
+
+/* Kick off (or retry) the destination parent-directory create. */
+static void
+chimera_s3_complete_create_dir(struct chimera_s3_complete_ctx *ctx)
+{
+    struct chimera_s3_request       *request = ctx->request;
+    struct chimera_server_s3_thread *thread  = request->thread;
+
+    request->set_attr.va_req_mask = 0;
+    request->set_attr.va_set_mask = 0;
+
+    chimera_vfs_create(
+        thread->vfs, &thread->shared->cred,
+        request->bucket_fh,
+        request->bucket_fhlen,
+        ctx->dirpath,
+        ctx->dirpathlen,
+        &request->set_attr,
+        CHIMERA_VFS_ATTR_FH,
+        chimera_s3_complete_create_root_callback,
+        ctx);
+} /* chimera_s3_complete_create_dir */
+
+/* One-shot timer callback: re-drive the parent-dir create after a back-off. */
+static void
+chimera_s3_complete_create_retry_timer_cb(
+    struct evpl       *evpl,
+    struct evpl_timer *timer)
+{
+    struct chimera_s3_complete_ctx *ctx = (struct chimera_s3_complete_ctx *)
+        ((char *) timer - offsetof(struct chimera_s3_complete_ctx,
+                                   create_retry_timer));
+
+    (void) evpl;
+    chimera_s3_complete_create_dir(ctx);
+} /* chimera_s3_complete_create_retry_timer_cb */
+
+/*
+ * Schedule a back-off'd retry of the destination parent-dir create. Returns 1 if
+ * a retry was armed (caller must return), 0 if the bound is exhausted or the
+ * error is not a transient handle-recycle error (caller should fail the op).
+ *
+ * The transient ESTALE/ENOENT is produced by the linux backend's
+ * open_by_handle_at when a cached directory handle is being evicted by the VFS
+ * close-sweep thread under concurrent load. An immediate re-walk in the same
+ * event-loop turn races the same eviction window; backing off for a short
+ * interval lets the sweep drain so the re-walk resolves a fresh handle.
+ */
+static int
+chimera_s3_complete_create_retry(
+    struct chimera_s3_complete_ctx *ctx,
+    enum chimera_vfs_error          error_code)
+{
+    struct chimera_server_s3_thread *thread = ctx->request->thread;
+
+    if ((error_code != CHIMERA_VFS_ESTALE &&
+         error_code != CHIMERA_VFS_ENOENT) ||
+        ctx->create_retries >= CHIMERA_S3_COMPLETE_CREATE_MAX_RETRIES) {
+        return 0;
+    }
+
+    ctx->create_retries++;
+
+    /* Drop any partially-resolved destination handles before re-walking so the
+     * retry starts clean (and so a stale handle is not released twice). */
+    if (ctx->request->dir_handle) {
+        chimera_vfs_release(thread->vfs, ctx->request->dir_handle);
+        ctx->request->dir_handle = NULL;
+    }
+    if (ctx->request->file_handle) {
+        chimera_vfs_release(thread->vfs, ctx->request->file_handle);
+        ctx->request->file_handle = NULL;
+    }
+
+    evpl_add_oneshot_timer(thread->evpl, &ctx->create_retry_timer,
+                           chimera_s3_complete_create_retry_timer_cb,
+                           CHIMERA_S3_COMPLETE_CREATE_RETRY_BACKOFF_US);
+    return 1;
+} /* chimera_s3_complete_create_retry */
 
 /*
  * Phase 1: dispatcher entry. Just initialize the body buffer so the
@@ -2541,6 +2746,120 @@ chimera_s3_complete_multipart_upload(
     request->multipart.body_cap = 0;
     request->vfs_state          = CHIMERA_S3_VFS_STATE_INIT;
 } /* chimera_s3_complete_multipart_upload */
+
+/* Parse a quoted 32-hex ETag ("\"<32hex>\"") as written by
+ * chimera_s3_mp_format_etag into a 128-bit value (low64, high64). Returns 0 on
+ * success, -1 on malformed input. The client echoes the exact per-part ETags
+ * the server returned, so this round-trips losslessly. */
+static int
+chimera_s3_mp_parse_etag(
+    const char *quoted,
+    uint64_t    out[2])
+{
+    const char *p = quoted;
+    uint8_t     bytes[16];
+
+    if (*p == '"') {
+        p++;
+    }
+
+    for (int i = 0; i < 16; i++) {
+        int hi, lo;
+
+        if (!isxdigit((unsigned char) p[0]) || !isxdigit((unsigned char) p[1])) {
+            return -1;
+        }
+        hi       = (p[0] <= '9') ? p[0] - '0' : (tolower(p[0]) - 'a' + 10);
+        lo       = (p[1] <= '9') ? p[1] - '0' : (tolower(p[1]) - 'a' + 10);
+        bytes[i] = (hi << 4) | lo;
+        p       += 2;
+    }
+
+    /* Mirror format_hex's byte order (it serializes the raw uint64[2]). */
+    memcpy(out, bytes, 16);
+    return 0;
+} /* chimera_s3_mp_parse_etag */
+
+/* Recompute the combined CompleteMultipartUpload ETag from the client's
+ * manifest alone (no server-side part list). Used to answer an idempotent
+ * retry whose upload was already detached by the winning Complete. */
+static int
+chimera_s3_mp_combined_etag_from_manifest(
+    const struct chimera_s3_client_part *client_parts,
+    int                                  n_client,
+    uint64_t                             out[2])
+{
+    struct {
+        uint64_t etag[2];
+    } *etag_buf;
+    XXH128_hash_t h;
+
+    out[0] = 0;
+    out[1] = 0;
+
+    if (n_client <= 0) {
+        return 0;
+    }
+
+    etag_buf = malloc(n_client * sizeof(*etag_buf));
+
+    for (int i = 0; i < n_client; i++) {
+        if (chimera_s3_mp_parse_etag(client_parts[i].etag, etag_buf[i].etag) != 0) {
+            free(etag_buf);
+            return -1;
+        }
+    }
+
+    h      = XXH3_128bits((const void *) etag_buf, n_client * sizeof(*etag_buf));
+    out[0] = h.low64;
+    out[1] = h.high64;
+    free(etag_buf);
+    return 0;
+} /* chimera_s3_mp_combined_etag_from_manifest */
+
+/* Context for the idempotent-retry existence check (lookup-miss path). */
+struct chimera_s3_complete_retry_ctx {
+    struct chimera_s3_request *request;
+    int                        part_count;
+    uint64_t                   combined_etag[2];
+};
+
+/* Result of the target-object existence check on a Complete whose upload was
+ * already removed from the table. CompleteMultipartUpload must be idempotent:
+ * S3 SDKs (boto3) retry it, and the winning attempt detaches the upload, so a
+ * legitimate retry would otherwise see the upload gone and return NoSuchUpload.
+ * If the object the prior Complete assembled is present, replay the success
+ * response; otherwise the upload truly never existed -> NoSuchUpload. */
+static void
+chimera_s3_complete_retry_lookup_callback(
+    enum chimera_vfs_error    error_code,
+    struct chimera_vfs_attrs *attr,
+    void                     *private_data)
+{
+    struct chimera_s3_complete_retry_ctx *rctx    = private_data;
+    struct chimera_s3_request            *request = rctx->request;
+    struct chimera_server_s3_thread      *thread  = request->thread;
+    struct evpl                          *evpl    = thread->evpl;
+
+    free(request->multipart.body_buf);
+    request->multipart.body_buf = NULL;
+    request->multipart.body_len = 0;
+    request->multipart.body_cap = 0;
+
+    if (error_code == CHIMERA_VFS_OK) {
+        /* Prior Complete already assembled the object: idempotent success. */
+        chimera_s3_complete_send_response(evpl, request, rctx->part_count,
+                                          rctx->combined_etag);
+    } else {
+        request->status    = CHIMERA_S3_STATUS_NO_SUCH_UPLOAD;
+        request->vfs_state = CHIMERA_S3_VFS_STATE_COMPLETE;
+        if (request->http_state == CHIMERA_S3_HTTP_STATE_RECVED) {
+            s3_server_respond(evpl, request);
+        }
+    }
+
+    free(rctx);
+} /* chimera_s3_complete_retry_lookup_callback */
 
 /*
  * Phase 2: full body in hand. Parse the manifest, validate against the
@@ -2598,9 +2917,44 @@ chimera_s3_complete_multipart_upload_body_done(
                                                request->multipart.upload_id,
                                                request->multipart.upload_idlen);
     if (!upload) {
+        /* The upload is not in the table. CompleteMultipartUpload must be
+         * idempotent: S3 clients (boto3's default retry mode) retry it, and
+         * the winning attempt detaches the upload before responding, so a
+         * legitimate retry lands here even though the operation succeeded.
+         * Distinguish a real "never existed" from "already completed" by
+         * checking whether the target object is present; if so, replay the
+         * success response (recomputing the combined ETag from the client's
+         * manifest, which echoes the same per-part ETags the server issued). */
+        struct chimera_s3_complete_retry_ctx *rctx;
+        uint64_t                              combined[2];
+
+        if (n_client > 0 &&
+            chimera_s3_mp_combined_etag_from_manifest(client_parts, n_client,
+                                                      combined) == 0) {
+            rctx                   = calloc(1, sizeof(*rctx));
+            rctx->request          = request;
+            rctx->part_count       = n_client;
+            rctx->combined_etag[0] = combined[0];
+            rctx->combined_etag[1] = combined[1];
+            free(client_parts);
+
+            chimera_vfs_lookup(thread->vfs, &thread->shared->cred,
+                               request->bucket_fh, request->bucket_fhlen,
+                               request->path, request->path_len,
+                               CHIMERA_VFS_ATTR_FH,
+                               0,
+                               chimera_s3_complete_retry_lookup_callback,
+                               rctx);
+            return;
+        }
+
         free(client_parts);
-        request->status    = CHIMERA_S3_STATUS_NO_SUCH_UPLOAD;
-        request->vfs_state = CHIMERA_S3_VFS_STATE_COMPLETE;
+        free(request->multipart.body_buf);
+        request->multipart.body_buf = NULL;
+        request->multipart.body_len = 0;
+        request->multipart.body_cap = 0;
+        request->status             = CHIMERA_S3_STATUS_NO_SUCH_UPLOAD;
+        request->vfs_state          = CHIMERA_S3_VFS_STATE_COMPLETE;
         if (request->http_state == CHIMERA_S3_HTTP_STATE_RECVED) {
             s3_server_respond(evpl, request);
         }
@@ -2610,11 +2964,43 @@ chimera_s3_complete_multipart_upload_body_done(
     pthread_mutex_lock(&upload->lock);
     err = chimera_s3_validate_complete_manifest(client_parts, n_client,
                                                 upload, &server_parts);
+
+    if (err == CHIMERA_S3_STATUS_OK && upload->completing) {
+        /* Another CompleteMultipartUpload (or an earlier retry) already won the
+         * race to assemble this upload and is in flight. Treat this as an
+         * idempotent duplicate: replay the success response from the manifest
+         * rather than assembling again. */
+        uint64_t combined[2];
+
+        pthread_mutex_unlock(&upload->lock);
+        free(server_parts);
+        chimera_s3_multipart_upload_release(thread, upload);
+
+        if (chimera_s3_mp_combined_etag_from_manifest(client_parts, n_client,
+                                                      combined) != 0) {
+            combined[0] = 0;
+            combined[1] = 0;
+        }
+        free(client_parts);
+        free(request->multipart.body_buf);
+        request->multipart.body_buf = NULL;
+        request->multipart.body_len = 0;
+        request->multipart.body_cap = 0;
+        chimera_s3_complete_send_response(evpl, request, n_client, combined);
+        return;
+    }
+
+    if (err == CHIMERA_S3_STATUS_OK) {
+        /* We win the race: claim assembly. The upload stays in the table (so a
+         * retried Complete still resolves it) until assembly succeeds. */
+        upload->completing = 1;
+    }
     pthread_mutex_unlock(&upload->lock);
     free(client_parts);
 
     if (err != CHIMERA_S3_STATUS_OK) {
         /* Drop our lookup ref; upload remains in the table. */
+        free(server_parts);
         chimera_s3_multipart_upload_release(thread, upload);
         request->status    = err;
         request->vfs_state = CHIMERA_S3_VFS_STATE_COMPLETE;
@@ -2624,13 +3010,11 @@ chimera_s3_complete_multipart_upload_body_done(
         return;
     }
 
-    /* Manifest valid. Detach upload so concurrent ops can't grab it,
-    * then drop our lookup ref. The implicit table ref (from insert)
-    * is what ctx->upload now owns; finish_common will release it. */
-    chimera_s3_multipart_table_detach(shared->multipart_table,
-                                      request->multipart.upload_id,
-                                      request->multipart.upload_idlen);
-    chimera_s3_multipart_upload_release(thread, upload);
+    /* Keep the lookup ref: ctx->upload owns it through assembly. The upload is
+     * deliberately NOT detached yet so a retried Complete still resolves it and
+     * is handled idempotently (via the `completing` flag above). finish_common
+     * detaches + frees it on success, or clears `completing` + drops the ref on
+     * failure so a genuine retry can re-drive assembly. */
 
     /* Build ctx. Combined ETag = XXH3_128 over the etags of the parts the
      * client selected (in client order), formatted "<hex>-<count>". */
@@ -2674,16 +3058,16 @@ chimera_s3_complete_multipart_upload_body_done(
     }
     request->name_len = strlen(request->name);
 
-    chimera_vfs_create(
-        thread->vfs, &thread->shared->cred,
-        request->bucket_fh,
-        request->bucket_fhlen,
-        dirpath,
-        dirpathlen,
-        &request->set_attr,
-        CHIMERA_VFS_ATTR_FH,
-        chimera_s3_complete_create_root_callback,
-        ctx);
+    /* Stash the parent dirpath so the create can be retried on a transient
+     * ESTALE (see chimera_s3_complete_create_root_callback). */
+    if (dirpathlen > (int) sizeof(ctx->dirpath) - 1) {
+        dirpathlen = sizeof(ctx->dirpath) - 1;
+    }
+    memcpy(ctx->dirpath, dirpath, dirpathlen);
+    ctx->dirpath[dirpathlen] = '\0';
+    ctx->dirpathlen          = dirpathlen;
+
+    chimera_s3_complete_create_dir(ctx);
 } /* chimera_s3_complete_multipart_upload_body_done */
 
 /* ----- AbortMultipartUpload ----- */

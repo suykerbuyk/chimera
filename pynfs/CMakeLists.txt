@@ -79,6 +79,17 @@ set(PYNFS_EXTRA_currentstateid nopnfs)
 set(PYNFS_SKIP_BACKENDS_WRT18  linux io_uring)
 set(PYNFS_SKIP_BACKENDS_SATT15 linux io_uring)
 
+# EID50 (st_exchange_id.testSSV) exercises SP4_SSV state protection.  Chimera
+# declines SP4_SSV in EXCHANGE_ID (returning SP4_NONE) because it cannot enforce
+# the SSV-derived RPCSEC_GSS credential -- advertising it would be a security
+# overstatement (issue #946).  testSSV unconditionally assumes the server
+# granted SSV and dereferences the (now-absent) ssv context, so it cannot pass
+# against a correctly-declining server.  Skip it on every backend, mirroring the
+# nopnfs exclusion of the pNFS-only CSID7 -- it is testing an unsupported
+# feature.  (EID50's only flag is `exchange_id`, which is isolated, so it is
+# already excluded from the combined suite; this drops the per-code entries.)
+set(PYNFS_SKIP_BACKENDS_EID50  ${PYNFS_BACKENDS})
+
 # Per-code NFSv4 lease-time override (seconds).  Delegation recall-handshake
 # tests open a file as one client, then drive a *second* client's conflicting
 # OPEN to force a CB_RECALL.  Establishing that second client (SETCLIENTID /
@@ -349,3 +360,37 @@ foreach(code ${PYNFS_FLEX_CODES})
         LABELS "pynfs;pynfs_flex;memfs;nfs4.1"
         ENVIRONMENT "PYTHONUNBUFFERED=1;PYNFS_RUNDEPS=1")
 endforeach()
+
+# RPCSEC_GSS / Kerberos (sec=krb5) end-to-end smoke.  Stands up an MIT KDC and a
+# chimera NFS server with Kerberos enabled inside a netns, then drives pynfs 4.1
+# with sec=krb5 (pynfs 4.1 derives the GSS target as nfs@<server>, so it works
+# unmodified).  Exercises the full RPCSEC_GSS path: context establishment, the
+# per-request call/reply verifiers, the replay window, and -- via BIND -- a GSS
+# context shared across trunked connections.  Skips (77) without krb5 tooling or
+# python gssapi.  memfs only; gated like the other netns tests.
+set(NFS_KRB_WRAPPER ${CMAKE_SOURCE_DIR}/scripts/nfs_kerberos_test_wrapper.sh)
+set(NFS_KRB_CODES EID1 EID2 CSESS1 CSESS2 SEQ1 SEQ4 BIND1 BIND2 BIND3 RECC1 OPEN1 OPEN2)
+add_test(NAME chimera/pynfs/kerberos/krb5_smoke_memfs_nfs4.1
+    COMMAND bash ${NFS_KRB_WRAPPER} ${CHIMERA_BINARY} memfs ${PYNFS_DIR} ${NFS_KRB_CODES})
+set_tests_properties(chimera/pynfs/kerberos/krb5_smoke_memfs_nfs4.1 PROPERTIES
+    LABELS "pynfs;pynfs_kerberos;rpcsec_gss;memfs;nfs4.1"
+    SKIP_RETURN_CODE 77
+    ENVIRONMENT "PYTHONUNBUFFERED=1")
+
+# Per-export sec= policy (Phase 2).  Restrict the export to krb5/krb5i and
+# verify (a) an allowed flavor (krb5) still works end-to-end through the
+# enforcement path, and (b) a disallowed flavor (sys) is rejected with
+# NFS4ERR_WRONGSEC at the export boundary.
+add_test(NAME chimera/pynfs/kerberos/sec_krb5only_allow_memfs_nfs4.1
+    COMMAND bash ${NFS_KRB_WRAPPER} ${CHIMERA_BINARY} memfs ${PYNFS_DIR} ${NFS_KRB_CODES})
+set_tests_properties(chimera/pynfs/kerberos/sec_krb5only_allow_memfs_nfs4.1 PROPERTIES
+    LABELS "pynfs;pynfs_kerberos;rpcsec_gss;memfs;nfs4.1"
+    SKIP_RETURN_CODE 77
+    ENVIRONMENT "PYTHONUNBUFFERED=1;NFS_EXPORT_SEC=krb5,krb5i;NFS_KRB_SEC=krb5")
+
+add_test(NAME chimera/pynfs/kerberos/sec_krb5only_deny_sys_memfs_nfs4.1
+    COMMAND bash ${NFS_KRB_WRAPPER} ${CHIMERA_BINARY} memfs ${PYNFS_DIR} EID1 CSESS1)
+set_tests_properties(chimera/pynfs/kerberos/sec_krb5only_deny_sys_memfs_nfs4.1 PROPERTIES
+    LABELS "pynfs;pynfs_kerberos;rpcsec_gss;memfs;nfs4.1"
+    SKIP_RETURN_CODE 77
+    ENVIRONMENT "PYTHONUNBUFFERED=1;NFS_EXPORT_SEC=krb5;NFS_KRB_SEC=sys;NFS_EXPECT_WRONGSEC=1")

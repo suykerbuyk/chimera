@@ -84,24 +84,10 @@ chimera_smb_query_directory_readdir_callback(
     uint32_t                          file_index, expected_length;
     struct evpl_iovec_cursor          entry_cursor;
     struct chimera_smb_attrs          smb_attrs;
-    int                               match;
 
-    if (request->query_directory.pattern_length == 1 &&
-        request->query_directory.pattern[0] == '*') {
-        match = 1;
-    } else {
-        /* XXX this is assuming pattern is not a glob */
-        if (namelen == request->query_directory.pattern_length) {
-            match = strncmp(name, request->query_directory.pattern, namelen) == 0;
-        } else {
-            match = 0;
-        }
-    }
-
-    if (!match) {
-        return 0;
-    }
-
+    /* The search-pattern wildcard match is applied by the VFS core
+     * (chimera_vfs_readdir match_pattern), so every entry that reaches here has
+     * already matched -- no per-entry filtering needed. */
 
     /* Access-based directory enumeration: hide an entry the caller cannot read.
      * Windows requires the DACL itself to grant the read rights (DATA + EA +
@@ -129,7 +115,7 @@ chimera_smb_query_directory_readdir_callback(
 
     namelen_padded = namelen ? namelen * 2 : 2;
 
-    namelen_padded += 8 - (namelen_padded & 7);
+    namelen_padded += (8 - (namelen_padded & 7)) & 7;
 
     if ((request->query_directory.flags & SMB2_INDEX_SPECIFIED) &&
         (file_index != request->query_directory.file_index)) {
@@ -219,7 +205,7 @@ chimera_smb_query_directory_readdir_callback(
             evpl_iovec_cursor_append_uint64(&entry_cursor, smb_attrs.smb_alloc_size);
             evpl_iovec_cursor_append_uint32(&entry_cursor, smb_attrs.smb_attributes);
             evpl_iovec_cursor_append_uint32(&entry_cursor, namelen * 2);
-            evpl_iovec_cursor_append_uint32(&entry_cursor, 0);
+            evpl_iovec_cursor_append_uint32(&entry_cursor, smb_attrs.smb_ea_size);
             evpl_iovec_cursor_zero(&entry_cursor, 26); /* short name */
 
 
@@ -255,7 +241,7 @@ chimera_smb_query_directory_readdir_callback(
             evpl_iovec_cursor_append_uint32(&entry_cursor, smb_attrs.smb_attributes);
             evpl_iovec_cursor_append_uint32(&entry_cursor, namelen * 2);
 
-            evpl_iovec_cursor_append_uint32(&entry_cursor, 0);
+            evpl_iovec_cursor_append_uint32(&entry_cursor, smb_attrs.smb_ea_size);
             namebuf = evpl_iovec_cursor_data(&entry_cursor);
             chimera_smb_utf8_to_utf16le(&thread->iconv_ctx,
                                         name, namelen,
@@ -275,7 +261,7 @@ chimera_smb_query_directory_readdir_callback(
             evpl_iovec_cursor_append_uint64(&entry_cursor, smb_attrs.smb_alloc_size);
             evpl_iovec_cursor_append_uint32(&entry_cursor, smb_attrs.smb_attributes);
             evpl_iovec_cursor_append_uint32(&entry_cursor, namelen * 2);
-            evpl_iovec_cursor_append_uint32(&entry_cursor, 0);
+            evpl_iovec_cursor_append_uint32(&entry_cursor, smb_attrs.smb_ea_size);
             evpl_iovec_cursor_zero(&entry_cursor, 28); /* short name */
             evpl_iovec_cursor_append_uint64(&entry_cursor, attrs->va_ino);
 
@@ -297,7 +283,7 @@ chimera_smb_query_directory_readdir_callback(
             evpl_iovec_cursor_append_uint64(&entry_cursor, smb_attrs.smb_alloc_size);
             evpl_iovec_cursor_append_uint32(&entry_cursor, smb_attrs.smb_attributes);
             evpl_iovec_cursor_append_uint32(&entry_cursor, namelen * 2);
-            evpl_iovec_cursor_append_uint32(&entry_cursor, 0);
+            evpl_iovec_cursor_append_uint32(&entry_cursor, smb_attrs.smb_ea_size);
             evpl_iovec_cursor_append_uint64(&entry_cursor, attrs->va_ino);
 
             namebuf = evpl_iovec_cursor_data(&entry_cursor);
@@ -370,6 +356,29 @@ chimera_smb_query_directory(struct chimera_smb_request *request)
         request->query_directory.max_output_length = CHIMERA_SMB_MAX_TRANSACT_SIZE;
     }
 
+    /* MS-FSA 2.1.5.5.3: if OutputBufferLength is too small to hold even the
+     * fixed header of one entry of the requested FileInformationClass, the
+     * query is failed with STATUS_INFO_LENGTH_MISMATCH -- regardless of whether
+     * the directory has matching entries (WPTS MS-FSAModel QueryDirectory
+     * tiny-buffer cases).  The header sizes match the per-class expected_length
+     * base in the readdir callback below. */
+    uint32_t qd_header_len;
+    switch (request->query_directory.info_class) {
+        case SMB2_FILE_DIRECTORY_INFORMATION:         qd_header_len = 64;  break;
+        case SMB2_FILE_FULL_DIRECTORY_INFORMATION:    qd_header_len = 68;  break;
+        case SMB2_FILE_BOTH_DIRECTORY_INFORMATION:    qd_header_len = 94;  break;
+        case SMB2_FILE_NAMES_INFORMATION:             qd_header_len = 12;  break;
+        case SMB2_FILE_ID_BOTH_DIRECTORY_INFORMATION: qd_header_len = 102; break;
+        case SMB2_FILE_ID_FULL_DIRECTORY_INFORMATION: qd_header_len = 74;  break;
+        default:                                      qd_header_len = 0;   break;
+    } /* switch */
+
+    if (request->query_directory.max_output_length < qd_header_len) {
+        chimera_smb_open_file_release(request, request->query_directory.open_file);
+        chimera_smb_complete_request(request, SMB2_STATUS_INFO_LENGTH_MISMATCH);
+        return;
+    }
+
     evpl_iovec_alloc(evpl,
                      request->query_directory.max_output_length,
                      4096,
@@ -389,20 +398,40 @@ chimera_smb_query_directory(struct chimera_smb_request *request)
         chimera_vfs_dup_handle(thread->vfs_thread, request->query_directory.open_file->handle);
     }
 
+    uint64_t readdir_mask = CHIMERA_VFS_ATTR_MASK_STAT | CHIMERA_VFS_ATTR_BTIME;
+
+    /* Only the info classes that carry an EaSize field pay for the per-entry EA
+     * enumeration; FILE_DIRECTORY/NAMES information do not. */
+    switch (request->query_directory.info_class) {
+        case SMB2_FILE_BOTH_DIRECTORY_INFORMATION:
+        case SMB2_FILE_FULL_DIRECTORY_INFORMATION:
+        case SMB2_FILE_ID_BOTH_DIRECTORY_INFORMATION:
+        case SMB2_FILE_ID_FULL_DIRECTORY_INFORMATION:
+            readdir_mask |= CHIMERA_VFS_ATTR_EA_SIZE;
+            break;
+        default:
+            break;
+    } /* switch */
+
+    /* Access-based enumeration needs each entry's ACL to decide visibility. */
+    if (request->tree && request->tree->share &&
+        request->tree->share->access_based_enum) {
+        readdir_mask |= CHIMERA_VFS_ATTR_ACL;
+    }
+
     chimera_vfs_readdir(
         thread->vfs_thread,
         &request->session_handle->session->cred,
         request->query_directory.open_file->handle,
-        /* Access-based enumeration needs each entry's ACL to decide
-         * visibility. */
-        (request->tree && request->tree->share &&
-         request->tree->share->access_based_enum) ?
-        (CHIMERA_VFS_ATTR_MASK_STAT | CHIMERA_VFS_ATTR_BTIME | CHIMERA_VFS_ATTR_ACL) :
-        (CHIMERA_VFS_ATTR_MASK_STAT | CHIMERA_VFS_ATTR_BTIME),
+        readdir_mask,
         0, /* dir_attr_mask */
         request->query_directory.open_file->position,
         0, /* verifier */
         CHIMERA_VFS_READDIR_EMIT_DOT,
+        /* SMB search pattern: the VFS core applies the MS-FSA wildcard match so
+         * the backend stays oblivious; the callback below no longer filters. */
+        request->query_directory.pattern,
+        request->query_directory.pattern_length,
         chimera_smb_query_directory_readdir_callback,
         chimera_smb_query_directory_readdir_complete,
         request
@@ -466,9 +495,9 @@ chimera_smb_parse_query_directory(
     request->query_directory.eof              = 1;
     request->query_directory.last_file_offset = NULL;
 
-    if (request->query_directory.pattern_length > SMB_FILENAME_MAX) {
+    if (request->query_directory.pattern_length > SMB_FILENAME_MAX * 2) {
         chimera_smb_error("Received SMB2 QUERY_DIRECTORY request with invalid name length (%u > %u)",
-                          request->query_directory.pattern_length, SMB_FILENAME_MAX);
+                          request->query_directory.pattern_length, SMB_FILENAME_MAX * 2);
         request->status = SMB2_STATUS_NAME_TOO_LONG;
         return -1;
     }

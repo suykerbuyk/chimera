@@ -5,9 +5,13 @@
 #pragma once
 
 #include <sys/sysmacros.h>
+#include <sys/xattr.h>
+#include <fcntl.h>
 
 #include "common/varint.h"
 #include "vfs/vfs_fh.h"
+#include "vfs/vfs_xattr_name.h"
+#include "vfs/vfs_fsid.h"
 
 #define chimera_linux_debug(...) chimera_debug("linux", \
                                                __FILE__, \
@@ -141,12 +145,13 @@ chimera_linux_stat_to_attr(
     attr->va_ctime      = st->st_ctim;
 
     /* FSID is part of the statfs set but is also an ordinary per-file
-     * attribute (NFSv3 post-op attrs carry it).  Satisfy it cheaply from the
-     * device id here so an FSID-carrying stat request does not have to make a
-     * cold fstatvfs() call on the hot path. */
+     * attribute (NFSv3 post-op attrs carry it, and the attr cache needs it).
+     * Map the device id to a stable per-filesystem fsid (see vfs_fsid.h) so it
+     * is distinct per submount and survives server restarts; the map is a cheap
+     * in-memory lookup, no fstatvfs() on the hot path. */
     if (attr->va_req_mask & CHIMERA_VFS_ATTR_FSID) {
         attr->va_set_mask |= CHIMERA_VFS_ATTR_FSID;
-        attr->va_fsid      = st->st_dev;
+        attr->va_fsid      = chimera_vfs_fsid_for_dev(major(st->st_dev), minor(st->st_dev));
     }
 } /* linux_stat_to_chimera_attr */
 
@@ -174,12 +179,12 @@ chimera_linux_statx_to_attr(
     attr->va_ctime.tv_sec  = stx->stx_ctime.tv_sec;
     attr->va_ctime.tv_nsec = stx->stx_ctime.tv_nsec;
 
-    /* See chimera_linux_stat_to_attr: satisfy FSID cheaply from the device id
-     * so an FSID-carrying stat request avoids a cold fstatvfs() on the hot
-     * path. */
+    /* See chimera_linux_stat_to_attr: map the device id to a stable
+     * per-filesystem fsid (vfs_fsid.h) rather than exposing the raw device
+     * number, so it is distinct per submount and survives server restarts. */
     if (attr->va_req_mask & CHIMERA_VFS_ATTR_FSID) {
         attr->va_set_mask |= CHIMERA_VFS_ATTR_FSID;
-        attr->va_fsid      = attr->va_dev;
+        attr->va_fsid      = chimera_vfs_fsid_for_dev(stx->stx_dev_major, stx->stx_dev_minor);
     }
 } /* io_uring_stat_to_chimera_attr */
 
@@ -376,6 +381,65 @@ linux_open_by_handle(
     return open_by_handle_at(mount->mount_fd, handle, flags);
 } /* linux_open_by_handle */
 
+/*
+ * SMB/OS-2 EaSize for a passthrough object: sum the FEALIST contribution of
+ * every user.* xattr on the host filesystem (flistxattr + per-name length via
+ * fgetxattr).  Only computed when CHIMERA_VFS_ATTR_EA_SIZE is requested (SMB EA
+ * info classes), so NFS getattr/readdir never pay for it.
+ */
+static inline uint64_t
+chimera_linux_ea_size_fd(int fd)
+{
+    char     names[4096];
+    ssize_t  nlen     = flistxattr(fd, names, sizeof(names));
+    ssize_t  off      = 0;
+    uint64_t ea_size  = 0;
+    uint32_t ea_count = 0;
+
+    if (nlen <= 0) {
+        return 0;
+    }
+
+    while (off < nlen) {
+        const char *nm    = names + off;
+        uint32_t    nmlen = strlen(nm);
+
+        if (chimera_vfs_xattr_is_user(nm, nmlen)) {
+            ssize_t vlen = fgetxattr(fd, nm, NULL, 0);
+
+            if (vlen >= 0) {
+                ea_size += chimera_vfs_xattr_ea_entry_size(
+                    nmlen - CHIMERA_VFS_XATTR_USER_PREFIX_LEN, (uint32_t) vlen);
+                ea_count++;
+            }
+        }
+        off += nmlen + 1;
+    }
+
+    if (ea_count) {
+        ea_size += CHIMERA_VFS_XATTR_EA_LIST_OVERHEAD;
+    }
+    return ea_size;
+} /* chimera_linux_ea_size_fd */
+
+/* Same, for a directory-relative child (readdir): open it (regular/dir only --
+ * callers gate on the type to avoid opening devices), compute, close. */
+static inline uint64_t
+chimera_linux_ea_size_at(
+    int         dirfd,
+    const char *name)
+{
+    int      fd = openat(dirfd, name, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
+    uint64_t sz;
+
+    if (fd < 0) {
+        return 0;
+    }
+    sz = chimera_linux_ea_size_fd(fd);
+    close(fd);
+    return sz;
+} /* chimera_linux_ea_size_at */
+
 static inline void
 chimera_linux_map_attrs(
     uint8_t                   fh_magic,
@@ -405,6 +469,11 @@ chimera_linux_map_attrs(
         }
     }
 
+    if (attr->va_req_mask & CHIMERA_VFS_ATTR_EA_SIZE) {
+        attr->va_ea_size   = chimera_linux_ea_size_fd(fd);
+        attr->va_set_mask |= CHIMERA_VFS_ATTR_EA_SIZE;
+    }
+
 } /* chimera_linux_map_attrs */
 
 static inline void
@@ -431,6 +500,11 @@ chimera_linux_map_attrs_statx(
         }
     }
 
+    if (attr->va_req_mask & CHIMERA_VFS_ATTR_EA_SIZE) {
+        attr->va_ea_size   = chimera_linux_ea_size_fd(fd);
+        attr->va_set_mask |= CHIMERA_VFS_ATTR_EA_SIZE;
+    }
+
 } /* chimera_linux_map_attrs */
 
 static inline int
@@ -444,6 +518,7 @@ chimera_linux_map_child_attrs(
     int            rc;
     struct stat    st;
     struct statvfs stvfs;
+    int            stat_valid = 0;
 
     (void) fh_magic; /* No longer used, kept for API compatibility */
 
@@ -458,6 +533,7 @@ chimera_linux_map_child_attrs(
         }
 
         chimera_linux_stat_to_attr(attr, &st);
+        stat_valid = 1;
     }
 
     if (attr->va_req_mask & CHIMERA_VFS_ATTR_FH) {
@@ -478,6 +554,12 @@ chimera_linux_map_child_attrs(
         if (rc == 0) {
             chimera_linux_statvfs_to_attr(attr, &stvfs);
         }
+    }
+
+    if ((attr->va_req_mask & CHIMERA_VFS_ATTR_EA_SIZE) && stat_valid &&
+        (S_ISREG(st.st_mode) || S_ISDIR(st.st_mode))) {
+        attr->va_ea_size   = chimera_linux_ea_size_at(dirfd, name);
+        attr->va_set_mask |= CHIMERA_VFS_ATTR_EA_SIZE;
     }
 
     return CHIMERA_VFS_OK;
@@ -520,6 +602,12 @@ chimera_linux_map_child_attrs_statx(
         if (rc == 0) {
             chimera_linux_statvfs_to_attr(attr, &stvfs);
         }
+    }
+
+    if ((attr->va_req_mask & CHIMERA_VFS_ATTR_EA_SIZE) &&
+        (S_ISREG(stx->stx_mode) || S_ISDIR(stx->stx_mode))) {
+        attr->va_ea_size   = chimera_linux_ea_size_at(dirfd, name);
+        attr->va_set_mask |= CHIMERA_VFS_ATTR_EA_SIZE;
     }
 
     return CHIMERA_VFS_OK;

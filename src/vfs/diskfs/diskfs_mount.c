@@ -730,7 +730,8 @@ diskfs_recover_log(
         }
         if (hdr->reclen < sizeof(*hdr) ||
             (hdr->reclen & (DISKFS_BLOCK_SIZE - 1)) ||
-            hdr->reclen != diskfs_il_hdr_len(hdr->num_blocks) + (uint64_t) hdr->num_blocks * DISKFS_BLOCK_SIZE ||
+            hdr->reclen != diskfs_il_hdr_len(hdr->num_blocks, hdr->num_deltas) +
+            (uint64_t) hdr->num_blocks * DISKFS_BLOCK_SIZE ||
             o + hdr->reclen > intent_log_size) {
             continue;
         }
@@ -738,7 +739,7 @@ diskfs_recover_log(
         hi           = hdr->csum_hi;
         hdr->csum_lo = 0;
         hdr->csum_hi = 0;
-        h            = XXH3_128bits(log + o, diskfs_il_hdr_len(hdr->num_blocks));
+        h            = XXH3_128bits(log + o, diskfs_il_hdr_len(hdr->num_blocks, hdr->num_deltas));
         hdr->csum_lo = lo;
         hdr->csum_hi = hi;
         if (h.low64 != lo || h.high64 != hi) {
@@ -746,7 +747,7 @@ diskfs_recover_log(
         }
         {
             char    *bhp  = log + o + sizeof(*hdr);
-            char    *data = log + o + diskfs_il_hdr_len(hdr->num_blocks);
+            char    *data = log + o + diskfs_il_hdr_len(hdr->num_blocks, hdr->num_deltas);
             uint32_t b;
             int      ok = 1;
 
@@ -781,11 +782,14 @@ diskfs_recover_log(
     for (i = 0; i < nrec; i++) {
         struct diskfs_redo_header *hdr  = (struct diskfs_redo_header *) (log + recs[i].offset);
         char                      *bhp  = log + recs[i].offset + sizeof(*hdr);
-        char                      *data = log + recs[i].offset + diskfs_il_hdr_len(hdr->num_blocks);
+        char                      *data = log + recs[i].offset +
+            diskfs_il_hdr_len(hdr->num_blocks, hdr->num_deltas);
+        char                      *dp;
         uint32_t                   b;
 
         /* New layout: all per-block headers are grouped after the redo header,
-         * and the block images follow the 4 KiB-aligned header region. */
+         * the space deltas follow them, and the block images follow the 4 KiB-
+         * aligned header region. */
         for (b = 0; b < hdr->num_blocks; b++) {
             struct diskfs_redo_block_header *bh =
                 (struct diskfs_redo_block_header *) (bhp + (size_t) b * sizeof(*bh));
@@ -798,6 +802,25 @@ diskfs_recover_log(
 
                 chimera_diskfs_abort_if(wr != 0,
                                         "recovery replay write failed");
+            }
+        }
+
+        /* Replay this record's space-map deltas on top of the loaded
+         * checkpoints: a delta is folded into its AG's snapshot iff the AG's
+         * ckpt_seq is already >= this record's seq, so apply only those above
+         * the frontier.  space_map_recover_delta is idempotent (an eager alloc
+         * may sit in the base above ckpt_seq). */
+        dp = bhp + (size_t) hdr->num_blocks * sizeof(struct diskfs_redo_block_header);
+        for (b = 0; b < hdr->num_deltas; b++) {
+            struct diskfs_redo_delta *rd = (struct diskfs_redo_delta *) dp;
+
+            dp += sizeof(*rd);
+
+            if (recs[i].seq > space_map_ag_ckpt_seq(shared->space_map,
+                                                    rd->device_id, rd->ag_index)) {
+                space_map_recover_delta(shared->space_map, rd->device_id,
+                                        rd->ag_index, rd->device_offset,
+                                        rd->length, rd->op);
             }
         }
     }
@@ -1137,15 +1160,12 @@ diskfs_init(
                 "mismatch): refusing to mount to avoid corrupting relocated AG logs");
         }
 
-        if (mode == 2) {
-            chimera_diskfs_info("superblock not clean: running crash recovery");
-            diskfs_recover_log(shared, mio);
-        }
-
-        /* Reload the persisted free-space map.  The allocator is authoritative
-         * for future writes; after recovery, mounting without it would let new
-         * allocations overlap live metadata/data until namespace-walk rebuild
-         * exists. */
+        /* Reload the persisted free-space map FIRST: it installs each AG's
+         * checkpoint base + ckpt_seq, which crash recovery then replays the
+         * redo-ring space deltas on top of (deltas with seq > the AG's
+         * ckpt_seq).  The allocator is authoritative for future writes; after
+         * recovery, mounting without it would let new allocations overlap live
+         * metadata/data until namespace-walk rebuild exists. */
         if (mode != 0 &&
             space_map_load(shared->space_map, &smio) != 0) {
             if (mode == 1) {
@@ -1155,6 +1175,11 @@ diskfs_init(
                     "post-recovery space-map reload failed; refusing unsafe mount "
                     "until namespace-walk reconstruction is implemented");
             }
+        }
+
+        if (mode == 2) {
+            chimera_diskfs_info("superblock not clean: running crash recovery");
+            diskfs_recover_log(shared, mio);
         }
 
         shared->mounted = (mode != 0);
@@ -1231,7 +1256,8 @@ diskfs_init(
          * header before any runtime delta is journaled -- otherwise a crash
          * right after format would leave the allocator log unreadable. */
         if (mode == 0) {
-            rc = space_map_persist(shared->space_map, &smio);
+            /* No redo records exist yet; the initial checkpoints stamp ckpt_seq 0. */
+            rc = space_map_persist(shared->space_map, &smio, 0);
             chimera_diskfs_abort_if(rc != 0, "Failed to persist initial space map");
         }
 
@@ -1275,6 +1301,10 @@ diskfs_init(
     shared->intent_log.commit_alive = 1;
     shared->intent_log.num_channels = 0;
     shared->intent_log.pending_head = NULL;
+    shared->intent_log.rec_pool     = NULL;   /* Stage A: commit-hot-path recycle pools */
+    shared->intent_log.ctx_pool     = NULL;
+    shared->intent_log.apply_ready  = 0;      /* Stage B: apply thread */
+    shared->intent_log.applied_seq  = 0;
     pthread_mutex_init(&shared->intent_log.registration_lock, NULL);
 
     /* Commit thread first: it allocates the cross-thread hand-off ring the
@@ -1287,24 +1317,24 @@ diskfs_init(
         /* spin briefly */
     }
 
+    /* Apply thread next: it consumes the commit thread's durable records and
+     * applies their space-map deltas off the commit hot path.  The commit thread
+     * allocated the apply ring in its init above, so it exists before any
+     * record is produced into it. */
+    shared->intent_log.apply_thread = evpl_thread_create(NULL,
+                                                         diskfs_il_apply_thread_init,
+                                                         diskfs_il_apply_thread_shutdown,
+                                                         &shared->intent_log);
+    while (!__atomic_load_n(&shared->intent_log.apply_ready, __ATOMIC_ACQUIRE)) {
+        /* spin briefly */
+    }
+
     shared->intent_log.push_thread = evpl_thread_create(NULL,
                                                         diskfs_il_push_thread_init,
                                                         diskfs_il_push_thread_shutdown,
                                                         &shared->intent_log);
     while (!__atomic_load_n(&shared->intent_log.push_ready, __ATOMIC_ACQUIRE)) {
         /* spin briefly */
-    }
-
-    /* Per-(device, AG) park lists for journaling stalled behind an AG-log
-     * condensation. */
-    shared->agw = calloc(shared->num_devices, sizeof(*shared->agw));
-    for (int d = 0; d < shared->num_devices; d++) {
-        uint32_t nags = shared->space_map->devices[d].num_ags;
-
-        shared->agw[d] = calloc(nags, sizeof(**shared->agw));
-        for (uint32_t a = 0; a < nags; a++) {
-            pthread_mutex_init(&shared->agw[d][a].lock, NULL);
-        }
     }
 
     /* Reclaim workers last: their thread contexts register intent-log
@@ -1362,13 +1392,14 @@ diskfs_bootstrap(struct diskfs_thread *thread)
      * enforcement a root-owned 0755 root would refuse all creation by non-root
      * clients on this engine-authoritative backend (matches memfs/cairn).
      * Subdirs are still created owned by their creator with 0755. */
-    inode->mode           = S_IFDIR | 0777;
-    inode->atime_sec      = now.tv_sec;
-    inode->atime_nsec     = now.tv_nsec;
-    inode->mtime_sec      = now.tv_sec;
-    inode->mtime_nsec     = now.tv_nsec;
-    inode->ctime_sec      = now.tv_sec;
-    inode->ctime_nsec     = now.tv_nsec;
+    inode->mode       = S_IFDIR | 0777;
+    inode->atime_sec  = now.tv_sec;
+    inode->atime_nsec = now.tv_nsec;
+    inode->mtime_sec  = now.tv_sec;
+    inode->mtime_nsec = now.tv_nsec;
+    inode->ctime_sec  = now.tv_sec;
+    inode->ctime_nsec = now.tv_nsec;
+    inode->change++;
     inode->btime_sec      = now.tv_sec;
     inode->btime_nsec     = now.tv_nsec;
     inode->dos_attributes = 0;
@@ -1408,16 +1439,17 @@ diskfs_bootstrap(struct diskfs_thread *thread)
                                                              oinum, &odev);
         struct diskfs_inode *oin = diskfs_inode_struct_new(oinum);
 
-        oin->size           = 4096;
-        oin->space_used     = 4096;
-        oin->nlink          = 1;
-        oin->mode           = S_IFDIR | 0700;
-        oin->atime_sec      = now.tv_sec;
-        oin->atime_nsec     = now.tv_nsec;
-        oin->mtime_sec      = now.tv_sec;
-        oin->mtime_nsec     = now.tv_nsec;
-        oin->ctime_sec      = now.tv_sec;
-        oin->ctime_nsec     = now.tv_nsec;
+        oin->size       = 4096;
+        oin->space_used = 4096;
+        oin->nlink      = 1;
+        oin->mode       = S_IFDIR | 0700;
+        oin->atime_sec  = now.tv_sec;
+        oin->atime_nsec = now.tv_nsec;
+        oin->mtime_sec  = now.tv_sec;
+        oin->mtime_nsec = now.tv_nsec;
+        oin->ctime_sec  = now.tv_sec;
+        oin->ctime_nsec = now.tv_nsec;
+        oin->change++;
         oin->btime_sec      = now.tv_sec;
         oin->btime_nsec     = now.tv_nsec;
         oin->dos_attributes = 0;
@@ -1503,9 +1535,37 @@ diskfs_destroy(void *private_data)
      * otherwise abort writing to it. */
     __atomic_store_n(&shared->intent_log.commit_alive, 0, __ATOMIC_RELEASE);
     evpl_thread_destroy(shared->intent_log.thread);
+    /* Apply thread next: its shutdown drains the apply queue (applying every
+     * remaining record's deltas and advancing applied_seq to the final
+     * durable_seq) so the push thread can finish trimming -- its checkpoint
+     * frontier reads applied_seq -- and the unmount checkpoint below persists a
+     * complete free map. */
+    evpl_thread_destroy(shared->intent_log.apply_thread);
     evpl_thread_destroy(shared->intent_log.push_thread);
+
+    /* Stage A: drain the commit-thread record/ctx recycle pools (all IL threads
+     * are stopped now, so the pools are quiescent). */
+    {
+        struct diskfs_il_record *rec;
+        struct diskfs_redo_ctx  *ctx;
+
+        while ((rec = shared->intent_log.rec_pool)) {
+            shared->intent_log.rec_pool = rec->recycle_next;
+            free(rec->iovs);
+            free(rec->block_bufs);
+            free(rec->blocks);
+            free(rec);
+        }
+        while ((ctx = shared->intent_log.ctx_pool)) {
+            shared->intent_log.ctx_pool = ctx->free_next;
+            free(ctx->entries);
+            free(ctx);
+        }
+    }
+
     pthread_mutex_destroy(&shared->intent_log.registration_lock);
     free(shared->intent_log.handoff);
+    free(shared->intent_log.apply_queue);   /* Stage B */
     free(shared->intent_log.metrics.block_io_device_ops);
     free(shared->intent_log.metrics.block_io_device_bytes);
 
@@ -1519,8 +1579,14 @@ diskfs_destroy(void *private_data)
     {
         struct diskfs_mount_io *mio  = diskfs_mount_io_open(shared);
         struct sm_io            smio = diskfs_mount_sm_io(mio);
+        /* The apply thread drained at teardown, so applied_seq == the final
+         * durable_seq; stamp every checkpoint with it.  The redo ring is fully
+         * trimmed, so the next clean mount loads these snapshots with no deltas
+         * left to replay. */
+        uint64_t                ckpt_seq = __atomic_load_n(&shared->intent_log.applied_seq,
+                                                           __ATOMIC_ACQUIRE);
 
-        if (space_map_persist(shared->space_map, &smio) != 0) {
+        if (space_map_persist(shared->space_map, &smio, ckpt_seq) != 0) {
             chimera_diskfs_error("space-map persist at unmount failed");
         } else if (shared->root_fhlen != 0) {
             /* Clean unmount: persist the exact next generation (no reserve
@@ -1545,18 +1611,6 @@ diskfs_destroy(void *private_data)
     }
 
     diskfs_block_cache_destroy(shared);
-
-    if (shared->agw) {
-        for (i = 0; i < shared->num_devices; i++) {
-            uint32_t nags = shared->space_map->devices[i].num_ags;
-
-            for (uint32_t a = 0; a < nags; a++) {
-                pthread_mutex_destroy(&shared->agw[i][a].lock);
-            }
-            free(shared->agw[i]);
-        }
-        free(shared->agw);
-    }
 
     space_map_destroy(shared->space_map);
 
@@ -1602,15 +1656,15 @@ diskfs_thread_init(
     thread->shared = shared;
     thread->evpl   = evpl;
 
-    /* Allocate this worker's intent-log channel and register the CQ
-     * doorbell on the worker's own evpl. */
+    /* Allocate this worker's intent-log channel (holds its private in-flight
+     * ring; completion is watermark-driven, so there is no per-worker CQ or
+     * doorbell). */
     thread->iq_channel         = calloc(1, sizeof(*thread->iq_channel));
     thread->iq_channel->worker = thread;
     thread->commits_inflight   = 0;
-    evpl_add_doorbell(evpl, &thread->iq_channel->cq_doorbell,
-                      diskfs_iq_cq_doorbell_cb);
     /* Reap intent-log completions every loop iteration (the worker is pinned in
-     * poll mode while a commit is outstanding); the doorbell is only a backstop. */
+     * poll mode while a commit is outstanding): ACK txns below the durable
+     * watermark, recycle txns below the applied watermark. */
     thread->cq_poll = evpl_add_poll(evpl, NULL, NULL, diskfs_iq_cq_poll,
                                     thread->iq_channel);
 
@@ -1756,7 +1810,8 @@ diskfs_thread_destroy(void *private_data)
     /* No txn at thread teardown; the unused metadata reservation tail returns to
      * the in-memory free set and is captured by the condense at clean unmount.
      * (File-data reservations live on the inode and are returned on close.) */
-    space_map_thread_cache_return(shared->space_map, NULL, &thread->space_cache);
+    space_map_release_reservation(shared->space_map, &thread->meta_resv);
+    space_map_release_reservation(shared->space_map, &thread->data_resv);
 
     /* Unregister the intent-log channel.  Caller must have quiesced all
      * in-flight VFS ops on this thread first. */
@@ -1776,7 +1831,6 @@ diskfs_thread_destroy(void *private_data)
         }
 
         evpl_remove_poll(thread->evpl, thread->cq_poll);
-        evpl_remove_doorbell(thread->evpl, &ch->cq_doorbell);
         free(ch);
         thread->iq_channel = NULL;
     }

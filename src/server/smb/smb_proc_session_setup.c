@@ -75,6 +75,29 @@ process_kerberos_auth(
     return rc;
 } // process_kerberos_auth
 
+/* The signing algorithm a connection effectively uses, derived from its dialect
+ * and (for 3.1.1) its negotiated SMB2_SIGNING_* value.  Only 3.1.1 negotiates a
+ * signing algorithm; 2.x is fixed at HMAC-SHA256 and 3.0/3.0.2 at AES-128-CMAC
+ * (MS-SMB2 §3.1.4.1 / §3.3.5.4), and for those dialects negotiated.signing_alg
+ * is left at its 0 default rather than the true algorithm.  Used to compare a
+ * binding connection against the connection the session was established on. */
+static inline uint16_t
+chimera_smb_effective_signing_alg(
+    uint16_t dialect,
+    uint16_t signing_alg)
+{
+    switch (dialect) {
+        case SMB2_DIALECT_2_0_2:
+        case SMB2_DIALECT_2_1:
+            return SMB2_SIGNING_HMAC_SHA256;
+        case SMB2_DIALECT_3_0:
+        case SMB2_DIALECT_3_0_2:
+            return SMB2_SIGNING_AES_CMAC;
+        default: /* 3.1.1: the negotiated algorithm is authoritative. */
+            return signing_alg;
+    } /* switch */
+} /* chimera_smb_effective_signing_alg */
+
 void
 chimera_smb_session_setup(struct chimera_smb_request *request)
 {
@@ -125,6 +148,22 @@ chimera_smb_session_setup(struct chimera_smb_request *request)
         return;
     }
 
+    /* MS-SMB2 3.3.5.2.4 (Verifying the Signature): a request whose SMB2 header
+    * has SMB2_FLAGS_SIGNED set is signature-verified against the session named
+    * by the header SessionId.  If that SessionId resolves to no session -- a
+    * signed first-leg SESSION_SETUP carrying SessionId 0, or any signed
+    * SESSION_SETUP whose id names no live session -- the lookup fails the
+    * request with STATUS_USER_SESSION_DELETED before authentication runs (a
+    * signed leg of an in-progress exchange resolves to its in-progress session
+    * handle and is unaffected).  SMB2Model Signing InvalidIdentifier cases. */
+    if ((request->smb2_hdr.flags & SMB2_FLAGS_SIGNED) &&
+        !request->session_handle) {
+        chimera_smb_complete_request(request, SMB2_STATUS_USER_SESSION_DELETED);
+        evpl_iovecs_release(thread->evpl, request->session_setup.input_iov,
+                            request->session_setup.input_niov);
+        return;
+    }
+
     /* MS-SMB2 3.3.5.5 step 4: a SESSION_SETUP that binds a new channel to an
      * existing session (SMB2_SESSION_FLAG_BINDING set, non-zero header
      * SessionId, dialect in the 3.x family, and the session found in the
@@ -149,33 +188,72 @@ chimera_smb_session_setup(struct chimera_smb_request *request)
         conn->dialect >= SMB2_DIALECT_3_0 &&
         request->smb2_hdr.session_id != 0 &&
         request->session_handle) {
-        struct chimera_smb_session *bind_session = request->session_handle->session;
-        int                         reject       = 0;
+        struct chimera_smb_session *bind_session  = request->session_handle->session;
+        uint32_t                    reject_status = 0;
+        uint16_t                    bind_sign_alg =
+            chimera_smb_effective_signing_alg(conn->dialect,
+                                              conn->negotiated.signing_alg);
+        uint16_t                    sess_sign_alg =
+            chimera_smb_effective_signing_alg(bind_session->dialect,
+                                              bind_session->sign_alg);
 
         if (!(request->smb2_hdr.flags & SMB2_FLAGS_SIGNED)) {
-            reject = 1;
+            reject_status = SMB2_STATUS_INVALID_PARAMETER;
+        } else if ((bind_session->flags & CHIMERA_SMB_SESSION_AUTHORIZED) &&
+                   bind_sign_alg == SMB2_SIGNING_AES_GMAC &&
+                   sess_sign_alg != SMB2_SIGNING_AES_GMAC) {
+            /* MS-SMB2 3.3.5.5: AES-128-GMAC ties the per-message signing key to
+             * the connection's GMAC nonce derivation, so a connection that
+             * negotiated GMAC cannot bind to a session whose establishing
+             * connection used a different (non-GMAC) signing algorithm.  This is
+             * rejected with STATUS_NOT_SUPPORTED -- a DIFFERENT status from the
+             * cipher/dialect/unsigned cases (which return INVALID_PARAMETER).
+             * Checked before the dialect mismatch because a 3.0.2-established
+             * session bound from a 3.1.1/GMAC connection (smb2.session.
+             * bind_negative_smb3signC30toG*) differs in both dialect and signing
+             * algorithm yet must report NOT_SUPPORTED.  smb2.session.bind_
+             * negative_smb3sign{CtoG,HtoG,C30toG} and smb3sne{CtoG,HtoG}
+             * exercise this; the reverse (a non-GMAC connection binding a
+             * GMAC-established session, GtoX) fails earlier in signature
+             * verification, and a CMAC/HMAC mismatch (CtoH or HtoC) is
+             * permitted (bind succeeds). */
+            reject_status = SMB2_STATUS_NOT_SUPPORTED;
         } else if ((bind_session->flags & CHIMERA_SMB_SESSION_AUTHORIZED) &&
                    bind_session->dialect != conn->dialect) {
             /* MS-SMB2 3.3.5.5: the binding connection's dialect MUST equal the
              * dialect of the connection the session was established on
              * (smb2.session.bind_negative_smb3to3* binds a 3.0.2 session from
              * a 3.1.1 connection and expects STATUS_INVALID_PARAMETER). */
-            reject = 1;
+            reject_status = SMB2_STATUS_INVALID_PARAMETER;
         } else if ((bind_session->flags & CHIMERA_SMB_SESSION_AUTHORIZED) &&
                    conn->negotiated.cipher_id != bind_session->conn_cipher_id) {
             /* MS-SMB2 3.3.5.5: likewise the negotiated cipher must match the
              * establishing connection's (smb2.session.bind_negative_
              * smb3encGtoC* negotiates AES-128-GCM on the first connection and
              * AES-128-CCM on the binding one). */
-            reject = 1;
+            reject_status = SMB2_STATUS_INVALID_PARAMETER;
         } else if (conn->dialect == SMB2_DIALECT_3_1_1 &&
                    bind_session->supports_notifications !=
                    conn->supports_notifications) {
-            reject = 1;
+            reject_status = SMB2_STATUS_INVALID_PARAMETER;
         }
 
-        if (reject) {
-            chimera_smb_complete_request(request, SMB2_STATUS_INVALID_PARAMETER);
+        if (reject_status) {
+            chimera_smb_complete_request(request, reject_status);
+            evpl_iovecs_release(thread->evpl, request->session_setup.input_iov,
+                                request->session_setup.input_niov);
+            return;
+        }
+
+        /* MS-SMB2 3.3.5.5 / 3.3.5.2.4: the bind request's signature, verified at
+         * dispatch against the established Session.SigningKey, must hold.  Applied
+         * HERE -- after the dialect/cipher/algorithm compatibility checks above --
+         * so those statuses (INVALID_PARAMETER / NOT_SUPPORTED) take precedence
+         * over the ACCESS_DENIED a signature failure yields, and so a bind that
+         * resolves to no session is answered USER_SESSION_DELETED rather than
+         * ACCESS_DENIED (smb2model SessionMgmtBindSession S268/S431). */
+        if (request->bind_sig_failed) {
+            chimera_smb_complete_request(request, SMB2_STATUS_ACCESS_DENIED);
             evpl_iovecs_release(thread->evpl, request->session_setup.input_iov,
                                 request->session_setup.input_niov);
             return;
@@ -342,13 +420,30 @@ chimera_smb_session_setup(struct chimera_smb_request *request)
             int over_limit = 0;
 
             /* MS-SMB2 3.3.5.5.3: the binding user MUST be the user the session
-            * was established by; a successful authentication as a DIFFERENT
-            * principal is rejected with STATUS_ACCESS_DENIED and the session
-            * (and its channels) survive (smb2.session.bind_different_user). */
-            if (mech == SMB_AUTH_MECH_NTLM &&
-                smb_ntlm_get_uid(&conn->ntlm_ctx) != session->cred.uid) {
-                chimera_smb_error("Channel bind rejected: user mismatch (uid %u != session uid %u)",
-                                  smb_ntlm_get_uid(&conn->ntlm_ctx), session->cred.uid);
+             * was established by; a successful authentication as a DIFFERENT
+             * principal is rejected with STATUS_ACCESS_DENIED and the session
+             * (and its channels) survive (smb2.session.bind_different_user).
+             * NTLM matches on the resolved uid; Kerberos matches on the
+             * establishing principal captured at session setup -- without this a
+             * service ticket for ANY principal could bind a channel onto a
+             * victim's session (cross-user session hijack). */
+            int bind_user_mismatch = 0;
+
+            if (mech == SMB_AUTH_MECH_NTLM) {
+                bind_user_mismatch =
+                    smb_ntlm_get_uid(&conn->ntlm_ctx) != session->cred.uid;
+            } else if (mech == SMB_AUTH_MECH_KERBEROS) {
+                const char *bind_principal =
+                    smb_gssapi_get_principal(&conn->gssapi_ctx);
+
+                bind_user_mismatch =
+                    !bind_principal || session->principal[0] == '\0' ||
+                    strcmp(bind_principal, session->principal) != 0;
+            }
+
+            if (bind_user_mismatch) {
+                chimera_smb_error("Channel bind rejected: binding user does not match session owner (%s)",
+                                  smb_auth_mech_name(mech));
                 chimera_smb_complete_request(request, SMB2_STATUS_ACCESS_DENIED);
                 evpl_iovecs_release(thread->evpl,
                                     request->session_setup.input_iov,
@@ -459,6 +554,14 @@ chimera_smb_session_setup(struct chimera_smb_request *request)
 
             chimera_smb_info("Kerberos auth complete: principal=%s uid=%u gid=%u sid=%s",
                              principal, uid, gid, sid ? sid : "none");
+
+            /* Record the establishing principal so a later multichannel bind can
+             * verify the binding connection authenticated as the SAME principal
+             * (MS-SMB2 3.3.5.5.3).  Only on the authorizing leg -- a bind/re-auth
+             * must not move the session's owning identity. */
+            if (!(session->flags & CHIMERA_SMB_SESSION_AUTHORIZED) && principal) {
+                snprintf(session->principal, sizeof(session->principal), "%s", principal);
+            }
         }
 
         // Cache AD users in VFS user cache (non-pinned, will expire)
@@ -473,8 +576,13 @@ chimera_smb_session_setup(struct chimera_smb_request *request)
             chimera_smb_debug("Cached AD user '%s' in VFS user cache", username);
         }
 
-        // Set session credentials
-        chimera_vfs_cred_init_attr(&session->cred, uid, gid, ngids, gids);
+        /* Set session credentials.  A binding leg must NOT replace the session's
+         * credentials: the binding user was already verified to match the
+         * session owner, and overwriting here would let a bind move the owning
+         * identity.  Re-authentication does refresh the security context. */
+        if (!is_binding) {
+            chimera_vfs_cred_init_attr(&session->cred, uid, gid, ngids, gids);
+        }
 
         /* SMB3 transport encryption: derive per-session keys from the raw
          * session key.

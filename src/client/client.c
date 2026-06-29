@@ -32,6 +32,8 @@ chimera_client_config_init(void)
     config->async_delegation         = 0;
     config->async_delegation_threads = 8;
     config->cache_ttl                = 60;
+    config->attr_cache_enabled       = 1;
+    config->name_cache_enabled       = 1;
     config->rcu_reclaim_threads      = 4; /* 4 = cap RCU reclaim workers to avoid thread exhaustion on many-core hosts */
     config->max_fds                  = 1024;
 
@@ -136,6 +138,20 @@ chimera_client_thread_shutdown(
 {
     struct chimera_client_request *request;
 
+    /* Drain in-flight VFS completions before chimera_vfs_thread_destroy() closes
+     * this thread's completion doorbell.  A delegated/parked request completes
+     * on another thread, which appends to our pending list and rings our
+     * doorbell (chimera_vfs_complete_delegate / the lease pump).  The delegation
+     * and close threads are still alive here -- chimera_vfs_destroy() tears them
+     * down only after the whole thread pool is gone -- so a late completion
+     * would write() to an fd that chimera_vfs_thread_destroy() has already
+     * close()d, EBADF -> fatal abort in evpl_ring_doorbell (doorbell.c).  Pump
+     * until quiescent so no producer can ring a closed doorbell.  The NFS server
+     * path already drains here; the client path did not, which is why the
+     * crash showed up on the client-only posix lock/open tests under teardown
+     * timing. */
+    chimera_vfs_thread_drain(thread->vfs_thread);
+
     while (thread->free_requests) {
         request = thread->free_requests;
         DL_DELETE(thread->free_requests, request);
@@ -180,6 +196,8 @@ chimera_client_init(
                                    config->num_modules,
                                    config->kv_module,
                                    config->cache_ttl,
+                                   config->attr_cache_enabled,
+                                   config->name_cache_enabled,
                                    config->rcu_reclaim_threads,
                                    metrics);
 
@@ -323,6 +341,14 @@ chimera_client_init_json(
             config->rcu_reclaim_threads = rcu_threads;
         }
     }
+
+    /* The VFS attribute cache (common.attr_cache) is a VFS-level facility shared
+     * with the server; on by default. */
+    config->attr_cache_enabled = chimera_common_attr_cache_enabled(root);
+
+    /* The VFS name (lookup) cache (common.name_cache) is likewise shared with
+     * the server; on by default. */
+    config->name_cache_enabled = chimera_common_name_cache_enabled(root);
 
     client = chimera_client_init(config, cred, metrics);
 

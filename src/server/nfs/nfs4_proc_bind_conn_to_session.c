@@ -45,6 +45,14 @@ chimera_nfs4_bind_conn_to_session(
     bool                              bind_fore, bind_back;
     channel_dir_from_server4          reply_dir;
 
+    /* BIND_CONN_TO_SESSION MUST be the only operation in the COMPOUND
+     * (RFC 8881 §18.34.3, §15.1.3.3); it is never preceded by SEQUENCE. */
+    if (!req->seen_sequence && req->args_compound->num_argarray != 1) {
+        res->bctsr_status = NFS4ERR_NOT_ONLY_OP;
+        chimera_nfs4_compound_complete(req, NFS4ERR_NOT_ONLY_OP);
+        return;
+    }
+
     session = nfs4_session_lookup(&thread->shared->nfs4_shared_clients,
                                   args->bctsa_sessid);
     if (!session) {
@@ -56,6 +64,24 @@ chimera_nfs4_bind_conn_to_session(
         res->bctsr_status = hs;
         chimera_nfs4_compound_complete(req, hs);
         return;
+    }
+
+    /* SP4_MACH_CRED: only the bound machine credential may bind a connection
+     * to the session (RFC 8881 §2.10.8.3). */
+    {
+        const struct nfs4_client_principal p = {
+            .flavor          = req->principal_flavor,
+            .uid             = req->principal_uid,
+            .gid             = req->principal_gid,
+            .machinename     = req->principal_machinename,
+            .machinename_len = req->principal_machinename_len,
+        };
+        if (!nfs4_client_mach_cred_ok(session->nfs4_session_client, &p)) {
+            nfs4_session_put(session);
+            res->bctsr_status = NFS4ERR_WRONG_CRED;
+            chimera_nfs4_compound_complete(req, NFS4ERR_WRONG_CRED);
+            return;
+        }
     }
 
     switch (args->bctsa_dir) {

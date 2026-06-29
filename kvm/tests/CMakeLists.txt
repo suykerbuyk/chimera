@@ -4,6 +4,7 @@
 
 set(CHIMERA_BINARY ${CMAKE_BINARY_DIR}/src/daemon/chimera)
 set(NFS_WRAPPER ${CMAKE_SOURCE_DIR}/kvm/kvm_nfs_test_wrapper.sh)
+set(NFS_KRB_WRAPPER ${CMAKE_SOURCE_DIR}/kvm/kvm_nfs_kerberos_test_wrapper.sh)
 set(NFS_REBOOT_WRAPPER ${CMAKE_SOURCE_DIR}/kvm/kvm_nfs_reboot_test_wrapper.sh)
 set(NFS3_DRC_REBOOT_WRAPPER ${CMAKE_SOURCE_DIR}/kvm/kvm_nfs3_drc_reboot_test_wrapper.sh)
 set(NFSTEST_WRAPPER ${CMAKE_SOURCE_DIR}/kvm/kvm_nfstest_test_wrapper.sh)
@@ -114,10 +115,18 @@ set(CTHON_CMD_special "cd /opt/cthon04 && ./runtests -s -f /mnt/test")
 
 # SMB cthon04 commands set CIFS=yes so the test suite skips NFS-specific
 # sub-tests (e.g. nfsidem duplicate request check, NFS-style op_ren).
-# MNTOPTIONS is checked by runtests.wrk to detect SMB version.
-set(SMB_CTHON_CMD_basic   "cd /opt/cthon04 && CIFS=yes MNTOPTIONS=vers=2.1 ./runtests -b -f /mnt/test")
-set(SMB_CTHON_CMD_general "cd /opt/cthon04 && CIFS=yes MNTOPTIONS=vers=2.1 ./runtests -g -f /mnt/test")
-set(SMB_CTHON_CMD_special "cd /opt/cthon04 && CIFS=yes MNTOPTIONS=vers=2.1 ./runtests -s -f /mnt/test")
+# MNTOPTIONS is checked by runtests.wrk to detect the SMB version; it is filled
+# in per dialect at registration time (the runtests flag per category below).
+set(SMB_CTHON_FLAG_basic   -b)
+set(SMB_CTHON_FLAG_general -g)
+set(SMB_CTHON_FLAG_special -s)
+
+# SMB dialect matrix.  The kernel cifs client mounts with vers=<dialect> and the
+# server's dialect floor is set to match (see kvm_smb_test_wrapper.sh).  The full
+# backend x dialect cross is expensive, so only the two broadest suites (cthon
+# "general" + xfstests fsstress/fsx) run on every dialect; the narrower suites
+# run on the newest dialect (3.1.1) only.  cairn runs at 3.1.1 only throughout.
+set(SMB_DIALECTS 2.0.2 2.1 3.0 3.0.2 3.1.1)
 
 # pNFS (NFSv4.1 file layout) workloads.  These run against an MDS + a separate
 # memfs data server.  The MDS holds no data for pNFS-backed files (it returns
@@ -256,6 +265,98 @@ foreach(image_spec ${KVM_IMAGES})
             PROPERTIES LABELS "kvm;${IMAGE_NAME}" PROCESSORS 2)
     endif()
 
+    # RPCSEC_GSS / Kerberos: boot the real Linux NFS client and mount the
+    # chimera export with sec=krb5 (rpc.gssd + machine keytab handed in over a
+    # 9p share).  Proves the full GSS path -- context establishment + per-request
+    # verifiers -- against the kernel client.  memfs only; NFSv4.1.  Skips (77)
+    # without /dev/kvm or krb5 tooling, or on an image too old to honour krb5=1.
+    add_test(NAME chimera/kvm/${IMAGE_NAME}/kerberos/krb5_mount_memfs_nfs4.1
+        COMMAND bash ${NFS_KRB_WRAPPER}
+                ${IMAGE_DIR}/vmlinuz ${IMAGE_DIR}/rootfs.qcow2
+                ${CHIMERA_BINARY} memfs 4.1
+                "stat /mnt && echo hello-krb5 > /mnt/f && grep -q hello-krb5 /mnt/f && dd if=/dev/zero of=/mnt/big bs=4k count=64 2>/dev/null && rm /mnt/f /mnt/big && echo KRB5_RW_OK")
+    set_tests_properties(chimera/kvm/${IMAGE_NAME}/kerberos/krb5_mount_memfs_nfs4.1
+        PROPERTIES LABELS "kvm;${IMAGE_NAME};rpcsec_gss" PROCESSORS 2
+        SKIP_RETURN_CODE 77)
+
+    # RPCSEC_GSS over NFSv3: the GSS layer lives below the RPC program dispatch,
+    # so krb5/krb5i work for NFSv3 just as for NFSv4 -- this drives a real-client
+    # vers=3 mount through MOUNT + portmap + a directory/file workload (MKDIR,
+    # CREATE, WRITE, READ, RENAME, READDIR, REMOVE) under GSS.  Mounted nolock:
+    # NFSv3's kernel mount wants rpc.statd for NLM, which is not in the image, so
+    # NLM-under-krb5 is out of scope here (the data path is what we validate).
+    # One entry per flavor (krb5 = auth, krb5i = integrity wrapping on v3 I/O).
+    set(KRB_V3_WORKLOAD "stat /mnt && mkdir /mnt/d && echo hello-v3 > /mnt/d/f && grep -q hello-v3 /mnt/d/f && dd if=/dev/zero of=/mnt/d/big bs=4k count=64 2>/dev/null && mv /mnt/d/f /mnt/d/f2 && ls /mnt/d | grep -q f2 && rm /mnt/d/f2 /mnt/d/big && rmdir /mnt/d && echo NFS3_KRB_RW_OK")
+    foreach(krbflavor krb5 krb5i)
+        add_test(NAME chimera/kvm/${IMAGE_NAME}/kerberos/${krbflavor}_mount_memfs_nfs3
+            COMMAND bash ${NFS_KRB_WRAPPER}
+                    ${IMAGE_DIR}/vmlinuz ${IMAGE_DIR}/rootfs.qcow2
+                    ${CHIMERA_BINARY} memfs 3
+                    "${KRB_V3_WORKLOAD}")
+        set_tests_properties(chimera/kvm/${IMAGE_NAME}/kerberos/${krbflavor}_mount_memfs_nfs3
+            PROPERTIES LABELS "kvm;${IMAGE_NAME};rpcsec_gss" PROCESSORS 2
+            SKIP_RETURN_CODE 77
+            ENVIRONMENT "MOUNT_SEC=${krbflavor}")
+    endforeach()
+
+    # NLM (lock manager) under RPCSEC_GSS: bring up rpcbind + rpc.statd in the
+    # guest (NFS_ENABLE_NLM), mount vers=3,sec=krb5 *with* locking, then take an
+    # exclusive file lock -- which routes a krb5-authenticated NLM LOCK to the
+    # server.  The lock-bookkeeping FH open runs with a system credential; before
+    # the fix it passed a NULL cred and crashed the server (NULL deref in the DAC
+    # gate) on engine-DAC backends like memfs.
+    add_test(NAME chimera/kvm/${IMAGE_NAME}/kerberos/krb5_nlm_lock_memfs_nfs3
+        COMMAND bash ${NFS_KRB_WRAPPER}
+                ${IMAGE_DIR}/vmlinuz ${IMAGE_DIR}/rootfs.qcow2
+                ${CHIMERA_BINARY} memfs 3
+                "echo data > /mnt/lf && flock -x /mnt/lf -c 'echo NLM_LOCK_HELD' && echo NFS3_NLM_KRB5_OK")
+    set_tests_properties(chimera/kvm/${IMAGE_NAME}/kerberos/krb5_nlm_lock_memfs_nfs3
+        PROPERTIES LABELS "kvm;${IMAGE_NAME};rpcsec_gss" PROCESSORS 2
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "NFS_ENABLE_NLM=1")
+
+    # NLM blocking-lock grant delivery (RFC 1813 / XNFS): two processes contend
+    # for the SAME exclusive POSIX byte-range lock over a real Linux NLM client
+    # (sec=sys, vers=3 mounted *with* locking via NFS_ENABLE_NLM).  A small Python
+    # program forks a holder that takes the lock and holds it 3s, while the waiter
+    # issues a BLOCKING fcntl lock (F_SETLKW -> NLM LOCK block=true) on the same
+    # range: the server must reply NLM4_BLOCKED, then once the holder releases
+    # make an NLM_GRANTED callback that unblocks the waiter.  The waiter's lockf
+    # returns only after that grant lands.  The test passes only if the event
+    # order is exactly A-LOCKED, A-UNLOCK, B-GRANTED AND the waiter genuinely
+    # blocked (>=1s) -- i.e. it did not get the lock until the holder released.
+    # See issue #971.
+    #
+    # fcntl byte-range locks (not flock(2)) are used deliberately: the Linux NFS
+    # client always routes POSIX byte-range locks through NLM, whereas flock(2)
+    # can be handled locally.  The script is base64-embedded so the kernel
+    # cmdline that carries the test command stays quote-free.
+    set(NLM_BLOCK_PY "aW1wb3J0IG9zLHN5cyx0aW1lLGZjbnRsClA9Ii9tbnQvbmxtX2JsayI7RT0iL21udC9ubG1fZXZ0IgpkZWYgbihtKToKIGY9b3BlbihFLCJhIik7Zi53cml0ZShtKyJcbiIpO2YuZmx1c2goKTtvcy5mc3luYyhmLmZpbGVubygpKTtmLmNsb3NlKCkKb3BlbihQLCJ3IikuY2xvc2UoKTtvcGVuKEUsInciKS5jbG9zZSgpCmlmIG9zLmZvcmsoKT09MDoKIGg9b3BlbihQLCJyKyIpO2ZjbnRsLmxvY2tmKGgsZmNudGwuTE9DS19FWCwwLDEpO24oIkFMIik7dGltZS5zbGVlcCgzKTtuKCJBVSIpO2ZjbnRsLmxvY2tmKGgsZmNudGwuTE9DS19VTiwwLDEpO29zLl9leGl0KDApCnRpbWUuc2xlZXAoMSkKdz1vcGVuKFAsInIrIik7dD10aW1lLnRpbWUoKTtmY250bC5sb2NrZih3LGZjbnRsLkxPQ0tfRVgsMCwxKTtkPXRpbWUudGltZSgpLXQ7bigiQkciKQpvcy53YWl0KCkKZT1vcGVuKEUpLnJlYWQoKS5zcGxpdCgpO3ByaW50KCJFVlQiLGUsIldBSVQgJS4xZiIlZCkKc3lzLmV4aXQoMCBpZiBlPT1bIkFMIiwiQVUiLCJCRyJdIGFuZCBkPj0xIGVsc2UgMSkK")
+    set(NLM_BLOCK_CMD "echo ${NLM_BLOCK_PY} | base64 -d > /tmp/nb.py && python3 /tmp/nb.py")
+    add_test(NAME chimera/kvm/${IMAGE_NAME}/nlm/blocking_lock_memfs_nfs3
+        COMMAND bash ${NFS_WRAPPER}
+                ${IMAGE_DIR}/vmlinuz ${IMAGE_DIR}/rootfs.qcow2
+                ${CHIMERA_BINARY} memfs 3
+                "${NLM_BLOCK_CMD}")
+    set_tests_properties(chimera/kvm/${IMAGE_NAME}/nlm/blocking_lock_memfs_nfs3
+        PROPERTIES LABELS "kvm;${IMAGE_NAME}" PROCESSORS 2
+        TIMEOUT 180
+        ENVIRONMENT "NFS_ENABLE_NLM=1")
+
+    # NFSv3 sec= policy rejection: an export restricted to krb5 must reject a
+    # sec=sys mount.  The real client reports "access denied by server" only if
+    # the server answers the post-mount probe with NFS3ERR_ACCES -- a stale/bad
+    # handle (the pre-fix behaviour) would surface a different error and fail
+    # this test, so it pins the WRONGSEC->ACCES mapping.
+    add_test(NAME chimera/kvm/${IMAGE_NAME}/kerberos/sec_krb5only_deny_sys_memfs_nfs3
+        COMMAND bash ${NFS_KRB_WRAPPER}
+                ${IMAGE_DIR}/vmlinuz ${IMAGE_DIR}/rootfs.qcow2
+                ${CHIMERA_BINARY} memfs 3 "deny")
+    set_tests_properties(chimera/kvm/${IMAGE_NAME}/kerberos/sec_krb5only_deny_sys_memfs_nfs3
+        PROPERTIES LABELS "kvm;${IMAGE_NAME};rpcsec_gss" PROCESSORS 2
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "MOUNT_SEC=sys;NFS_EXPORT_SEC=krb5;NFS_EXPECT_DENY=1")
+
     # NFS cthon04 tests
     foreach(nfsver ${NFS_VERSIONS})
         foreach(category ${CTHON_CATEGORIES})
@@ -314,7 +415,7 @@ foreach(image_spec ${KVM_IMAGES})
         endforeach()
     endif()
 
-    # ----- Linux nfstest single-host suite (ubuntu2404 only) -----
+    # ----- Linux nfstest single-host suite (ubuntu2404 + ubuntu2604) -----
     # nfstest is a client-side conformance suite: it mounts the share itself (so
     # this uses a dedicated no-pre-mount wrapper) and verifies on-the-wire
     # behaviour with its own tcpdump-driven RPC dissector.  The nfstest tree and
@@ -331,7 +432,7 @@ foreach(image_spec ${KVM_IMAGES})
     # nfstest_cache and nfstest_delegation are registered below (they need a
     # second client host -- see the 2-client wrapper).  Not yet registered:
     # nfstest_pnfs.
-    if(IMAGE_NAME STREQUAL "ubuntu2404")
+    if(IMAGE_NAME STREQUAL "ubuntu2404" OR IMAGE_NAME STREQUAL "ubuntu2604")
         set(NFSTEST_MATRIX
             "nfstest_posix|3 4.0 4.1 4.2"
             "nfstest_interop|4.0"
@@ -447,11 +548,11 @@ foreach(image_spec ${KVM_IMAGES})
             PROPERTIES LABELS "kvm;${IMAGE_NAME}" PROCESSORS 4 TIMEOUT 1800)
     endif()
 
-    # Linux Test Project (LTP) -- ubuntu2404 only.  Reuses the plain NFS wrapper:
+    # Linux Test Project (LTP) -- ubuntu2404 + ubuntu2604.  Reuses the plain NFS wrapper:
     # LTP runs against the pre-mounted share at /mnt exactly like cthon/xfstests,
     # so it needs no dedicated wrapper.  See LTP_MATRIX above for the pared-down
     # group selection (the non-duplicative slice).
-    if(IMAGE_NAME STREQUAL "ubuntu2404")
+    if(IMAGE_NAME STREQUAL "ubuntu2404" OR IMAGE_NAME STREQUAL "ubuntu2604")
         set(LTP_BACKENDS ${KVM_BACKENDS})
         if(CAIRN_ENABLED)
             list(APPEND LTP_BACKENDS cairn)
@@ -548,6 +649,17 @@ foreach(image_spec ${KVM_IMAGES})
     # pNFS block layout (RFC 5663): diskfs sources block layouts; the client
     # does data I/O directly to the signed virtio-SCSI data disk (/dev/sda),
     # never through the MDS (which can't reach it).
+    #
+    # Disabled on ubuntu2604: Ubuntu 26.04 (resolute) dropped the blkmapd binary
+    # from nfs-common (nfs-utils 2.8.5) and ships it in no package, so the block-
+    # layout client cannot be brought up (PNFS_BLOCK_SETUP runs /usr/sbin/blkmapd).
+    # The block-layout MDS path stays covered by the ubuntu2404 / ubuntu2204_hwe
+    # variants.  Only block layout needs blkmapd; the file/proxy pNFS tests above
+    # still run on 2604.
+    set(PNFS_BLOCK_DISABLED FALSE)
+    if(IMAGE_NAME STREQUAL "ubuntu2604")
+        set(PNFS_BLOCK_DISABLED TRUE)
+    endif()
     foreach(prog ${PNFS_BLOCK_PROGRAMS})
         foreach(pbackend ${PNFS_BLOCK_BACKENDS})
             add_test(NAME chimera/kvm/${IMAGE_NAME}/pnfs/block_${prog}_${pbackend}_nfs4.1
@@ -556,7 +668,8 @@ foreach(image_spec ${KVM_IMAGES})
                         ${CHIMERA_BINARY} ${pbackend}
                         "${PNFS_BLOCK_SETUP} && ${PNFS_BLOCK_WL_${prog}}")
             set_tests_properties(chimera/kvm/${IMAGE_NAME}/pnfs/block_${prog}_${pbackend}_nfs4.1
-                PROPERTIES LABELS "kvm;${IMAGE_NAME};pnfs" PROCESSORS 2)
+                PROPERTIES LABELS "kvm;${IMAGE_NAME};pnfs" PROCESSORS 2
+                           DISABLED ${PNFS_BLOCK_DISABLED})
         endforeach()
     endforeach()
 
@@ -590,60 +703,76 @@ foreach(image_spec ${KVM_IMAGES})
         endforeach()
     endforeach()
 
-    # SMB cthon04 tests
+    # SMB cthon04 tests, fanned over the dialect matrix (see SMB_DIALECTS).
     foreach(category ${CTHON_CATEGORIES})
-        foreach(backend ${KVM_BACKENDS})
-            add_test(NAME chimera/kvm/${IMAGE_NAME}/smb/cthon/${category}_${backend}
-                COMMAND bash ${SMB_WRAPPER}
-                        ${IMAGE_DIR}/vmlinuz ${IMAGE_DIR}/rootfs.qcow2
-                        ${CHIMERA_BINARY} ${backend}
-                        "${SMB_CTHON_CMD_${category}}")
-            set_tests_properties(chimera/kvm/${IMAGE_NAME}/smb/cthon/${category}_${backend}
-                PROPERTIES LABELS "kvm;${IMAGE_NAME}" PROCESSORS 2)
+        # "general" exercises every dialect; basic/special run on 3.1.1 only.
+        if(category STREQUAL "general")
+            set(_smb_cthon_dialects ${SMB_DIALECTS})
+        else()
+            set(_smb_cthon_dialects 3.1.1)
+        endif()
+        foreach(dialect ${_smb_cthon_dialects})
+            foreach(backend ${KVM_BACKENDS})
+                add_test(NAME chimera/kvm/${IMAGE_NAME}/smb/${dialect}/cthon/${category}_${backend}
+                    COMMAND bash ${SMB_WRAPPER}
+                            ${IMAGE_DIR}/vmlinuz ${IMAGE_DIR}/rootfs.qcow2
+                            ${CHIMERA_BINARY} ${backend} ${dialect} none
+                            "cd /opt/cthon04 && CIFS=yes MNTOPTIONS=vers=${dialect} ./runtests ${SMB_CTHON_FLAG_${category}} -f /mnt/test")
+                set_tests_properties(chimera/kvm/${IMAGE_NAME}/smb/${dialect}/cthon/${category}_${backend}
+                    PROPERTIES LABELS "kvm;${IMAGE_NAME}" PROCESSORS 2)
+            endforeach()
         endforeach()
     endforeach()
 
     if(CAIRN_ENABLED)
         foreach(category ${CTHON_CATEGORIES})
-            add_test(NAME chimera/kvm/${IMAGE_NAME}/smb/cthon/${category}_cairn
+            add_test(NAME chimera/kvm/${IMAGE_NAME}/smb/3.1.1/cthon/${category}_cairn
                 COMMAND bash ${SMB_WRAPPER}
                         ${IMAGE_DIR}/vmlinuz ${IMAGE_DIR}/rootfs.qcow2
-                        ${CHIMERA_BINARY} cairn
-                        "${SMB_CTHON_CMD_${category}}")
+                        ${CHIMERA_BINARY} cairn 3.1.1 none
+                        "cd /opt/cthon04 && CIFS=yes MNTOPTIONS=vers=3.1.1 ./runtests ${SMB_CTHON_FLAG_${category}} -f /mnt/test")
             # cairn's lock-key contention can push the SMB cthon run past the CI
             # default `ctest --timeout 300` under parallel load, so it flakes
             # (fails once, passes on rerun -- tracker #733).  Give it headroom
             # like the other contention-bound suites (cf. fsx, #805); a test
             # TIMEOUT property overrides the command-line default.
-            set_tests_properties(chimera/kvm/${IMAGE_NAME}/smb/cthon/${category}_cairn
+            set_tests_properties(chimera/kvm/${IMAGE_NAME}/smb/3.1.1/cthon/${category}_cairn
                 PROPERTIES LABELS "kvm;${IMAGE_NAME}" PROCESSORS 2 TIMEOUT 600)
         endforeach()
     endif()
 
-    # SMB xfstests
+    # SMB xfstests, fanned over the dialect matrix.  The two broad stress
+    # programs (fsstress, fsx) run on every dialect; the rest run on 3.1.1 only.
     foreach(prog ${XFSTESTS_PROGRAMS})
-        foreach(backend ${KVM_BACKENDS})
-            add_test(NAME chimera/kvm/${IMAGE_NAME}/smb/xfstests/${prog}_${backend}
-                COMMAND bash ${SMB_WRAPPER}
-                        ${IMAGE_DIR}/vmlinuz ${IMAGE_DIR}/rootfs.qcow2
-                        ${CHIMERA_BINARY} ${backend}
-                        "${XFSTESTS_CMD_${prog}}")
-            set_tests_properties(chimera/kvm/${IMAGE_NAME}/smb/xfstests/${prog}_${backend}
-                PROPERTIES LABELS "kvm;${IMAGE_NAME}" PROCESSORS 2)
+        if(prog STREQUAL "fsstress" OR prog STREQUAL "fsx")
+            set(_smb_xfs_dialects ${SMB_DIALECTS})
+        else()
+            set(_smb_xfs_dialects 3.1.1)
+        endif()
+        foreach(dialect ${_smb_xfs_dialects})
+            foreach(backend ${KVM_BACKENDS})
+                add_test(NAME chimera/kvm/${IMAGE_NAME}/smb/${dialect}/xfstests/${prog}_${backend}
+                    COMMAND bash ${SMB_WRAPPER}
+                            ${IMAGE_DIR}/vmlinuz ${IMAGE_DIR}/rootfs.qcow2
+                            ${CHIMERA_BINARY} ${backend} ${dialect} none
+                            "${XFSTESTS_CMD_${prog}}")
+                set_tests_properties(chimera/kvm/${IMAGE_NAME}/smb/${dialect}/xfstests/${prog}_${backend}
+                    PROPERTIES LABELS "kvm;${IMAGE_NAME}" PROCESSORS 2)
+            endforeach()
         endforeach()
     endforeach()
 
     if(CAIRN_ENABLED)
         foreach(prog ${XFSTESTS_PROGRAMS})
-            add_test(NAME chimera/kvm/${IMAGE_NAME}/smb/xfstests/${prog}_cairn
+            add_test(NAME chimera/kvm/${IMAGE_NAME}/smb/3.1.1/xfstests/${prog}_cairn
                 COMMAND bash ${SMB_WRAPPER}
                         ${IMAGE_DIR}/vmlinuz ${IMAGE_DIR}/rootfs.qcow2
-                        ${CHIMERA_BINARY} cairn
+                        ${CHIMERA_BINARY} cairn 3.1.1 none
                         "${XFSTESTS_CMD_${prog}}")
             # Same cairn lock-key contention as the SMB cthon cairn block above:
             # under load these can exceed the 300s CI default (e.g. the recurring
             # rewinddir_cairn timeout, #733).  Give them matching headroom.
-            set_tests_properties(chimera/kvm/${IMAGE_NAME}/smb/xfstests/${prog}_cairn
+            set_tests_properties(chimera/kvm/${IMAGE_NAME}/smb/3.1.1/xfstests/${prog}_cairn
                 PROPERTIES LABELS "kvm;${IMAGE_NAME}" PROCESSORS 2 TIMEOUT 600)
         endforeach()
     endif()

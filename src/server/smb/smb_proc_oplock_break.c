@@ -317,6 +317,9 @@ chimera_smb_lease_break_cb(
                 msg           = calloc(1, sizeof(*msg));
                 msg->conn     = conn;
                 msg->is_lease = true;
+                memcpy(msg->fh, file->fh, file->fh_len);
+                msg->fh_len  = file->fh_len;
+                msg->fh_hash = file->fh_hash;
                 memcpy(msg->lease_key, lease_key, 16);
                 msg->current_state             = current_smb;
                 msg->new_state                 = new_smb;
@@ -429,6 +432,9 @@ SYMBOL_EXPORT void
 chimera_smb_lease_break_flush(struct chimera_server_smb_thread *thread)
 {
     struct chimera_smb_lease_break_msg *list, *msg, *fifo = NULL;
+    struct chimera_vfs_state           *vfs_state =
+        thread->vfs_thread->vfs->vfs_state;
+    bool                                sent_lease = false;
 
     pthread_mutex_lock(&thread->lease_break_lock);
     list                      = thread->lease_break_ready;
@@ -454,6 +460,12 @@ chimera_smb_lease_break_flush(struct chimera_server_smb_thread *thread)
             chimera_smb_send_oplock_break_lease(msg->conn, msg->lease_key,
                                                 msg->current_state, msg->new_state,
                                                 msg->ack_required, msg->new_epoch);
+            /* The notification is now on the wire: mark the break delivered so a
+             * delete-on-close open parked for delivery (not for an ack) resumes
+             * with its reply ordered AFTER this break (smb2.lease.unlink). */
+            chimera_vfs_state_mark_break_notified(vfs_state, msg->fh, msg->fh_len,
+                                                  msg->fh_hash, msg->lease_key);
+            sent_lease = true;
         } else {
             chimera_smb_send_oplock_break_legacy(msg->conn,
                                                  msg->file_id_pid,
@@ -461,6 +473,13 @@ chimera_smb_lease_break_flush(struct chimera_server_smb_thread *thread)
                                                  msg->new_oplock_level);
         }
         free(msg);
+    }
+
+    /* Wake any delete-on-close open parked on a now-delivered break so it can
+     * complete on notify.  Broadcast (not just this thread) because the parked
+     * open lives on the triggering connection's thread, not the holder's. */
+    if (sent_lease) {
+        chimera_smb_create_resume_parked_broadcast(thread);
     }
 } /* chimera_smb_lease_break_flush */
 
@@ -624,6 +643,12 @@ chimera_smb_oplock_break(struct chimera_smb_request *request)
             open_file->lease_state = request->oplock_break.lease_state;
             chimera_smb_open_file_release(request, open_file);
         }
+        /* A lease-break ack whose lease key resolves to no open is benign --
+         * the holder closed before acking, or another handle still carries the
+         * lease (Samba smb2.lease.v2_complex2 acks after the breaking handle is
+         * gone and expects STATUS_OK).  FILE_CLOSED is reserved for the oplock
+         * (FileId) ack path below per MS-SMB2 3.3.5.22.1; here we fall through to
+         * settle/resume and reply SUCCESS. */
 
         /* The ack settled the lease; resume any CREATE that parked waiting for
          * this break to complete (MS-SMB2 pending-open). */
@@ -635,36 +660,98 @@ chimera_smb_oplock_break(struct chimera_smb_request *request)
     open_file = chimera_smb_open_file_resolve(request, &request->oplock_break.file_id);
 
     if (open_file) {
-        if (!open_file->oplock_break_ack_required) {
-            /* No acknowledgment was expected for this break -- e.g. it broke a
-             * LEVEL_II oplock to NONE, which MS-SMB2 says the client must not
-             * acknowledge.  Reply with the protocol error (3.3.5.22.2). */
+        uint8_t ack = request->oplock_break.oplock_level;
+        uint8_t cur = open_file->oplock_level;
+        /* "Open.OplockState == Breaking": a break that requires an ack is
+         * outstanding on this open.  A LEVEL_II break (to NONE) needs no ack, so
+         * such an open is never in this state -- a client ack against it is
+         * handled by the not-Breaking branch below. */
+        bool    breaking = open_file->oplock_break_ack_required &&
+            open_file->grant &&
+            open_file->grant->lease.break_state == CHIMERA_VFS_BREAK_BREAKING;
+
+        if (!breaking) {
+            /* MS-SMB2 3.3.5.22.1: an oplock acknowledgment received while the
+             * open is NOT in the Breaking state is rejected, and the exact
+             * status depends on the acknowledged OplockLevel and the level
+             * currently held on the open:
+             *   - ack == LEASE                          -> INVALID_PARAMETER
+             *   - open EXCLUSIVE/BATCH, ack not II/NONE  -> INVALID_OPLOCK_PROTOCOL
+             *   - open LEVEL_II, ack != NONE            -> INVALID_OPLOCK_PROTOCOL
+             *   - ack == II or NONE                     -> INVALID_DEVICE_STATE
+             * chimera previously collapsed every not-Breaking ack to
+             * INVALID_OPLOCK_PROTOCOL (WPTS OplockOnShareWithForceLevel2
+             * not-Breaking acks expect INVALID_PARAMETER / INVALID_DEVICE_STATE). */
+            uint32_t status;
+
+            if (ack == SMB2_OPLOCK_LEVEL_LEASE) {
+                status = SMB2_STATUS_INVALID_PARAMETER;
+            } else if ((cur == SMB2_OPLOCK_LEVEL_EXCLUSIVE ||
+                        cur == SMB2_OPLOCK_LEVEL_BATCH) &&
+                       ack != SMB2_OPLOCK_LEVEL_II &&
+                       ack != SMB2_OPLOCK_LEVEL_NONE) {
+                status = SMB2_STATUS_INVALID_OPLOCK_PROTOCOL;
+            } else if (cur == SMB2_OPLOCK_LEVEL_II &&
+                       ack != SMB2_OPLOCK_LEVEL_NONE) {
+                status = SMB2_STATUS_INVALID_OPLOCK_PROTOCOL;
+            } else if (ack == SMB2_OPLOCK_LEVEL_II ||
+                       ack == SMB2_OPLOCK_LEVEL_NONE) {
+                status = SMB2_STATUS_INVALID_DEVICE_STATE;
+            } else {
+                status = SMB2_STATUS_INVALID_OPLOCK_PROTOCOL;
+            }
+
             chimera_smb_open_file_release(request, open_file);
-            chimera_smb_complete_request(request,
-                                         SMB2_STATUS_INVALID_OPLOCK_PROTOCOL);
+            chimera_smb_complete_request(request, status);
             return;
         }
 
-        /* Resolve the outstanding break with the level the client chose to
-         * keep (it may drop further than what we asked -- e.g. straight to
-         * NONE).  The lease is genuinely BREAKING here (we no longer ack
-         * optimistically), so the canonical ack applies the mode, re-arms a
-         * surviving lease, and pumps any parked acquirer. */
+        /* Breaking: complete the outstanding break with the level the client
+         * chose to keep (it may drop further than what we asked -- e.g. straight
+         * to NONE).  Only LEVEL_II retains a read cache; NONE and any
+         * higher/garbage acknowledged level collapse to no caching. */
         if (open_file->grant) {
-            struct chimera_vfs_lease_mode kept = {
-                .granted = (request->oplock_break.oplock_level ==
-                            SMB2_OPLOCK_LEVEL_II) ? CHIMERA_VFS_LEASE_MODE_R : 0,
-                .denied  = 0,
-            };
+            struct chimera_vfs_lease     *lease    = &open_file->grant->lease;
+            uint8_t                       kept_vfs = (ack == SMB2_OPLOCK_LEVEL_II) ?
+                CHIMERA_VFS_LEASE_MODE_R : 0;
+            struct chimera_vfs_lease_mode kept;
 
-            chimera_vfs_lease_ack(&open_file->grant->lease, kept);
+            /* The kept level must be a subset of what the break left the holder
+             * (break_needed_mode).  A break driven by a write / namespace
+             * invalidation breaks to NONE (break_needed_mode == 0), so an ack
+             * that keeps LEVEL_II (a read cache) on data a conflicting writer is
+             * mutating is rejected rather than silently re-arming a stale read
+             * cache (#1285). */
+            if (kept_vfs & ~lease->break_needed_mode) {
+                chimera_smb_open_file_release(request, open_file);
+                chimera_smb_complete_request(request,
+                                             SMB2_STATUS_REQUEST_NOT_ACCEPTED);
+                return;
+            }
+
+            kept.granted = kept_vfs;
+            kept.denied  = 0;
+
+            chimera_vfs_lease_ack(lease, kept);
         }
         (void) vfs_state;
 
-        open_file->oplock_level              = request->oplock_break.oplock_level;
+        /* 3.3.5.22.1: set Open.OplockLevel to II only when the client kept a
+         * LEVEL_II read cache; otherwise the open drops to NONE. */
+        open_file->oplock_level = (ack == SMB2_OPLOCK_LEVEL_II) ?
+            SMB2_OPLOCK_LEVEL_II : SMB2_OPLOCK_LEVEL_NONE;
         open_file->oplock_break_ack_required = 0;
 
         chimera_smb_open_file_release(request, open_file);
+    } else {
+        /* MS-SMB2 3.3.5.22.1 "Processing an Oplock Acknowledgment": if the
+         * FileId in the acknowledgment does not map to an open in the table
+         * (the open was closed before the client's ack arrived), the server
+         * MUST fail the request with STATUS_FILE_CLOSED.  Previously this path
+         * fell through to STATUS_SUCCESS, which the MS-SMB2Model suite flags. */
+        chimera_smb_create_resume_parked(request);
+        chimera_smb_complete_request(request, SMB2_STATUS_FILE_CLOSED);
+        return;
     }
 
     /* Resume any CREATE parked waiting for this break to complete. */
@@ -682,8 +769,9 @@ chimera_smb_oplock_break_reply(
         evpl_iovec_cursor_append_uint16(reply_cursor,
                                         SMB2_OPLOCK_BREAK_ACK_LEASE_SIZE);
         evpl_iovec_cursor_append_uint16(reply_cursor, 0);  /* Reserved */
-        evpl_iovec_cursor_append_uint32(reply_cursor,
-                                        request->oplock_break.lease_flags);
+        /* Flags is Reserved in the lease break-ack response (MS-SMB2 2.2.25.2):
+         * the server MUST set it to zero, not echo the client's LeaseFlags. */
+        evpl_iovec_cursor_append_uint32(reply_cursor, 0);
         /* LeaseKey (16) */
         evpl_iovec_cursor_append_blob(reply_cursor,
                                       request->oplock_break.lease_key, 16);

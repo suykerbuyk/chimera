@@ -9,6 +9,22 @@
 #include "vfs/vfs_release.h"
 #include "s3_internal.h"
 #include "s3_etag.h"
+#include "s3_metadata.h"
+#include "s3_tagging.h"
+
+/* Terminal: emit the PutObject response (called directly, or after the
+ * optional x-amz-tagging xattrs have been stored). */
+static void
+chimera_s3_put_respond(
+    struct evpl               *evpl,
+    struct chimera_s3_request *request)
+{
+    request->vfs_state = CHIMERA_S3_VFS_STATE_SEND;
+
+    if (request->http_state == CHIMERA_S3_HTTP_STATE_RECVED) {
+        s3_server_respond(evpl, request);
+    }
+} /* chimera_s3_put_respond */
 
 static void
 chimera_s3_put_getattr_callback(
@@ -30,13 +46,21 @@ chimera_s3_put_getattr_callback(
         chimera_s3_attach_etag(request->http_request, attr);
     }
 
-    chimera_vfs_release(thread->vfs, request->file_handle);
-
-    request->vfs_state = CHIMERA_S3_VFS_STATE_SEND;
-
-    if (request->http_state == CHIMERA_S3_HTTP_STATE_RECVED) {
-        s3_server_respond(evpl, request);
+    if (request->file_handle) {
+        chimera_vfs_release(thread->vfs, request->file_handle);
+        request->file_handle = NULL;
     }
+
+    /* If the PutObject carried an x-amz-tagging header, store the parsed tags
+     * as xattrs on the freshly-written object before responding. */
+    if (request->status == CHIMERA_S3_STATUS_OK && request->tagging &&
+        request->tagging->n_tags > 0) {
+        chimera_s3_tagging_store_by_path(evpl, thread, request,
+                                         chimera_s3_put_respond);
+        return;
+    }
+
+    chimera_s3_put_respond(evpl, request);
 } /* chimera_s3_put_getattr_callback */
 
 static inline void
@@ -48,11 +72,17 @@ chimera_s3_put_finish_common(
     struct chimera_server_s3_thread *thread  = request->thread;
     struct evpl                     *evpl    = thread->evpl;
 
-    chimera_vfs_release(thread->vfs, request->dir_handle);
+    if (request->dir_handle) {
+        chimera_vfs_release(thread->vfs, request->dir_handle);
+        request->dir_handle = NULL;
+    }
 
     if (error_code) {
         request->status = CHIMERA_S3_STATUS_INTERNAL_ERROR;
-        chimera_vfs_release(thread->vfs, request->file_handle);
+        if (request->file_handle) {
+            chimera_vfs_release(thread->vfs, request->file_handle);
+            request->file_handle = NULL;
+        }
         request->vfs_state = CHIMERA_S3_VFS_STATE_SEND;
         if (request->http_state == CHIMERA_S3_HTTP_STATE_RECVED) {
             s3_server_respond(evpl, request);
@@ -61,7 +91,8 @@ chimera_s3_put_finish_common(
     }
 
     /* Fetch the object's final attributes to build the response ETag, then
-     * release the file handle and respond from the getattr callback. */
+     * release the file handle and respond (storing x-amz-tagging xattrs first,
+     * if present) from the getattr callback. */
     chimera_vfs_getattr(thread->vfs,
                         &thread->shared->cred,
                         request->file_handle,
@@ -280,6 +311,35 @@ chimera_s3_put_recv(
 } /* chimera_s3_put_recv */
 
 
+/*
+ * The destination file exists and its metadata xattrs (Content-Type and any
+ * x-amz-meta-*) have been written. Begin draining the request body into it.
+ */
+static void
+chimera_s3_put_metadata_done(
+    struct chimera_s3_request *request,
+    int                        error,
+    void                      *private_data)
+{
+    struct chimera_server_s3_thread *thread = request->thread;
+    struct evpl                     *evpl   = thread->evpl;
+
+    if (error) {
+        request->status    = CHIMERA_S3_STATUS_INTERNAL_ERROR;
+        request->vfs_state = CHIMERA_S3_VFS_STATE_COMPLETE;
+        chimera_vfs_release(thread->vfs, request->file_handle);
+        request->file_handle = NULL;
+        chimera_vfs_release(thread->vfs, request->dir_handle);
+        request->dir_handle = NULL;
+        if (request->http_state == CHIMERA_S3_HTTP_STATE_RECVED) {
+            s3_server_respond(evpl, request);
+        }
+        return;
+    }
+
+    chimera_s3_put_recv(evpl, request);
+} /* chimera_s3_put_metadata_done */
+
 static void
 chimera_s3_put_create_unlinked_callback(
     enum chimera_vfs_error          error_code,
@@ -290,7 +350,6 @@ chimera_s3_put_create_unlinked_callback(
 {
     struct chimera_s3_request       *request = private_data;
     struct chimera_server_s3_thread *thread  = request->thread;
-    struct evpl                     *evpl    = thread->evpl;
 
     if (error_code) {
         request->status    = CHIMERA_S3_STATUS_NO_SUCH_KEY;
@@ -305,7 +364,8 @@ chimera_s3_put_create_unlinked_callback(
     /* The response ETag is attached after the body is written, from the
      * object's final attributes (see chimera_s3_put_getattr_callback). */
 
-    chimera_s3_put_recv(evpl, request);
+    chimera_s3_metadata_store_from_headers(request, oh,
+                                           chimera_s3_put_metadata_done, NULL);
 
 } /* chimera_s3_put_create_unlinked_callback */
 
@@ -321,7 +381,6 @@ chimera_s3_put_create_callback(
 {
     struct chimera_s3_request       *request = private_data;
     struct chimera_server_s3_thread *thread  = request->thread;
-    struct evpl                     *evpl    = thread->evpl;
 
     if (error_code) {
         request->status    = CHIMERA_S3_STATUS_NO_SUCH_KEY;
@@ -336,7 +395,8 @@ chimera_s3_put_create_callback(
     /* The response ETag is attached after the body is written, from the
      * object's final attributes (see chimera_s3_put_getattr_callback). */
 
-    chimera_s3_put_recv(evpl, request);
+    chimera_s3_metadata_store_from_headers(request, oh,
+                                           chimera_s3_put_metadata_done, NULL);
 
 } /* chimera_s3_put_create_callback */
 
@@ -427,6 +487,29 @@ chimera_s3_put(
     const char *slash;
     const char *dirpath = request->path;
     int         dirpathlen;
+    const char *tagging_hdr;
+
+    /* x-amz-tagging: parse + validate the tag set now so a violation is
+     * reported as 400 InvalidTag before any object bytes are written. The tags
+     * are applied as xattrs once the object is in place (put_finish_common). */
+    tagging_hdr = evpl_http_request_header(request->http_request, "x-amz-tagging");
+
+    if (tagging_hdr && tagging_hdr[0]) {
+        struct chimera_s3_tagging_ctx *ctx = calloc(1, sizeof(*ctx));
+
+        request->tagging = ctx;
+
+        if (chimera_s3_tagging_parse_header(ctx, tagging_hdr) != 0) {
+            free(ctx);
+            request->tagging   = NULL;
+            request->status    = CHIMERA_S3_STATUS_INVALID_TAG;
+            request->vfs_state = CHIMERA_S3_VFS_STATE_COMPLETE;
+            if (request->http_state == CHIMERA_S3_HTTP_STATE_RECVED) {
+                s3_server_respond(evpl, request);
+            }
+            return;
+        }
+    }
 
     slash = rindex(request->path, '/');
 

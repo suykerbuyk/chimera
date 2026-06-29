@@ -49,19 +49,41 @@ chimera_nfs3_link(
     void                      *private_data)
 {
     struct chimera_server_nfs_thread *thread = private_data;
+    struct chimera_server_nfs_shared *shared = thread->shared;
     struct nfs_request               *req;
+    struct LINK3res                   res;
+    uint16_t                          linkdir_export_id;
+    int                               rc;
 
     req = nfs_request_alloc(thread, conn, encoding);
-    chimera_nfs_map_cred(&req->cred, cred);
+    chimera_nfs_map_cred_req(req, cred);
 
     nfs3_dump_link(req, args);
 
+    /* Decode the existing-file handle (sets the request export + squash) and
+     * the target-directory handle (authenticated into req->saved_fh).  The
+     * target handle must outlive this (async) call, so it lives in the request
+     * rather than on the stack (saved_fh is unused by NFSv3). */
+    res.status = chimera_nfs3_decode_fh(req, args->file.data.data, args->file.data.len);
+    if (res.status != NFS3_OK ||
+        chimera_nfs_fh_unwrap(args->link.dir.data.data, args->link.dir.data.len,
+                              &linkdir_export_id, req->saved_fh, &req->saved_fhlen,
+                              shared->fh_key, shared->fh_sign) != CHIMERA_NFS_FH_OK) {
+        nfsstat3 fh_status = res.status != NFS3_OK ? res.status : NFS3ERR_BADHANDLE;
+        memset(&res, 0, sizeof(res));
+        res.status = fh_status;
+        rc         = shared->nfs_v3.send_reply_NFSPROC3_LINK(evpl, NULL, &res, req->encoding);
+        chimera_nfs_abort_if(rc, "Failed to send RPC2 reply");
+        nfs_request_free(thread, req);
+        return;
+    }
+
     chimera_vfs_link_at(thread->vfs_thread,
                         &req->cred,
-                        args->file.data.data,
-                        args->file.data.len,
-                        args->link.dir.data.data,
-                        args->link.dir.data.len,
+                        req->fh,
+                        req->fhlen,
+                        req->saved_fh,
+                        req->saved_fhlen,
                         args->link.name.str,
                         args->link.name.len,
                         0,
