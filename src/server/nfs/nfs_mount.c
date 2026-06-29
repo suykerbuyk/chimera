@@ -180,29 +180,61 @@ chimera_nfs_mount_lookup_complete(
     struct chimera_server_nfs_thread *thread = req->thread;
     struct evpl                      *evpl   = thread->evpl;
     struct chimera_server_nfs_shared *shared = thread->shared;
-    int32_t                           auth_flavors[2];
+    int32_t                           auth_flavors[3];
     struct mountres3                  res;
     int                               rc;
 
     if (error_code == CHIMERA_VFS_OK) {
-        res.fhs_status                 = MNT3_OK;
-        res.mountinfo.num_auth_flavors = 2;
+        const struct chimera_nfs_export *export =
+            chimera_nfs_get_export_by_id(shared, req->export_id);
+        uint32_t                         sec = export ? export->sec_allowed : 0;
+        int                              nf  = 0;
+
+        res.fhs_status = MNT3_OK;
+
+        /* Advertise the export's allowed flavors.  MOUNT carries bare flavor
+         * numbers, so krb5/krb5i/krb5p collapse to RPCSEC_GSS (6).  An export
+         * with no explicit policy keeps the historical [AUTH_NONE, AUTH_SYS]. */
+        if (sec == 0) {
+            auth_flavors[nf++] = AUTH_NONE;
+            auth_flavors[nf++] = AUTH_SYS;
+        } else {
+            if (sec & CHIMERA_NFS_SEC_SYS) {
+                auth_flavors[nf++] = AUTH_SYS;
+            }
+            if (sec & (CHIMERA_NFS_SEC_KRB5 | CHIMERA_NFS_SEC_KRB5I |
+                       CHIMERA_NFS_SEC_KRB5P)) {
+                auth_flavors[nf++] = 6;   /* RPCSEC_GSS */
+            }
+        }
+        res.mountinfo.num_auth_flavors = nf;
         res.mountinfo.auth_flavors     = auth_flavors;
-        auth_flavors[0]                = AUTH_NONE;
-        auth_flavors[1]                = AUTH_SYS;
+
+        uint8_t wire[CHIMERA_NFS_FH_MAX];
+        int     wirelen;
 
         chimera_nfs_abort_if(!(attr->va_set_mask & CHIMERA_VFS_ATTR_FH),
                              "NFS mount: no file handle was returned");
 
+        /* Wrap the export root handle with its export id (and sign it) before
+         * handing it to the client, so subsequent NFSv3 ops can attribute it. */
+        chimera_nfs_fh_encode(req, attr->va_fh, attr->va_fh_len, wire, &wirelen);
+
         rc = xdr_dbuf_alloc_opaque(&res.mountinfo.fhandle,
-                                   attr->va_fh_len,
+                                   wirelen,
                                    req->encoding->dbuf);
         chimera_nfs_abort_if(rc, "Failed to allocate opaque");
-        memcpy(res.mountinfo.fhandle.data,
-               attr->va_fh,
-               attr->va_fh_len);
+        memcpy(res.mountinfo.fhandle.data, wire, wirelen);
     } else {
-        res.fhs_status = MNT3ERR_NOENT;
+        /* Map the export-root lookup failure to the matching mountstat3 rather
+         * than collapsing everything to NOENT (RFC 1813 App. I). */
+        switch (error_code) {
+            case CHIMERA_VFS_EACCES:  res.fhs_status = MNT3ERR_ACCES; break;
+            case CHIMERA_VFS_ENOTDIR: res.fhs_status = MNT3ERR_NOTDIR; break;
+            case CHIMERA_VFS_EINVAL:  res.fhs_status = MNT3ERR_INVAL; break;
+            case CHIMERA_VFS_ENOENT:  res.fhs_status = MNT3ERR_NOENT; break;
+            default:                  res.fhs_status = MNT3ERR_SERVERFAULT; break;
+        } /* switch */
     }
 
     rc = shared->mount_v3.send_reply_MOUNTPROC3_MNT(evpl, NULL, &res, req->encoding);
@@ -230,11 +262,13 @@ chimera_nfs_mount_mnt(
     char                              hostname[64];
     char                              directory[MNTPATHLEN + 1];
 
+    const struct chimera_nfs_export  *export = NULL;
+
     req = nfs_request_alloc(thread, conn, encoding);
 
-    chimera_nfs_map_cred(&req->cred, cred);
+    chimera_nfs_map_cred_req(req, cred);
 
-    rc = chimera_nfs_find_export_path(shared, args->path.str, args->path.len, &full_path);
+    rc = chimera_nfs_find_export_path(shared, args->path.str, args->path.len, &full_path, &export);
     if (rc) {
         // Export not found, return error
         chimera_nfs_debug("NFS mount request for unknown export '%s'", args->path.str);
@@ -252,6 +286,10 @@ chimera_nfs_mount_mnt(
      * succeed; recording here keeps the advisory rmtab simple without
      * threading the path through the async completion.
      */
+    /* Adopt the matched export so the MNT reply's root handle is wrapped with
+     * its id (and the export's squash applies to this request). */
+    chimera_nfs_set_export(req, export);
+
     chimera_nfs_mount_client_host(conn, hostname, sizeof(hostname));
     chimera_nfs_mount_copy_path(&args->path, directory, sizeof(directory));
     chimera_nfs_mount_record(shared, hostname, directory);

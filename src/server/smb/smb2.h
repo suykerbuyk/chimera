@@ -129,6 +129,8 @@
 #define SMB2_STATUS_NO_EAS_ON_FILE                    0xC0000052
 #define SMB2_STATUS_EA_CORRUPT_ERROR                  0xC0000053
 #define SMB2_STATUS_FILE_LOCK_CONFLICT                0xC0000054
+#define SMB2_STATUS_INVALID_EA_NAME                   0x80000013
+#define SMB2_STATUS_EA_LIST_INCONSISTENT              0x80000014
 #define SMB2_STATUS_LOCK_NOT_GRANTED                  0xC0000055
 #define SMB2_STATUS_INVALID_LOCK_RANGE                0xC00001A1
 #define SMB2_STATUS_DELETE_PENDING                    0xC0000056
@@ -272,6 +274,9 @@
 #define SMB2_STATUS_DOMAIN_LIMIT_EXCEEDED             0xC00000E1
 #define SMB2_STATUS_OPLOCK_NOT_GRANTED                0xC00000E2
 #define SMB2_STATUS_INVALID_OPLOCK_PROTOCOL           0xC00000E3
+/* Returned for an atomic FILE_OPEN_REQUIRING_OPLOCK create whose oplock/lease
+ * could not be granted (MS-SMB2 3.3.5.9.9). */
+#define SMB2_STATUS_CANNOT_BREAK_OPLOCK               0xC0000909
 #define SMB2_STATUS_INTERNAL_DB_CORRUPTION            0xC00000E4
 #define SMB2_STATUS_INTERNAL_ERROR                    0xC00000E5
 #define SMB2_STATUS_GENERIC_NOT_MAPPED                0xC00000E6
@@ -707,6 +712,7 @@ typedef uint8_t smb2_guid[SMB2_GUID_SIZE];
 #define SMB2_SIGNING_REQUIRED                       0x02
 
 // SMB2 TREE_CONNECT response ShareFlags
+#define SMB2_SHAREFLAG_FORCE_LEVELII_OPLOCK         0x00001000 // Share forces level-2 oplocks
 #define SMB2_SHAREFLAG_ACCESS_BASED_DIRECTORY_ENUM  0x00000800
 #define SMB2_SHAREFLAG_ENCRYPT_DATA                 0x00008000 // Per-share encryption (SMB 3.0+)
 #define SMB2_SHAREFLAG_COMPRESS_DATA                0x00100000 // Share supports compression (SMB 3.1.1+)
@@ -793,6 +799,9 @@ typedef uint8_t smb2_guid[SMB2_GUID_SIZE];
 /* CHANGE_NOTIFY constants */
 #define SMB2_CHANGE_NOTIFY_REQUEST_SIZE             32
 #define SMB2_CHANGE_NOTIFY_REPLY_SIZE               9
+
+/* CANCEL request fixed StructureSize (MS-SMB2 2.2.30). */
+#define SMB2_CANCEL_REQUEST_SIZE                    4
 
 #define SMB2_WATCH_TREE                             0x0001
 
@@ -1065,9 +1074,20 @@ typedef uint8_t smb2_guid[SMB2_GUID_SIZE];
  * default; any larger request is capped at the maximum (MS-SMB2 3.3.5.15.9). */
 #define CHIMERA_SMB_RESILIENCY_DEFAULT_TIMEOUT_MS   120000U
 #define CHIMERA_SMB_RESILIENCY_MAX_TIMEOUT_MS       300000U
+/* Server floor on a requested resiliency timeout: a handle reconnect needs
+ * several round trips after the network drop, so a sub-second window would
+ * expire the handle mid-reconnect under load.  Below every resiliency timeout
+ * the pike persistent.py suite uses (>= 2 s), so it only affects durable.py's
+ * 100 ms cases. */
+#define CHIMERA_SMB_RESILIENCY_MIN_TIMEOUT_MS       1000U
 
 #define SMB2_IO_REPARSE_TAG_NFS                     0x80000014
 #define SMB2_IO_REPARSE_TAG_SYMLINK                 0xA000000C
+/* SymbolicLinkErrorResponse SymLinkErrorTag (MS-SMB2 2.2.2.2.1): 'SYML'. */
+#define SMB2_SYMLINK_ERROR_TAG                      0x4C4D5953
+/* SYMBOLIC_LINK_REPARSE_BUFFER Flags (MS-FSCC 2.1.2.4). */
+#define SMB2_SYMLINK_FLAG_ABSOLUTE                  0x00000000
+#define SMB2_SYMLINK_FLAG_RELATIVE                  0x00000001
 #define SMB2_NFS_SPECFILE_LNK                       0x0000000000004B4E4CULL
 #define SMB2_NFS_SPECFILE_CHR                       0x0000000000524843ULL
 #define SMB2_NFS_SPECFILE_BLK                       0x00000000004B4C42ULL
@@ -1143,7 +1163,9 @@ typedef uint8_t smb2_guid[SMB2_GUID_SIZE];
 #define SMB2_FS_ATTR_CASE_SENSITIVE_SEARCH          0x00000001
 #define SMB2_FS_ATTR_CASE_PRESERVED_NAMES           0x00000002
 #define SMB2_FS_ATTR_UNICODE_ON_DISK                0x00000004
+#define SMB2_FS_ATTR_SUPPORTS_SPARSE_FILES          0x00000040
 #define SMB2_FS_ATTR_SUPPORTS_REPARSE_POINTS        0x00000080
+#define SMB2_FS_ATTR_SUPPORTS_BLOCK_REFCOUNTING     0x08000000
 
 /*
  * FileAllInformation includes all the following structures:
@@ -1212,4 +1234,5 @@ struct smb_direct_hdr {
     uint32_t data_length;
 };
 
-#define SMB2_CHANNEL_RDMA_V1 0x00000001
+#define SMB2_CHANNEL_RDMA_V1            0x00000001
+#define SMB2_CHANNEL_RDMA_V1_INVALIDATE 0x00000002

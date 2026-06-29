@@ -53,7 +53,7 @@ chimera_smb_negotiate(struct chimera_smb_request *request)
     struct chimera_server_smb_thread *thread = request->compound->thread;
     struct chimera_server_smb_shared *shared = thread->shared;
     struct chimera_smb_conn          *conn   = request->compound->conn;
-    struct timespec                   now, up, boot;
+    struct timespec                   now;
     uint16_t                          dialect = 0, candidate;
     int                               i, j;
 
@@ -82,19 +82,6 @@ chimera_smb_negotiate(struct chimera_smb_request *request)
         CLOCK_REALTIME,
         &now);
 
-    clock_gettime(
-        CLOCK_BOOTTIME,
-        &up);
-
-    boot.tv_sec = now.tv_sec  - up.tv_sec;
-
-    if (now.tv_nsec >= up.tv_nsec) {
-        boot.tv_nsec = now.tv_nsec - up.tv_nsec;
-    } else {
-        boot.tv_nsec = up.tv_nsec - now.tv_nsec;
-        boot.tv_sec--;
-    }
-
     for (i = 0; i < request->negotiate.dialect_count; i++) {
 
         candidate = request->negotiate.dialects[i];
@@ -112,8 +99,16 @@ chimera_smb_negotiate(struct chimera_smb_request *request)
     }
 
     if (dialect == 0) {
-        chimera_smb_error("No valid dialect found");
-        chimera_smb_complete_request(request, SMB2_STATUS_INVALID_PARAMETER);
+        /* MS-SMB2 3.3.5.4: DialectCount == 0 (no dialects offered) MUST fail with
+         * STATUS_INVALID_PARAMETER; dialects offered but none in common is
+         * STATUS_NOT_SUPPORTED. */
+        if (request->negotiate.dialect_count == 0) {
+            chimera_smb_error("SMB2 NEGOTIATE with DialectCount 0");
+            chimera_smb_complete_request(request, SMB2_STATUS_INVALID_PARAMETER);
+        } else {
+            chimera_smb_error("No common SMB2 dialect found");
+            chimera_smb_complete_request(request, SMB2_STATUS_NOT_SUPPORTED);
+        }
         return;
     }
 
@@ -125,7 +120,16 @@ chimera_smb_negotiate(struct chimera_smb_request *request)
     if (dialect >= 0x210 && (shared->config.capabilities & SMB2_GLOBAL_CAP_LEASING)) {
         conn->capabilities |= SMB2_GLOBAL_CAP_LEASING;
     }
-    if (dialect >= 0x300 && (shared->config.capabilities & SMB2_GLOBAL_CAP_MULTI_CHANNEL)) {
+    /* Advertise MULTI_CHANNEL only when (a) at least one network interface is
+     * configured -- the capability is meaningless without interfaces to return
+     * from FSCTL_QUERY_NETWORK_INTERFACE_INFO -- AND (b) the client also offered
+     * SMB2_GLOBAL_CAP_MULTI_CHANNEL in its NEGOTIATE.  Per MS-SMB2 3.3.5.4 the
+     * client drives whether alternate channels are negotiated, so a client that
+     * did not request it must not see it echoed back (pike negotiate
+     * test_smb3_no_advert vs the positive test_smb3 on a multichannel server). */
+    if (dialect >= 0x300 && (shared->config.capabilities & SMB2_GLOBAL_CAP_MULTI_CHANNEL) &&
+        shared->config.num_nic_info > 0 &&
+        (request->negotiate.capabilities & SMB2_GLOBAL_CAP_MULTI_CHANNEL)) {
         conn->capabilities |= SMB2_GLOBAL_CAP_MULTI_CHANNEL;
     }
     if (dialect >= 0x300 && shared->config.persistent_handles) {
@@ -138,8 +142,12 @@ chimera_smb_negotiate(struct chimera_smb_request *request)
     }
     /* Encryption is advertised via SMB2_GLOBAL_CAP_ENCRYPTION for 3.0/3.0.2;
      * for 3.1.1 it is negotiated through the encryption-capabilities context
-     * instead and the capability bit MUST NOT be set (MS-SMB2 §3.3.5.4). */
-    if (dialect >= 0x300 && dialect < 0x311 && shared->config.encryption) {
+     * instead and the capability bit MUST NOT be set (MS-SMB2 §3.3.5.4).  The
+     * server echoes the capability only when the CLIENT also advertised it: per
+     * §3.3.5.4 SMB2_GLOBAL_CAP_ENCRYPTION is set in the response only if it was
+     * set in the request (SMB2Model Encryption ClientNotSupportsEncryption). */
+    if (dialect >= 0x300 && dialect < 0x311 && shared->config.encryption &&
+        (request->negotiate.capabilities & SMB2_GLOBAL_CAP_ENCRYPTION)) {
         conn->capabilities |= SMB2_GLOBAL_CAP_ENCRYPTION;
     }
 
@@ -160,7 +168,10 @@ chimera_smb_negotiate(struct chimera_smb_request *request)
     request->negotiate.r_max_read_size     = 8 * 1024 * 1024;
     request->negotiate.r_max_write_size    = 8 * 1024 * 1024;
     request->negotiate.r_system_time       = chimera_nt_time(&now);
-    request->negotiate.r_server_start_time = chimera_nt_time(&boot);
+    /* ServerStartTime is the SMB server instance start time (captured once at
+     * init), not the OS boot time -- so an in-place chimera restart is visible
+     * to clients keying off this field (issue #1225, MS-SMB2 3.3.1.5). */
+    request->negotiate.r_server_start_time = shared->server_start_time;
 
     memcpy(request->negotiate.r_server_guid, shared->guid, SMB2_GUID_SIZE);
 
@@ -952,12 +963,20 @@ chimera_smb_select_negotiated_algorithms(
         }
     } else if (conn->dialect >= SMB2_DIALECT_3_0 &&
                conn->dialect < SMB2_DIALECT_3_1_1 &&
-               (conn->thread->shared->config.encryption ||
-                conn->thread->shared->any_share_encrypt)) {
+               (conn->thread->shared->config.encryption
+                ? (request->negotiate.capabilities & SMB2_GLOBAL_CAP_ENCRYPTION)
+                : conn->thread->shared->any_share_encrypt)) {
         /* SMB 3.0/3.0.2 has no encryption-capabilities context; the only cipher
          * is AES-128-CCM (MS-SMB2 §3.1.4.3).  Set it so SESSION_SETUP can derive
          * keys when encryption is enabled globally OR a per-share-encrypted tree
-         * may be reached on this connection. */
+         * may be reached on this connection.  Under GLOBAL (whole-session)
+         * encryption the cipher is set only when the CLIENT advertised
+         * SMB2_GLOBAL_CAP_ENCRYPTION: a 3.x client that cannot encrypt must not be
+         * marked encrypt-all and then have its cleartext traffic rejected (SMB2Model
+         * Encryption ClientNotSupportsEncryption).  Under per-share-only encryption
+         * the session is not encrypt-all, so the cipher is provisioned whenever an
+         * encrypted share may be reached (a non-encrypting client is instead denied
+         * by the per-share ENCRYPT_DATA check), preserving the prior behavior. */
         conn->negotiated.cipher_id = SMB2_ENCRYPTION_AES_128_CCM;
     }
 
@@ -1001,8 +1020,15 @@ chimera_smb_select_negotiated_algorithms(
                 conn->negotiated.compression_flags = SMB2_COMPRESSION_FLAG_CHAINED;
             }
         } else {
-            /* No shared algorithm: do not emit a response context. */
-            conn->negotiated.ctx_present_mask &= ~CHIMERA_SMB_NEGOTIATE_CTX_COMPRESSION;
+            /* No shared algorithm: MS-SMB2 3.3.5.4 still requires the server to
+             * build a COMPRESSION_CAPABILITIES response context when it processed
+             * the request context, advertising CompressionAlgorithmCount=1 with
+             * the algorithm NONE.  This lets the client distinguish "no common
+             * algorithm" from "no compression support" (issue #1031).  Keep the
+             * context bit set so the emitter runs. */
+            conn->negotiated.compression_algs[0]   = SMB2_COMPRESSION_NONE;
+            conn->negotiated.compression_alg_count = 1;
+            conn->negotiated.compression_flags     = 0;
         }
     }
 } /* chimera_smb_select_negotiated_algorithms */
@@ -1058,6 +1084,18 @@ chimera_smb_parse_negotiate(
     request->negotiate.ctx_present_mask = 0;
 
     if (request->negotiate.negotiate_context_count) {
+        /* Bound NegotiateContextCount up-front (MS-SMB2 2.2.3.1 / 3.3.5.4): a
+         * hostile count (e.g. 0xFFFF) would otherwise drive the parse loop until
+         * a truncation guard fires.  There are only a handful of valid context
+         * types; reject anything beyond the supported maximum rather than
+         * leniently scanning off the end of the message (issue #1224). */
+        if (request->negotiate.negotiate_context_count > SMB2_MAX_NEGOTIATE_CONTEXTS) {
+            chimera_smb_error("SMB2 NEGOTIATE context count %u exceeds max %u",
+                              request->negotiate.negotiate_context_count,
+                              SMB2_MAX_NEGOTIATE_CONTEXTS);
+            return chimera_smb_parse_reject(request, SMB2_STATUS_INVALID_PARAMETER);
+        }
+
         /* Seek to the context list (validated forward and within the message);
          * smb_cursor_seek_to subsumes the old precedes-consumed underflow guard. */
         if (unlikely(smb_cursor_seek_to(request_cursor,

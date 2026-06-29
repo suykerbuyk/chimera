@@ -84,7 +84,8 @@ chimera_nfs3_setattr_guard_callback(
         return;
     }
 
-    if (attr->va_ctime.tv_sec  != args->guard.obj_ctime.seconds ||
+    if (!(attr->va_set_mask & CHIMERA_VFS_ATTR_CTIME) ||
+        attr->va_ctime.tv_sec  != args->guard.obj_ctime.seconds ||
         attr->va_ctime.tv_nsec != args->guard.obj_ctime.nseconds) {
         res.status = NFS3ERR_NOT_SYNC;
         chimera_nfs3_set_wcc_data(&res.resfail.obj_wcc, NULL, NULL);
@@ -144,15 +145,29 @@ chimera_nfs3_setattr(
     void                      *private_data)
 {
     struct chimera_server_nfs_thread *thread = private_data;
+    struct chimera_server_nfs_shared *shared = thread->shared;
     struct nfs_request               *req;
+    struct SETATTR3res                res;
     unsigned int                      open_flags;
+    int                               rc;
 
     req = nfs_request_alloc(thread, conn, encoding);
-    chimera_nfs_map_cred(&req->cred, cred);
+    chimera_nfs_map_cred_req(req, cred);
 
     nfs3_dump_setattr(req, args);
 
     req->args_setattr = args;
+
+    res.status = chimera_nfs3_decode_fh(req, args->object.data.data, args->object.data.len);
+    if (res.status != NFS3_OK) {
+        nfsstat3 fh_status = res.status;
+        memset(&res, 0, sizeof(res));
+        res.status = fh_status;
+        rc         = shared->nfs_v3.send_reply_NFSPROC3_SETATTR(evpl, NULL, &res, req->encoding);
+        chimera_nfs_abort_if(rc, "Failed to send RPC2 reply");
+        nfs_request_free(thread, req);
+        return;
+    }
 
     /*
      * Use a real file handle instead of OPEN_PATH when setting size, because
@@ -165,8 +180,8 @@ chimera_nfs3_setattr(
     }
 
     chimera_vfs_open_fh(thread->vfs_thread, &req->cred,
-                        args->object.data.data,
-                        args->object.data.len,
+                        req->fh,
+                        req->fhlen,
                         open_flags,
                         chimera_nfs3_setattr_open_callback,
                         req);

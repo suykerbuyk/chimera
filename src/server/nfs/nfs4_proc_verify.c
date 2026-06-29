@@ -102,7 +102,10 @@ chimera_nfs4_verify_complete(
                                                              req->fh, req->fhlen),
                                 chimera_server_config_get_nfs4_delegations(
                                     req->thread->shared->config),
-                                req->thread->shared->nfs_lease_time_s);
+                                req->thread->shared->nfs_lease_time_s,
+                                req->export_id,
+                                req->thread->shared->fh_key,
+                                req->thread->shared->fh_sign);
 
     bool match = (num_out_mask == args->num_attrmask) &&
         (memcmp(out_mask, args->attrmask,
@@ -160,7 +163,7 @@ verify_validate_mask(
         (1 << FATTR4_SYMLINK_SUPPORT) | (1 << FATTR4_NAMED_ATTR) |
         (1 << FATTR4_FSID)            | (1 << FATTR4_UNIQUE_HANDLES) |
         (1 << FATTR4_LEASE_TIME)      | (1 << FATTR4_RDATTR_ERROR) |
-        (1 << FATTR4_ACLSUPPORT)      | (1 << FATTR4_ARCHIVE) |
+        (1 << FATTR4_ACL)             | (1 << FATTR4_ACLSUPPORT)      | (1 << FATTR4_ARCHIVE) |
         (1 << FATTR4_CANSETTIME)      | (1 << FATTR4_CASE_INSENSITIVE) |
         (1 << FATTR4_CASE_PRESERVING) | (1 << FATTR4_CHOWN_RESTRICTED) |
         (1 << FATTR4_FILEHANDLE)      | (1 << FATTR4_FILEID) |

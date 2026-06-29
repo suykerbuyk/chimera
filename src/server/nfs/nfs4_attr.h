@@ -16,6 +16,24 @@
 #include "vfs/vfs_procs.h"
 #include "vfs/vfs_pnfs.h"
 #include "nfs4_lease.h"
+#include "nfs_fh_wrap.h"
+
+/*
+ * Derive the NFSv4 fattr4_change value from a set of VFS attributes, using the
+ * exact same rule as the FATTR4_CHANGE marshaller below: a native monotonic
+ * counter (CHIMERA_VFS_ATTR_CHANGE) when the backend supplies one, otherwise
+ * ctime in nanoseconds (matching Linux nfsd without i_version).  Shared with the
+ * §10.4.3 combine logic so the cached sc and the marshalled change always agree.
+ */
+static inline uint64_t
+chimera_nfs4_change_from_attrs(const struct chimera_vfs_attrs *attr)
+{
+    if (attr->va_set_mask & CHIMERA_VFS_ATTR_CHANGE) {
+        return attr->va_change;
+    }
+    return (uint64_t) attr->va_ctime.tv_sec * 1000000000ULL +
+           (uint64_t) attr->va_ctime.tv_nsec;
+} /* chimera_nfs4_change_from_attrs */
 
 /* RFC 8275 OPEN-arguments attribute and its enumerations.  Not present in our
  * generated nfs4.x (which stops at FATTR4_SEC_LABEL), so define what we need to
@@ -119,7 +137,12 @@ chimera_nfs4_attr2mask(
                         attr_mask |= CHIMERA_VFS_ATTR_FH;
                         break;
                     case FATTR4_CHANGE:
-                        attr_mask |= CHIMERA_VFS_ATTR_CTIME;
+                    case FATTR4_CHANGE_ATTR_TYPE:
+                        /* Request the native change counter as well as ctime:
+                         * backends with CHIMERA_VFS_CAP_CHANGE fill va_change,
+                         * the rest fill only ctime and the marshaller derives
+                         * change from it. */
+                        attr_mask |= CHIMERA_VFS_ATTR_CTIME | CHIMERA_VFS_ATTR_CHANGE;
                         break;
                     case FATTR4_SIZE:
                         attr_mask |= CHIMERA_VFS_ATTR_SIZE;
@@ -350,9 +373,10 @@ chimera_nfs4_attr_append_acl(
         uint32_t                  flag = ace->flags;
         int                       is_group;
 
-        is_group = (ace->who.type == CHIMERA_PRINCIPAL_GROUP) ||
-            (ace->who.type == CHIMERA_PRINCIPAL_SPECIAL &&
-             ace->who.special == CHIMERA_WHO_GROUP);
+        /* ACE4_IDENTIFIER_GROUP applies only to a named group principal; for
+         * special identifiers (incl. GROUP@) it SHOULD be zero on encode
+         * (RFC 7530 §6.2.1.5) and the decoder ignores it for specials. */
+        is_group = (ace->who.type == CHIMERA_PRINCIPAL_GROUP);
 
         if (is_group) {
             flag |= CHIMERA_ACE_FLAG_IDENTIFIER_GROUP;
@@ -389,7 +413,10 @@ chimera_nfs4_marshall_attrs(
     uint32_t                        pnfs_layout_type,
     int                             xattr_supported,
     int                             nfs4_delegations,
-    uint32_t                        lease_time_s)
+    uint32_t                        lease_time_s,
+    uint16_t                        export_id,
+    const uint8_t                  *fh_key,
+    int                             fh_sign)
 {
     /* pnfs_layout_type is the single layouttype4 this file's backend supports
      * (LAYOUT4_FLEX_FILES 0x4 or LAYOUT4_BLOCK_VOLUME 0x3), or 0 when pNFS is
@@ -468,9 +495,13 @@ chimera_nfs4_marshall_attrs(
                     word2 |= (1 << (FATTR4_OPEN_ARGUMENTS - 64));
                 }
 
-                /* Extended attributes (RFC 8276) are an NFSv4.2 feature. */
+                /* Extended attributes (RFC 8276) and change_attr_type
+                 * (RFC 7862) are NFSv4.2 features.  change_attr_type is always
+                 * supported at 4.2: the marshaller returns a value for every
+                 * object (native MONOTONIC_INCR or ctime-derived TIME_METADATA). */
                 if (minorversion >= 2) {
                     word2 |= (1 << (FATTR4_XATTR_SUPPORT - 64));
+                    word2 |= (1 << (FATTR4_CHANGE_ATTR_TYPE - 64));
                 }
 
                 /* Layout types (attr 64) advertised when pNFS is enabled. */
@@ -525,7 +556,14 @@ chimera_nfs4_marshall_attrs(
             rsp_mask[0]  |= (1 << FATTR4_CHANGE);
             *num_rsp_mask = 1;
 
-            v64 = attr->va_ctime.tv_sec * 1000000000 + attr->va_ctime.tv_nsec;
+            if (attr->va_set_mask & CHIMERA_VFS_ATTR_CHANGE) {
+                /* Backend supplied a native monotonic version counter. */
+                v64 = attr->va_change;
+            } else {
+                /* Derive change from ctime (matches Linux nfsd without
+                 * i_version: change_attr_type is then TIME_METADATA). */
+                v64 = attr->va_ctime.tv_sec * 1000000000 + attr->va_ctime.tv_nsec;
+            }
             chimera_nfs4_attr_append_uint64(&attrs, v64);
         }
 
@@ -653,15 +691,34 @@ chimera_nfs4_marshall_attrs(
 
         if (req_mask[0] & (1 << FATTR4_FILEHANDLE) &&
             (attr->va_set_mask & CHIMERA_VFS_ATTR_FH)) {
+            const uint8_t *fhp;
+            int            fhl;
+            uint8_t        wire[CHIMERA_NFS_FH_MAX];
+            int            wirelen;
+
+            /* Wrap the FILEHANDLE attribute with its export id (and sign it)
+             * exactly as GETFH would, so a handle a client harvests from
+             * GETATTR/READDIR round-trips through PUTFH.  export_id 0 means a
+             * pseudo-fs / unattributed handle, emitted verbatim. */
+            if (export_id == 0) {
+                fhp = attr->va_fh;
+                fhl = attr->va_fh_len;
+            } else {
+                chimera_nfs_fh_wrap(wire, &wirelen, export_id, attr->va_fh,
+                                    attr->va_fh_len, fh_key, fh_sign);
+                fhp = wire;
+                fhl = wirelen;
+            }
+
             rsp_mask[0]  |= (1 << FATTR4_FILEHANDLE);
             *num_rsp_mask = 1;
 
-            chimera_nfs4_attr_append_uint32(&attrs, attr->va_fh_len);
-            memcpy(attrs, attr->va_fh, attr->va_fh_len);
-            attrs += attr->va_fh_len;
+            chimera_nfs4_attr_append_uint32(&attrs, fhl);
+            memcpy(attrs, fhp, fhl);
+            attrs += fhl;
 
-            if (attr->va_fh_len & 0x3) {
-                uint32_t pad = 4 - (attr->va_fh_len & 0x3);
+            if (fhl & 0x3) {
+                uint32_t pad = 4 - (fhl & 0x3);
                 memset(attrs, 0, pad);
                 attrs += pad;
             }
@@ -868,16 +925,6 @@ chimera_nfs4_marshall_attrs(
             chimera_nfs4_attr_append_uint32(&attrs, 4096);
         }
 
-        if ((req_mask[2] & (1 << (FATTR4_XATTR_SUPPORT - 64))) &&
-            minorversion >= 2) {
-            rsp_mask[2]  |= (1 << (FATTR4_XATTR_SUPPORT - 64));
-            *num_rsp_mask = 3;
-
-            /* Per-object: TRUE only if this file's backend implements xattrs
-             * (CHIMERA_VFS_CAP_XATTR). See RFC 8276 sec 8.2.1 - per-fs attribute. */
-            chimera_nfs4_attr_append_uint32(&attrs, xattr_supported);
-        }
-
         if (req_mask[2] & (1 << (FATTR4_SUPPATTR_EXCLCREAT - 64))) {
             rsp_mask[2]  |= (1 << (FATTR4_SUPPATTR_EXCLCREAT - 64));
             *num_rsp_mask = 3;
@@ -892,6 +939,36 @@ chimera_nfs4_marshall_attrs(
                                             (1UL << (FATTR4_MODE - 32)) |
                                             (1UL << (FATTR4_OWNER - 32)) |
                                             (1UL << (FATTR4_OWNER_GROUP - 32)));
+        }
+
+        if ((req_mask[2] & (1 << (FATTR4_CHANGE_ATTR_TYPE - 64))) &&
+            minorversion >= 2) {
+            rsp_mask[2]  |= (1 << (FATTR4_CHANGE_ATTR_TYPE - 64));
+            *num_rsp_mask = 3;
+
+            /* Per-object: a backend with a native change counter
+             * (CHIMERA_VFS_ATTR_CHANGE) reports a strictly increasing value;
+             * otherwise change is the ctime, i.e. time_metadata.  Mirrors the
+             * fattr4_change source chosen in the FATTR4_CHANGE block above. */
+            chimera_nfs4_attr_append_uint32(&attrs,
+                                            (attr->va_set_mask & CHIMERA_VFS_ATTR_CHANGE) ?
+                                            NFS4_CHANGE_TYPE_IS_MONOTONIC_INCR :
+                                            NFS4_CHANGE_TYPE_IS_TIME_METADATA);
+        }
+
+        /* xattr_support is attr 82: it MUST be emitted after change_attr_type
+         * (79) and suppattr_exclcreat (75) -- fattr4 values are packed in
+         * ascending attribute order to match the response bitmap the client
+         * decodes low-to-high.  (Previously emitted before them, a latent bug
+         * that bit once change_attr_type became co-requested at v4.2 mount.) */
+        if ((req_mask[2] & (1 << (FATTR4_XATTR_SUPPORT - 64))) &&
+            minorversion >= 2) {
+            rsp_mask[2]  |= (1 << (FATTR4_XATTR_SUPPORT - 64));
+            *num_rsp_mask = 3;
+
+            /* Per-object: TRUE only if this file's backend implements xattrs
+             * (CHIMERA_VFS_CAP_XATTR). See RFC 8276 sec 8.2.1 - per-fs attribute. */
+            chimera_nfs4_attr_append_uint32(&attrs, xattr_supported);
         }
 
         if (nfs4_delegations &&
@@ -995,6 +1072,16 @@ chimera_nfs4_unmarshall_attrs(
                 padded = (wholen + 3) & ~3u;
                 if (unlikely(attrs + padded > attrsend || wholen == 0)) {
                     return NFS4ERR_BADXDR;
+                }
+
+                /* aclsupport advertises only ALLOW/DENY ACEs (see the
+                 * fattr4_aclsupport encode below).  RFC 7530 §6.2.1.4.1
+                 * requires rejecting an ACE of an unsupported type with
+                 * NFS4ERR_ATTRNOTSUPP rather than silently storing an
+                 * AUDIT/ALARM ACE that would never be enforced. */
+                if (type != ACE4_ACCESS_ALLOWED_ACE_TYPE &&
+                    type != ACE4_ACCESS_DENIED_ACE_TYPE) {
+                    return NFS4ERR_ATTRNOTSUPP;
                 }
 
                 is_group = !!(flag & CHIMERA_ACE_FLAG_IDENTIFIER_GROUP);
@@ -1278,9 +1365,23 @@ chimera_nfs4_set_changeinfo(
     struct chimera_vfs_attrs *dir_pre_attr,
     struct chimera_vfs_attrs *dir_post_attr)
 {
-    cinfo->atomic = (dir_pre_attr->va_set_mask & CHIMERA_VFS_ATTR_ATOMIC) &&
-        (dir_post_attr->va_set_mask & CHIMERA_VFS_ATTR_ATOMIC);
-    cinfo->before = dir_pre_attr->va_mtime.tv_sec * 1000000000 + dir_pre_attr->va_mtime.tv_nsec;
-    cinfo->after  = dir_post_attr->va_mtime.tv_sec * 1000000000 + dir_post_attr->va_mtime.tv_nsec;
-
+    /* before/after are the directory's change attribute (here, its mtime)
+     * pre and post the operation.  They are only meaningful if the backend
+     * actually filled mtime in both snapshots: not every backend populates the
+     * rename/link pre/post directory attrs, and reading va_mtime when the
+     * attr was never set reads uninitialized memory -- which a self-rename
+     * (RFC 7530 §10.4.5: must be a no-op) then reports as a spurious change,
+     * failing pynfs RNM18/19/20.  Without both mtimes, report a non-atomic,
+     * no-change cinfo (before == after) rather than fabricating a delta. */
+    if ((dir_pre_attr->va_set_mask & CHIMERA_VFS_ATTR_MTIME) &&
+        (dir_post_attr->va_set_mask & CHIMERA_VFS_ATTR_MTIME)) {
+        cinfo->atomic = (dir_pre_attr->va_set_mask & CHIMERA_VFS_ATTR_ATOMIC) &&
+            (dir_post_attr->va_set_mask & CHIMERA_VFS_ATTR_ATOMIC);
+        cinfo->before = dir_pre_attr->va_mtime.tv_sec * 1000000000 + dir_pre_attr->va_mtime.tv_nsec;
+        cinfo->after  = dir_post_attr->va_mtime.tv_sec * 1000000000 + dir_post_attr->va_mtime.tv_nsec;
+    } else {
+        cinfo->atomic = 0;
+        cinfo->before = 0;
+        cinfo->after  = 0;
+    }
 } /* chimera_nfs4_set_changeinfo */

@@ -289,6 +289,8 @@ run_phase(
         1,
         "cairn",
         60,
+        1,                 /* attr_cache_enabled */
+        1,                 /* name_cache_enabled */
         0,                 /* num_rcu_reclaim_threads: 0 = one per CPU */
         metrics);
     assert(ctx.vfs != NULL);

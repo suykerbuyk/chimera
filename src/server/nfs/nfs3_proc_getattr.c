@@ -75,19 +75,33 @@ chimera_nfs3_getattr(
     void                      *private_data)
 {
     struct chimera_server_nfs_thread *thread = private_data;
+    struct chimera_server_nfs_shared *shared = thread->shared;
     struct nfs_request               *req;
+    struct GETATTR3res                res;
+    int                               rc;
 
     req = nfs_request_alloc(thread, conn, encoding);
 
-    chimera_nfs_map_cred(&req->cred, cred);
+    chimera_nfs_map_cred_req(req, cred);
 
     nfs3_dump_getattr(req, args);
 
     req->args_getattr = args;
 
+    res.status = chimera_nfs3_decode_fh(req, args->object.data.data, args->object.data.len);
+    if (res.status != NFS3_OK) {
+        nfsstat3 fh_status = res.status;
+        memset(&res, 0, sizeof(res));
+        res.status = fh_status;
+        rc         = shared->nfs_v3.send_reply_NFSPROC3_GETATTR(evpl, NULL, &res, req->encoding);
+        chimera_nfs_abort_if(rc, "Failed to send RPC2 reply");
+        nfs_request_free(thread, req);
+        return;
+    }
+
     chimera_vfs_open_fh(thread->vfs_thread, &req->cred,
-                        args->object.data.data,
-                        args->object.data.len,
+                        req->fh,
+                        req->fhlen,
                         CHIMERA_VFS_OPEN_INFERRED | CHIMERA_VFS_OPEN_PATH,
                         chimera_nfs3_getattr_open_callback,
                         req);

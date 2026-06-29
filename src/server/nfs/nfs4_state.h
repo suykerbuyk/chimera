@@ -396,6 +396,10 @@ struct nfs_delegation {
     uint8_t                        fh[NFS4_FHSIZE];
     uint16_t                       fh_len;
     uint64_t                       fh_hash;
+    /* Export the file belongs to, so the (internal, unwrapped) fh above can be
+     * re-wrapped to the client's on-wire form when sent in a CB_RECALL /
+     * CB_GETATTR callback. */
+    uint16_t                       export_id;
 
     /* Slot identity (decoded from stateid.other). */
     uint8_t                        shard;
@@ -409,24 +413,44 @@ struct nfs_delegation {
     struct chimera_vfs_file_state *file_state;
     bool                           lease_held;
 
-    _Atomic uint8_t                cb_recall_state;  /* NFS4_DELEG_* */
+    /*
+     * RFC 7530/8881 §10.4.3 server-side change-attribute combine state.  The
+     * server caches the file's NFSv4 change attribute at grant time (`sc`) and,
+     * on each peer GETATTR that runs CB_GETATTR, compares the holder's reported
+     * value (`cc`) against `sc`:
+     *   cc == sc  -> the holder has not modified; the server returns its own
+     *                LOCAL change/time_metadata/time_modify (NOT the holder's).
+     *   cc != sc  -> the holder has modified; the server synthesises
+     *                time_metadata/time_modify from the current time, computes a
+     *                new server change value nsc >= sc + 1, returns nsc, replaces
+     *                the cached sc with nsc, and guarantees each returned nsc
+     *                STRICTLY exceeds the previously returned one (monotonicity).
+     * `combine_lock` guards these fields, which may be read/updated from any
+     * requester thread that runs a peer GETATTR against this delegation.
+     */
+    pthread_mutex_t        combine_lock;
+    uint64_t               combine_sc;              /* cached change attr (sc) */
+    uint64_t               combine_last;            /* last nsc returned to a peer */
+    bool                   combine_valid;           /* sc captured at grant     */
+
+    _Atomic uint8_t        cb_recall_state;         /* NFS4_DELEG_* */
     /* Count of CB_RECALL retransmits attempted because the client's callback
      * session was not yet usable (CB_SEQUENCE returned NFS4ERR_BADSESSION right
      * after a CREATE_SESSION, before the client finished registering the new
      * session).  Bounds the retransmit loop below the recall deadline. */
-    _Atomic uint8_t                cb_recall_retries;
+    _Atomic uint8_t        cb_recall_retries;
     /* Set when the delegation was force-revoked (recall unanswered /
      * conflicting access) rather than returned.  A revoked stateid resolves to
      * NFS4ERR_DELEG_REVOKED until the client FREE_STATEIDs it. */
-    _Atomic uint8_t                revoked;
+    _Atomic uint8_t        revoked;
 
-    struct nfs_delegation         *next_in_client;  /* utlist on client->delegations */
+    struct nfs_delegation *next_in_client;          /* utlist on client->delegations */
     /* Single-link queue for cross-thread recall marshalling (owner thread's
      * doorbell drains it); see nfs4_callback.c. */
-    struct nfs_delegation         *recall_qnext;
+    struct nfs_delegation *recall_qnext;
 
-    _Atomic uint32_t               refcount;
-    _Atomic uint8_t                destroyed;
+    _Atomic uint32_t       refcount;
+    _Atomic uint8_t        destroyed;
 };
 
 /*
@@ -444,6 +468,7 @@ struct nfs_layout_state {
     struct nfs_client       *client;    /* borrowed; client outlives the layout */
     uint8_t                  fh[NFS4_FHSIZE];
     uint16_t                 fh_len;
+    uint16_t                 export_id; /* to re-wrap fh for CB_LAYOUTRECALL */
     uint32_t                 seqid;     /* server-incremented layout stateid seqid */
     uint32_t                 iomode;    /* current LAYOUTIOMODE4 */
 
@@ -816,6 +841,7 @@ nfs_delegation_create(
     const uint8_t          *fh,
     uint16_t                fh_len,
     uint64_t                fh_hash,
+    uint16_t                export_id,
     struct nfs_state_table *table,
     struct stateid4        *out_stateid);
 
@@ -880,6 +906,7 @@ nfs_layout_state_create(
     struct nfs_client       *client,
     const uint8_t           *fh,
     uint16_t                 fh_len,
+    uint16_t                 export_id,
     uint32_t                 iomode,
     uint32_t                 client_short_id,
     struct nfs_state_table  *table,

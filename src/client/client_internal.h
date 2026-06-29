@@ -56,6 +56,7 @@ enum chimera_client_request_opcode {
     CHIMERA_CLIENT_OP_COPY_RANGE,
     CHIMERA_CLIENT_OP_CLONE_RANGE,
     CHIMERA_CLIENT_OP_ALLOCATE,
+    CHIMERA_CLIENT_OP_SEEK,
 };
 
 struct chimera_client_request;
@@ -340,6 +341,14 @@ struct chimera_client_request {
 
         struct {
             struct chimera_vfs_open_handle *handle;
+            uint64_t                        offset;
+            uint32_t                        what;   /* 0 = SEEK_DATA, 1 = SEEK_HOLE */
+            chimera_seek_callback_t         callback;
+            void                           *private_data;
+        } seek;
+
+        struct {
+            struct chimera_vfs_open_handle *handle;
             chimera_statfs_callback_t       callback;
             void                           *private_data;
             int                             path_len;
@@ -414,6 +423,8 @@ struct chimera_client_config {
     int                           async_delegation;
     int                           async_delegation_threads;
     int                           cache_ttl;
+    int                           attr_cache_enabled;
+    int                           name_cache_enabled;
     int                           rcu_reclaim_threads;
     int                           max_fds;
     enum chimera_tcp_flavor       tcp_flavor;

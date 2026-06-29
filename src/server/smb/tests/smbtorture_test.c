@@ -85,18 +85,25 @@ run_smbtorture(
 
     /* SMB3 signing-algorithm offer.  The smb2.session.signing-* and
      * session.encryption-* subtests skip unless the server negotiated signing
-     * >= AES-128-GMAC (they exercise per-algorithm negotiation), so offer GMAC
-     * (preferred) for those.  Every other suite -- including the
-     * bind_negative_smb3sign* cases, which need a signing-mismatch bind
-     * rejection chimera does not yet implement -- stays on AES-128-CMAC so it
-     * keeps its current behaviour rather than un-skipping into a failure.
-     * smb2.session is force-isolated (one daemon per subtest) so this scopes
-     * per-test. */
+     * >= AES-128-GMAC, so offer GMAC (preferred) for those.
+     *
+     * The bind_negative_smb3sign / smb3sne family exercises session-bind
+     * signing-algorithm mismatches.  chimera currently implements only the
+     * non-GMAC-session-bound-from-a-GMAC-connection direction (the *toG cases
+     * -- CtoG/HtoG/C30toG/sneCtoG/sneHtoG -- which MS-SMB2 3.3.5.5 rejects with
+     * STATUS_NOT_SUPPORTED), so offer GMAC only for those (every *toG name
+     * carries the "toG" substring; none of the unimplemented reverse "Gto*"
+     * REQUEST_OUT_OF_SEQUENCE or CMAC<->HMAC cross-bind cases do).  The
+     * remainder keep AES-128-CMAC and so stay skipped rather than un-skipping
+     * into a failure; implementing them is a follow-up.  smb2.session is
+     * force-isolated (one daemon per subtest) so this scopes per-test. */
     const char *sign_algos = "aes-128-cmac";
 
     for (i = 0; i < num_tests; i++) {
         if (strstr(tests[i], "session.signing") != NULL ||
-            strstr(tests[i], "session.encryption") != NULL) {
+            strstr(tests[i], "session.encryption") != NULL ||
+            (strstr(tests[i], "bind_negative_smb3s") != NULL &&
+             strstr(tests[i], "toG") != NULL)) {
             sign_algos = "aes-128-gmac, aes-128-cmac, hmac-sha256";
             break;
         }
@@ -141,6 +148,16 @@ run_smbtorture(
                     * exit, so the rules cannot leak between tests.  The default
                     * iptables_command (/usr/sbin/iptables) is correct here. */
                    " --option=torture:use_iptables=yes"
+                   /* smb2.lock.open-brlock-deadlock self-skips without the
+                    * deadlock timeout it uses to bound the blocking-lock wait;
+                    * the option is specific to that test. */
+                   " --option=torture:open_brlock_deadlock_timemout=2"
+                   /* chimera revokes an unacked oplock/lease break at its 30s
+                    * deadline (CHIMERA_VFS_STATE_DEFAULT_BREAK_DEADLINE_MS); tell
+                    * the client so the smb2.oplock.batch22a/b break-timeout
+                    * duration assertion (CHECK_RANGE(te, timeout-1, timeout+15))
+                    * brackets 30s rather than the 35s Windows default. */
+                   " --option=torture:oplocktimeout=30"
                    /* SMB3 signing algorithms the client offers (see sign_algos
                     * above): GMAC-first only for the signing/encryption subtests
                     * that require it, CMAC otherwise. */
@@ -419,12 +436,21 @@ main(
      * suite still runs with the feature off on the same backend.  Also match
      * individual smb2.streams.* subtests so the per-subtest harvest variant
      * (run one stream subtest in its own server process) gets the same
-     * capability the combined smb2.streams suite needs. */
+     * capability the combined smb2.streams suite needs.
+     *
+     * A handful of oplock/lease subtests open named streams (a real Windows
+     * server always exposes the ADS namespace), so they need the same
+     * capability: smb2.oplock.stream1 / smb2.oplock.batch26 take oplocks on a
+     * stream, and smb2.lease.request leases a stream.  Without it the stream
+     * create is refused OBJECT_NAME_INVALID by the named-streams-off gate. */
     for (i = 0; i < num_tests; i++) {
         if (strcmp(tests[i], "smb2.streams") == 0 ||
             strncmp(tests[i], "smb2.streams.", 13) == 0 ||
             strcmp(tests[i], "smb2.ioctl-on-stream") == 0 ||
-            strcmp(tests[i], "smb2.sdread") == 0) {
+            strcmp(tests[i], "smb2.sdread") == 0 ||
+            strcmp(tests[i], "smb2.oplock.stream1") == 0 ||
+            strcmp(tests[i], "smb2.oplock.batch26") == 0 ||
+            strcmp(tests[i], "smb2.lease.request") == 0) {
             chimera_server_config_set_smb_named_streams(config, 1);
             break;
         }
@@ -565,6 +591,8 @@ main(
      * that asserts unencrypted behaviour such as reconnect2. */
     for (i = 0; i < num_tests; i++) {
         if (strstr(tests[i], "bind_negative_smb3enc") != NULL ||
+            (strstr(tests[i], "bind_negative_smb3s") != NULL &&
+             strstr(tests[i], "toG") != NULL) ||
             strstr(tests[i], "session.encryption") != NULL ||
             strstr(tests[i], "anon-encryption") != NULL) {
             chimera_server_config_set_smb_encryption(config, 1);

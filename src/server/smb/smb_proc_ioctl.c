@@ -68,6 +68,40 @@ chimera_smb_ioctl(struct chimera_smb_request *request)
     struct chimera_smb_open_file     *open_file;
     int                               status;
 
+    /* MS-SMB2 §3.3.5.2.10: the state-modifying FSCTLs belong to the same
+     * channel-sequence-checked set as WRITE/SET_INFO.  A stale, post-failover
+     * replay of one of these must be rejected with FILE_NOT_AVAILABLE so it
+     * cannot re-apply a write the client has since superseded (e.g. re-zeroing a
+     * range a newer write refilled).  Previously ONLY the read-only
+     * CREATE_OR_GET_OBJECT_ID was guarded while the genuinely mutating FSCTLs
+     * were not (issues #1123/#1256).  Resolve the IOCTL's target handle, run the
+     * check, and release -- the per-FSCTL handlers re-resolve as needed. */
+    switch (request->ioctl.ctl_code) {
+        case SMB2_FSCTL_SET_REPARSE_POINT:
+        case SMB2_FSCTL_SET_SPARSE:
+        case SMB2_FSCTL_SET_ZERO_DATA:
+        case SMB2_FSCTL_SRV_COPYCHUNK:
+        case SMB2_FSCTL_SRV_COPYCHUNK_WRITE:
+        case SMB2_FSCTL_DUPLICATE_EXTENTS_TO_FILE:
+        case SMB2_FSCTL_OFFLOAD_WRITE:
+        case SMB2_FSCTL_SET_INTEGRITY_INFORMATION:
+            open_file = chimera_smb_open_file_resolve(request, &request->ioctl.file_id);
+            if (open_file) {
+                bool stale = chimera_smb_channel_sequence_stale(
+                    open_file, request->channel_sequence, 1);
+
+                chimera_smb_open_file_release(request, open_file);
+
+                if (stale) {
+                    chimera_smb_complete_request(request, SMB2_STATUS_FILE_NOT_AVAILABLE);
+                    return;
+                }
+            }
+            break;
+        default:
+            break;
+    } /* state-modifying FSCTL channel-sequence guard */
+
     switch (request->ioctl.ctl_code) {
         case SMB2_FSCTL_DFS_GET_REFERRALS:
             /* No DFS support; tell the client to stop asking. */
@@ -315,7 +349,22 @@ chimera_smb_ioctl(struct chimera_smb_request *request)
                 if (timeout_ms == 0) {
                     timeout_ms = CHIMERA_SMB_RESILIENCY_DEFAULT_TIMEOUT_MS;
                 } else if (timeout_ms > CHIMERA_SMB_RESILIENCY_MAX_TIMEOUT_MS) {
-                    timeout_ms = CHIMERA_SMB_RESILIENCY_MAX_TIMEOUT_MS;
+                    /* MS-SMB2 3.3.5.15.9: a Timeout greater than the maximum MUST
+                     * fail with STATUS_INVALID_PARAMETER, not be silently clamped. */
+                    chimera_smb_open_file_release(request, open_file);
+                    chimera_smb_complete_request(request, SMB2_STATUS_INVALID_PARAMETER);
+                    return;
+                } else if (timeout_ms < CHIMERA_SMB_RESILIENCY_MIN_TIMEOUT_MS) {
+                    /* Enforce a server minimum on the disconnect-survival window.
+                     * A client may request an absurdly short timeout (pike's
+                     * durable resiliency cases ask for 100 ms), but a real handle
+                     * reconnect involves several round trips after the network
+                     * drop; honoring a sub-second timeout literally would expire
+                     * the handle mid-reconnect on a loaded server.  OneFS (whose
+                     * suite these are) likewise floors the granted timeout.  The
+                     * grant is reported only as SUCCESS (no granted-timeout field),
+                     * so raising it is invisible to the client. */
+                    timeout_ms = CHIMERA_SMB_RESILIENCY_MIN_TIMEOUT_MS;
                 }
 
                 /* Register the open in the durable registry (as a non-persistent
@@ -328,6 +377,7 @@ chimera_smb_ioctl(struct chimera_smb_request *request)
                     chimera_smb_durable_register(
                         request->compound->thread->shared, open_file,
                         request->session_handle->session->session_id,
+                        request->session_handle->session->cred.uid,
                         request->compound->conn->client_guid,
                         open_file->name, open_file->name_len, false);
                 }
@@ -433,8 +483,15 @@ chimera_smb_ioctl_reply(
     evpl_iovec_cursor_append_uint16(reply_cursor, SMB2_IOCTL_REPLY_SIZE);
     evpl_iovec_cursor_append_uint16(reply_cursor, 0); /* Reserved (MS-SMB2 2.2.32) */
     evpl_iovec_cursor_append_uint32(reply_cursor, request->ioctl.ctl_code);
-    evpl_iovec_cursor_append_uint64(reply_cursor, 0xffffffffffffffffULL); /* file_id.pid */
-    evpl_iovec_cursor_append_uint64(reply_cursor, 0xffffffffffffffffULL); /* file_id.vid */
+    /* FileId (MS-SMB2 2.2.32): echo the request's FileId.  A file-targeted FSCTL
+     * (e.g. FSCTL_LMR_REQUEST_RESILIENCY -- 3.3.5.15.9 requires the response
+     * FileId.Persistent/Volatile to be the open's DurableFileId/FileId) carries
+     * the open's id, which the client validates against the handle it operated
+     * on; a file-less FSCTL (FSCTL_VALIDATE_NEGOTIATE_INFO,
+     * FSCTL_QUERY_NETWORK_INTERFACE_INFO, ...) carries the { 0xFFFF...FFFF,
+     * 0xFFFF...FFFF } sentinel on the wire and so is echoed back unchanged. */
+    evpl_iovec_cursor_append_uint64(reply_cursor, request->ioctl.file_id.pid);
+    evpl_iovec_cursor_append_uint64(reply_cursor, request->ioctl.file_id.vid);
     evpl_iovec_cursor_append_uint32(reply_cursor, input_offset); /* input offset */
     evpl_iovec_cursor_append_uint32(reply_cursor, input_length); /* input count */
     evpl_iovec_cursor_append_uint32(reply_cursor, output_offset); /* output_offset */
@@ -469,7 +526,12 @@ chimera_smb_ioctl_reply(
             for (int i = 0; i < shared->config.num_nic_info; i++) {
                 nic_info = &shared->config.nic_info[i];
 
-                caps = 0x1; /* RSS */
+                /* MS-SMB2 2.2.32 RSS_CAPABLE (0x1) must mirror the real NIC
+                 * capability; chimera has no RSS backing and no config knob, so
+                 * report 0 (no RSS) rather than asserting it unconditionally
+                 * (issue #1289).  RDMA_CAPABLE (0x2) is reported only when the
+                 * interface is actually configured for RDMA. */
+                caps = 0;
 
                 if (nic_info->rdma) {
                     caps |= 0x2; /* RDMA */
@@ -477,7 +539,7 @@ chimera_smb_ioctl_reply(
 
                 evpl_iovec_cursor_append_uint32(reply_cursor,  i == shared->config.num_nic_info - 1 ? 0 : 152); /* next */
                 evpl_iovec_cursor_append_uint32(reply_cursor, i + 1); /* ifindex */
-                evpl_iovec_cursor_append_uint32(reply_cursor, caps); /* capabilities (RSS) */
+                evpl_iovec_cursor_append_uint32(reply_cursor, caps); /* capabilities (RSS/RDMA) */
                 evpl_iovec_cursor_append_uint32(reply_cursor, 0); /* reserved */
                 evpl_iovec_cursor_append_uint64(reply_cursor, nic_info->speed); /* speed */
                 /* SOCKADDR_STORAGE.ss_family is the Windows AF_* value on the
@@ -487,17 +549,30 @@ chimera_smb_ioctl_reply(
                 evpl_iovec_cursor_append_uint16(reply_cursor, nic_info->addr.ss_family == AF_INET ? 2 :
                                                 23);                                                                    /* Windows AF_INET / AF_INET6 */
                 evpl_iovec_cursor_append_uint16(reply_cursor, 0); /* port */
+                /* The SockAddr field is a fixed 128-byte SOCKADDR_STORAGE
+                 * (MS-SMB2 2.2.32 / MS-DTYP).  family(2)+port(2) are already
+                 * written; emit the family-specific body and zero-fill the
+                 * remainder so EVERY record is exactly Next(4)+IfIndex(4)+
+                 * Capability(4)+Reserved(4)+LinkSpeed(8)+SockAddr(128) = 152
+                 * bytes -- matching the hardcoded Next and the declared
+                 * output_length.  The IPv6 form is family(2)+port(2)+
+                 * flowinfo(4)+addr(16)+scope_id(4), NOT the IPv4 layout. */
                 if (nic_info->addr.ss_family == AF_INET) {
                     evpl_iovec_cursor_append_blob(reply_cursor,
                                                   &((struct sockaddr_in *) &nic_info->addr)->sin_addr.s_addr,
-                                                  4);                                                                   /* IPv4 address */
+                                                  4);                                                                   /* sin_addr */
+                    evpl_iovec_cursor_zero(reply_cursor, 120); /* SOCKADDR_STORAGE remainder: 128 - (2+2+4) */
                 } else {
+                    evpl_iovec_cursor_append_uint32(reply_cursor,
+                                                    ((struct sockaddr_in6 *) &nic_info->addr)->sin6_flowinfo); /* sin6_flowinfo */
                     evpl_iovec_cursor_append_blob(reply_cursor,
                                                   &((struct sockaddr_in6 *) &nic_info->addr)->sin6_addr.
                                                   s6_addr,
-                                                  16);                                                                  /* IPv6 address */
+                                                  16);                                                                  /* sin6_addr */
+                    evpl_iovec_cursor_append_uint32(reply_cursor,
+                                                    ((struct sockaddr_in6 *) &nic_info->addr)->sin6_scope_id); /* sin6_scope_id */
+                    evpl_iovec_cursor_zero(reply_cursor, 100); /* SOCKADDR_STORAGE remainder: 128 - (2+2+4+16+4) */
                 }
-                evpl_iovec_cursor_zero(reply_cursor, 120); /* ifname length */
             }
             break;
         case SMB2_FSCTL_GET_REPARSE_POINT:
@@ -523,7 +598,7 @@ chimera_smb_ioctl_reply(
         case SMB2_FSCTL_SRV_COPYCHUNK:
         case SMB2_FSCTL_SRV_COPYCHUNK_WRITE:
             evpl_iovec_cursor_append_uint32(reply_cursor, request->ioctl.cc_chunks_written);
-            evpl_iovec_cursor_append_uint32(reply_cursor, 0); /* ChunkBytesWritten */
+            evpl_iovec_cursor_append_uint32(reply_cursor, request->ioctl.cc_chunk_bytes); /* ChunkBytesWritten */
             evpl_iovec_cursor_append_uint32(reply_cursor, (uint32_t) request->ioctl.cc_total_written);
             break;
         case SMB2_FSCTL_OFFLOAD_READ:
@@ -580,8 +655,7 @@ chimera_smb_parse_ioctl(
         chimera_smb_error("Received SMB2 IOCTL request with invalid struct size (%u expected %u)",
                           request->request_struct_size,
                           SMB2_IOCTL_REQUEST_SIZE);
-        request->status = SMB2_STATUS_INVALID_PARAMETER;
-        return -1;
+        return chimera_smb_parse_reject(request, SMB2_STATUS_INVALID_PARAMETER);
     }
 
 
@@ -631,8 +705,7 @@ chimera_smb_parse_ioctl(
                 if (request->ioctl.input_count < 24) {
                     chimera_smb_error("VALIDATE_NEGOTIATE_INFO input too small (%u < 24)",
                                       request->ioctl.input_count);
-                    request->status = SMB2_STATUS_INVALID_PARAMETER;
-                    return -1;
+                    return chimera_smb_parse_reject(request, SMB2_STATUS_INVALID_PARAMETER);
                 }
 
                 /* Parse validate negotiate info request */
@@ -645,14 +718,12 @@ chimera_smb_parse_ioctl(
                 if (request->ioctl.vni_dialect_count > SMB2_MAX_DIALECTS) {
                     chimera_smb_error("VALIDATE_NEGOTIATE_INFO dialect count too large (%u > %u)",
                                       request->ioctl.vni_dialect_count, SMB2_MAX_DIALECTS);
-                    request->status = SMB2_STATUS_INVALID_PARAMETER;
-                    return -1;
+                    return chimera_smb_parse_reject(request, SMB2_STATUS_INVALID_PARAMETER);
                 }
 
                 if (request->ioctl.input_count < 24 + (request->ioctl.vni_dialect_count * 2)) {
                     chimera_smb_error("VALIDATE_NEGOTIATE_INFO input too small for dialect count");
-                    request->status = SMB2_STATUS_INVALID_PARAMETER;
-                    return -1;
+                    return chimera_smb_parse_reject(request, SMB2_STATUS_INVALID_PARAMETER);
                 }
 
                 for (i = 0; i < request->ioctl.vni_dialect_count; i++) {
@@ -674,8 +745,7 @@ chimera_smb_parse_ioctl(
                 if (request->ioctl.input_count < 8) {
                     chimera_smb_error("SET_REPARSE_POINT input too small (%u < 8)",
                                       request->ioctl.input_count);
-                    request->status = SMB2_STATUS_INVALID_PARAMETER;
-                    return -1;
+                    return chimera_smb_parse_reject(request, SMB2_STATUS_INVALID_PARAMETER);
                 }
 
                 evpl_iovec_cursor_get_uint32(request_cursor, &request->ioctl.rp_reparse_tag);
@@ -687,8 +757,7 @@ chimera_smb_parse_ioctl(
                     if (request->ioctl.input_count < 16) {
                         chimera_smb_error("SET_REPARSE_POINT NFS input too small (%u < 16)",
                                           request->ioctl.input_count);
-                        request->status = SMB2_STATUS_INVALID_PARAMETER;
-                        return -1;
+                        return chimera_smb_parse_reject(request, SMB2_STATUS_INVALID_PARAMETER);
                     }
 
                     evpl_iovec_cursor_get_uint64(request_cursor, &request->ioctl.rp_nfs_type);
@@ -702,8 +771,7 @@ chimera_smb_parse_ioctl(
                             if (utf16_data_len <= 0 || utf16_data_len > (CHIMERA_VFS_PATH_MAX - 1) * 2) {
                                 chimera_smb_error("SET_REPARSE_POINT LNK: invalid target len %d",
                                                   utf16_data_len);
-                                request->status = SMB2_STATUS_INVALID_PARAMETER;
-                                return -1;
+                                return chimera_smb_parse_reject(request, SMB2_STATUS_INVALID_PARAMETER);
                             }
 
                             {
@@ -725,8 +793,7 @@ chimera_smb_parse_ioctl(
 
                                 if (utf8_len < 0) {
                                     chimera_smb_error("SET_REPARSE_POINT LNK: UTF-16LE conversion failed");
-                                    request->status = SMB2_STATUS_INVALID_PARAMETER;
-                                    return -1;
+                                    return chimera_smb_parse_reject(request, SMB2_STATUS_INVALID_PARAMETER);
                                 }
 
                                 request->ioctl.rp_target[utf8_len] = '\0';
@@ -746,8 +813,7 @@ chimera_smb_parse_ioctl(
                             if (reparse_data_len < 16) {
                                 chimera_smb_error("SET_REPARSE_POINT CHR/BLK: data too small (%u < 16)",
                                                   reparse_data_len);
-                                request->status = SMB2_STATUS_INVALID_PARAMETER;
-                                return -1;
+                                return chimera_smb_parse_reject(request, SMB2_STATUS_INVALID_PARAMETER);
                             }
                             if (unlikely(evpl_iovec_cursor_try_get_uint32(request_cursor,
                                                                           &request->ioctl.rp_device_major) ||
@@ -777,11 +843,10 @@ chimera_smb_parse_ioctl(
                     if (reparse_data_len < 12) {
                         chimera_smb_error("SET_REPARSE_POINT SYMLINK: data too small (%u < 12)",
                                           reparse_data_len);
-                        request->status = SMB2_STATUS_INVALID_PARAMETER;
-                        return -1;
+                        return chimera_smb_parse_reject(request, SMB2_STATUS_INVALID_PARAMETER);
                     }
 
-                    int src = 0;
+                    int      src = 0;
                     src |= evpl_iovec_cursor_try_get_uint16(request_cursor, &sub_name_offset);
                     src |= evpl_iovec_cursor_try_get_uint16(request_cursor, &sub_name_length);
                     src |= evpl_iovec_cursor_try_get_uint16(request_cursor, &print_name_offset);
@@ -797,8 +862,7 @@ chimera_smb_parse_ioctl(
                         sub_name_length > (CHIMERA_VFS_PATH_MAX - 1) * 2) {
                         chimera_smb_error("SET_REPARSE_POINT SYMLINK: invalid sub_name_length %u",
                                           sub_name_length);
-                        request->status = SMB2_STATUS_INVALID_PARAMETER;
-                        return -1;
+                        return chimera_smb_parse_reject(request, SMB2_STATUS_INVALID_PARAMETER);
                     }
 
                     /* Skip to SubstituteName within PathBuffer */
@@ -828,8 +892,7 @@ chimera_smb_parse_ioctl(
 
                         if (utf8_len < 0) {
                             chimera_smb_error("SET_REPARSE_POINT SYMLINK: UTF-16LE conversion failed");
-                            request->status = SMB2_STATUS_INVALID_PARAMETER;
-                            return -1;
+                            return chimera_smb_parse_reject(request, SMB2_STATUS_INVALID_PARAMETER);
                         }
 
                         request->ioctl.rp_target[utf8_len] = '\0';
@@ -863,8 +926,7 @@ chimera_smb_parse_ioctl(
                 if (request->ioctl.input_count < 16) {
                     chimera_smb_error("SET_ZERO_DATA input too small (%u < 16)",
                                       request->ioctl.input_count);
-                    request->status = SMB2_STATUS_INVALID_PARAMETER;
-                    return -1;
+                    return chimera_smb_parse_reject(request, SMB2_STATUS_INVALID_PARAMETER);
                 }
                 evpl_iovec_cursor_get_uint64(request_cursor, &request->ioctl.sp_zero_offset);
                 evpl_iovec_cursor_get_uint64(request_cursor, &request->ioctl.sp_zero_beyond);
@@ -874,8 +936,7 @@ chimera_smb_parse_ioctl(
                 if (request->ioctl.input_count < 16) {
                     chimera_smb_error("QUERY_ALLOCATED_RANGES input too small (%u < 16)",
                                       request->ioctl.input_count);
-                    request->status = SMB2_STATUS_INVALID_PARAMETER;
-                    return -1;
+                    return chimera_smb_parse_reject(request, SMB2_STATUS_INVALID_PARAMETER);
                 }
                 evpl_iovec_cursor_get_uint64(request_cursor, &request->ioctl.sp_qar_offset);
                 evpl_iovec_cursor_get_uint64(request_cursor, &request->ioctl.sp_qar_length);
@@ -888,8 +949,7 @@ chimera_smb_parse_ioctl(
                 uint32_t reserved, cc, i;
 
                 if (request->ioctl.input_count < 32) {
-                    request->status = SMB2_STATUS_INVALID_PARAMETER;
-                    return -1;
+                    return chimera_smb_parse_reject(request, SMB2_STATUS_INVALID_PARAMETER);
                 }
                 /* The 24-byte SourceKey encodes the source open's FileId. */
                 evpl_iovec_cursor_get_uint64(request_cursor, &request->ioctl.cc_src_file_id.pid);
@@ -898,13 +958,22 @@ chimera_smb_parse_ioctl(
                 evpl_iovec_cursor_get_uint32(request_cursor, &cc);
                 evpl_iovec_cursor_get_uint32(request_cursor, &reserved);
 
-                if (cc > CHIMERA_SMB_COPYCHUNK_MAX ||
-                    request->ioctl.input_count < 32 + (uint64_t) cc * 24) {
-                    request->status = SMB2_STATUS_INVALID_PARAMETER;
-                    return -1;
+                request->ioctl.cc_chunk_count = cc;
+
+                /* An over-limit ChunkCount is NOT a parse failure: the handler
+                 * answers STATUS_INVALID_PARAMETER with the SRV_COPYCHUNK_RESPONSE
+                 * limit body so the client can resubmit (MS-SMB2 3.3.5.15.6).
+                 * Rejecting it here would leave the client hanging, and parsing
+                 * cc entries would overrun cc_chunks[], so skip the chunk array
+                 * entirely and let the handler reject by count. */
+                if (cc > CHIMERA_SMB_COPYCHUNK_MAX) {
+                    break;
                 }
 
-                request->ioctl.cc_chunk_count = cc;
+                if (request->ioctl.input_count < 32 + (uint64_t) cc * 24) {
+                    return chimera_smb_parse_reject(request, SMB2_STATUS_INVALID_PARAMETER);
+                }
+
                 for (i = 0; i < cc; i++) {
                     evpl_iovec_cursor_get_uint64(request_cursor, &request->ioctl.cc_chunks[i].src_offset);
                     evpl_iovec_cursor_get_uint64(request_cursor, &request->ioctl.cc_chunks[i].dst_offset);
@@ -918,8 +987,7 @@ chimera_smb_parse_ioctl(
                  * SourceFileID is a 16-byte SMB2 FileId (pid + vid), then
                  * SourceFileOffset(8), TargetFileOffset(8), ByteCount(8). */
                 if (request->ioctl.input_count < 40) {
-                    request->status = SMB2_STATUS_INVALID_PARAMETER;
-                    return -1;
+                    return chimera_smb_parse_reject(request, SMB2_STATUS_INVALID_PARAMETER);
                 }
                 evpl_iovec_cursor_get_uint64(request_cursor, &request->ioctl.de_src_file_id.pid);
                 evpl_iovec_cursor_get_uint64(request_cursor, &request->ioctl.de_src_file_id.vid);
@@ -932,8 +1000,7 @@ chimera_smb_parse_ioctl(
                  * + TokenTimeToLive(4) + Reserved(4) + FileOffset(8) +
                  * CopyLength(8). */
                 if (request->ioctl.input_count < 32) {
-                    request->status = SMB2_STATUS_INVALID_PARAMETER;
-                    return -1;
+                    return chimera_smb_parse_reject(request, SMB2_STATUS_INVALID_PARAMETER);
                 }
                 evpl_iovec_cursor_skip(request_cursor, 16); /* Size, Flags, TTL, Reserved */
                 evpl_iovec_cursor_get_uint64(request_cursor, &request->ioctl.od_file_offset);
@@ -944,8 +1011,7 @@ chimera_smb_parse_ioctl(
                  * + FileOffset(8) + CopyLength(8) + TransferOffset(8) +
                  * Token(512). */
                 if (request->ioctl.input_count < 32 + SMB2_OFFLOAD_TOKEN_SIZE) {
-                    request->status = SMB2_STATUS_INVALID_PARAMETER;
-                    return -1;
+                    return chimera_smb_parse_reject(request, SMB2_STATUS_INVALID_PARAMETER);
                 }
                 evpl_iovec_cursor_skip(request_cursor, 8); /* Size, Flags */
                 evpl_iovec_cursor_get_uint64(request_cursor, &request->ioctl.od_file_offset);
@@ -958,8 +1024,7 @@ chimera_smb_parse_ioctl(
                  * NumRanges(4) + NumRanges * { Offset(8), Length(8) }.  We only
                  * need Key (must be 0) and NumRanges (to report processed). */
                 if (request->ioctl.input_count < 8) {
-                    request->status = SMB2_STATUS_INVALID_PARAMETER;
-                    return -1;
+                    return chimera_smb_parse_reject(request, SMB2_STATUS_INVALID_PARAMETER);
                 }
                 evpl_iovec_cursor_get_uint32(request_cursor, &request->ioctl.tr_key);
                 evpl_iovec_cursor_get_uint32(request_cursor, &request->ioctl.tr_num_ranges);
@@ -968,8 +1033,7 @@ chimera_smb_parse_ioctl(
                 /* SET_INTEGRITY_INFORMATION_BUFFER (MS-FSCC 2.3.55):
                  * ChecksumAlgorithm(2) + Reserved(2) + Flags(4). */
                 if (request->ioctl.input_count < 8) {
-                    request->status = SMB2_STATUS_INVALID_PARAMETER;
-                    return -1;
+                    return chimera_smb_parse_reject(request, SMB2_STATUS_INVALID_PARAMETER);
                 }
                 evpl_iovec_cursor_get_uint16(request_cursor, &request->ioctl.ii_algo);
                 evpl_iovec_cursor_skip(request_cursor, 2); /* Reserved */
@@ -979,10 +1043,13 @@ chimera_smb_parse_ioctl(
                 /* NETWORK_RESILIENCY_REQUEST (MS-SMB2 2.2.31.3): Timeout(4) +
                  * Reserved(4). */
                 if (request->ioctl.input_count < 8) {
+                    /* A NETWORK_RESILIENCY_REQUEST shorter than 8 bytes is
+                     * rejected with STATUS_INVALID_PARAMETER (smb2.durable-v2
+                     * resiliency_buffer_too_small; pike's persistent suite wants
+                     * BUFFER_TOO_SMALL here but that is a OneFS-specific quirk). */
                     chimera_smb_error("LMR_REQUEST_RESILIENCY input too small (%u < 8)",
                                       request->ioctl.input_count);
-                    request->status = SMB2_STATUS_INVALID_PARAMETER;
-                    return -1;
+                    return chimera_smb_parse_reject(request, SMB2_STATUS_INVALID_PARAMETER);
                 }
                 evpl_iovec_cursor_get_uint32(request_cursor, &request->ioctl.rr_timeout_ms);
                 evpl_iovec_cursor_skip(request_cursor, 4); /* Reserved */

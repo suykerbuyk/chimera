@@ -281,19 +281,38 @@ diskfs_drain_final_cb(
  * home block itself is returned to the space map.  Generation reuse is safe:
  * generations are drawn from the global epoch counter, so whatever this inum
  * becomes next carries a generation no file handle has ever seen. */
+/* Home block resident (faulted async if it had been evicted): log the final
+ * tombstone dinode, return the reservation, free the inode and its home block,
+ * and commit. */
 static void
-diskfs_drain_after_unrecord(void *priv)
+diskfs_drain_pinned_cb(
+    struct diskfs_inode *inode,
+    int                  status,
+    void                *priv)
 {
     struct diskfs_drain *d = priv;
     uint32_t             dev;
     uint64_t             off = sm_inum_to_device_offset(d->thread->shared->space_map,
                                                         d->inum, &dev);
 
-    diskfs_txn_pin_inode_block(d->thread, d->txn, d->inode, 0);
+    (void) inode;
+    (void) status;
     diskfs_inode_return_reservation(d->thread, d->txn, d->inode);
     diskfs_inode_free(d->thread, d->inode);
     diskfs_txn_free_space(d->thread, d->txn, dev, off, DISKFS_BLOCK_SIZE);
     diskfs_txn_commit(d->txn, diskfs_drain_final_cb, d);
+} /* diskfs_drain_pinned_cb */
+
+
+static void
+diskfs_drain_after_unrecord(void *priv)
+{
+    struct diskfs_drain *d = priv;
+
+    /* Establish the home block (async-load if evicted), then log the tombstone
+     * dinode and free everything in diskfs_drain_pinned_cb. */
+    diskfs_inode_finish_write_pin(d->thread, d->txn, d->inode,
+                                  diskfs_drain_pinned_cb, d, 0);
 } /* diskfs_drain_after_unrecord */
 
 
@@ -554,31 +573,18 @@ diskfs_condense_finish(
     struct diskfs_condense       *c      = private_data;
     struct diskfs_reclaim_worker *w      = c->worker;
     struct diskfs_shared         *shared = w->shared;
-    struct diskfs_ag_wait        *agw    = &shared->agw[c->device_id][c->ag_index];
-    struct diskfs_block_waiter   *waiters, *wt;
     uint32_t                      base_count;
 
     chimera_diskfs_abort_if(status != 0,
-                            "AG-log condense header write failed: %d", status);
+                            "AG checkpoint header write failed: %d", status);
 
     base_count = ((struct sm_ag_log_header *) c->scratch)->base_count;
     space_map_condense_commit(shared->space_map, c->device_id, c->ag_index,
-                              base_count);
+                              base_count, c->ckpt_seq);
 
-    chimera_diskfs_info("AG %u/%u log condensed (%u free extents)",
-                        c->device_id, c->ag_index, base_count);
-
-    /* Re-drive everything parked behind the condensation. */
-    pthread_mutex_lock(&agw->lock);
-    waiters   = agw->head;
-    agw->head = NULL;
-    pthread_mutex_unlock(&agw->lock);
-
-    while (waiters) {
-        wt      = waiters;
-        waiters = wt->next;
-        diskfs_block_waiter_dispatch(w->ctx, wt);
-    }
+    /* The checkpoint advanced this AG's ckpt_seq; nudge the push thread so it
+     * can retry the trim it was blocked on (diskfs_push_trim's frontier gate). */
+    diskfs_il_checkpoint_advanced(&shared->intent_log);
 
     evpl_iovec_release(evpl, &c->hdr);
     if (c->body_len) {
@@ -604,7 +610,7 @@ diskfs_condense_body_done(
                             "AG-log condense body write failed: %d", status);
 
     memcpy(c->hdr.data, c->scratch, DISKFS_BLOCK_SIZE);
-    evpl_block_write(evpl, w->ctx->queue[c->device_id], &c->hdr, 1,
+    evpl_block_write(evpl, w->ctx->queue[c->log_device_id], &c->hdr, 1,
                      c->slot_off, 1 /* FUA */, diskfs_condense_finish, c);
 } /* diskfs_condense_body_done */
 
@@ -617,9 +623,21 @@ diskfs_condense_try(struct diskfs_condense *c)
     struct evpl                  *evpl   = w->ctx->evpl;
     uint64_t                      payload, aligned;
 
+    /* Stamp the snapshot with the apply frontier (Stage B): every space delta
+     * with seq <= applied_seq has been applied to the in-memory free map, so it
+     * is reflected here.  applied_seq (NOT durable_seq) is the correct frontier
+     * now that apply is async -- durable_seq leads it, and a delta that is
+     * durably logged but not yet applied must NOT be folded into the snapshot.
+     * Sampled before the snapshot is taken under ag->lock, so it can only
+     * undercount what the snapshot reflects -- conservative, never optimistic
+     * (recovery replays seq > ckpt_seq idempotently). */
+    c->ckpt_seq = __atomic_load_n(&shared->intent_log.applied_seq,
+                                  __ATOMIC_ACQUIRE);
+
     space_map_condense_prepare(shared->space_map, c->device_id,
                                c->ag_index, c->scratch,
-                               &c->slot_off, &payload);
+                               &c->slot_off, &c->log_device_id, &payload,
+                               c->ckpt_seq);
 
     aligned = (payload + DISKFS_BLOCK_SIZE - 1) & ~((uint64_t) DISKFS_BLOCK_SIZE - 1);
     memset(c->scratch + payload, 0, aligned - payload);
@@ -632,7 +650,7 @@ diskfs_condense_try(struct diskfs_condense *c)
     if (c->body_len) {
         evpl_iovec_alloc(evpl, c->body_len, DISKFS_BLOCK_SIZE, 1, 0, &c->body);
         memcpy(c->body.data, c->scratch + DISKFS_BLOCK_SIZE, c->body_len);
-        evpl_block_write(evpl, w->ctx->queue[c->device_id], &c->body, 1,
+        evpl_block_write(evpl, w->ctx->queue[c->log_device_id], &c->body, 1,
                          c->slot_off + DISKFS_BLOCK_SIZE, 1 /* FUA */,
                          diskfs_condense_body_done, c);
     } else {
@@ -659,43 +677,32 @@ diskfs_condense_start(
 } /* diskfs_condense_start */
 
 
-/* sm_journal bridge (called under the AG lock; see space_map.h). */
+/*
+ * Schedule a background checkpoint of one AG.  Called by the push thread when
+ * the redo trim frontier is blocked on an AG whose ckpt_seq still lags the
+ * record being trimmed (diskfs_push_trim).  Idempotent: if a checkpoint of the
+ * AG is already in progress, this is a no-op (its commit advances ckpt_seq).
+ * The push thread never parks -- it kicks and moves on, retrying the trim when
+ * the checkpoint completes (diskfs_il_checkpoint_advanced).
+ */
 void
-diskfs_sm_ag_condense(
-    void    *user,
-    uint32_t device_id,
-    uint32_t ag_index)
+diskfs_checkpoint_kick(
+    struct diskfs_shared *shared,
+    uint32_t              device_id,
+    uint32_t              ag_index)
 {
-    struct diskfs_sm_jnl      *c = user;
-    struct diskfs_reclaim_job *j = calloc(1, sizeof(*j));
+    struct diskfs_reclaim_job *j;
 
+    if (!space_map_ag_begin_checkpoint(shared->space_map, device_id, ag_index)) {
+        return;     /* already checkpointing */
+    }
+
+    j            = calloc(1, sizeof(*j));
     j->type      = DISKFS_RECLAIM_JOB_CONDENSE;
     j->device_id = device_id;
     j->ag_index  = ag_index;
-    diskfs_reclaim_submit_job(c->thread->shared, j);
-} /* diskfs_sm_ag_condense */
-
-
-void
-diskfs_sm_ag_park(
-    void    *user,
-    uint32_t device_id,
-    uint32_t ag_index)
-{
-    struct diskfs_sm_jnl       *c      = user;
-    struct diskfs_shared       *shared = c->thread->shared;
-    struct diskfs_ag_wait      *agw    = &shared->agw[device_id][ag_index];
-    struct diskfs_block_waiter *w      = diskfs_block_waiter_alloc(c->thread);
-
-    w->thread = c->thread;
-    w->resume = c->resume;
-    w->arg    = c->resume_arg;
-
-    pthread_mutex_lock(&agw->lock);
-    w->next   = agw->head;
-    agw->head = w;
-    pthread_mutex_unlock(&agw->lock);
-} /* diskfs_sm_ag_park */
+    diskfs_reclaim_submit_job(shared, j);
+} /* diskfs_checkpoint_kick */
 
 
 static void

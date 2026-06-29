@@ -4,6 +4,11 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/random.h>
 #include <pthread.h>
 #include <arpa/inet.h>
 #include <gssapi/gssapi.h>
@@ -44,6 +49,71 @@ chimera_smb_is_error_status(unsigned int status)
            status != SMB2_STATUS_MORE_PROCESSING_REQUIRED &&
            status != SMB2_STATUS_NOTIFY_ENUM_DIR;
 } /* chimera_smb_is_error_status */
+
+/*
+ * Establish the server's ServerGuid (MS-SMB2 2.2.4 / 3.3.5.4).  The ServerGuid
+ * must uniquely identify this server AND stay stable across restarts so that
+ * SMB3 clients can session-bind / durable-reconnect / multichannel-match to the
+ * same node.  Generate it once and persist it under the configured state_dir
+ * (mirroring the NFS fh.key mechanism); regenerate only if the file is absent
+ * or invalid.  If no state_dir is configured, fall back to a per-process random
+ * GUID (unique, but not stable -- acceptable for an ephemeral deployment).
+ */
+static void
+chimera_smb_server_guid_init(
+    struct chimera_server_smb_shared   *shared,
+    const struct chimera_server_config *config)
+{
+    const char *state_dir = chimera_server_config_get_state_dir(config);
+    char        path[512];
+    int         fd;
+
+    if (state_dir && state_dir[0]) {
+        snprintf(path, sizeof(path), "%s/smb_server.guid", state_dir);
+
+        fd = open(path, O_RDONLY);
+        if (fd >= 0) {
+            ssize_t n = read(fd, shared->guid, SMB2_GUID_SIZE);
+            close(fd);
+            if (n == (ssize_t) SMB2_GUID_SIZE) {
+                chimera_smb_info("Loaded SMB ServerGuid from %s", path);
+                return;
+            }
+            chimera_smb_error("Short read of SMB ServerGuid %s; regenerating", path);
+        }
+    }
+
+    if (getrandom(shared->guid, SMB2_GUID_SIZE, 0) != (ssize_t) SMB2_GUID_SIZE) {
+        /* Last-resort fallback: derive from a per-host identity so two distinct
+         * hosts still differ even if getrandom is unavailable. */
+        XXH128_hash_t h = XXH3_128bits(shared->config.identity,
+                                       strlen(shared->config.identity));
+        memcpy(shared->guid, &h, SMB2_GUID_SIZE);
+        chimera_smb_error("getrandom failed for SMB ServerGuid; "
+                          "falling back to identity-derived GUID");
+        return;
+    }
+
+    if (!state_dir || !state_dir[0]) {
+        chimera_smb_info("Generated per-process SMB ServerGuid "
+                         "(no state_dir; not stable across restarts)");
+        return;
+    }
+
+    fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd >= 0) {
+        if (write(fd, shared->guid, SMB2_GUID_SIZE) != (ssize_t) SMB2_GUID_SIZE) {
+            chimera_smb_error("Failed to persist SMB ServerGuid to %s; GUID will "
+                              "not survive restart", path);
+        } else {
+            chimera_smb_info("Generated and persisted SMB ServerGuid at %s", path);
+        }
+        close(fd);
+    } else {
+        chimera_smb_error("Could not persist SMB ServerGuid to %s (%s); GUID will "
+                          "not survive restart", path, strerror(errno));
+    }
+} /* chimera_smb_server_guid_init */
 
 static void *
 chimera_smb_server_init(
@@ -173,7 +243,19 @@ chimera_smb_server_init(
     shared->vfs     = vfs;
     shared->metrics = metrics;
 
-    *(XXH128_hash_t *) shared->guid = XXH3_128bits(shared->config.identity, strlen(shared->config.identity));
+    /* ServerGuid: unique per server, stable across restarts (persisted under
+     * state_dir).  Was previously XXH3_128("chimera") -- identical on every
+     * instance (issue #984). */
+    chimera_smb_server_guid_init(shared, config);
+
+    /* Capture this SMB server instance's start time (MS-SMB2 3.3.1.5 Global
+     * ServerStartTime).  Reported in NEGOTIATE so clients can detect an
+     * in-place restart -- this is the instance start, not the OS boot time. */
+    {
+        struct timespec start;
+        clock_gettime(CLOCK_REALTIME, &start);
+        shared->server_start_time = chimera_nt_time(&start);
+    }
 
     /* Derive the server's account-domain (machine) SID S-1-5-21-X-Y-Z once, from
      * a stable per-host identity (/etc/machine-id, else hostname), so the SIDs
@@ -478,11 +560,31 @@ chimera_smb_compound_reply(struct chimera_smb_compound *compound)
         if (chimera_smb_is_error_status(request->status) &&
             !(request->smb2_hdr.command == SMB2_IOCTL &&
               request->ioctl.cc_limit_response)) {
-            evpl_iovec_cursor_append_uint16(&reply_cursor, SMB2_ERROR_REPLY_SIZE);
-            evpl_iovec_cursor_append_uint16(&reply_cursor, 0);
-            evpl_iovec_cursor_append_uint16(&reply_cursor, 0);
-            evpl_iovec_cursor_append_uint16(&reply_cursor, 0);
-            evpl_iovec_cursor_append_uint8(&reply_cursor, 0);
+            if (request->status == SMB2_STATUS_BUFFER_TOO_SMALL &&
+                request->smb2_hdr.command == SMB2_QUERY_INFO) {
+                /* MS-SMB2 2.2.2 / 3.3.4.4: a QUERY_INFO that fails
+                 * STATUS_BUFFER_TOO_SMALL returns an ERROR Response whose
+                 * ByteCount is 4 and whose ErrorData is the minimum buffer
+                 * length the client must supply (stashed in output_length). */
+                evpl_iovec_cursor_append_uint16(&reply_cursor, SMB2_ERROR_REPLY_SIZE);
+                evpl_iovec_cursor_append_uint16(&reply_cursor, 0); /* ErrorContextCount + Reserved */
+                evpl_iovec_cursor_append_uint32(&reply_cursor, 4); /* ByteCount */
+                evpl_iovec_cursor_append_uint32(&reply_cursor,
+                                                request->query_info.output_length);
+            } else if (request->status == SMB2_STATUS_STOPPED_ON_SYMLINK &&
+                       request->smb2_hdr.command == SMB2_CREATE &&
+                       request->create.r_symlink_error) {
+                /* MS-SMB2 2.2.2.2.1: a CREATE that stopped on a symbolic link
+                 * returns the SymbolicLinkErrorResponse body so the client can
+                 * resolve the link target and reissue the open. */
+                chimera_smb_create_emit_symlink_error(&reply_cursor, request);
+            } else {
+                evpl_iovec_cursor_append_uint16(&reply_cursor, SMB2_ERROR_REPLY_SIZE);
+                evpl_iovec_cursor_append_uint16(&reply_cursor, 0);
+                evpl_iovec_cursor_append_uint16(&reply_cursor, 0);
+                evpl_iovec_cursor_append_uint16(&reply_cursor, 0);
+                evpl_iovec_cursor_append_uint8(&reply_cursor, 0);
+            }
         } else {
             switch (request->smb2_hdr.command) {
                 case SMB2_NEGOTIATE:
@@ -1047,6 +1149,33 @@ chimera_smb_compound_advance(struct chimera_smb_compound *compound)
         return;
     }
 
+    /* Global encrypt-all (MS-SMB2 3.3.5.2.9): when the session negotiated
+     * Session.EncryptData every post-session-setup request MUST arrive
+     * encrypted, and signing does NOT substitute for encryption -- an
+     * unencrypted (even if signed) request is rejected with STATUS_ACCESS_DENIED.
+     * Checked in the request preamble, BEFORE tree resolution, so an unencrypted
+     * operation whose tree-connect was itself refused is answered ACCESS_DENIED
+     * rather than NETWORK_NAME_DELETED (MS-SMB2 sequences the encryption check
+     * ahead of TreeId validation).  A bare unsigned + unencrypted request was
+     * already torn down at parse as a protocol violation (it cannot be
+     * signature-verified either), so this is the signed-but-unencrypted path;
+     * NEGOTIATE / SESSION_SETUP precede the encrypt-all decision and ECHO is
+     * exempt, matching the parse-time check.  (SMB2Model Encryption
+     * ConnectToUnEncryptedShare / UnEncryptedRequest cases.) */
+    if (unlikely(request->session_handle && request->session_handle->session &&
+                 (request->session_handle->session->flags &
+                  CHIMERA_SMB_SESSION_ENCRYPT_DATA) &&
+                 !compound->received_encrypted &&
+                 request->smb2_hdr.command != SMB2_NEGOTIATE &&
+                 request->smb2_hdr.command != SMB2_SESSION_SETUP &&
+                 request->smb2_hdr.command != SMB2_ECHO)) {
+        if (request->smb2_hdr.command == SMB2_WRITE) {
+            evpl_iovecs_release(compound->thread->evpl, request->write.iov, request->write.niov);
+        }
+        chimera_smb_complete_request(request, SMB2_STATUS_ACCESS_DENIED);
+        return;
+    }
+
     /* Reject commands that require a valid tree connection */
     if (unlikely(!request->tree &&
                  request->smb2_hdr.command != SMB2_NEGOTIATE &&
@@ -1302,6 +1431,7 @@ chimera_smb_server_handle_smb2(
          * MS-SMB2 §3.3.5.2.10 stale-write detection and create-context replay. */
         request->channel_sequence = (uint16_t) (request->smb2_hdr.status & 0xFFFF);
         request->is_replay        = (request->smb2_hdr.flags & SMB2_FLAGS_REPLAY_OPERATION) ? 1 : 0;
+        request->bind_sig_failed  = 0;
 
         signature_cursor = *request_cursor;
 
@@ -1323,6 +1453,43 @@ chimera_smb_server_handle_smb2(
         evpl_iovec_cursor_copy(request_cursor,
                                &request->request_struct_size,
                                sizeof(request->request_struct_size));
+
+        /* Validate the request's MessageId / CreditCharge against
+         * Connection.CommandSequenceWindow (MS-SMB2 3.3.5.2.3).  Every command
+         * consumes max(CreditCharge, 1) MessageIds from the window; if the range
+         * is not currently granted-and-unconsumed -- a MessageId the client has
+         * already used, or one beyond the credits the server has granted (the
+         * model's UsedMid / UnavailableMid cases, and a multi-credit
+         * CreditCharge that exceeds the window's remaining width) -- the server
+         * SHOULD terminate the connection rather than process it.  SMB2_CANCEL is
+         * exempt: it reuses the MessageId of an in-flight request and does not
+         * consume a new sequence number (MS-SMB2 3.3.5.16). */
+        if (likely(request->smb2_hdr.command != SMB2_CANCEL)) {
+            /* The window consumes CreditCharge MessageIds only when
+             * Connection.SupportsMultiCredit is TRUE (dialect 2.1 / 3.x).  On
+             * SMB 2.0.2 the CreditCharge field is reserved and each request
+             * consumes exactly one sequence number regardless of its value
+             * (MS-SMB2 3.1.5.2 / 3.3.5.2.3); treating it otherwise would
+             * spuriously reject a valid 2.0.2 request whose header happens to
+             * carry a non-zero CreditCharge. */
+            uint32_t charge =
+                (conn->dialect >= SMB2_DIALECT_2_1 &&
+                 request->smb2_hdr.credit_charge) ?
+                request->smb2_hdr.credit_charge : 1;
+
+            if (unlikely(chimera_smb_seq_window_consume(conn,
+                                                        request->smb2_hdr.message_id,
+                                                        charge) != 0)) {
+                chimera_smb_error(
+                    "SMB2 request MessageId %lu (CreditCharge %u) outside the "
+                    "command sequence window [%lu, %lu); closing connection",
+                    request->smb2_hdr.message_id, charge,
+                    conn->seq_low, conn->seq_high);
+                chimera_smb_request_free(thread, request);
+                evpl_close(evpl, conn->bind);
+                return;
+            }
+        }
 
         /* Validate the compound chain link before anything trusts it -- the
          * per-element cursor window, the signing payload length, and the skip to
@@ -1440,6 +1607,22 @@ chimera_smb_server_handle_smb2(
             goto next_compound_request;
         }
 
+        /* A request received inside a TRANSFORM is authenticated by the AEAD
+         * tag, NOT by a signature: encryption and signing are mutually exclusive
+         * per message (MS-SMB2 3.1.4.3).  Its inner header may nonetheless carry
+         * SMB2_FLAGS_SIGNED (some clients set it before encrypting), but the
+         * message is not signed.  Clear the bit on the request now, because the
+         * reply header inherits the request's flags (see reply_hdr->flags below)
+         * and the reply will itself be encrypted, not signed -- leaving the bit
+         * set would make the encrypted reply falsely advertise SMB2_FLAGS_SIGNED
+         * with no valid signature.  A conformant peer skips verifying a decrypted
+         * message's signature (3.3.5.2.9, which this server also does on receive
+         * just below), but a stricter one verifies whenever the flag is set and
+         * then rejects the reply (pike's SMB 3.1.1 encryption cases). */
+        if (received_encrypted) {
+            request->smb2_hdr.flags &= ~SMB2_FLAGS_SIGNED;
+        }
+
         /* A session that exists globally but has no channel on THIS connection
          * (the handle was attached by the global-session lookup above, e.g.
          * for a channel bind in progress or one that failed) may only be
@@ -1469,6 +1652,65 @@ chimera_smb_server_handle_smb2(
          * verification for a successfully decrypted request.  Such inner SMB2
          * headers commonly carry SMB2_FLAGS_SIGNED with a zeroed Signature
          * field, which would otherwise fail verification. */
+        /* MS-SMB2 §3.3.5.5 step 4 / §3.3.5.2.4: a channel-binding SESSION_SETUP
+         * carries a signature over the EXISTING Session.SigningKey -- the proof
+         * that the binding connection belongs to the already-authenticated
+         * principal (without it a client that learns a victim's SessionId could
+         * hijack the session).  The generic block below skips ALL SESSION_SETUP
+         * signature verification (correct only for an initial/re-auth leg, whose
+         * key is derived while processing it), so a bind is verified here, where
+         * the on-wire bytes are still available.  But we only STASH the result --
+         * the rejection is applied in the handler AFTER its dialect/cipher/
+         * algorithm compatibility checks, whose INVALID_PARAMETER/NOT_SUPPORTED
+         * statuses MUST take precedence over ACCESS_DENIED (MS-SMB2 3.3.5.5;
+         * smb2model SessionMgmtBindSession).  The dispatcher already adopted the
+         * target session onto this connection and copied its signing key into
+         * request->session_handle->signing_key, so the key is in hand. */
+        if (request->smb2_hdr.command == SMB2_SESSION_SETUP &&
+            conn->dialect >= SMB2_DIALECT_3_0 &&
+            (request->smb2_hdr.flags & SMB2_FLAGS_SIGNED) &&
+            !received_encrypted &&
+            request->session_handle &&
+            (request->session_handle->session->flags & CHIMERA_SMB_SESSION_AUTHORIZED)) {
+            struct evpl_iovec_cursor peek = signature_cursor;
+            uint8_t                  ss_byte = 0, ss_flags = 0;
+
+            /* SESSION_SETUP body (MS-SMB2 2.2.5): StructureSize(2), Flags(1).
+             * signature_cursor sits at the body start; peek Flags off a copy. */
+            evpl_iovec_cursor_try_get_uint8(&peek, &ss_byte);  /* StructureSize lo */
+            evpl_iovec_cursor_try_get_uint8(&peek, &ss_byte);  /* StructureSize hi */
+            evpl_iovec_cursor_try_get_uint8(&peek, &ss_flags); /* Flags */
+
+            if (ss_flags & SMB2_SESSION_FLAG_BINDING) {
+                if (request->smb2_hdr.next_command) {
+                    payload_length = request->smb2_hdr.next_command - sizeof(request->smb2_hdr);
+                } else {
+                    payload_length = left;
+                }
+
+                request->bind_sig_failed =
+                    chimera_smb_verify_signature(thread->signing_ctx, request,
+                                                 request->session_handle->signing_key,
+                                                 &signature_cursor, payload_length) != 0;
+            }
+        }
+
+        /* MS-SMB2 3.3.5.2.4 / 3.3.5.3: an SMB2 NEGOTIATE request is exchanged
+         * before any session (and therefore any signing key) exists, so it can
+         * never carry a valid signature -- a NEGOTIATE with SMB2_FLAGS_SIGNED set
+         * is malformed and MUST be failed with STATUS_INVALID_PARAMETER (answered
+         * in order, not by dropping the transport).  SMB2Model Signing cases that
+         * negotiate with the signed flag set. */
+        if ((request->smb2_hdr.flags & SMB2_FLAGS_SIGNED) &&
+            !received_encrypted &&
+            request->smb2_hdr.command == SMB2_NEGOTIATE) {
+            request->session_handle                      = NULL;
+            request->status                              = SMB2_STATUS_INVALID_PARAMETER;
+            request->flags                              |= CHIMERA_SMB_REQUEST_FLAG_PARSE_FAILED;
+            compound->requests[compound->num_requests++] = request;
+            goto next_compound_request;
+        }
+
         if ((request->smb2_hdr.flags & SMB2_FLAGS_SIGNED) &&
             !received_encrypted &&
             request->smb2_hdr.command != SMB2_SESSION_SETUP) {
@@ -1492,11 +1734,20 @@ chimera_smb_server_handle_smb2(
                 signing_key = conn->last_session_handle->signing_key;
             } else {
                 if (unlikely(request->session_handle == NULL)) {
+                    /* MS-SMB2 3.3.5.2.4: a signed request whose SessionId names no
+                     * session (e.g. a signed NEGOTIATE, or any signed non-
+                     * SESSION_SETUP command carrying SessionId 0 or a stale id)
+                     * cannot be signature-verified.  Answer STATUS_USER_SESSION_
+                     * DELETED in order -- the same graceful deferral the unsigned
+                     * unknown-session path uses -- rather than dropping the
+                     * transport (SMB2Model Signing InvalidIdentifier cases). */
                     chimera_smb_error("Received signed SMB2 message with missing/invalid session id %x",
                                       request->smb2_hdr.session_id);
-                    chimera_smb_request_free(thread, request);
-                    evpl_close(evpl, conn->bind);
-                    return;
+                    request->session_handle                      = NULL;
+                    request->status                              = SMB2_STATUS_USER_SESSION_DELETED;
+                    request->flags                              |= CHIMERA_SMB_REQUEST_FLAG_PARSE_FAILED;
+                    compound->requests[compound->num_requests++] = request;
+                    goto next_compound_request;
                 }
                 signing_key = request->session_handle->signing_key;
             }
@@ -1661,6 +1912,42 @@ chimera_smb_server_handle_smb2(
                 request->status = SMB2_STATUS_NOT_IMPLEMENTED;
                 rc              = 0;
         } /* switch */
+
+        /* MS-SMB2 3.3.5.2.5: when Connection.SupportsMultiCredit is TRUE (the
+         * negotiated dialect is 2.1 or a 3.x family member) the server MUST
+         * verify the request's CreditCharge against the payload size of the
+         * operation (here a READ or WRITE data length).  Compute the credits the
+         * operation actually requires -- one per 64 KiB started (3.1.5.2) -- and
+         * fail the request with STATUS_INVALID_PARAMETER if the client charged
+         * fewer: a CreditCharge of zero for a payload over 64 KiB, or a non-zero
+         * CreditCharge smaller than the calculated number.  A normal small
+         * operation needs one credit, so any CreditCharge >= 1 (or 0 for <= 64
+         * KiB) passes untouched. */
+        if (rc == 0 && conn->dialect >= SMB2_DIALECT_2_1 &&
+            (request->smb2_hdr.command == SMB2_READ ||
+             request->smb2_hdr.command == SMB2_WRITE)) {
+            uint32_t payload = request->smb2_hdr.command == SMB2_READ ?
+                request->read.length : request->write.length;
+            uint16_t charge        = request->smb2_hdr.credit_charge;
+            int      charge_failed = 0;
+
+            if (charge == 0) {
+                charge_failed = payload > 65536;
+            } else {
+                uint32_t need = payload ? (payload - 1) / 65536 + 1 : 1;
+
+                charge_failed = need > charge;
+            }
+
+            if (unlikely(charge_failed)) {
+                /* Fail the request itself (not the connection) -- the model and
+                 * MS-SMB2 expect the error reply, with the connection left up. */
+                request->status                              = SMB2_STATUS_INVALID_PARAMETER;
+                request->flags                              |= CHIMERA_SMB_REQUEST_FLAG_PARSE_FAILED;
+                compound->requests[compound->num_requests++] = request;
+                goto next_compound_request;
+            }
+        }
 
         compound->requests[compound->num_requests++] = request;
 
@@ -2357,6 +2644,14 @@ chimera_smb_server_accept(
     conn->requests_completed = 0;
     conn->async_outstanding  = 0;
     conn->credits_balance    = 0;
+    /* Connection.CommandSequenceWindow starts holding exactly MessageId 0 -- the
+     * one implicit credit a client may use for its first request (NEGOTIATE)
+     * before any credits are granted (MS-SMB2 3.3.1.1).  Each credit granted in a
+     * response extends the window (chimera_smb_grant_credits). */
+    conn->seq_low  = 0;
+    conn->seq_high = 1;
+    memset(conn->seq_bitmap, 0, sizeof(conn->seq_bitmap));
+    conn->seq_bitmap[0] = 1ULL;
 
     evpl_bind_get_local_address(bind, conn->local_addr, sizeof(conn->local_addr));
     evpl_bind_get_remote_address(bind, conn->remote_addr, sizeof(conn->remote_addr));
@@ -2588,6 +2883,29 @@ chimera_smb_share_set_encrypt_data(
 
     return rc;
 } /* chimera_smb_share_set_encrypt_data */
+
+SYMBOL_EXPORT int
+chimera_smb_share_set_force_level2_oplock(
+    void       *smb_shared,
+    const char *name)
+{
+    struct chimera_server_smb_shared *shared = smb_shared;
+    struct chimera_smb_share         *cur;
+    int                               rc = -1;
+
+    pthread_mutex_lock(&shared->shares_lock);
+    LL_FOREACH(shared->shares, cur)
+    {
+        if (strcasecmp(cur->name, name) == 0) {
+            cur->force_level2_oplock = true;
+            rc                       = 0;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&shared->shares_lock);
+
+    return rc;
+} /* chimera_smb_share_set_force_level2_oplock */
 
 
 SYMBOL_EXPORT int

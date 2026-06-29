@@ -188,6 +188,16 @@ chimera_server_config_set_rcu_reclaim_threads(
     int                           threads);
 
 void
+chimera_server_config_set_attr_cache_enabled(
+    struct chimera_server_config *config,
+    int                           enabled);
+
+void
+chimera_server_config_set_name_cache_enabled(
+    struct chimera_server_config *config,
+    int                           enabled);
+
+void
 chimera_server_config_set_nfs4_session_slots(
     struct chimera_server_config *config,
     int                           slots);
@@ -550,6 +560,24 @@ uint32_t
 chimera_server_config_get_anongid(
     const struct chimera_server_config *config);
 
+void
+chimera_server_config_set_nfs_fh_sign(
+    struct chimera_server_config *config,
+    int                           enable);
+
+int
+chimera_server_config_get_nfs_fh_sign(
+    const struct chimera_server_config *config);
+
+void
+chimera_server_config_set_nfs_fh_key(
+    struct chimera_server_config *config,
+    const char                   *hexkey);
+
+const char *
+chimera_server_config_get_nfs_fh_key(
+    const struct chimera_server_config *config);
+
 static void
 chimera_server_thread_wake(
     struct evpl       *evpl,
@@ -580,6 +608,14 @@ chimera_server_mkpath(
  * 0 on success, -1 otherwise. */
 int
 chimera_server_seed_symlinks(
+    struct chimera_server *server,
+    const char            *module_name);
+
+/* Seed the fixtures the WPTS MS-FSA suite expects to pre-exist on a memfs-backed
+ * share: a directory (ExistingFolder) and a regular file (ExistingFile.txt).  A
+ * test-harness aid.  Returns 0 on success, -1 otherwise. */
+int
+chimera_server_seed_fsa(
     struct chimera_server *server,
     const char            *module_name);
 
@@ -634,10 +670,30 @@ chimera_server_share_set_encrypt_data(
     const char            *share_name);
 
 int
+chimera_server_share_set_force_level2_oplock(
+    struct chimera_server *server,
+    const char            *share_name);
+
+int
 chimera_server_create_export(
     struct chimera_server *server,
     const char            *share_name,
     const char            *share_path);
+
+int
+chimera_server_export_set_options(
+    struct chimera_server *server,
+    const char            *name,
+    uint32_t               options,
+    uint32_t               squash,
+    uint32_t               anonuid,
+    uint32_t               anongid);
+
+int
+chimera_server_export_set_sec(
+    struct chimera_server *server,
+    const char            *name,
+    uint32_t               sec_allowed);
 
 struct chimera_server *
 chimera_server_init(
@@ -794,6 +850,24 @@ chimera_server_config_set_smb_kerberos_keytab(
 
 const char *
 chimera_server_config_get_smb_kerberos_keytab(
+    const struct chimera_server_config *config);
+
+void
+chimera_server_config_set_nfs_kerberos_enabled(
+    struct chimera_server_config *config,
+    int                           enabled);
+
+int
+chimera_server_config_get_nfs_kerberos_enabled(
+    const struct chimera_server_config *config);
+
+void
+chimera_server_config_set_nfs_kerberos_keytab(
+    struct chimera_server_config *config,
+    const char                   *keytab);
+
+const char *
+chimera_server_config_get_nfs_kerberos_keytab(
     const struct chimera_server_config *config);
 
 void

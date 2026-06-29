@@ -310,6 +310,18 @@ chimera_vfs_state_set_delete_pending(struct chimera_vfs_file_state *file)
     }
 } /* chimera_vfs_state_set_delete_pending */
 
+/* Clear delete-pending -- e.g. a SET_INFO disposition that turns delete-on-close
+ * back off before the last close (smb2.* DispositionInformation toggling). */
+SYMBOL_EXPORT void
+chimera_vfs_state_clear_delete_pending(struct chimera_vfs_file_state *file)
+{
+    if (file) {
+        pthread_mutex_lock(&file->lock);
+        file->delete_pending = 0;
+        pthread_mutex_unlock(&file->lock);
+    }
+} /* chimera_vfs_state_clear_delete_pending */
+
 SYMBOL_EXPORT bool
 chimera_vfs_state_is_delete_pending(struct chimera_vfs_file_state *file)
 {
@@ -1020,6 +1032,32 @@ chimera_vfs_state_would_conflict(
         break;
 
         case CHIMERA_VFS_LEASE_CACHING:
+            /* A byte-range lock is incompatible with caching on the stream
+             * (MS-FSA 2.1.5.18): a caching lease cannot be granted while another
+             * owner holds a range lock, so a fresh lease behind a peer's lock is
+             * capped to NONE (smb2.lease.lease-epoch).  Same-owner / same-grant
+             * locks are exempt -- a handle may lock its own file and keep its
+             * cache (smb2.oplock.brl2) -- as is an NFSv4 client's own lock vs its
+             * own delegation (RFC 8881 §10.2).  A bare LEASE_NONE probe (no
+             * caching bits) is unaffected. */
+            if (probe->mode.granted) {
+                for (cur = file->range_locks; cur; cur = cur->next) {
+                    if (chimera_vfs_lease_owner_equal(&cur->owner, &probe->owner) ||
+                        (probe->owner.cb_private &&
+                         cur->owner.cb_private == probe->owner.cb_private)) {
+                        continue;
+                    }
+                    if (cur->owner.protocol == CHIMERA_VFS_LEASE_PROTO_NFSV4 &&
+                        probe->owner.protocol == CHIMERA_VFS_LEASE_PROTO_NFSV4 &&
+                        cur->owner.client_key == probe->owner.client_key) {
+                        continue;
+                    }
+                    if (conflict_out) {
+                        *conflict_out = cur;
+                    }
+                    return CHIMERA_VFS_LEASE_DENIED;
+                }
+            }
             for (cur = file->caching_leases; cur; cur = cur->next) {
                 if (chimera_vfs_lease_owner_equal(&cur->owner, &probe->owner)) {
                     continue;
@@ -1238,6 +1276,16 @@ chimera_vfs_file_state_remove_lease(
     lease->file = NULL;
 } /* chimera_vfs_file_state_remove_lease */
 
+/* Forward declaration: defined below, used by the conflict-resolution break
+ * paths above its definition. */
+static void
+chimera_vfs_lease_begin_break_ex(
+    struct chimera_vfs_state *state,
+    struct chimera_vfs_lease *lease,
+    uint8_t                   floor,
+    uint32_t                  deadline_ms,
+    bool                      one_shot);
+
 /* The mode a conflicting holder is allowed to RETAIN when `acquirer` forces it to
 * break -- i.e. the break floor handed to begin_break.  The floor must be the
 * holder's granted mode with exactly the bits that CONFLICT with the acquirer
@@ -1410,8 +1458,26 @@ chimera_vfs_state_try_insert(
                     floor = conflict->mode.granted & ~CHIMERA_VFS_LEASE_MODE_H;
                 }
 
-                chimera_vfs_lease_begin_break(state, conflict, floor,
-                                              deadline_ms);
+                /* A byte-range lock is incompatible with ANY caching on the
+                 * stream -- read AND handle -- so a range-lock acquirer breaks a
+                 * conflicting caching lease all the way to NONE, not just down to
+                 * the generic write-contention floor (which would leave H).  The
+                 * same-open / same-grant exemption already ran in
+                 * would_conflict, so a holder reaching here genuinely conflicts
+                 * (MS-FSA 2.1.5.18; smb2.lease.lock1 expects LEASE2/LEASE3 -> 0). */
+                if (lease->kind == CHIMERA_VFS_LEASE_RANGE &&
+                    conflict->kind == CHIMERA_VFS_LEASE_CACHING) {
+                    floor = 0;
+                }
+
+                /* A byte-range lock invalidates the whole caching lease at once,
+                 * like a write or namespace mutation, so break it in a SINGLE
+                 * shot to the floor rather than cascading one bit per ack (a
+                 * cascade RH->R->NONE would send two notifications where the
+                 * client expects one -- smb2.lease.lock1). */
+                chimera_vfs_lease_begin_break_ex(
+                    state, conflict, floor, deadline_ms,
+                    lease->kind == CHIMERA_VFS_LEASE_RANGE /* one_shot */);
                 began_live_break = true;
             } else {
                 /* Surfaced because its recall deadline elapsed -- the holder
@@ -1654,13 +1720,14 @@ chimera_vfs_state_remove(
 /* -------------------------------------------------------------------- */
 
 SYMBOL_EXPORT void
-chimera_vfs_lease_acquire(
+chimera_vfs_lease_acquire_blocking(
     struct chimera_vfs_state           *state,
     struct chimera_vfs_file_state      *file,
     struct chimera_vfs_lease           *lease,
     struct chimera_vfs_pending_acquire *ticket,
     bool                                wait,
     chimera_vfs_lease_acquire_cb_t      cb,
+    chimera_vfs_lease_blocked_cb_t      blocked_cb,
     void                               *private_data)
 {
     enum chimera_vfs_lease_result result;
@@ -1684,12 +1751,20 @@ chimera_vfs_lease_acquire(
         pthread_mutex_lock(&file->lock);
         chimera_vfs_pending_enqueue_locked(file, ticket);
         pthread_mutex_unlock(&file->lock);
+        /* Tell the caller the result is deferred (e.g. NLM sends NLM4_BLOCKED).
+         * Fired after the enqueue but before return, so the result callback (run
+         * from a later pump, possibly on another thread) cannot race ahead of it;
+         * a NULL blocked_cb (every non-NLM caller) is simply a no-op. */
+        if (blocked_cb) {
+            blocked_cb(private_data);
+        }
         return;
     }
 
     /* A RANGE lease (byte-range lock) that is hard-DENIED by another owner's
      * conflicting lock, when the caller asked to wait, is an SMB2 blocking lock
-     * (MS-SMB2 3.3.5.14): queue it rather than bouncing DENIED.  The ticket fires
+     * (MS-SMB2 3.3.5.14) or a blocking NLM lock (RFC 1813 / XNFS NLM_LOCK with
+     * block==true): queue it rather than bouncing DENIED.  The ticket fires
      * GRANTED when the conflicting range is released (chimera_vfs_state_remove ->
      * pump_pending re-runs try_insert), or the caller cancels it
      * (chimera_vfs_lease_acquire_cancel) on CANCEL / handle close / teardown.
@@ -1701,6 +1776,9 @@ chimera_vfs_lease_acquire(
         pthread_mutex_lock(&file->lock);
         chimera_vfs_pending_enqueue_locked(file, ticket);
         pthread_mutex_unlock(&file->lock);
+        if (blocked_cb) {
+            blocked_cb(private_data);
+        }
         return;
     }
 
@@ -1713,6 +1791,20 @@ chimera_vfs_lease_acquire(
     /* Done exposing `conflict` to the cb; drop the try_insert pin (no-op unless
      * it is a caching grant). */
     chimera_vfs_state_conflict_unref(state, conflict);
+} /* chimera_vfs_lease_acquire_blocking */
+
+SYMBOL_EXPORT void
+chimera_vfs_lease_acquire(
+    struct chimera_vfs_state           *state,
+    struct chimera_vfs_file_state      *file,
+    struct chimera_vfs_lease           *lease,
+    struct chimera_vfs_pending_acquire *ticket,
+    bool                                wait,
+    chimera_vfs_lease_acquire_cb_t      cb,
+    void                               *private_data)
+{
+    chimera_vfs_lease_acquire_blocking(state, file, lease, ticket, wait, cb,
+                                       NULL, private_data);
 } /* chimera_vfs_lease_acquire */
 
 SYMBOL_EXPORT void
@@ -1907,7 +1999,8 @@ chimera_vfs_caching_grant_try_upgrade(
 SYMBOL_EXPORT uint8_t
 chimera_vfs_caching_grant_cap_mode(
     struct chimera_vfs_file_state  *file,
-    const struct chimera_vfs_lease *lease)
+    const struct chimera_vfs_lease *lease,
+    bool                            strict)
 {
     struct chimera_vfs_lease  probe    = *lease;
     struct chimera_vfs_lease *conflict = NULL;
@@ -1922,13 +2015,20 @@ chimera_vfs_caching_grant_cap_mode(
         }
         /* Step down toward the read floor: drop the exclusive write cache first,
          * then handle caching.  Once at R with a remaining conflict there is
-         * nothing left to yield -- return R and let try_insert resolve it (a
-         * genuine cross-client read/handle conflict that a cap cannot dissolve). */
+         * nothing left to yield. */
         if (mode & CHIMERA_VFS_LEASE_MODE_W) {
             mode &= ~CHIMERA_VFS_LEASE_MODE_W;
         } else if (mode & CHIMERA_VFS_LEASE_MODE_H) {
             mode &= ~CHIMERA_VFS_LEASE_MODE_H;
         } else {
+            /* At the R floor and still conflicting.  Non-strict: return R and let
+             * the caller's try_insert resolve the residual cross-client read /
+             * handle conflict.  Strict (an oplock-transparent stat-open): yield
+             * everything -- no subset is grantable without a break -- so return 0
+             * and take no oplock rather than breaking the holder. */
+            if (strict) {
+                mode = 0;
+            }
             break;
         }
     }
@@ -2141,6 +2241,93 @@ chimera_vfs_state_caching_breaking(
     return breaking;
 } /* chimera_vfs_state_caching_breaking */
 
+/*
+ * True while a caching break has been BEGUN on this file but its notification
+ * has NOT yet been delivered to the holder (break_notified == 0).  An SMB
+ * delete-on-close open -- a namespace mutation that must complete ON NOTIFY
+ * rather than on an ack the holder need never send -- parks on this so its reply
+ * cannot overtake the break on the wire (smbtorture smb2.lease.unlink, a
+ * cross-connection RH->R handle break).  Once the protocol server flushes the
+ * notification (chimera_vfs_state_mark_break_notified) this returns false and
+ * the parked open resumes.
+ */
+SYMBOL_EXPORT bool
+chimera_vfs_state_caching_break_pending_notify(
+    struct chimera_vfs_state *state,
+    const uint8_t            *fh,
+    uint8_t                   fh_len,
+    uint64_t                  fh_hash)
+{
+    struct chimera_vfs_file_state *file;
+    struct chimera_vfs_lease      *cur;
+    bool                           pending = false;
+
+    if (!state || fh_len == 0) {
+        return false;
+    }
+
+    file = chimera_vfs_state_get(state, fh, fh_len, fh_hash, false);
+    if (!file) {
+        return false;
+    }
+
+    pthread_mutex_lock(&file->lock);
+    for (cur = file->caching_leases; cur; cur = cur->next) {
+        if (cur->break_state == CHIMERA_VFS_BREAK_BREAKING &&
+            !cur->break_notified) {
+            pending = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&file->lock);
+
+    chimera_vfs_state_put(state, file);
+    return pending;
+} /* chimera_vfs_state_caching_break_pending_notify */
+
+/*
+ * Mark the outstanding break on this file's SMB2 caching lease identified by
+ * `lease_key` as DELIVERED: the protocol server has now sent the notification on
+ * the wire.  Called from the lease-break flush right after the send, so a
+ * delete-on-close open parked in caching_break_pending_notify resumes only after
+ * its break has actually left for the holder.  No-op if the lease has already
+ * settled (acked/closed) or no longer matches.
+ */
+SYMBOL_EXPORT void
+chimera_vfs_state_mark_break_notified(
+    struct chimera_vfs_state *state,
+    const uint8_t            *fh,
+    uint8_t                   fh_len,
+    uint64_t                  fh_hash,
+    const uint8_t            *lease_key)
+{
+    struct chimera_vfs_file_state *file;
+    struct chimera_vfs_lease      *cur;
+
+    if (!state || fh_len == 0) {
+        return;
+    }
+
+    file = chimera_vfs_state_get(state, fh, fh_len, fh_hash, false);
+    if (!file) {
+        return;
+    }
+
+    pthread_mutex_lock(&file->lock);
+    for (cur = file->caching_leases; cur; cur = cur->next) {
+        if (cur->break_state == CHIMERA_VFS_BREAK_BREAKING &&
+            cur->owner.is_lease &&
+            memcmp(&cur->owner.owner_lo, lease_key, 8) == 0 &&
+            memcmp(&cur->owner.owner_hi, lease_key + 8, 8) == 0) {
+            cur->break_notified = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&file->lock);
+
+    chimera_vfs_state_put(state, file);
+} /* chimera_vfs_state_mark_break_notified */
+
 SYMBOL_EXPORT bool
 chimera_vfs_lease_acquire_cancel(
     struct chimera_vfs_state           *state,
@@ -2333,7 +2520,11 @@ chimera_vfs_lease_begin_break_ex(
         lease->break_state       = CHIMERA_VFS_BREAK_BREAKING;
         lease->break_floor       = floor;
         lease->break_needed_mode = step;
-        lease->break_deadline    = chimera_vfs_now_ticks() +
+        /* A fresh notification is about to be queued for this break: it has not
+         * been delivered to the holder yet (set under file->lock, paired with
+         * break_state, so caching_break_pending_notify observes them together). */
+        lease->break_notified = 0;
+        lease->break_deadline = chimera_vfs_now_ticks() +
             chimera_vfs_ns_to_ticks((uint64_t) deadline_ms * 1000000ULL);
         /* Publish break_ack_required ATOMICALLY with break_state, under file->lock.
          * A break needs a client acknowledgment when it strips write or handle
@@ -3009,7 +3200,8 @@ chimera_vfs_state_break_caching_for_open(
     uint64_t                              fh_hash,
     const struct chimera_vfs_lease_owner *opener,
     uint8_t                               trigger_bits,
-    uint8_t                               retain_mode)
+    uint8_t                               retain_mode,
+    int                                   break_leases)
 {
     struct chimera_vfs_file_state    *file;
     struct chimera_vfs_lease         *cur;
@@ -3051,7 +3243,7 @@ chimera_vfs_state_break_caching_for_open(
          * lease's handle is only recalled by a genuine share conflict (handled in
          * the share path) or when the directory itself is removed/renamed. */
         if (trigger_bits == CHIMERA_VFS_LEASE_MODE_H &&
-            cur->grant && !cur->grant->is_oplock) {
+            cur->grant && !cur->grant->is_oplock && !break_leases) {
             continue;
         }
         if (n < CHIMERA_VFS_STATE_MAX_BREAK_BATCH) {
@@ -3724,6 +3916,17 @@ chimera_vfs_state_revoke_expired_breaks(
 
     pthread_mutex_lock(&file->lock);
     for (cur = file->caching_leases; cur; cur = cur->next) {
+        /* NFSv4 delegations are NOT force-revoked on a recall-deadline miss:
+         * RFC 7530 governs their lifetime through the client's lease (a client
+         * that stops renewing has ALL state expired by the NFSv4 lease-expiry
+         * path; a client that keeps renewing while its callback path is down is
+         * told CB_PATH_DOWN and given the chance to recover and DELEGRETURN --
+         * pynfs DELEG6).  This proactive sweep exists for SMB2 oplock/lease
+         * break-ack timeouts (#1030), where a dead-but-not-disconnected client
+         * would otherwise pin the lease BREAKING forever. */
+        if (cur->owner.protocol == CHIMERA_VFS_LEASE_PROTO_NFSV4) {
+            continue;
+        }
         if (cur->break_state == CHIMERA_VFS_BREAK_BREAKING &&
             chimera_vfs_break_deadline_passed(cur) &&
             n < CHIMERA_VFS_STATE_MAX_BREAK_BATCH) {
@@ -3758,10 +3961,13 @@ chimera_vfs_state_reap_idle(
         for (file = bucket->files;
              file && n < CHIMERA_VFS_STATE_REAP_BATCH;
              file = file->bucket_next) {
-            /* Candidates: files holding an implicit lease (reapable when idle)
-             * or with parked I/O waiters (re-pumped so an unresponsive holder
-             * is revoked at its recall deadline and the waiter makes progress). */
-            if (file->implicit_active || file->io_wait_head) {
+            /* Candidates: files holding an implicit lease (reapable when idle),
+             * with parked I/O waiters (re-pumped so an unresponsive holder is
+             * revoked at its recall deadline and the waiter makes progress), or
+             * holding any caching lease (an oplock/lease/delegation may be stuck
+             * BREAKING past its deadline with NO waiter behind it -- #1030). */
+            if (file->implicit_active || file->io_wait_head ||
+                file->caching_leases) {
                 file->refcount++;
                 cand[n++] = file;
             }
@@ -3774,6 +3980,8 @@ chimera_vfs_state_reap_idle(
 
             file = cand[i];
 
+            bool has_caching;
+
             pthread_mutex_lock(&file->lock);
             reapable = file->implicit_active &&
                 !file->implicit_draining &&
@@ -3783,17 +3991,27 @@ chimera_vfs_state_reap_idle(
                 file->implicit_draining = 1;
             }
             has_waiters = (file->io_wait_head != NULL);
+            has_caching = (file->caching_leases != NULL);
             pthread_mutex_unlock(&file->lock);
+
+            /* Forcibly revoke any caching lease stuck BREAKING past its deadline
+             * (MS-SMB2 oplock-break ack timeout / NFSv4 recall timeout) even
+             * when no conflicting acquirer is waiting -- otherwise a
+             * dead-but-not-disconnected client that never sends its OPLOCK_BREAK
+             * ack pins the lease BREAKING forever, holding caching state the
+             * server already told it to relinquish (#1030).  revoke_expired_
+             * breaks is a no-op when nothing has expired, and the revoke itself
+             * pumps the file's pending / I/O queues. */
+            if (has_caching) {
+                chimera_vfs_state_revoke_expired_breaks(state, file);
+            }
 
             if (reapable) {
                 /* finish_drain pumps the wait queue itself. */
                 chimera_vfs_implicit_finish_drain(state, file);
             } else if (has_waiters) {
                 /* A parked I/O / namespace op is waiting on a caching holder to
-                 * break.  If that holder never acknowledged and its break
-                 * deadline has elapsed, forcibly revoke it (MS-SMB2 / NFSv4
-                 * recall timeout) so the waiter can proceed, then re-pump. */
-                chimera_vfs_state_revoke_expired_breaks(state, file);
+                * break; re-pump so it makes progress once the break settles. */
                 chimera_vfs_state_pump_io(state, file);
             }
 

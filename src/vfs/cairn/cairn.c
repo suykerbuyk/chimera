@@ -34,6 +34,7 @@ void rocksdb_flush_wal(
 #include "vfs/vfs_acl.h"
 #include "vfs/vfs_acl_serialize.h"
 #include "vfs/vfs_access.h"
+#include "vfs/vfs_xattr_name.h"
 #include "cairn.h"
 #include "common/logging.h"
 #include "common/misc.h"
@@ -181,6 +182,7 @@ struct cairn_inode {
     struct timespec ctime;
     struct timespec btime;
     uint32_t        dos_attributes;
+    uint64_t        change;       /* native monotonic change counter */
 };
 
 struct cairn_inode_handle {
@@ -1227,6 +1229,7 @@ cairn_init(
         inode.ctime          = now;
         inode.btime          = now;
         inode.dos_attributes = 0;
+        inode.change         = 0;
 
         super.fsid = chimera_rand64();
 
@@ -1673,8 +1676,9 @@ cairn_alloc_inum(
 {
     uint64_t id = thread->next_inum++;
 
-    inode->inum = (id << 8) + thread->thread_id;
-    inode->gen  = 1;
+    inode->inum   = (id << 8) + thread->thread_id;
+    inode->gen    = 1;
+    inode->change = 0;
 } /* cairn_alloc_inum */
 
 static inline void
@@ -1719,6 +1723,12 @@ cairn_map_attrs(
         attr->va_btime     = inode->btime;
     }
 
+    /* Native monotonic change counter (CHIMERA_VFS_CAP_CHANGE). */
+    if (attr->va_req_mask & CHIMERA_VFS_ATTR_CHANGE) {
+        attr->va_set_mask |= CHIMERA_VFS_ATTR_CHANGE;
+        attr->va_change    = inode->change;
+    }
+
     if (attr->va_req_mask & CHIMERA_VFS_ATTR_FSID) {
         attr->va_set_mask |= CHIMERA_VFS_ATTR_FSID;
         attr->va_fsid      = shared->fsid;
@@ -1736,6 +1746,70 @@ cairn_map_attrs(
         attr->va_fsid           = shared->fsid;
     }
 } /* cairn_map_attrs */
+
+/*
+ * Compute the SMB/OS-2 EaSize (CHIMERA_VFS_ATTR_EA_SIZE) for an inode by range-
+ * scanning its xattr records and summing the FEALIST contribution of each
+ * user.* attribute.  Kept out of cairn_map_attrs() because it needs the thread
+ * (for the RocksDB iterator) and only getattr/readdir request it; call it after
+ * cairn_map_attrs(), which has already reset va_set_mask.
+ */
+static inline void
+cairn_map_ea_size(
+    struct cairn_thread      *thread,
+    struct cairn_inode       *inode,
+    struct chimera_vfs_attrs *attr)
+{
+    struct cairn_xattr_key start_key, *key;
+    rocksdb_iterator_t    *iter;
+    const char            *value;
+    size_t                 klen, vlen;
+    uint64_t               ea_size  = 0;
+    uint32_t               ea_count = 0;
+
+    if (!(attr->va_req_mask & CHIMERA_VFS_ATTR_EA_SIZE)) {
+        return;
+    }
+
+    start_key.keytype = CAIRN_KEY_XATTR;
+    start_key.inum    = inode->inum;
+    start_key.hash    = 0;
+
+    iter = cairn_meta_iterator(thread);
+    rocksdb_iter_seek(iter, (const char *) &start_key, sizeof(start_key));
+
+    while (rocksdb_iter_valid(iter)) {
+        key = (struct cairn_xattr_key *) rocksdb_iter_key(iter, &klen);
+        if (klen != sizeof(*key) ||
+            key->keytype != CAIRN_KEY_XATTR ||
+            key->inum != start_key.inum) {
+            break;
+        }
+
+        value = rocksdb_iter_value(iter, &vlen);
+        if (vlen >= sizeof(struct cairn_xattr_value)) {
+            const struct cairn_xattr_value *xv =
+                (const struct cairn_xattr_value *) value;
+            if (vlen >= sizeof(*xv) + xv->name_len + xv->value_len &&
+                chimera_vfs_xattr_is_user(xv->data, xv->name_len)) {
+                ea_size += chimera_vfs_xattr_ea_entry_size(
+                    xv->name_len - CHIMERA_VFS_XATTR_USER_PREFIX_LEN,
+                    xv->value_len);
+                ea_count++;
+            }
+        }
+
+        rocksdb_iter_next(iter);
+    }
+
+    rocksdb_iter_destroy(iter);
+
+    if (ea_count) {
+        ea_size += CHIMERA_VFS_XATTR_EA_LIST_OVERHEAD;
+    }
+    attr->va_set_mask |= CHIMERA_VFS_ATTR_EA_SIZE;
+    attr->va_ea_size   = ea_size;
+} /* cairn_map_ea_size */
 
 static inline void
 cairn_apply_attrs(
@@ -1799,6 +1873,9 @@ cairn_apply_attrs(
         inode->ctime = now;
     }
 
+    /* Any setattr is a metadata change; advance the native change counter. */
+    inode->change++;
+
 } /* cairn_apply_attrs */
 
 static void
@@ -1823,6 +1900,7 @@ cairn_getattr(
     inode = ih.inode;
 
     cairn_map_attrs(shared, &request->getattr.r_attr, inode);
+    cairn_map_ea_size(thread, inode, &request->getattr.r_attr);
     cairn_map_acl(thread, &request->getattr.r_attr, inode);
 
     cairn_inode_handle_release(&ih);
@@ -2236,17 +2314,18 @@ cairn_mkdir_at(
     }
 
     cairn_alloc_inum(thread, &inode);
-    inode.parent_inum    = parent_inode->inum; /* Set parent for ".." lookup */
-    inode.size           = 4096;
-    inode.space_used     = 4096;
-    inode.uid            = request->cred->uid;
-    inode.gid            = request->cred->gid;
-    inode.nlink          = 2;
-    inode.rdev           = 0;
-    inode.mode           = S_IFDIR | 0755;
-    inode.atime          = now;
-    inode.mtime          = now;
-    inode.ctime          = now;
+    inode.parent_inum = parent_inode->inum;    /* Set parent for ".." lookup */
+    inode.size        = 4096;
+    inode.space_used  = 4096;
+    inode.uid         = request->cred->uid;
+    inode.gid         = request->cred->gid;
+    inode.nlink       = 2;
+    inode.rdev        = 0;
+    inode.mode        = S_IFDIR | 0755;
+    inode.atime       = now;
+    inode.mtime       = now;
+    inode.ctime       = now;
+    inode.change++;
     inode.btime          = now;
     inode.dos_attributes = 0;
 
@@ -2275,6 +2354,7 @@ cairn_mkdir_at(
 
     parent_inode->mtime = now;
     parent_inode->ctime = now;
+    parent_inode->change++;
 
     cairn_map_attrs(shared, &request->mkdir_at.r_dir_post_attr, parent_inode);
 
@@ -2348,16 +2428,17 @@ cairn_mknod_at(
     }
 
     cairn_alloc_inum(thread, &inode);
-    inode.parent_inum    = parent_inode->inum;
-    inode.size           = 0;
-    inode.space_used     = 0;
-    inode.uid            = request->cred->uid;
-    inode.gid            = request->cred->gid;
-    inode.nlink          = 1;
-    inode.rdev           = 0;
-    inode.atime          = now;
-    inode.mtime          = now;
-    inode.ctime          = now;
+    inode.parent_inum = parent_inode->inum;
+    inode.size        = 0;
+    inode.space_used  = 0;
+    inode.uid         = request->cred->uid;
+    inode.gid         = request->cred->gid;
+    inode.nlink       = 1;
+    inode.rdev        = 0;
+    inode.atime       = now;
+    inode.mtime       = now;
+    inode.ctime       = now;
+    inode.change++;
     inode.btime          = now;
     inode.dos_attributes = 0;
 
@@ -2384,6 +2465,7 @@ cairn_mknod_at(
 
     parent_inode->mtime = now;
     parent_inode->ctime = now;
+    parent_inode->change++;
 
     cairn_map_attrs(shared, &request->mknod_at.r_dir_post_attr, parent_inode);
 
@@ -2474,6 +2556,7 @@ cairn_remove_at(
 
     parent_inode->mtime = now;
     parent_inode->ctime = now;
+    parent_inode->change++;
 
     if (S_ISDIR(inode->mode)) {
         inode->nlink = 0;
@@ -2485,6 +2568,7 @@ cairn_remove_at(
          * link count, which is a status change: bump its ctime. */
         if (inode->nlink > 0) {
             inode->ctime = now;
+            inode->change++;
         }
     }
 
@@ -2582,6 +2666,7 @@ cairn_readdir(
         /* Handle "." entry (cookie 0 -> 1) */
         if (cookie < CAIRN_COOKIE_DOT) {
             cairn_map_attrs(shared, &attr, inode);
+            cairn_map_ea_size(thread, inode, &attr);
 
             rc = request->readdir.callback(
                 inode->inum,
@@ -2607,9 +2692,11 @@ cairn_readdir(
             if (rc == 0) {
                 parent_inode = parent_ih.inode;
                 cairn_map_attrs(shared, &attr, parent_inode);
+                cairn_map_ea_size(thread, parent_inode, &attr);
                 cairn_inode_handle_release(&parent_ih);
             } else {
                 cairn_map_attrs(shared, &attr, inode);
+                cairn_map_ea_size(thread, inode, &attr);
             }
 
             rc = request->readdir.callback(
@@ -2676,6 +2763,7 @@ cairn_readdir(
         dirent_inode = dirent_ih.inode;
 
         cairn_map_attrs(shared, &attr, dirent_inode);
+        cairn_map_ea_size(thread, dirent_inode, &attr);
         cairn_map_acl(thread, &attr, dirent_inode);
 
         cairn_inode_handle_release(&dirent_ih);
@@ -2860,16 +2948,17 @@ cairn_open_at(
         is_new_inode = 1;
 
         cairn_alloc_inum(thread, &new_inode);
-        new_inode.size           = 0;
-        new_inode.space_used     = 0;
-        new_inode.uid            = request->cred->uid;
-        new_inode.gid            = request->cred->gid;
-        new_inode.nlink          = 1;
-        new_inode.rdev           = 0;
-        new_inode.mode           = S_IFREG |  0644;
-        new_inode.atime          = now;
-        new_inode.mtime          = now;
-        new_inode.ctime          = now;
+        new_inode.size       = 0;
+        new_inode.space_used = 0;
+        new_inode.uid        = request->cred->uid;
+        new_inode.gid        = request->cred->gid;
+        new_inode.nlink      = 1;
+        new_inode.rdev       = 0;
+        new_inode.mode       = S_IFREG |  0644;
+        new_inode.atime      = now;
+        new_inode.mtime      = now;
+        new_inode.ctime      = now;
+        new_inode.change++;
         new_inode.btime          = now;
         new_inode.dos_attributes = 0;
         new_inode.refcnt         = 1;
@@ -2894,6 +2983,7 @@ cairn_open_at(
 
         parent_inode->mtime = now;
         parent_inode->ctime = now;
+        parent_inode->change++;
 
         /* Signal to the protocol layer that this open created the file (vs.
          * opened an existing one) so the SMB CREATE reply reports the correct
@@ -3448,6 +3538,7 @@ cairn_write(
     inode->space_used += total_space;
     inode->mtime       = now;
     inode->ctime       = now;
+    inode->change++;
 
     /* POSIX kill-priv: a non-privileged write to a regular file clears the
      * set-user-ID bit and the set-group-ID bit (when group-executable). */
@@ -3512,6 +3603,7 @@ cairn_allocate(
 
     inode->mtime = now;
     inode->ctime = now;
+    inode->change++;
 
     cairn_map_attrs(shared, &request->allocate.r_post_attr, inode);
 
@@ -3760,16 +3852,17 @@ cairn_symlink_at(
     }
 
     cairn_alloc_inum(thread, &new_inode);
-    new_inode.size           = request->symlink_at.targetlen;
-    new_inode.space_used     = request->symlink_at.targetlen;
-    new_inode.uid            = request->cred->uid;
-    new_inode.gid            = request->cred->gid;
-    new_inode.nlink          = 1;
-    new_inode.rdev           = 0;
-    new_inode.mode           = S_IFLNK | 0755;
-    new_inode.atime          = now;
-    new_inode.mtime          = now;
-    new_inode.ctime          = now;
+    new_inode.size       = request->symlink_at.targetlen;
+    new_inode.space_used = request->symlink_at.targetlen;
+    new_inode.uid        = request->cred->uid;
+    new_inode.gid        = request->cred->gid;
+    new_inode.nlink      = 1;
+    new_inode.rdev       = 0;
+    new_inode.mode       = S_IFLNK | 0755;
+    new_inode.atime      = now;
+    new_inode.mtime      = now;
+    new_inode.ctime      = now;
+    new_inode.change++;
     new_inode.btime          = now;
     new_inode.dos_attributes = 0;
 
@@ -3779,6 +3872,7 @@ cairn_symlink_at(
 
     parent_inode->mtime = now;
     parent_inode->ctime = now;
+    parent_inode->change++;
 
     cairn_map_attrs(shared, &request->symlink_at.r_attr, &new_inode);
     cairn_map_attrs(shared, &request->symlink_at.r_dir_post_attr, parent_inode);
@@ -4163,6 +4257,7 @@ cairn_rename_at(
     }
 
     target_inode->ctime = now;
+    target_inode->change++;
     if (cmp != 0 && S_ISDIR(target_inode->mode)) {
         target_inode->parent_inum = new_parent_inode->inum;
     }
@@ -4179,8 +4274,10 @@ cairn_rename_at(
 
     old_parent_inode->mtime = now;
     old_parent_inode->ctime = now;
+    old_parent_inode->change++;
     new_parent_inode->mtime = now;
     new_parent_inode->ctime = now;
+    new_parent_inode->change++;
 
     if (cmp != 0 && S_ISDIR(target_inode->mode)) {
         old_parent_inode->nlink--;
@@ -4280,8 +4377,10 @@ cairn_link_at(
 
     target_inode->nlink++;
     target_inode->ctime = now;
+    target_inode->change++;
     parent_inode->mtime = now;
     parent_inode->ctime = now;
+    parent_inode->change++;
 
     cairn_put_dirent(thread, &dirent_key, &dirent_value);
     cairn_put_inode(thread, parent_inode);
@@ -5016,7 +5115,7 @@ SYMBOL_EXPORT struct chimera_vfs_module vfs_cairn = {
         CHIMERA_VFS_CAP_FS_RELATIVE_OP | CHIMERA_VFS_CAP_ACL_NATIVE |
         CHIMERA_VFS_CAP_ATOMIC_HANDLE_STATE |
         CHIMERA_VFS_CAP_XATTR | CHIMERA_VFS_CAP_READ_PROVIDES_BUFFERS |
-        CHIMERA_VFS_CAP_FS_LOCK,
+        CHIMERA_VFS_CAP_FS_LOCK | CHIMERA_VFS_CAP_CHANGE,
     .init           = cairn_init,
     .destroy        = cairn_destroy,
     .thread_init    = cairn_thread_init,

@@ -19,6 +19,7 @@
 #include "s3_bucket_map.h"
 #include "s3_auth.h"
 #include "s3_multipart.h"
+#include "s3_tagging.h"
 #include "s3.h"
 #include "vfs/vfs.h"
 #include "vfs/vfs_procs.h"
@@ -163,7 +164,9 @@ s3_server_respond(
 
     if (request->is_list) {
         evpl_http_request_add_header(request->http_request, "Content-Type", "application/xml");
-    } else {
+    } else if (!request->have_content_type) {
+        /* GET/HEAD attaches the object's stored Content-Type (if any) before
+         * dispatch; only fall back to the generic type when none was stored. */
         evpl_http_request_add_header(request->http_request, "Content-Type", "application/octet-stream");
     }
     evpl_http_request_add_header(request->http_request, "Accept-Ranges", "bytes");
@@ -254,7 +257,11 @@ s3_server_notify(
     switch (notify_type) {
         case EVPL_HTTP_NOTIFY_RECEIVE_DATA:
             if (request_type == EVPL_HTTP_REQUEST_TYPE_PUT &&
-                s3_request->vfs_state == CHIMERA_S3_VFS_STATE_RECV) {
+                s3_request->has_tagging) {
+                /* PutObjectTagging: accumulate the <Tagging> body. */
+                chimera_s3_put_tagging_recv(evpl, s3_request);
+            } else if (request_type == EVPL_HTTP_REQUEST_TYPE_PUT &&
+                       s3_request->vfs_state == CHIMERA_S3_VFS_STATE_RECV) {
                 if (is_upload_part) {
                     chimera_s3_upload_part_recv(evpl, s3_request);
                 } else {
@@ -280,7 +287,17 @@ s3_server_notify(
             s3_request->http_state = CHIMERA_S3_HTTP_STATE_RECVED;
 
             if (request_type == EVPL_HTTP_REQUEST_TYPE_PUT &&
-                s3_request->vfs_state == CHIMERA_S3_VFS_STATE_RECV) {
+                s3_request->has_tagging) {
+                /* PutObjectTagging: drain any trailing body, then parse + store
+                 * once the bucket FH is resolved. If the bucket lookup is still
+                 * in flight, its callback drives body_done instead. */
+                chimera_s3_put_tagging_recv(evpl, s3_request);
+                if (s3_request->bucket_fhlen != 0 &&
+                    s3_request->vfs_state != CHIMERA_S3_VFS_STATE_COMPLETE) {
+                    chimera_s3_put_tagging_body_done(evpl, s3_request);
+                }
+            } else if (request_type == EVPL_HTTP_REQUEST_TYPE_PUT &&
+                       s3_request->vfs_state == CHIMERA_S3_VFS_STATE_RECV) {
                 if (is_upload_part) {
                     chimera_s3_upload_part_recv(evpl, s3_request);
                 } else {
@@ -320,6 +337,8 @@ s3_server_notify(
 
             chimera_s3_dump_response(s3_request);
 
+            chimera_s3_tagging_request_cleanup(s3_request);
+
             chimera_s3_request_free(thread, s3_request);
             break;
         default:
@@ -347,6 +366,33 @@ chimera_s3_dispatch_callback(
 
     memcpy(s3_request->bucket_fh, attr->va_fh, attr->va_fh_len);
     s3_request->bucket_fhlen = attr->va_fh_len;
+
+    /* ?tagging subresource (object or bucket): route to the tagging handlers
+     * before the normal object/bucket method routing. */
+    if (s3_request->has_tagging) {
+        switch (evpl_http_request_type(s3_request->http_request)) {
+            case EVPL_HTTP_REQUEST_TYPE_GET:
+                chimera_s3_get_tagging(evpl, thread, s3_request);
+                break;
+            case EVPL_HTTP_REQUEST_TYPE_DELETE:
+                chimera_s3_delete_tagging(evpl, thread, s3_request);
+                break;
+            case EVPL_HTTP_REQUEST_TYPE_PUT:
+                /* PutObjectTagging: the <Tagging> body is parsed once fully
+                 * received (chimera_s3_put_tagging_body_done), which then
+                 * invokes chimera_s3_put_tagging. If the body already arrived
+                 * before this lookup completed, drive it now. */
+                if (s3_request->http_state == CHIMERA_S3_HTTP_STATE_RECVED) {
+                    chimera_s3_put_tagging_body_done(evpl, s3_request);
+                }
+                break;
+            default:
+                s3_request->status    = CHIMERA_S3_STATUS_METHOD_NOT_ALLOWED;
+                s3_request->vfs_state = CHIMERA_S3_VFS_STATE_COMPLETE;
+                break;
+        } /* switch */
+        return;
+    }
 
     switch (evpl_http_request_type(s3_request->http_request)) {
         case EVPL_HTTP_REQUEST_TYPE_HEAD:
@@ -444,13 +490,30 @@ s3_server_dispatch(
     s3_request->has_delete         = 0;
     s3_request->has_versions       = 0;
     s3_request->has_part_number    = 0;
+    s3_request->has_tagging        = 0;
+    s3_request->tagging            = NULL;
+    s3_request->bucket_fhlen       = 0;
     s3_request->op_bucket          = 0;
     s3_request->has_attributes     = 0;
     s3_request->chunked            = 0;
     s3_request->responded          = 0;
+    s3_request->have_content_type  = 0;
     s3_request->query_upload_idlen = 0;
     s3_request->query_part_number  = 0;
     s3_request->http_request       = request;
+
+    /* Requests are recycled through a per-thread free list (see
+     * chimera_s3_request_alloc) and are NOT zeroed on reuse. The VFS open
+     * handles are released by each handler's completion path, but several of
+     * those paths drop the reference without clearing the pointer, so a
+     * recycled request can carry a dangling file_handle / dir_handle from a
+     * prior op. If a later handler's error path then releases that stale
+     * pointer (e.g. CompleteMultipartUpload's create-dir error branch in
+     * chimera_s3_complete_finish_common), and the VFS close thread has since
+     * swept the now-idle cached handle, the release is a use-after-free.
+     * Clear them here so a fresh request always starts with no held handles. */
+    s3_request->file_handle = NULL;
+    s3_request->dir_handle  = NULL;
 
     *notify_callback = s3_server_notify;
     *notify_data     = s3_request;
@@ -661,6 +724,8 @@ s3_server_dispatch(
                     memcpy(upload_id_marker_buf, value_start, copy);
                     upload_id_marker_buf[copy] = '\0';
                     upload_id_marker_len       = copy;
+                } else if (key_len == 7 && memcmp(key_start, "tagging", 7) == 0) {
+                    s3_request->has_tagging = 1;
                 } else if (key_len == 6 && memcmp(key_start, "prefix", 6) == 0) {
                     prefix_len = chimera_s3_pct_decode(prefix_buf, sizeof(prefix_buf),
                                                        value_start, value_len);
@@ -779,7 +844,12 @@ s3_server_dispatch(
                 s3_request->del.cur      = 0;
                 s3_request->del.quiet    = 0;
             } else if (qmark == s3_request->path) {
-                if (saw_unknown && !s3_request->has_versions) {
+                if (s3_request->has_tagging) {
+                    /* Bucket-level ?tagging: no object key, route to the
+                     * tagging handlers (which operate on the bucket dir). */
+                    s3_request->path     = "";
+                    s3_request->path_len = 0;
+                } else if (saw_unknown && !s3_request->has_versions) {
                     /* Path is "?<subresource>" we don't implement (acl, policy,
                      * tagging, cors, lifecycle, versioning, website, ...). These
                      * configure features that have no meaning for a filesystem-
@@ -862,7 +932,7 @@ s3_server_dispatch(
         /* CreateBucket: PUT /bucket with no object key. The target bucket does
          * not exist yet, so this is handled before the bucket-map lookup. */
         if (method == EVPL_HTTP_REQUEST_TYPE_PUT && s3_request->path_len == 0 &&
-            !s3_request->has_upload_id) {
+            !s3_request->has_upload_id && !s3_request->has_tagging) {
             s3_request->op_bucket = 1;
             chimera_s3_create_bucket(evpl, thread, s3_request);
             return;
@@ -881,7 +951,7 @@ s3_server_dispatch(
          * no object-style subresource query. */
         if (s3_request->path_len == 0 && !s3_request->has_uploads &&
             !s3_request->has_delete && !s3_request->has_upload_id &&
-            !s3_request->is_list) {
+            !s3_request->is_list && !s3_request->has_tagging) {
 
             if (method == EVPL_HTTP_REQUEST_TYPE_DELETE) {
                 s3_request->op_bucket = 1;

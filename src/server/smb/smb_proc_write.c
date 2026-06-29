@@ -9,11 +9,6 @@
 #include "vfs/vfs_notify.h"
 #include "vfs/vfs_state.h"
 
-/* Maximum supported file size, matching the Windows/Samba value
- * (0xFFFFFFF0000 == 2^44 - 2^16).  A write whose last byte would extend past
- * this is rejected with INVALID_PARAMETER. */
-#define CHIMERA_SMB_MAX_FILE_SIZE 0xfffffff0000ULL
-
 /* A write-time-sticky handle needs the pre-write mtime back from the VFS so the
  * write callback can restore it; otherwise no pre-attrs are requested. */
 static inline uint64_t
@@ -280,6 +275,19 @@ chimera_smb_write(struct chimera_smb_request *request)
         return;
     }
 
+    /* MS-SMB2 §3.3.5.13: an RDMA channel is only valid over an RDMA transport.
+    * The Channel field is client-controlled; honoring RDMA_V1 on a plain-TCP
+    * connection would dispatch evpl_rdma_read on a non-RDMA bind.  Reject with
+    * INVALID_PARAMETER (the spec-required status) before touching the data. */
+    if ((request->write.channel == SMB2_CHANNEL_RDMA_V1 ||
+         request->write.channel == SMB2_CHANNEL_RDMA_V1_INVALIDATE) &&
+        !evpl_bind_is_rdma(request->compound->conn->bind)) {
+        evpl_iovecs_release(evpl, request->write.iov, request->write.niov);
+        chimera_smb_open_file_release(request, request->write.open_file);
+        chimera_smb_complete_request(request, SMB2_STATUS_INVALID_PARAMETER);
+        return;
+    }
+
     /* MS-SMB2 §3.3.5.2.10: a WRITE carrying a stale ChannelSequence (the client
      * has since failed over to a higher sequence) must be rejected with
      * FILE_NOT_AVAILABLE so a delayed retry cannot clobber newer data. */
@@ -288,6 +296,20 @@ chimera_smb_write(struct chimera_smb_request *request)
         evpl_iovecs_release(evpl, request->write.iov, request->write.niov);
         chimera_smb_open_file_release(request, request->write.open_file);
         chimera_smb_complete_request(request, SMB2_STATUS_FILE_NOT_AVAILABLE);
+        return;
+    }
+
+    /* A zero-length write accesses no byte range: per MS-FSA 2.1.5.3 it
+     * completes immediately with Count 0.  It must take NO byte-range-lock
+     * conflict (a 0-byte write inside another owner's exclusive lock is allowed
+     * -- smb2.lock.allow_zero_byte_write) and break NO oplock/lease (it changes
+     * no data, so cached readers stay valid -- smb2 readwrite write_none_*).
+     * Short-circuit here, before the lock-conflict check and the VFS write that
+     * would otherwise drive a read-cache break. */
+    if (request->write.length == 0) {
+        evpl_iovecs_release(evpl, request->write.iov, request->write.niov);
+        chimera_smb_open_file_release(request, request->write.open_file);
+        chimera_smb_complete_request(request, SMB2_STATUS_SUCCESS);
         return;
     }
 
@@ -388,6 +410,14 @@ chimera_smb_parse_write(
     int          i;
 
     int          prc = 0;
+
+    /* MS-SMB2 3.3.5.13 / 2.2.21: a WRITE StructureSize that is not exactly 49
+     * is a per-request STATUS_INVALID_PARAMETER. */
+    if (unlikely(request->request_struct_size != SMB2_WRITE_REQUEST_SIZE)) {
+        chimera_smb_error("Received SMB2 WRITE request with invalid struct size (%u expected %u)",
+                          request->request_struct_size, SMB2_WRITE_REQUEST_SIZE);
+        return chimera_smb_parse_reject(request, SMB2_STATUS_INVALID_PARAMETER);
+    }
 
     prc |= evpl_iovec_cursor_try_get_uint16(request_cursor, &data_offset);
     prc |= evpl_iovec_cursor_try_get_uint32(request_cursor, &request->write.length);

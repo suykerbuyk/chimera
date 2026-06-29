@@ -529,6 +529,8 @@ diskfs_setattr_trunc_done(struct chimera_vfs_request *request)
     }
 
     diskfs_map_attrs(thread, &request->setattr.r_post_attr, inode);
+    chimera_diskfs_info("setattr trunc done inum=%lu new_size=%lu -> committing",
+                        (unsigned long) inode->inum, (unsigned long) inode->size);
     diskfs_op_ok(request, p->txn);
 } /* diskfs_setattr_trunc_done */
 
@@ -857,6 +859,16 @@ diskfs_setattr_inode_cb(
     }
 
     diskfs_map_attrs(thread, &request->setattr.r_pre_attr, inode);
+
+    if (orig_mask & CHIMERA_VFS_ATTR_SIZE) {
+        chimera_diskfs_info("setattr SIZE inum=%lu cur=%lu new=%lu mask=0x%lx (%s)",
+                            (unsigned long) inode->inum,
+                            (unsigned long) inode->size,
+                            (unsigned long) request->setattr.set_attr->va_size,
+                            (unsigned long) orig_mask,
+                            (request->setattr.set_attr->va_size < inode->size) ?
+                            "trunc" : "grow");
+    }
 
     /* Handle truncation: remove/trim extents past new EOF. */
     if ((request->setattr.set_attr->va_set_mask & CHIMERA_VFS_ATTR_SIZE) &&
@@ -1592,6 +1604,22 @@ diskfs_set_xattr_inserted_cb(
     clock_gettime(CLOCK_REALTIME, &now);
     inode->ctime_sec  = now.tv_sec;
     inode->ctime_nsec = now.tv_nsec;
+    inode->change++;
+
+    /* Maintain the cached EaSize aggregate (user.* xattrs only). */
+    if (chimera_vfs_xattr_is_user(request->set_xattr.name,
+                                  request->set_xattr.namelen)) {
+        uint64_t new_size = chimera_vfs_xattr_ea_entry_size(
+            request->set_xattr.namelen - CHIMERA_VFS_XATTR_USER_PREFIX_LEN,
+            request->set_xattr.value_len);
+
+        if (p->ea_replace) {
+            inode->ea_size += new_size - p->ea_old_size;
+        } else {
+            inode->ea_size += new_size;
+            inode->ea_count++;
+        }
+    }
 
     diskfs_map_attrs(p->thread, &request->set_xattr.r_post_attr, inode);
     diskfs_op_ok(request, p->txn);
@@ -1672,6 +1700,15 @@ diskfs_set_xattr_lookup_cb(
             diskfs_op_fail(request, p->txn, CHIMERA_VFS_EEXIST);
             return;
         }
+        /* Replacing an existing EA: capture its FEALIST size so the insert
+         * completion can apply the size delta to the cached aggregate. */
+        if (chimera_vfs_xattr_is_user(request->set_xattr.name,
+                                      request->set_xattr.namelen)) {
+            p->ea_replace  = 1;
+            p->ea_old_size = chimera_vfs_xattr_ea_entry_size(
+                request->set_xattr.namelen - CHIMERA_VFS_XATTR_USER_PREFIX_LEN,
+                old_rec->value_len);
+        }
         free(p->xattr_rec);
         {
             struct diskfs_bt_key key = diskfs_set_xattr_key(request);
@@ -1723,6 +1760,8 @@ diskfs_set_xattr_inode_cb(
     diskfs_map_attrs(p->thread, &request->set_xattr.r_pre_attr, inode);
 
     p->inode_stash[0] = inode;
+    p->ea_replace     = 0;
+    p->ea_old_size    = 0;
 
     key          = diskfs_set_xattr_key(request);
     p->xattr_rec = malloc(DISKFS_BT_NODE_CAP);
@@ -1928,6 +1967,15 @@ diskfs_remove_xattr_removed_cb(
     clock_gettime(CLOCK_REALTIME, &now);
     inode->ctime_sec  = now.tv_sec;
     inode->ctime_nsec = now.tv_nsec;
+    inode->change++;
+
+    /* Maintain the cached EaSize aggregate (user.* xattrs only). */
+    if (chimera_vfs_xattr_is_user(request->remove_xattr.name,
+                                  request->remove_xattr.namelen) &&
+        inode->ea_count) {
+        inode->ea_size -= p->ea_old_size;
+        inode->ea_count--;
+    }
 
     diskfs_map_attrs(p->thread, &request->remove_xattr.r_post_attr, inode);
     diskfs_op_ok(request, p->txn);
@@ -1953,6 +2001,14 @@ diskfs_remove_xattr_lookup_cb(
         free(p->xattr_rec);
         diskfs_op_fail(request, p->txn, CHIMERA_VFS_ENODATA);
         return;
+    }
+
+    /* Capture the removed EA's FEALIST size for the cached-aggregate update. */
+    if (chimera_vfs_xattr_is_user(request->remove_xattr.name,
+                                  request->remove_xattr.namelen)) {
+        p->ea_old_size = chimera_vfs_xattr_ea_entry_size(
+            request->remove_xattr.namelen - CHIMERA_VFS_XATTR_USER_PREFIX_LEN,
+            rec->value_len);
     }
     free(p->xattr_rec);
 
@@ -1984,6 +2040,7 @@ diskfs_remove_xattr_inode_cb(
     diskfs_map_attrs(p->thread, &request->remove_xattr.r_pre_attr, inode);
 
     p->inode_stash[0] = inode;
+    p->ea_old_size    = 0;
 
     p->xattr_rec = malloc(DISKFS_BT_NODE_CAP);
     op           = diskfs_bt_op_alloc(p->thread);

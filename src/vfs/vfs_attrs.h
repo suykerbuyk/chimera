@@ -8,7 +8,16 @@
 
 struct chimera_acl;
 
-#define CHIMERA_VFS_FH_SIZE                 48
+/*
+ * Maximum chimera VFS file-handle length.  Backends produce much smaller
+ * handles (mount_id + a short fragment, typically ~28-36 bytes), but the NFS
+ * client/proxy (vfs_nfs) nests a remote server's handle inside its own handle,
+ * and the NFS server wraps handles with an export id + signing MAC, so the cap
+ * is set above the worst-case nested+wrapped size rather than the bare backend
+ * size.  Kept at/below NFS3_FHSIZE (64) so a backend handle still fits an
+ * NFSv3 wire handle once wrapped.
+ */
+#define CHIMERA_VFS_FH_SIZE                 64
 
 #define CHIMERA_VFS_ATTR_DEV                (1UL << 0)
 #define CHIMERA_VFS_ATTR_INUM               (1UL << 1)
@@ -56,6 +65,29 @@ struct chimera_acl;
  * fresh, mask-gated, only when a protocol asks for them. */
 #define CHIMERA_VFS_ATTR_ACL                (1UL << 24)
 
+/* Native change attribute (va_change).  Optional and cacheable, modeled on
+ * BTIME: a backend sets this bit in va_set_mask only if it tracks a real
+ * monotonic change counter (CHIMERA_VFS_CAP_CHANGE).  Deliberately NOT part of
+ * MASK_STAT (which every backend must supply); backends without a native
+ * counter simply leave it unset and the NFS server derives change from ctime. */
+#define CHIMERA_VFS_ATTR_CHANGE             (1UL << 25)
+
+/* SMB AllocationSize reservation (va_alloc_size): the minimum allocated size a
+ * file reserves independent of its EOF, set via a CREATE AllocationSize context
+ * or FileAllocationInformation.  Optional: a backend sets this bit in
+ * va_set_mask only if it persists the reservation, and folds it into the
+ * reported va_space_used (max of real usage and the reservation). */
+#define CHIMERA_VFS_ATTR_ALLOC_SIZE         (1UL << 26)
+
+/* SMB/OS-2 EaSize: the combined byte length of the object's user-namespace
+ * extended attributes, in the OS/2 FEALIST encoding (see
+ * chimera_vfs_xattr_ea_entry_size in vfs_xattr_name.h).  Optional and computed
+ * by enumeration only when requested, so it is deliberately NOT in MASK_STAT or
+ * MASK_CACHEABLE -- only the SMB server asks for it, and only for the info
+ * levels that carry EaSize.  A backend sets the bit in va_set_mask iff it
+ * supports xattrs (CHIMERA_VFS_CAP_XATTR). */
+#define CHIMERA_VFS_ATTR_EA_SIZE            (1UL << 27)
+
 #define CHIMERA_VFS_ATTR_MASK_STAT          ( \
             CHIMERA_VFS_ATTR_DEV | \
             CHIMERA_VFS_ATTR_INUM | \
@@ -99,7 +131,8 @@ struct chimera_acl;
  * track btime (linux/io_uring/cairn) must still satisfy MASK_STAT. */
 #define CHIMERA_VFS_ATTR_MASK_CACHEABLE     ( \
             CHIMERA_VFS_ATTR_MASK_STAT | \
-            CHIMERA_VFS_ATTR_BTIME)
+            CHIMERA_VFS_ATTR_BTIME | \
+            CHIMERA_VFS_ATTR_CHANGE)
 
 #define CHIMERA_VFS_TIME_NOW                ((1l << 30) - 3l)
 
@@ -152,10 +185,23 @@ struct chimera_vfs_attrs {
     uint64_t            va_rdev;
     uint64_t            va_size;
     uint64_t            va_space_used;
+    uint64_t            va_alloc_size;
     struct timespec     va_atime;
     struct timespec     va_mtime;
     struct timespec     va_ctime;
     struct timespec     va_btime;
+
+    /* Native change attribute (CHIMERA_VFS_ATTR_CHANGE): a monotonically
+     * increasing per-object version counter.  Optional: a backend sets this bit
+     * in va_set_mask only if it supplies a real counter (CHIMERA_VFS_CAP_CHANGE),
+     * letting the NFS server report change_attr_type MONOTONIC_INCR instead of
+     * falling back to a ctime-derived change value. */
+    uint64_t            va_change;
+
+    /* SMB/OS-2 EaSize (CHIMERA_VFS_ATTR_EA_SIZE): combined OS/2-FEALIST byte
+     * length of this object's user-namespace xattrs.  Optional; filled only when
+     * the bit is requested. */
+    uint64_t            va_ea_size;
 
     uint64_t            va_fs_space_avail;
     uint64_t            va_fs_space_free;

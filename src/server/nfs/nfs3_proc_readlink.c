@@ -27,6 +27,16 @@ chimera_nfs3_readlink_complete(
 
     res->status = chimera_vfs_error_to_nfsstat3(error_code);
 
+    /* READLINK is only valid on a symlink (RFC 1813 §3.3.5); enforce at the
+     * protocol layer rather than relying on every backend to map a non-symlink
+     * to EINVAL.  The type comes from the attrs already fetched, so no extra
+     * round-trip. */
+    if (res->status == NFS3_OK && attr &&
+        (attr->va_set_mask & CHIMERA_VFS_ATTR_MODE) &&
+        (attr->va_mode & S_IFMT) != S_IFLNK) {
+        res->status = NFS3ERR_INVAL;
+    }
+
     if (res->status == NFS3_OK) {
         chimera_nfs3_set_post_op_attr(&res->resok.symlink_attributes, attr);
         res->resok.data.len = targetlen;
@@ -86,11 +96,13 @@ chimera_nfs3_readlink(
     void                      *private_data)
 {
     struct chimera_server_nfs_thread *thread = private_data;
+    struct chimera_server_nfs_shared *shared = thread->shared;
     struct nfs_request               *req;
     struct READLINK3res              *res;
+    int                               rc;
 
     req = nfs_request_alloc(thread, conn, encoding);
-    chimera_nfs_map_cred(&req->cred, cred);
+    chimera_nfs_map_cred_req(req, cred);
 
     nfs3_dump_readlink(req, args);
     res = &req->res_readlink;
@@ -100,9 +112,20 @@ chimera_nfs3_readlink(
 
     req->args_readlink = args;
 
+    res->status = chimera_nfs3_decode_fh(req, args->symlink.data.data, args->symlink.data.len);
+    if (res->status != NFS3_OK) {
+        nfsstat3 fh_status = res->status;
+        memset(res, 0, sizeof(*res));
+        res->status = fh_status;
+        rc          = shared->nfs_v3.send_reply_NFSPROC3_READLINK(evpl, NULL, res, req->encoding);
+        chimera_nfs_abort_if(rc, "Failed to send RPC2 reply");
+        nfs_request_free(thread, req);
+        return;
+    }
+
     chimera_vfs_open_fh(thread->vfs_thread, &req->cred,
-                        args->symlink.data.data,
-                        args->symlink.data.len,
+                        req->fh,
+                        req->fhlen,
                         CHIMERA_VFS_OPEN_INFERRED | CHIMERA_VFS_OPEN_PATH,
                         chimera_nfs3_readlink_open_callback,
                         req);

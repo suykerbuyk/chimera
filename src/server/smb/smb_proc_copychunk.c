@@ -27,14 +27,16 @@
  * resolves that FileId within the same session to find the source handle.
  */
 
-/* MS-SMB2 server-side copy limits (2.2.32.1):
+/* Server-side copy limits:
  *   MaxChunkCount  = 256
  *   MaxChunkSize   = 1 MiB
  *   TotalSizeLimit = 16 MiB
  * A request that exceeds any of these is answered with STATUS_INVALID_PARAMETER
  * and a SRV_COPYCHUNK_RESPONSE whose ChunksWritten / ChunkBytesWritten /
  * TotalBytesWritten advertise these maxima so the client resubmits within them
- * (MS-SMB2 3.3.5.15.6). */
+ * (MS-SMB2 3.3.5.15.6).  ServerSideCopyMaxNumberOfChunks is an implementation-
+ * chosen ADM value; we use 256 (the Windows Server value real clients -- pike,
+ * Windows -- expect), not the 16 a prior audit read into the spec. */
 #define CHIMERA_SMB_CC_MAX_CHUNKS    256
 #define CHIMERA_SMB_CC_MAX_CHUNK_LEN (1024 * 1024)
 #define CHIMERA_SMB_CC_MAX_TOTAL_LEN (16 * 1024 * 1024)
@@ -45,6 +47,7 @@ static void
 chimera_smb_copychunk_limit_fail(struct chimera_smb_request *request)
 {
     request->ioctl.cc_chunks_written = CHIMERA_SMB_CC_MAX_CHUNKS;
+    request->ioctl.cc_chunk_bytes    = CHIMERA_SMB_CC_MAX_CHUNK_LEN;
     request->ioctl.cc_total_written  = CHIMERA_SMB_CC_MAX_TOTAL_LEN;
     request->ioctl.cc_limit_response = 1;
     chimera_smb_complete_request(request, SMB2_STATUS_INVALID_PARAMETER);
@@ -101,10 +104,22 @@ chimera_smb_copychunk_cb(
     if (error_code != CHIMERA_VFS_OK) {
         /* A backend without server-side copy support must answer
          * NOT_SUPPORTED so the client falls back to a normal read/write
-         * copy rather than treating it as a hard error. */
-        uint32_t status = (error_code == CHIMERA_VFS_ENOTSUP)
-                          ? SMB2_STATUS_NOT_SUPPORTED
-                          : SMB2_STATUS_INVALID_PARAMETER;
+         * copy rather than treating it as a hard error.  A directory source
+         * or destination is rejected with STATUS_INVALID_DEVICE_REQUEST
+         * (MS-SMB2 3.3.5.15.6; smb2.ioctl copychunk-to-a-directory). */
+        uint32_t status;
+
+        switch (error_code) {
+            case CHIMERA_VFS_ENOTSUP:
+                status = SMB2_STATUS_NOT_SUPPORTED;
+                break;
+            case CHIMERA_VFS_EISDIR:
+                status = SMB2_STATUS_INVALID_DEVICE_REQUEST;
+                break;
+            default:
+                status = SMB2_STATUS_INVALID_PARAMETER;
+                break;
+        } /* switch */
 
         chimera_smb_copychunk_done(request, status);
         return;
@@ -125,6 +140,13 @@ chimera_smb_copychunk_error_with_body(
     struct chimera_smb_request *request,
     uint32_t                    status)
 {
+    /* On a byte-range lock conflict the response MUST report zero chunks written
+     * (MS-SMB2 3.3.5.15.6); other error bodies (e.g. the past-EOF
+     * STATUS_INVALID_VIEW_SIZE reply) keep the partial progress recorded so far. */
+    if (status == SMB2_STATUS_FILE_LOCK_CONFLICT) {
+        request->ioctl.cc_chunks_written = 0;
+        request->ioctl.cc_total_written  = 0;
+    }
     request->ioctl.cc_limit_response = 1;
     chimera_smb_copychunk_done(request, status);
 } /* chimera_smb_copychunk_error_with_body */
@@ -255,6 +277,7 @@ chimera_smb_ioctl_copychunk(struct chimera_smb_request *request)
     request->ioctl.cc_dst_open_file  = NULL;
     request->ioctl.cc_chunk_idx      = 0;
     request->ioctl.cc_chunks_written = 0;
+    request->ioctl.cc_chunk_bytes    = 0;
     request->ioctl.cc_total_written  = 0;
     request->ioctl.cc_limit_response = 0;
 
@@ -299,8 +322,17 @@ chimera_smb_ioctl_copychunk(struct chimera_smb_request *request)
         return;
     }
 
-    /* The source is identified by the resume key (its FileId). */
-    src_open_file = chimera_smb_open_file_resolve(request, &request->ioctl.cc_src_file_id);
+    /* The source is identified by the resume key (its FileId).  Resolving it is
+     * an internal lookup that must NOT clobber the compound's related-handle
+     * inheritance: chimera_smb_open_file_resolve updates compound->saved_file_id
+     * to the last resolved handle, but the FSCTL "operates on" the DESTINATION,
+     * so a chained READ/CLOSE after this copychunk must inherit the destination
+     * handle, not the source (MS-SMB2 3.3.5.2.7.2; pike copychunk
+     * ssc_in_compound_req).  Snapshot saved_file_id (= dst, set just above) and
+     * restore it after the source lookup. */
+    struct chimera_smb_file_id cc_saved_file_id = request->compound->saved_file_id;
+    src_open_file                    = chimera_smb_open_file_resolve(request, &request->ioctl.cc_src_file_id);
+    request->compound->saved_file_id = cc_saved_file_id;
     if (unlikely(!src_open_file)) {
         chimera_smb_open_file_release(request, dst_open_file);
         /* An unknown/expired resume key -> OBJECT_NAME_NOT_FOUND per

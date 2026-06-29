@@ -4,8 +4,10 @@
 
 #include "smb_internal.h"
 #include "smb_procs.h"
+#include "smb_ea.h"
 #include "common/misc.h"
 #include "vfs/vfs.h"
+#include "vfs/vfs_procs.h"
 #include "vfs/vfs_release.h"
 #include "vfs/vfs_notify.h"
 
@@ -240,6 +242,242 @@ chimera_smb_set_info_doc_recall_callback(
     chimera_smb_complete_request(request, SMB2_STATUS_SUCCESS);
 } /* chimera_smb_set_info_doc_recall_callback */
 
+/* ---- FILE_FULL_EA_INFORMATION apply engine (shared by SetInfo and CREATE
+ * ExtA): applies a client EA list to the VFS xattr store one entry at a time
+ * (zero-length value deletes; names canonicalized case-insensitively against the
+ * existing user.* set, Samba-style).  The caller owns ea_buf for the duration
+ * and is invoked via `done` with the resulting NTSTATUS.  State lives in a heap
+ * context so the engine is independent of the request union. ---- */
+
+struct chimera_smb_ea_apply {
+    struct chimera_server_smb_thread *thread;
+    const struct chimera_vfs_cred    *cred;
+    struct chimera_vfs_open_handle   *handle;
+    const uint8_t                    *ea_buf;
+    uint32_t                          ea_buf_len;
+    uint32_t                          ea_off;
+    void                              (*done)(
+        uint32_t status,
+        void    *arg);
+    void                             *arg;
+    uint32_t                          list_len;
+    uint32_t                          name_len;
+    uint8_t                           list[4096];
+    char                              name[CHIMERA_VFS_XATTR_NAME_MAX];
+};
+
+static void chimera_smb_ea_apply_step(
+    struct chimera_smb_ea_apply *a);
+
+static void
+chimera_smb_ea_apply_finish(
+    struct chimera_smb_ea_apply *a,
+    uint32_t                     status)
+{
+    void  (*done)(
+        uint32_t,
+        void *) = a->done;
+    void *arg = a->arg;
+
+    free(a);
+    done(status, arg);
+} /* chimera_smb_ea_apply_finish */
+
+static void
+chimera_smb_ea_apply_op_cb(
+    enum chimera_vfs_error          error_code,
+    const struct chimera_vfs_attrs *pre_attr,
+    const struct chimera_vfs_attrs *post_attr,
+    void                           *private_data)
+{
+    struct chimera_smb_ea_apply *a = private_data;
+
+    (void) pre_attr;
+    (void) post_attr;
+
+    /* Deleting an EA that does not exist is a no-op success. */
+    if (error_code != CHIMERA_VFS_OK && error_code != CHIMERA_VFS_ENODATA) {
+        chimera_smb_ea_apply_finish(a, chimera_smb_ea_status(error_code));
+        return;
+    }
+
+    chimera_smb_ea_apply_step(a);
+} /* chimera_smb_ea_apply_op_cb */
+
+static void
+chimera_smb_ea_apply_step(struct chimera_smb_ea_apply *a)
+{
+    struct chimera_smb_ea_entry entry;
+    const char                 *p, *end;
+    int                         found = 0;
+
+    if (a->ea_off >= a->ea_buf_len) {
+        chimera_smb_ea_apply_finish(a, SMB2_STATUS_SUCCESS);
+        return;
+    }
+
+    if (chimera_smb_ea_full_parse_one(a->ea_buf, a->ea_buf_len,
+                                      &a->ea_off, &entry) != 0) {
+        chimera_smb_ea_apply_finish(a, SMB2_STATUS_EA_LIST_INCONSISTENT);
+        return;
+    }
+
+    if (entry.name_len == 0 ||
+        !chimera_smb_ea_name_valid(entry.name, entry.name_len)) {
+        chimera_smb_ea_apply_finish(a, SMB2_STATUS_INVALID_EA_NAME);
+        return;
+    }
+
+    /* Only Flags 0 and FILE_NEED_EA are defined (MS-FSCC 2.4.15); any other bit
+     * makes the entry malformed (MS-FSA fails the set with INVALID_EA_NAME). */
+    if (entry.flags & ~FILE_NEED_EA) {
+        chimera_smb_ea_apply_finish(a, SMB2_STATUS_INVALID_EA_NAME);
+        return;
+    }
+
+    /* Reuse an existing case-variant's stored spelling if present. */
+    p   = (const char *) a->list;
+    end = p + a->list_len;
+    while (p < end) {
+        uint32_t llen = strlen(p);
+
+        if (chimera_vfs_xattr_is_user(p, llen) &&
+            chimera_smb_ea_name_eq(p + CHIMERA_VFS_XATTR_USER_PREFIX_LEN,
+                                   llen - CHIMERA_VFS_XATTR_USER_PREFIX_LEN,
+                                   entry.name, entry.name_len)) {
+            memcpy(a->name, p, llen);
+            a->name_len = llen;
+            found       = 1;
+            break;
+        }
+        p += llen + 1;
+    }
+
+    if (!found) {
+        int n = chimera_vfs_xattr_build_user(a->name, sizeof(a->name),
+                                             entry.name, entry.name_len);
+        if (n < 0) {
+            chimera_smb_ea_apply_finish(a, SMB2_STATUS_INVALID_EA_NAME);
+            return;
+        }
+        a->name_len = (uint32_t) n;
+    }
+
+    if (entry.value_len == 0) {
+        chimera_vfs_remove_xattr(a->thread->vfs_thread, a->cred, a->handle,
+                                 a->name, a->name_len,
+                                 chimera_smb_ea_apply_op_cb, a);
+    } else {
+        chimera_vfs_set_xattr(a->thread->vfs_thread, a->cred, a->handle,
+                              CHIMERA_VFS_XATTR_EITHER, a->name, a->name_len,
+                              entry.value, entry.value_len,
+                              chimera_smb_ea_apply_op_cb, a);
+    }
+} /* chimera_smb_ea_apply_step */
+
+static void
+chimera_smb_ea_apply_list_cb(
+    enum chimera_vfs_error error_code,
+    const char            *names,
+    uint32_t               names_len,
+    uint32_t               count,
+    uint32_t               eof,
+    uint64_t               cookie,
+    void                  *private_data)
+{
+    struct chimera_smb_ea_apply *a = private_data;
+
+    (void) names;       /* == a->list (the buffer we passed) */
+    (void) count;
+    (void) eof;
+    (void) cookie;
+
+    /* On error (e.g. ERANGE) just skip case canonicalization. */
+    a->list_len = (error_code == CHIMERA_VFS_OK) ? names_len : 0;
+    a->ea_off   = 0;
+    chimera_smb_ea_apply_step(a);
+} /* chimera_smb_ea_apply_list_cb */
+
+void
+chimera_smb_ea_apply(
+    struct chimera_server_smb_thread *thread,
+    const struct chimera_vfs_cred *cred,
+    struct chimera_vfs_open_handle *handle,
+    const uint8_t *ea_buf,
+    uint32_t ea_buf_len,
+    void ( *done )(uint32_t status, void *arg),
+    void *arg)
+{
+    struct chimera_smb_ea_apply *a;
+
+    if (!(handle->vfs_module->capabilities & CHIMERA_VFS_CAP_XATTR)) {
+        done(SMB2_STATUS_EAS_NOT_SUPPORTED, arg);
+        return;
+    }
+
+    if (ea_buf_len == 0) {
+        done(SMB2_STATUS_SUCCESS, arg);
+        return;
+    }
+
+    a             = calloc(1, sizeof(*a));
+    a->thread     = thread;
+    a->cred       = cred;
+    a->handle     = handle;
+    a->ea_buf     = ea_buf;
+    a->ea_buf_len = ea_buf_len;
+    a->done       = done;
+    a->arg        = arg;
+
+    /* List the existing user.* names first so each set can match case-
+     * insensitively and reuse the stored spelling. */
+    chimera_vfs_list_xattrs(thread->vfs_thread, cred, handle, 0,
+                            a->list, sizeof(a->list),
+                            chimera_smb_ea_apply_list_cb, a);
+} /* chimera_smb_ea_apply */
+
+static void
+chimera_smb_set_ea_done(
+    uint32_t status,
+    void    *arg)
+{
+    struct chimera_smb_request *request = arg;
+
+    if (request->set_info.ea_buf) {
+        free(request->set_info.ea_buf);
+        request->set_info.ea_buf = NULL;
+    }
+
+    /* A successful EA change fires FILE_NOTIFY_CHANGE_EA on the parent
+     * (smb2.change_notify ChangeEa). */
+    if (status == SMB2_STATUS_SUCCESS &&
+        request->set_info.open_file->parent_fh_len > 0) {
+        struct chimera_server_smb_thread *thread = request->compound->thread;
+
+        chimera_vfs_notify_emit(thread->shared->vfs->vfs_notify,
+                                request->set_info.open_file->parent_fh,
+                                request->set_info.open_file->parent_fh_len,
+                                CHIMERA_VFS_NOTIFY_ATTRS_CHANGED,
+                                request->set_info.open_file->name,
+                                request->set_info.open_file->name_len,
+                                NULL, 0);
+    }
+
+    chimera_smb_open_file_release(request, request->set_info.open_file);
+    chimera_smb_complete_request(request, status);
+} /* chimera_smb_set_ea_done */
+
+static void
+chimera_smb_set_ea(struct chimera_smb_request *request)
+{
+    chimera_smb_ea_apply(request->compound->thread,
+                         &request->session_handle->session->cred,
+                         request->set_info.open_file->handle,
+                         request->set_info.ea_buf,
+                         request->set_info.ea_buf_len,
+                         chimera_smb_set_ea_done, request);
+} /* chimera_smb_set_ea */
+
 void
 chimera_smb_set_info(struct chimera_smb_request *request)
 {
@@ -282,6 +520,21 @@ chimera_smb_set_info(struct chimera_smb_request *request)
                         break;
                     }
 
+                    /* MS-FSA 2.1.5.14.2: a FileBasicInformation timestamp is
+                     * either a valid (non-negative) FILETIME or one of the
+                     * sentinels 0 (omit), -1 (freeze) or -2 (thaw); any value
+                     * below -2 is rejected with STATUS_INVALID_PARAMETER (WPTS
+                     * MS-FSAModel SetFileBasicInformation {Creation,LastAccess,
+                     * LastWrite,Change}TimeLessthanM1). */
+                    if ((int64_t) request->set_info.attrs.smb_crttime < -2 ||
+                        (int64_t) request->set_info.attrs.smb_atime < -2 ||
+                        (int64_t) request->set_info.attrs.smb_mtime < -2 ||
+                        (int64_t) request->set_info.attrs.smb_ctime < -2) {
+                        chimera_smb_open_file_release(request, request->set_info.open_file);
+                        chimera_smb_complete_request(request, SMB2_STATUS_INVALID_PARAMETER);
+                        break;
+                    }
+
                     chimera_smb_unmarshal_basic_info(&request->set_info.attrs, &request->set_info.vfs_attrs);
 
                     /* An explicit (non-sentinel) write-time set hands control of
@@ -302,6 +555,31 @@ chimera_smb_set_info(struct chimera_smb_request *request)
                         request);
                     break;
                 case SMB2_FILE_ENDOFFILE_INFO:
+
+                    /* EndOfFile/Allocation apply to a data stream; a directory
+                     * has none, so Windows fails the set with
+                     * STATUS_INVALID_PARAMETER (MS-FSCC 2.4.14 / MS-FSA
+                     * 2.1.5.14.13; issue #1261). */
+                    if (request->set_info.open_file->flags &
+                        CHIMERA_SMB_OPEN_FILE_FLAG_DIRECTORY) {
+                        chimera_smb_open_file_release(request, request->set_info.open_file);
+                        chimera_smb_complete_request(request,
+                                                     SMB2_STATUS_INVALID_PARAMETER);
+                        break;
+                    }
+
+                    /* MS-FSA 2.1.5.16: a SetEndOfFile whose size exceeds the
+                     * maximum supported file size is rejected with
+                     * STATUS_INVALID_PARAMETER -- the same bound the write path
+                     * enforces, which also covers every value that is negative
+                     * when read as a signed LONGLONG (WPTS MS-FSAModel
+                     * SetFileEndOfFileInformation isEndOfFileGreatThanMaxSize). */
+                    if (request->set_info.attrs.smb_size > CHIMERA_SMB_MAX_FILE_SIZE) {
+                        chimera_smb_open_file_release(request, request->set_info.open_file);
+                        chimera_smb_complete_request(request, SMB2_STATUS_INVALID_PARAMETER);
+                        break;
+                    }
+
                     chimera_smb_unmarshal_end_of_file_info(&request->set_info.attrs, &request->set_info.vfs_attrs);
 
                     /* A size change fires FILE_NOTIFY_CHANGE_SIZE (and, via the
@@ -330,12 +608,34 @@ chimera_smb_set_info(struct chimera_smb_request *request)
                         request);
                     break;
                 case SMB2_FILE_ALLOCATION_INFO:
+
+                    /* A directory has no data stream to (de)allocate; reject with
+                    * STATUS_INVALID_PARAMETER (MS-FSCC 2.4.4 / MS-FSA; #1261). */
+                    if (request->set_info.open_file->flags &
+                        CHIMERA_SMB_OPEN_FILE_FLAG_DIRECTORY) {
+                        chimera_smb_open_file_release(request, request->set_info.open_file);
+                        chimera_smb_complete_request(request,
+                                                     SMB2_STATUS_INVALID_PARAMETER);
+                        break;
+                    }
+
                     /* AllocationInfo only changes the file when the requested
                      * allocation is below the current EOF, in which case the
                      * file is truncated to it (MS-FSCC §2.4.4).  A truncation
                      * advances LastWriteTime; a grow/hint only touches
                      * ChangeTime.  Both need the current size to decide, so this
                      * is resolved in the getattr callback. */
+                    /* MS-FSA 2.1.5.13: a SetAllocation whose size exceeds the
+                     * maximum supported file size is rejected with
+                     * STATUS_INVALID_PARAMETER (also covers every value negative
+                     * when read as a signed LONGLONG) -- WPTS MS-FSAModel
+                     * SetFileAllocOrObjIdInformation. */
+                    if (request->set_info.attrs.smb_size > CHIMERA_SMB_MAX_FILE_SIZE) {
+                        chimera_smb_open_file_release(request, request->set_info.open_file);
+                        chimera_smb_complete_request(request, SMB2_STATUS_INVALID_PARAMETER);
+                        break;
+                    }
+
                     request->set_info.notify_mask = CHIMERA_VFS_NOTIFY_SIZE_CHANGED |
                         CHIMERA_VFS_NOTIFY_FILE_MODIFIED |
                         CHIMERA_VFS_NOTIFY_STREAM_SIZE;
@@ -360,6 +660,11 @@ chimera_smb_set_info(struct chimera_smb_request *request)
                          * mechanism (which would remove_at the whole file). */
                         if (!(request->set_info.open_file->flags &
                               CHIMERA_SMB_OPEN_FILE_FLAG_STREAM)) {
+                            /* The file is now delete-pending: a subsequent name
+                            * open is answered STATUS_DELETE_PENDING while this
+                            * handle keeps it open (MS-FSA; smb2.oplock.doc). */
+                            chimera_vfs_state_set_delete_pending(
+                                request->set_info.open_file->share_file_state);
                             /* Propagate to VFS handle for final-close deletion */
                             chimera_vfs_set_delete_on_close(
                                 request->compound->thread->vfs_thread,
@@ -394,6 +699,10 @@ chimera_smb_set_info(struct chimera_smb_request *request)
                             chimera_vfs_clear_delete_on_close(
                                 request->compound->thread->vfs_thread,
                                 request->set_info.open_file->handle);
+                            /* Disposition turned back off: no longer delete-
+                             * pending, so new opens succeed again. */
+                            chimera_vfs_state_clear_delete_pending(
+                                request->set_info.open_file->share_file_state);
                         }
                     }
                     chimera_smb_open_file_release(request, request->set_info.open_file);
@@ -406,25 +715,26 @@ chimera_smb_set_info(struct chimera_smb_request *request)
                     chimera_smb_set_info_link_process(request);
                     break;
                 case SMB2_FILE_FULL_EA_INFO:
-                    /* chimera does not persist EAs, but a SET of extended
-                     * attributes still fires FILE_NOTIFY_CHANGE_EA on the parent
-                     * (smb2.change_notify ChangeEa). */
-                    if (request->set_info.open_file->parent_fh_len > 0) {
-                        struct chimera_server_smb_thread *thread = request->compound->thread;
-
-                        chimera_vfs_notify_emit(thread->shared->vfs->vfs_notify,
-                                                request->set_info.open_file->parent_fh,
-                                                request->set_info.open_file->parent_fh_len,
-                                                CHIMERA_VFS_NOTIFY_ATTRS_CHANGED,
-                                                request->set_info.open_file->name,
-                                                request->set_info.open_file->name_len,
-                                                NULL, 0);
+                    chimera_smb_set_ea(request);
+                    break;
+                case SMB2_FILE_POSITION_INFO:
+                    /* MS-FSA 2.1.5.20: CurrentByteOffset is a signed LONGLONG; a
+                     * negative value is rejected with STATUS_INVALID_PARAMETER
+                     * (WPTS MS-FSAModel SetFilePositionInformation). */
+                    if ((int64_t) request->set_info.attrs.smb_position < 0) {
+                        chimera_smb_open_file_release(request, request->set_info.open_file);
+                        chimera_smb_complete_request(request, SMB2_STATUS_INVALID_PARAMETER);
+                        break;
                     }
+                    request->set_info.open_file->position = request->set_info.attrs.smb_position;
                     chimera_smb_open_file_release(request, request->set_info.open_file);
                     chimera_smb_complete_request(request, SMB2_STATUS_SUCCESS);
                     break;
-                case SMB2_FILE_POSITION_INFO:
-                    request->set_info.open_file->position = request->set_info.attrs.smb_position;
+                case SMB2_FILE_MODE_INFO:
+                    /* FileModeInformation (MS-FSCC 2.4.26) is a single Mode DWORD
+                     * of per-handle I/O hints (write-through, sequential-only,
+                     * no-buffering, ...); chimera tracks none of them, so accept
+                     * the set and report success (pike set test_set_file_mode_info). */
                     chimera_smb_open_file_release(request, request->set_info.open_file);
                     chimera_smb_complete_request(request, SMB2_STATUS_SUCCESS);
                     break;
@@ -498,6 +808,15 @@ chimera_smb_parse_set_info(
         case SMB2_INFO_FILE:
             switch (request->set_info.info_class) {
                 case SMB2_FILE_BASIC_INFO:
+                    /* [MS-FSA] 2.1.5.14.2 / [MS-FSCC] 2.4.7: the input buffer
+                     * must be at least sizeof(FILE_BASIC_INFORMATION) (40 bytes:
+                     * four 8-byte timestamps + 4-byte FileAttributes + 4-byte
+                     * Reserved).  A shorter buffer is rejected with
+                     * STATUS_INFO_LENGTH_MISMATCH rather than silently accepted
+                     * (WPTS MS-FSAModel SetFileBasicInformation cases). */
+                    if (unlikely(request->set_info.buffer_length < SMB2_FILE_BASIC_INFO_SIZE)) {
+                        return chimera_smb_parse_reject(request, SMB2_STATUS_INFO_LENGTH_MISMATCH);
+                    }
                     rc = chimera_smb_parse_basic_info(request_cursor, &request->set_info.attrs);
                     break;
                 case SMB2_FILE_DISPOSITION_INFO:
@@ -517,10 +836,40 @@ chimera_smb_parse_set_info(
                     rc = chimera_smb_parse_rename_info(request_cursor, request);
                     break;
                 case SMB2_FILE_FULL_EA_INFO:
-                    /* EAs not supported, accept and ignore */
+                    /* Capture the client's FILE_FULL_EA_INFORMATION buffer; the
+                     * process phase parses and applies it to the VFS xattr
+                     * store one EA at a time. */
+                    request->set_info.ea_buf     = NULL;
+                    request->set_info.ea_buf_len = 0;
+                    if (request->set_info.buffer_length > CHIMERA_SMB_EA_VALUE_MAX) {
+                        request->status = SMB2_STATUS_EA_TOO_LARGE;
+                        rc              = -1;
+                        break;
+                    }
+                    if (request->set_info.buffer_length) {
+                        request->set_info.ea_buf = malloc(request->set_info.buffer_length);
+                        if (evpl_iovec_cursor_try_copy(request_cursor,
+                                                       request->set_info.ea_buf,
+                                                       request->set_info.buffer_length) != 0) {
+                            free(request->set_info.ea_buf);
+                            request->set_info.ea_buf = NULL;
+                            return chimera_smb_parse_reject(request,
+                                                            SMB2_STATUS_INFO_LENGTH_MISMATCH);
+                        }
+                        request->set_info.ea_buf_len = request->set_info.buffer_length;
+                    }
                     break;
                 case SMB2_FILE_POSITION_INFO:
                     rc = chimera_smb_parse_position_info(request_cursor, &request->set_info.attrs);
+                    break;
+                case SMB2_FILE_MODE_INFO:
+                    /* FileModeInformation: a 4-byte Mode DWORD (MS-FSCC 2.4.26).
+                     * Nothing to capture (the flags are per-handle I/O hints we
+                     * do not track); just validate the length. */
+                    if (unlikely(request->set_info.buffer_length < SMB2_FILE_MODE_INFO_SIZE)) {
+                        return chimera_smb_parse_reject(request,
+                                                        SMB2_STATUS_INFO_LENGTH_MISMATCH);
+                    }
                     break;
 
                 default:

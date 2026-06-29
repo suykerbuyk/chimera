@@ -21,6 +21,7 @@
 #include "vfs/vfs_internal.h"
 #include "vfs/vfs_acl.h"
 #include "vfs/vfs_access.h"
+#include "vfs/vfs_xattr_name.h"
 #include "memfs.h"
 #include "common/logging.h"
 #include "common/misc.h"
@@ -172,6 +173,7 @@ struct memfs_inode {
     uint32_t                   refcnt;
     uint64_t                   size;
     uint64_t                   space_used;
+    uint64_t                   alloc_size;   /* SMB AllocationSize reservation */
     uint32_t                   mode;
     uint32_t                   nlink;
     uint32_t                   uid;
@@ -183,6 +185,7 @@ struct memfs_inode {
     struct timespec            mtime;
     struct timespec            ctime;
     struct timespec            btime;
+    uint64_t                   change; /* native monotonic change counter */
     struct memfs_inode        *next;
     struct memfs_xattr        *xattrs;
     struct memfs_remote       *remote; /* non-NULL => pNFS stub (data lives on a DS) */
@@ -672,6 +675,7 @@ memfs_inode_alloc(
     inode->gen++;
     inode->refcnt         = 1;
     inode->mode           = 0;
+    inode->change         = 0;
     inode->dos_attributes = 0;
     inode->acl            = NULL;
     inode->xattrs         = NULL;
@@ -1093,6 +1097,7 @@ memfs_init(
     inode->atime = now;
     inode->mtime = now;
     inode->ctime = now;
+    inode->change++;
     inode->btime = now;
 
     rb_tree_init(&inode->dir.dirents);
@@ -1314,19 +1319,22 @@ memfs_map_attrs(
     }
 
     if (attr->va_req_mask & CHIMERA_VFS_ATTR_MASK_STAT) {
-        attr->va_set_mask  |= CHIMERA_VFS_ATTR_MASK_STAT;
-        attr->va_mode       = inode->mode;
-        attr->va_nlink      = inode->nlink;
-        attr->va_uid        = inode->uid;
-        attr->va_gid        = inode->gid;
-        attr->va_size       = inode->size;
-        attr->va_space_used = inode->space_used;
-        attr->va_atime      = inode->atime;
-        attr->va_mtime      = inode->mtime;
-        attr->va_ctime      = inode->ctime;
-        attr->va_ino        = inode->inum;
-        attr->va_dev        = (42UL << 32) | 42;
-        attr->va_rdev       = inode->rdev;
+        attr->va_set_mask |= CHIMERA_VFS_ATTR_MASK_STAT;
+        attr->va_mode      = inode->mode;
+        attr->va_nlink     = inode->nlink;
+        attr->va_uid       = inode->uid;
+        attr->va_gid       = inode->gid;
+        attr->va_size      = inode->size;
+        /* Report the larger of real usage and any AllocationSize reservation so
+         * an over-allocated file's AllocationSize reflects the reserved space. */
+        attr->va_space_used = inode->space_used > inode->alloc_size ?
+            inode->space_used : inode->alloc_size;
+        attr->va_atime = inode->atime;
+        attr->va_mtime = inode->mtime;
+        attr->va_ctime = inode->ctime;
+        attr->va_ino   = inode->inum;
+        attr->va_dev   = (42UL << 32) | 42;
+        attr->va_rdev  = inode->rdev;
 
         /* memfs persists DOS attributes, so report them alongside stat. */
         attr->va_set_mask      |= CHIMERA_VFS_ATTR_DOS_ATTRIBUTES;
@@ -1358,6 +1366,33 @@ memfs_map_attrs(
     if (attr->va_req_mask & CHIMERA_VFS_ATTR_BTIME) {
         attr->va_set_mask |= CHIMERA_VFS_ATTR_BTIME;
         attr->va_btime     = inode->btime;
+    }
+
+    /* Native monotonic change counter (CHIMERA_VFS_CAP_CHANGE). */
+    if (attr->va_req_mask & CHIMERA_VFS_ATTR_CHANGE) {
+        attr->va_set_mask |= CHIMERA_VFS_ATTR_CHANGE;
+        attr->va_change    = inode->change;
+    }
+
+    /* SMB/OS-2 EaSize: sum the FEALIST contribution of every user.* xattr. */
+    if (attr->va_req_mask & CHIMERA_VFS_ATTR_EA_SIZE) {
+        struct memfs_xattr *xa;
+        uint64_t            ea_size  = 0;
+        uint32_t            ea_count = 0;
+
+        for (xa = inode->xattrs; xa; xa = xa->next) {
+            if (chimera_vfs_xattr_is_user(xa->name, xa->name_len)) {
+                ea_size += chimera_vfs_xattr_ea_entry_size(
+                    xa->name_len - CHIMERA_VFS_XATTR_USER_PREFIX_LEN,
+                    xa->value_len);
+                ea_count++;
+            }
+        }
+        if (ea_count) {
+            ea_size += CHIMERA_VFS_XATTR_EA_LIST_OVERHEAD;
+        }
+        attr->va_set_mask |= CHIMERA_VFS_ATTR_EA_SIZE;
+        attr->va_ea_size   = ea_size;
     }
 
     if (attr->va_req_mask & CHIMERA_VFS_ATTR_FSID) {
@@ -1448,6 +1483,19 @@ memfs_apply_attrs(
     if (set_mask & CHIMERA_VFS_ATTR_SIZE) {
         attr->va_set_mask |= CHIMERA_VFS_ATTR_SIZE;
         inode->size        = attr->va_size;
+        /* A reservation only holds while it exceeds the live data; once EOF is
+         * set at/above it the reservation is subsumed and no longer separate. */
+        if (inode->alloc_size <= inode->size) {
+            inode->alloc_size = 0;
+        }
+    }
+
+    if (set_mask & CHIMERA_VFS_ATTR_ALLOC_SIZE) {
+        attr->va_set_mask |= CHIMERA_VFS_ATTR_ALLOC_SIZE;
+        /* Reserve only the part of the allocation beyond the current EOF; a
+         * request at/below EOF is already satisfied by real usage. */
+        inode->alloc_size = attr->va_alloc_size > inode->size ?
+            attr->va_alloc_size : 0;
     }
 
     if (set_mask & CHIMERA_VFS_ATTR_DOS_ATTRIBUTES) {
@@ -1519,6 +1567,9 @@ memfs_apply_attrs(
     } else {
         inode->ctime = now;
     }
+
+    /* Any setattr is a metadata change; advance the native change counter. */
+    inode->change++;
 
 } /* memfs_apply_attrs */
 
@@ -1674,9 +1725,11 @@ memfs_setattr(
 
     /* SETATTR(SIZE) is only meaningful for regular files. RFC 7530 §5.7:
      * directories must report ISDIR; symlinks should report SYMLINK or
-     * INVAL; other non-regular file types report INVAL.  (A named-stream
-     * handle always resolves to a regular base inode, so streams pass.) */
+     * INVAL; other non-regular file types report INVAL.  A named-stream
+     * handle (stream != NULL) carries its own data fork and may be resized
+     * regardless of the base object's type -- a directory's ADS is sizeable. */
     if ((attr->va_set_mask & CHIMERA_VFS_ATTR_SIZE) &&
+        !stream &&
         !S_ISREG(inode->mode)) {
         enum chimera_vfs_error err;
         if (S_ISDIR(inode->mode)) {
@@ -1905,19 +1958,22 @@ memfs_mount(
 
     /* Fill in other attrs if requested */
     if (attr->va_req_mask & CHIMERA_VFS_ATTR_MASK_STAT) {
-        attr->va_set_mask  |= CHIMERA_VFS_ATTR_MASK_STAT;
-        attr->va_mode       = inode->mode;
-        attr->va_nlink      = inode->nlink;
-        attr->va_uid        = inode->uid;
-        attr->va_gid        = inode->gid;
-        attr->va_size       = inode->size;
-        attr->va_space_used = inode->space_used;
-        attr->va_atime      = inode->atime;
-        attr->va_mtime      = inode->mtime;
-        attr->va_ctime      = inode->ctime;
-        attr->va_ino        = inode->inum;
-        attr->va_dev        = (42UL << 32) | 42;
-        attr->va_rdev       = inode->rdev;
+        attr->va_set_mask |= CHIMERA_VFS_ATTR_MASK_STAT;
+        attr->va_mode      = inode->mode;
+        attr->va_nlink     = inode->nlink;
+        attr->va_uid       = inode->uid;
+        attr->va_gid       = inode->gid;
+        attr->va_size      = inode->size;
+        /* Report the larger of real usage and any AllocationSize reservation so
+         * an over-allocated file's AllocationSize reflects the reserved space. */
+        attr->va_space_used = inode->space_used > inode->alloc_size ?
+            inode->space_used : inode->alloc_size;
+        attr->va_atime = inode->atime;
+        attr->va_mtime = inode->mtime;
+        attr->va_ctime = inode->ctime;
+        attr->va_ino   = inode->inum;
+        attr->va_dev   = (42UL << 32) | 42;
+        attr->va_rdev  = inode->rdev;
 
         /* memfs persists DOS attributes, so report them alongside stat. */
         attr->va_set_mask      |= CHIMERA_VFS_ATTR_DOS_ATTRIBUTES;
@@ -1929,6 +1985,12 @@ memfs_mount(
     if (attr->va_req_mask & CHIMERA_VFS_ATTR_BTIME) {
         attr->va_set_mask |= CHIMERA_VFS_ATTR_BTIME;
         attr->va_btime     = inode->btime;
+    }
+
+    /* Native monotonic change counter (CHIMERA_VFS_CAP_CHANGE). */
+    if (attr->va_req_mask & CHIMERA_VFS_ATTR_CHANGE) {
+        attr->va_set_mask |= CHIMERA_VFS_ATTR_CHANGE;
+        attr->va_change    = inode->change;
     }
 
     if (attr->va_req_mask & CHIMERA_VFS_ATTR_FSID) {
@@ -2200,7 +2262,8 @@ memfs_mkdir_at(
     inode->atime      = now;
     inode->mtime      = now;
     inode->ctime      = now;
-    inode->btime      = now;
+    inode->change++;
+    inode->btime = now;
 
     rb_tree_init(&inode->dir.dirents);
 
@@ -2276,6 +2339,7 @@ memfs_mkdir_at(
 
     parent_inode->mtime = now;
     parent_inode->ctime = now;
+    parent_inode->change++;
 
     memfs_map_attrs(shared, r_dir_post_attr, parent_inode, request->fh);
 
@@ -2316,7 +2380,8 @@ memfs_mknod_at(
     inode->atime      = now;
     inode->mtime      = now;
     inode->ctime      = now;
-    inode->btime      = now;
+    inode->change++;
+    inode->btime = now;
 
     /* The mode (including file type bits S_IFCHR/S_IFBLK/S_IFSOCK/S_IFIFO)
      * and rdev are set via set_attr by the caller */
@@ -2390,6 +2455,7 @@ memfs_mknod_at(
 
     parent_inode->mtime = now;
     parent_inode->ctime = now;
+    parent_inode->change++;
 
     memfs_map_attrs(shared, r_dir_post_attr, parent_inode, request->fh);
 
@@ -2450,6 +2516,32 @@ memfs_remove_at(
         return;
     }
 
+    /* Inode-scoped removal (request->remove_at.match_child_fh): only unlink the
+     * name while it STILL resolves to the caller's object.  Guards an async
+     * delete-on-close against a file that was removed and re-created with the
+     * same name by another opener in the meantime -- removing the replacement
+     * would destroy an unrelated file.  The original is already gone, so report
+     * success and leave the new entry intact.  Gated on the flag so every
+     * ordinary by-name caller is unaffected. */
+    if (request->remove_at.match_child_fh &&
+        request->remove_at.child_fh && request->remove_at.child_fh_len > 0) {
+        uint64_t want_inum;
+        uint32_t want_gen;
+
+        memfs_fh_to_inum(&want_inum, &want_gen,
+                         request->remove_at.child_fh,
+                         request->remove_at.child_fh_len);
+
+        if (want_inum != dirent->inum || want_gen != dirent->gen) {
+            pthread_mutex_unlock(&inode->lock);
+            pthread_mutex_unlock(&parent_inode->lock);
+            request->remove_at.r_unmatched = 1;
+            request->status                = CHIMERA_VFS_OK;
+            request->complete(request);
+            return;
+        }
+    }
+
     if (S_ISDIR(inode->mode) && !rb_tree_empty(&inode->dir.dirents)) {
         pthread_mutex_unlock(&parent_inode->lock);
         pthread_mutex_unlock(&inode->lock);
@@ -2463,6 +2555,7 @@ memfs_remove_at(
     }
     parent_inode->mtime = now;
     parent_inode->ctime = now;
+    parent_inode->change++;
 
     rb_tree_remove(&parent_inode->dir.dirents, &dirent->node);
 
@@ -2474,6 +2567,7 @@ memfs_remove_at(
          * link count, which is a status change: bump its ctime. */
         if (inode->nlink > 0) {
             inode->ctime = now;
+            inode->change++;
         }
     }
 
@@ -2748,17 +2842,28 @@ memfs_open_at(
             return;
         }
 
-        /* Creating a new file requires add-file (WRITE_DATA) + search (EXECUTE)
-         * permission on the parent directory.  On the NFSv4/Windows ACL model
-         * WRITE_DATA == ADD_FILE and APPEND_DATA == ADD_SUBDIRECTORY, so a plain
-         * file create is gated by WRITE_DATA (mkdir, which adds a subdirectory,
-         * is gated by APPEND_DATA in the VFS-core mkdir_at path).  Enforce POSIX
-         * semantics for AUTH_UNIX callers (root is exempt); SMB/ACL (AUTH_ATTR)
-         * callers are authorized by the engine. */
+        /* Creating a new file requires add-file permission on the parent
+         * directory.  On the NFSv4/Windows ACL model WRITE_DATA == ADD_FILE and
+         * APPEND_DATA == ADD_SUBDIRECTORY, so a plain file create is gated by
+         * WRITE_DATA (mkdir, which adds a subdirectory, is gated by APPEND_DATA in
+         * the VFS-core mkdir_at path).  The required parent access differs by
+         * credential model: AUTH_UNIX (POSIX, root exempt) needs write + search
+         * (WRITE_DATA | EXECUTE) on the directory; AUTH_ATTR (SMB/Windows) checks
+         * ADD_FILE (WRITE_DATA) only -- traverse (EXECUTE) is bypassed by default
+         * on Windows (SeChangeNotifyPrivilege), so a directory whose DACL grants
+         * ADD_FILE without EXECUTE must still permit the create (smb2.acls.DYNAMIC),
+         * while an explicit deny-ADD_FILE ace still blocks it (smb2.create.mkdir-visible). */
+        uint32_t create_access = 0;
+
         if (request->cred->flavor == CHIMERA_VFS_AUTH_UNIX &&
-            request->cred->uid != 0 &&
-            !memfs_inode_access(parent_inode, request->cred,
-                                CHIMERA_ACE_WRITE_DATA | CHIMERA_ACE_EXECUTE)) {
+            request->cred->uid != 0) {
+            create_access = CHIMERA_ACE_WRITE_DATA | CHIMERA_ACE_EXECUTE;
+        } else if (request->cred->flavor == CHIMERA_VFS_AUTH_ATTR) {
+            create_access = CHIMERA_ACE_WRITE_DATA;
+        }
+
+        if (create_access &&
+            !memfs_inode_access(parent_inode, request->cred, create_access)) {
             pthread_mutex_unlock(&parent_inode->lock);
             request->status = CHIMERA_VFS_EACCES;
             request->complete(request);
@@ -2769,15 +2874,16 @@ memfs_open_at(
 
         pthread_mutex_lock(&inode->lock);
 
-        inode->size            = 0;
-        inode->space_used      = 0;
-        inode->uid             = request->cred->uid;
-        inode->gid             = request->cred->gid;
-        inode->nlink           = 1;
-        inode->mode            = S_IFREG |  0644;
-        inode->atime           = now;
-        inode->mtime           = now;
-        inode->ctime           = now;
+        inode->size       = 0;
+        inode->space_used = 0;
+        inode->uid        = request->cred->uid;
+        inode->gid        = request->cred->gid;
+        inode->nlink      = 1;
+        inode->mode       = S_IFREG |  0644;
+        inode->atime      = now;
+        inode->mtime      = now;
+        inode->ctime      = now;
+        inode->change++;
         inode->file.blocks     = NULL;
         inode->file.max_blocks = 0;
         inode->file.num_blocks = 0;
@@ -2796,8 +2902,9 @@ memfs_open_at(
 
         rb_tree_insert(&parent_inode->dir.dirents, hash, dirent);
 
-        parent_inode->mtime        = now;
-        parent_inode->ctime        = now;
+        parent_inode->mtime = now;
+        parent_inode->ctime = now;
+        parent_inode->change++;
         request->open_at.r_created = 1;
     } else {
         inode = memfs_inode_get_inum(shared, dirent->inum, dirent->gen);
@@ -2923,15 +3030,16 @@ memfs_create_unlinked(
 
     inode = memfs_inode_alloc_thread(thread);
 
-    inode->size            = 0;
-    inode->space_used      = 0;
-    inode->uid             = request->cred->uid;
-    inode->gid             = request->cred->gid;
-    inode->nlink           = 0;
-    inode->mode            = S_IFREG |  0644;
-    inode->atime           = now;
-    inode->mtime           = now;
-    inode->ctime           = now;
+    inode->size       = 0;
+    inode->space_used = 0;
+    inode->uid        = request->cred->uid;
+    inode->gid        = request->cred->gid;
+    inode->nlink      = 0;
+    inode->mode       = S_IFREG |  0644;
+    inode->atime      = now;
+    inode->mtime      = now;
+    inode->ctime      = now;
+    inode->change++;
     inode->file.blocks     = NULL;
     inode->file.max_blocks = 0;
     inode->file.num_blocks = 0;
@@ -3216,7 +3324,10 @@ memfs_write(
         return;
     }
 
-    if (!S_ISREG(inode->mode)) {
+    /* A write to a named stream (stream != NULL) targets the stream's own data
+     * fork and is valid on any base object, including a directory's ADS.  A
+     * plain write only makes sense for a regular file. */
+    if (!stream && !S_ISREG(inode->mode)) {
         request->status = S_ISDIR(inode->mode) ?
             CHIMERA_VFS_EISDIR : CHIMERA_VFS_EINVAL;
         pthread_mutex_unlock(&inode->lock);
@@ -3361,6 +3472,7 @@ memfs_write(
 
     inode->mtime = now;
     inode->ctime = now;
+    inode->change++;
 
     /* POSIX kill-priv: a non-privileged write to a regular file clears the
      * set-user-ID bit and the set-group-ID bit (when group-executable).  Named
@@ -3553,6 +3665,7 @@ memfs_allocate(
 
     inode->mtime = now;
     inode->ctime = now;
+    inode->change++;
 
     memfs_map_attrs_fork(shared, &request->allocate.r_post_attr, inode, stream, request->fh);
 
@@ -3712,6 +3825,26 @@ memfs_copy_range(
         return;
     }
 
+    /* Range copy is only defined between regular files.  The inode's block fork
+     * (inode->file) shares a union with the directory dirent tree (inode->dir)
+     * and the symlink target, so treating a non-regular inode as a file here
+     * would scribble over that other union member and corrupt the heap (a
+     * directory destination with FILE_DELETE_ON_CLOSE then double-frees its
+     * dirent tree on teardown).  Reject a directory with EISDIR (the SMB
+     * copychunk path maps it to STATUS_INVALID_DEVICE_REQUEST) and any other
+     * non-regular type with EINVAL. */
+    if (S_ISDIR(src_inode->mode) || S_ISDIR(dst_inode->mode)) {
+        request->status = CHIMERA_VFS_EISDIR;
+        request->complete(request);
+        return;
+    }
+
+    if (!S_ISREG(src_inode->mode) || !S_ISREG(dst_inode->mode)) {
+        request->status = CHIMERA_VFS_EINVAL;
+        request->complete(request);
+        return;
+    }
+
     src_offset = request->copy_range.src_offset;
     dst_offset = request->copy_range.dst_offset;
     length     = request->copy_range.length;
@@ -3862,6 +3995,7 @@ memfs_copy_range(
 
     dst_inode->mtime = now;
     dst_inode->ctime = now;
+    dst_inode->change++;
     src_inode->atime = now;
 
     memfs_map_attrs(shared, &request->copy_range.r_post_attr, dst_inode,
@@ -4008,8 +4142,10 @@ memfs_move_range(
 
     dst_inode->mtime = now;
     dst_inode->ctime = now;
+    dst_inode->change++;
     src_inode->mtime = now;
     src_inode->ctime = now;
+    src_inode->change++;
 
     memfs_map_attrs(shared, &request->move_range.r_dst_post_attr, dst_inode,
                     request->move_range.dst_handle->fh);
@@ -4251,6 +4387,7 @@ memfs_clone_range(
 
     dst_inode->mtime = now;
     dst_inode->ctime = now;
+    dst_inode->change++;
     src_inode->atime = now;
 
     memfs_map_attrs(shared, &request->clone_range.r_post_attr, dst_inode,
@@ -4401,7 +4538,8 @@ memfs_symlink_at(
     inode->atime      = now;
     inode->mtime      = now;
     inode->ctime      = now;
-    inode->btime      = now;
+    inode->change++;
+    inode->btime = now;
 
     inode->symlink.target = memfs_symlink_target_alloc(thread);
 
@@ -4456,6 +4594,7 @@ memfs_symlink_at(
 
     parent_inode->mtime = now;
     parent_inode->ctime = now;
+    parent_inode->change++;
 
     memfs_map_attrs(shared, &request->symlink_at.r_dir_post_attr, parent_inode, request->fh);
 
@@ -4489,11 +4628,19 @@ memfs_readlink(
         return;
     }
 
-    request->readlink.r_target_length = inode->symlink.target->length;
+    /* Clamp to the caller-supplied buffer; a stored target longer than the
+     * provided buffer must not overrun it. */
+    uint32_t copy_len = inode->symlink.target->length;
+
+    if (copy_len > request->readlink.target_maxlength) {
+        copy_len = request->readlink.target_maxlength;
+    }
+
+    request->readlink.r_target_length = copy_len;
 
     memcpy(request->readlink.r_target,
            inode->symlink.target->data,
-           inode->symlink.target->length);
+           copy_len);
 
     memfs_map_attrs(shared, &request->readlink.r_attr, inode, request->fh);
 
@@ -4783,11 +4930,14 @@ memfs_rename_at(
 
     old_parent_inode->mtime = now;
     old_parent_inode->ctime = now;
+    old_parent_inode->change++;
     new_parent_inode->mtime = now;
     new_parent_inode->ctime = now;
+    new_parent_inode->change++;
 
     /* POSIX: a successful rename marks the renamed file's status-change time. */
     child_inode->ctime = now;
+    child_inode->change++;
 
     memfs_map_attrs(shared, &request->rename_at.r_fromdir_post_attr, old_parent_inode, request->fh);
     memfs_map_attrs(shared, &request->rename_at.r_todir_post_attr, new_parent_inode, request->rename_at.new_fh);
@@ -4884,9 +5034,11 @@ memfs_link_at(
          * the target's mutex. */
         if (existing_dirent->inum == inode->inum &&
             existing_dirent->gen == inode->gen) {
-            inode->ctime        = now;
+            inode->ctime = now;
+            inode->change++;
             parent_inode->mtime = now;
             parent_inode->ctime = now;
+            parent_inode->change++;
             memfs_map_attrs(shared, &request->link_at.r_dir_post_attr,
                             parent_inode, request->link_at.dir_fh);
             memfs_map_attrs(shared, &request->link_at.r_attr, inode,
@@ -4938,9 +5090,11 @@ memfs_link_at(
 
     inode->nlink++;
 
-    inode->ctime        = now;
+    inode->ctime = now;
+    inode->change++;
     parent_inode->mtime = now;
     parent_inode->ctime = now;
+    parent_inode->change++;
 
     memfs_map_attrs(shared, &request->link_at.r_dir_post_attr, parent_inode, request->link_at.dir_fh);
     memfs_map_attrs(shared, &request->link_at.r_attr, inode, request->fh);
@@ -5067,6 +5221,7 @@ memfs_set_xattr(
 
     chimera_vfs_realtime(&now);
     inode->ctime = now;
+    inode->change++;
 
     memfs_map_attrs(shared, &request->set_xattr.r_post_attr, inode, request->fh);
 
@@ -5166,6 +5321,7 @@ memfs_remove_xattr(
 
     chimera_vfs_realtime(&now);
     inode->ctime = now;
+    inode->change++;
 
     memfs_map_attrs(shared, &request->remove_xattr.r_post_attr, inode, request->fh);
 
@@ -5198,8 +5354,11 @@ memfs_open_stream(
         return;
     }
 
-    /* Named streams attach only to regular files. */
-    if (!S_ISREG(inode->mode)) {
+    /* Named streams (SMB alternate data streams) attach to regular files and
+     * directories alike -- NTFS allows ADS on a directory, it just has no
+     * default "::$DATA" data fork (that explicit form is rejected earlier in
+     * the SMB create path).  Symlinks and special files have no streams. */
+    if (!S_ISREG(inode->mode) && !S_ISDIR(inode->mode)) {
         pthread_mutex_unlock(&inode->lock);
         request->status = CHIMERA_VFS_EINVAL;
         request->complete(request);
@@ -5221,13 +5380,14 @@ memfs_open_stream(
         stream->name = malloc(request->open_stream.namelen);
         memcpy(stream->name, request->open_stream.name,
                request->open_stream.namelen);
-        stream->name_len               = request->open_stream.namelen;
-        stream->id                     = ++inode->next_stream_id;
-        stream->linked                 = 1;
-        stream->next                   = inode->streams;
-        inode->streams                 = stream;
-        inode->mtime                   = now;
-        inode->ctime                   = now;
+        stream->name_len = request->open_stream.namelen;
+        stream->id       = ++inode->next_stream_id;
+        stream->linked   = 1;
+        stream->next     = inode->streams;
+        inode->streams   = stream;
+        inode->mtime     = now;
+        inode->ctime     = now;
+        inode->change++;
         request->open_stream.r_created = 1;
     } else if (flags & CHIMERA_VFS_OPEN_EXCLUSIVE) {
         pthread_mutex_unlock(&inode->lock);
@@ -5240,6 +5400,7 @@ memfs_open_stream(
         stream->space_used = 0;
         inode->mtime       = now;
         inode->ctime       = now;
+        inode->change++;
     }
 
     /* Named streams share the base file's metadata (mode/owner/timestamps and
@@ -5401,6 +5562,7 @@ memfs_remove_stream(
     }
 
     inode->ctime = now;
+    inode->change++;
 
     memfs_map_attrs(shared, &request->remove_stream.r_post_attr, inode, request->fh);
 
@@ -5535,7 +5697,8 @@ SYMBOL_EXPORT struct chimera_vfs_module vfs_memfs = {
         CHIMERA_VFS_CAP_COPY_RANGE | CHIMERA_VFS_CAP_CLONE_RANGE | CHIMERA_VFS_CAP_MOVE_RANGE |
         CHIMERA_VFS_CAP_ACL_NATIVE | CHIMERA_VFS_CAP_XATTR | CHIMERA_VFS_CAP_LAYOUT |
         CHIMERA_VFS_CAP_READ_PROVIDES_BUFFERS |
-        CHIMERA_VFS_CAP_NAMED_STREAMS | CHIMERA_VFS_CAP_RPL | CHIMERA_VFS_CAP_FS_LOCK,
+        CHIMERA_VFS_CAP_NAMED_STREAMS | CHIMERA_VFS_CAP_RPL | CHIMERA_VFS_CAP_FS_LOCK |
+        CHIMERA_VFS_CAP_CHANGE,
     .init           = memfs_init,
     .destroy        = memfs_destroy,
     .thread_init    = memfs_thread_init,

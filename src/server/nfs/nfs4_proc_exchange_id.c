@@ -18,147 +18,64 @@
          EXCHGID4_FLAG_USE_PNFS_MDS | EXCHGID4_FLAG_USE_PNFS_DS |             \
          EXCHGID4_FLAG_UPD_CONFIRMED_REC_A)
 
-/*
- * SSV state-protection (SP4_SSV) algorithm tables.  Each entry is a DER-encoded
- * ASN.1 OBJECT IDENTIFIER as it appears on the wire in ssv_sp_parms4, plus (for
- * hashes) the SSV length, which is the hash's output size (RFC 8881 §2.10.9).
- */
-struct nfs4_ssv_alg {
-    const uint8_t *oid;
-    uint32_t       oid_len;
-    uint32_t       ssv_len; /* hash digest size; unused (0) for ciphers */
-};
-
-/* *INDENT-OFF* */
-/* DER-encoded OBJECT IDENTIFIERs and the column-aligned tables below confuse
- * uncrustify's alignment pass (it oscillates), so format them by hand. */
-static const uint8_t nfs4_oid_sha1[]   = { 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a };
-static const uint8_t nfs4_oid_sha224[] = { 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x04 };
-static const uint8_t nfs4_oid_sha256[] = { 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01 };
-static const uint8_t nfs4_oid_sha384[] = { 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02 };
-static const uint8_t nfs4_oid_sha512[] = { 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03 };
-
-static const struct nfs4_ssv_alg nfs4_ssv_hashes[] = {
-    { nfs4_oid_sha256, sizeof(nfs4_oid_sha256), 32 },
-    { nfs4_oid_sha1,   sizeof(nfs4_oid_sha1),   20 },
-    { nfs4_oid_sha512, sizeof(nfs4_oid_sha512), 64 },
-    { nfs4_oid_sha384, sizeof(nfs4_oid_sha384), 48 },
-    { nfs4_oid_sha224, sizeof(nfs4_oid_sha224), 28 },
-};
-
-static const uint8_t nfs4_oid_aes128_cbc[] = { 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x01, 0x02 };
-static const uint8_t nfs4_oid_aes192_cbc[] = { 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x01, 0x16 };
-static const uint8_t nfs4_oid_aes256_cbc[] = { 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x01, 0x2a };
-
-static const struct nfs4_ssv_alg nfs4_ssv_ciphers[] = {
-    { nfs4_oid_aes256_cbc, sizeof(nfs4_oid_aes256_cbc), 0 },
-    { nfs4_oid_aes192_cbc, sizeof(nfs4_oid_aes192_cbc), 0 },
-    { nfs4_oid_aes128_cbc, sizeof(nfs4_oid_aes128_cbc), 0 },
-};
-/* *INDENT-ON* */
+/* State-management operations chimera enforces under SP4_MACH_CRED, as a
+ * bitmap4 (RFC 8881 §2.10.8.3): BIND_CONN_TO_SESSION(41), EXCHANGE_ID(42),
+ * CREATE_SESSION(43), DESTROY_SESSION(44), DESTROY_CLIENTID(57).  Bit op N is
+ * word[N/32] bit (N%32); ops 41-57 all fall in word 1. */
+#define NFS4_MACH_ENFORCE_WORD1                                                 \
+        ((1u << (41 - 32)) | (1u << (42 - 32)) | (1u << (43 - 32)) |            \
+         (1u << (44 - 32)) | (1u << (57 - 32)))
 
 /*
- * Walk the client's offered algorithm list in preference order and pick the
- * first entry the server recognizes.  spi_hash_alg / spi_encr_alg are returned
- * as indices into the client's list (RFC 8881 §18.35.3), so the client must
- * present at least one algorithm we know.  Returns 0 on a match.
+ * Build the EXCHANGE_ID reply's state-protection result (RFC 8881 §18.35.3)
+ * and return the negotiated mode (stored on the client record for per-op
+ * enforcement).  SP4_MACH_CRED is honored when requested: the server echoes
+ * the operations it will enforce against the machine credential.
+ *
+ * SP4_SSV is declined -- we fall back to SP4_NONE.  Although the wire encoding
+ * could be negotiated, chimera does not actually enforce the SSV-derived
+ * RPCSEC_GSS credential on the spo_must_enforce state-management operations,
+ * SET_SSV does not compute the ssr_digest proof-of-knowledge, and
+ * nfs4_client_mach_cred_ok never checks an SSV credential (RFC 8881
+ * §2.10.8.3 / §18.47.3).  Advertising SP4_SSV would therefore be both a
+ * protocol lie (claiming a capability we cannot back) and a security
+ * overstatement (a client would believe its session-management operations are
+ * cryptographically bound to a shared secret when they are not).  Until real
+ * SSV enforcement is implemented we decline it.  Any case we cannot satisfy
+ * falls back to SP4_NONE.
  */
-static int
-nfs4_ssv_select(
-    const struct sec_oid4     *offered,
-    uint32_t                   num_offered,
-    const struct nfs4_ssv_alg *known,
-    size_t                     num_known,
-    uint32_t                  *out_idx,
-    uint32_t                  *out_ssv_len)
-{
-    for (uint32_t i = 0; i < num_offered; i++) {
-        for (size_t k = 0; k < num_known; k++) {
-            if (offered[i].oid.len == known[k].oid_len &&
-                memcmp(offered[i].oid.data, known[k].oid, known[k].oid_len) == 0) {
-                *out_idx = i;
-                if (out_ssv_len) {
-                    *out_ssv_len = known[k].ssv_len;
-                }
-                return 0;
-            }
-        }
-    }
-    return -1;
-} /* nfs4_ssv_select */
-
-/* Echo a state_protect_ops4 (the operations the server will enforce / allow)
- * into the reply, copying the bitmap arrays into the response dbuf. */
-static void
-nfs4_copy_protect_ops(
-    struct state_protect_ops4       *dst,
-    const struct state_protect_ops4 *src,
-    xdr_dbuf                        *dbuf)
-{
-    dst->num_spo_must_enforce = src->num_spo_must_enforce;
-    dst->spo_must_enforce     = NULL;
-    if (src->num_spo_must_enforce) {
-        size_t sz = (size_t) src->num_spo_must_enforce * sizeof(uint32_t);
-        dst->spo_must_enforce = xdr_dbuf_alloc_space(sz, dbuf);
-        chimera_nfs_abort_if(dst->spo_must_enforce == NULL, "Failed to allocate space");
-        memcpy(dst->spo_must_enforce, src->spo_must_enforce, sz);
-    }
-
-    dst->num_spo_must_allow = src->num_spo_must_allow;
-    dst->spo_must_allow     = NULL;
-    if (src->num_spo_must_allow) {
-        size_t sz = (size_t) src->num_spo_must_allow * sizeof(uint32_t);
-        dst->spo_must_allow = xdr_dbuf_alloc_space(sz, dbuf);
-        chimera_nfs_abort_if(dst->spo_must_allow == NULL, "Failed to allocate space");
-        memcpy(dst->spo_must_allow, src->spo_must_allow, sz);
-    }
-} /* nfs4_copy_protect_ops */
-
-/*
- * Build the EXCHANGE_ID reply's state-protection result (RFC 8881 §18.35.3).
- * SP4_SSV is honored when the client offers an SSV hash (and cipher) we
- * support; the server picks the algorithms, echoes the operation-protection
- * bitmaps, and reports the negotiated SSV length so the client can size its
- * key.  SP4_NONE and any case we cannot satisfy fall back to SP4_NONE.
- */
-static void
+static uint32_t
 nfs4_set_state_protect(
     const struct state_protect4_a *req_sp,
     struct state_protect4_r       *res_sp,
     xdr_dbuf                      *dbuf)
 {
+    if (req_sp->spa_how == SP4_MACH_CRED) {
+        static const uint32_t      enforce[2] = { 0, NFS4_MACH_ENFORCE_WORD1 };
+        struct state_protect_ops4 *ops        = &res_sp->spr_mach_ops;
+
+        chimera_nfs_debug("EXCHANGE_ID: negotiated SP4_MACH_CRED state protection");
+        res_sp->spr_how           = SP4_MACH_CRED;
+        ops->num_spo_must_enforce = 2;
+        ops->spo_must_enforce     = xdr_dbuf_alloc_space(sizeof(enforce), dbuf);
+        chimera_nfs_abort_if(ops->spo_must_enforce == NULL, "Failed to allocate space");
+        memcpy(ops->spo_must_enforce, enforce, sizeof(enforce));
+        ops->num_spo_must_allow = 0;
+        ops->spo_must_allow     = NULL;
+        return SP4_MACH_CRED;
+    }
+
+    /* SP4_SSV is declined: chimera cannot enforce SSV-derived credentials, so
+     * it falls through to the SP4_NONE result below rather than advertising a
+     * capability it does not back.  See the function comment above. */
     if (req_sp->spa_how == SP4_SSV) {
-        const struct ssv_sp_parms4 *p = &req_sp->spa_ssv_parms;
-        uint32_t                    hash_idx, encr_idx, ssv_len;
-
-        if (nfs4_ssv_select(p->ssp_hash_algs, p->num_ssp_hash_algs,
-                            nfs4_ssv_hashes,
-                            sizeof(nfs4_ssv_hashes) / sizeof(nfs4_ssv_hashes[0]),
-                            &hash_idx, &ssv_len) == 0 &&
-            nfs4_ssv_select(p->ssp_encr_algs, p->num_ssp_encr_algs,
-                            nfs4_ssv_ciphers,
-                            sizeof(nfs4_ssv_ciphers) / sizeof(nfs4_ssv_ciphers[0]),
-                            &encr_idx, NULL) == 0) {
-            struct ssv_prot_info4 *info = &res_sp->spr_ssv_info;
-
-            res_sp->spr_how = SP4_SSV;
-            nfs4_copy_protect_ops(&info->spi_ops, &p->ssp_ops, dbuf);
-            info->spi_hash_alg = hash_idx;
-            info->spi_encr_alg = encr_idx;
-            info->spi_ssv_len  = ssv_len;
-            /* ssp_window is the number of concurrent SSV versions the client
-             * wants tracked; echo it (a zero window is meaningless, so floor
-             * it at one). */
-            info->spi_window = p->ssp_window ? p->ssp_window : 1;
-            /* No GSS handles are pre-provisioned; the client gets them via the
-             * RPCSEC_GSS SSV mechanism if/when it uses SSV-secured RPC. */
-            info->spi_handles.len  = 0;
-            info->spi_handles.data = NULL;
-            return;
-        }
+        chimera_nfs_debug(
+            "EXCHANGE_ID: client requested SP4_SSV; declining (not enforced), "
+            "negotiating SP4_NONE instead");
     }
 
     res_sp->spr_how = SP4_NONE;
+    return SP4_NONE;
 } /* nfs4_set_state_protect */
 
 void
@@ -257,6 +174,12 @@ chimera_nfs4_exchange_id(
         return;
     }
 
+    /* Negotiate state protection (RFC 8881 §18.35.3) and record the chosen mode
+     * on the client so per-op enforcement (SP4_MACH_CRED) can consult it. */
+    uint32_t sp_how = nfs4_set_state_protect(&args->eia_state_protect,
+                                             &res->eir_resok4.eir_state_protect,
+                                             req->encoding->dbuf);
+
     /* Phase 5: 4.1+ EXCHANGE_ID is the moment of identity establishment;
      * stub-persist the unified client so a future stable-storage backend
      * can pick it up after a restart. */
@@ -268,7 +191,8 @@ chimera_nfs4_exchange_id(
                   thread->shared->nfs4_shared_clients.nfs4_ct_clients_by_id,
                   &eid.clientid, sizeof(eid.clientid), c);
         if (c) {
-            uc = c->unified;
+            c->nfs4_client_sp_how = sp_how;
+            uc                    = c->unified;
             /* EXCHANGE_ID is client liveness: renew the lease so a client
              * mid-handshake (EXCHANGE_ID -> CREATE_SESSION -> first SEQUENCE)
              * is not expired by the lease sweep before it establishes a
@@ -301,9 +225,8 @@ chimera_nfs4_exchange_id(
     res->eir_resok4.eir_sequenceid = 1;
     res->eir_resok4.eir_flags      = pnfs_flags |
         (eid.confirmed ? EXCHGID4_FLAG_CONFIRMED_R : 0);
-    nfs4_set_state_protect(&args->eia_state_protect,
-                           &res->eir_resok4.eir_state_protect,
-                           req->encoding->dbuf);
+    /* eir_state_protect was already filled (and the mode recorded on the
+     * client) above. */
     res->eir_resok4.num_eir_server_impl_id = 1;
 
     res->eir_resok4.eir_server_impl_id = xdr_dbuf_alloc_space(sizeof(struct nfs_impl_id4), req->encoding->dbuf);

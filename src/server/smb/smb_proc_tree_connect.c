@@ -81,10 +81,27 @@ chimera_smb_tree_connect(struct chimera_smb_request *request)
 
         tree->tree_id = session->max_trees;
 
-        session->max_trees *= 2;
-        session->trees      = realloc(session->trees,
-                                      session->max_trees * sizeof(struct chimera_smb_tree *));
+        struct chimera_smb_tree **grown =
+            realloc(session->trees,
+                    session->max_trees * 2 * sizeof(struct chimera_smb_tree *));
 
+        if (unlikely(!grown)) {
+            /* realloc failed: the original array is intact (not freed); reject
+             * the tree connect rather than dereferencing NULL (MS-SMB2 3.3.5.7). */
+            pthread_mutex_unlock(&session->lock);
+            chimera_smb_complete_request(request, SMB2_STATUS_INSUFFICIENT_RESOURCES);
+            return;
+        }
+
+        /* realloc() does not zero the newly grown region.  The free-slot scan
+         * above and the dispatcher's TreeId resolution both rely on unused
+         * slots being NULL, so zero every newly added slot before publishing
+         * the grown array. */
+        memset(&grown[session->max_trees], 0,
+               session->max_trees * sizeof(struct chimera_smb_tree *));
+
+        session->max_trees           *= 2;
+        session->trees                = grown;
         session->trees[tree->tree_id] = tree;
     }
 
@@ -119,6 +136,12 @@ chimera_smb_tree_connect_reply(
         if (request->tree && request->tree->share &&
             request->tree->share->access_based_enum) {
             share_flags |= SMB2_SHAREFLAG_ACCESS_BASED_DIRECTORY_ENUM;
+        }
+        /* Force level-2 oplocks: advertise so the client knows this share grants
+         * at most a read (LEVEL_II) cache (MS-SMB2 §2.2.10). */
+        if (request->tree && request->tree->share &&
+            request->tree->share->force_level2_oplock) {
+            share_flags |= SMB2_SHAREFLAG_FORCE_LEVELII_OPLOCK;
         }
         /* Per-share encryption: tell the client to encrypt all traffic on this
          * tree (MS-SMB2 §2.2.10 / §3.3.5.7). */

@@ -60,6 +60,10 @@ void chimera_smb_create_reply(
     struct evpl_iovec_cursor   *reply_cursor,
     struct chimera_smb_request *request);
 
+void chimera_smb_create_emit_symlink_error(
+    struct evpl_iovec_cursor   *cursor,
+    struct chimera_smb_request *request);
+
 int chimera_smb_parse_close(
     struct evpl_iovec_cursor   *request_cursor,
     struct chimera_smb_request *request);
@@ -181,6 +185,18 @@ void chimera_smb_query_directory(
 
 void chimera_smb_set_info(
     struct chimera_smb_request *request);
+
+/* Apply a client FILE_FULL_EA_INFORMATION buffer to an open object's xattrs,
+ * one EA at a time (shared by SetInfo and CREATE ExtA).  The caller owns ea_buf
+ * for the duration; `done` is invoked with the resulting NTSTATUS. */
+void chimera_smb_ea_apply(
+    struct chimera_server_smb_thread *thread,
+    const struct chimera_vfs_cred *cred,
+    struct chimera_vfs_open_handle *handle,
+    const uint8_t *ea_buf,
+    uint32_t ea_buf_len,
+    void ( *done )(uint32_t status, void *arg),
+    void *arg);
 
 void chimera_smb_set_security(
     struct chimera_smb_request *request);

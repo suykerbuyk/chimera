@@ -70,6 +70,7 @@ chimera_smb_durable_register(
     struct chimera_server_smb_shared *shared,
     struct chimera_smb_open_file     *open_file,
     uint64_t                          session_id,
+    uint32_t                          owner_uid,
     const uint8_t                    *client_guid,
     const char                       *name,
     uint32_t                          name_len,
@@ -79,6 +80,7 @@ chimera_smb_durable_register(
 
     entry->persistent_id = open_file->file_id.pid;
     entry->session_id    = session_id;
+    entry->owner_uid     = owner_uid;
     entry->open_file     = open_file;
     entry->parked        = false;
     entry->persistent    = persistent;
@@ -169,6 +171,13 @@ struct chimera_smb_durable_doc {
     struct chimera_vfs_thread      *vfs_thread;
     struct chimera_vfs_doc_info     doc_info;
     struct chimera_vfs_open_handle *parent_handle;
+    /* FH of the file this delete-on-close targets, so the async remove only
+     * unlinks the name while it still resolves to THIS object -- not a fresh
+     * file another opener created with the same name in the meantime (the
+     * grace-timer reap of a DELETE_ON_CLOSE handle can land arbitrarily late
+     * under load). */
+    uint8_t                         file_fh[CHIMERA_VFS_FH_SIZE];
+    int                             file_fh_len;
 };
 
 static void
@@ -207,10 +216,11 @@ chimera_smb_durable_doc_open_parent_cb(
         return;
     }
     ctx->parent_handle = oh;
-    chimera_vfs_remove_at(ctx->vfs_thread, &ctx->doc_info.cred, oh,
-                          ctx->doc_info.name, ctx->doc_info.name_len, NULL, 0, 0, 0,
-                          NULL, /* parent_lease_skip */
-                          chimera_smb_durable_doc_remove_cb, ctx);
+    chimera_vfs_remove_at_match_fh(ctx->vfs_thread, &ctx->doc_info.cred, oh,
+                                   ctx->doc_info.name, ctx->doc_info.name_len,
+                                   ctx->file_fh, ctx->file_fh_len, 0, 0,
+                                   NULL, /* parent_lease_skip */
+                                   chimera_smb_durable_doc_remove_cb, ctx);
 } /* chimera_smb_durable_doc_open_parent_cb */
 
 /*
@@ -226,11 +236,18 @@ chimera_smb_durable_release_handle(
 {
     struct chimera_smb_durable_doc *ctx;
     struct chimera_vfs_doc_info     doc_info;
+    uint8_t                         file_fh[CHIMERA_VFS_FH_SIZE];
+    int                             file_fh_len;
     int                             need_doc;
 
     if (!open_file->handle) {
         return;
     }
+
+    /* Capture the target file's FH before release_doc clears the handle, so the
+     * async unlink below is inode-scoped (see struct chimera_smb_durable_doc). */
+    file_fh_len = open_file->handle->fh_len;
+    memcpy(file_fh, open_file->handle->fh, file_fh_len);
 
     need_doc          = chimera_vfs_release_doc(thread->vfs_thread, open_file->handle, &doc_info);
     open_file->handle = NULL;
@@ -243,6 +260,8 @@ chimera_smb_durable_release_handle(
     ctx->vfs_thread    = thread->vfs_thread;
     ctx->doc_info      = doc_info;
     ctx->parent_handle = NULL;
+    ctx->file_fh_len   = file_fh_len;
+    memcpy(ctx->file_fh, file_fh, file_fh_len);
 
     chimera_vfs_open_fh(thread->vfs_thread, &ctx->doc_info.cred,
                         ctx->doc_info.parent_fh, ctx->doc_info.parent_fh_len,
@@ -263,7 +282,8 @@ chimera_smb_durable_release_handle(
 SYMBOL_EXPORT bool
 chimera_smb_durable_purge_parked(
     struct chimera_server_smb_thread *thread,
-    uint64_t                          persistent_id)
+    uint64_t                          persistent_id,
+    bool                              include_persistent)
 {
     struct chimera_server_smb_shared *shared = thread->shared;
     struct chimera_smb_durable_entry *entry;
@@ -271,8 +291,8 @@ chimera_smb_durable_purge_parked(
 
     pthread_mutex_lock(&shared->durable.lock);
     HASH_FIND(hh, shared->durable.by_pid, &persistent_id, sizeof(persistent_id), entry);
-    if (entry && entry->parked && !entry->persistent && !entry->cold &&
-        entry->open_file) {
+    if (entry && entry->parked && (include_persistent || !entry->persistent) &&
+        !entry->cold && entry->open_file) {
         HASH_DELETE(hh, shared->durable.by_pid, entry);
         open_file = entry->open_file;
         free(entry);
@@ -377,13 +397,21 @@ chimera_smb_durable_park(
     pthread_mutex_lock(&shared->durable.lock);
     HASH_FIND(hh, shared->durable.by_pid, &pid, sizeof(pid), entry);
     if (entry) {
-        /* A resilient open is held for its resiliency timeout; a durable open
-         * for its durable timeout.  When an open is both, keep it for the
-         * longer of the two. */
-        uint64_t timeout_ms = open_file->durable_timeout_ms;
-        if (open_file->resilient && open_file->resilient_timeout_ms > timeout_ms) {
-            timeout_ms = open_file->resilient_timeout_ms;
-        }
+        /* The disconnect-survival timeout: a resiliency request SETS the open's
+         * timeout (MS-SMB2 3.3.5.15.9 -- it governs even when the open is also
+         * durable/persistent, and may be SHORTER than the durable default), so
+         * when the open is resilient the resiliency timeout wins outright; a
+         * plain durable open uses its durable timeout. */
+        uint64_t timeout_ms = open_file->resilient
+            ? open_file->resilient_timeout_ms
+            : open_file->durable_timeout_ms;
+
+        entry->resilient = open_file->resilient;
+        /* A pure persistent (CA) handle with no resiliency timeout holds the
+         * file until an explicit reclaim/close: it never expires on the grace
+         * timer.  A persistent+resilient handle DOES expire at the resiliency
+         * timeout (test_resiliency_*_after_timeout). */
+        entry->never_expires     = entry->persistent && !open_file->resilient;
         entry->parked            = true;
         entry->deadline          = now;
         entry->deadline.tv_sec  += timeout_ms / 1000;
@@ -397,10 +425,13 @@ chimera_smb_durable_park(
 
     /* Mark the caching grant's lease AND the share reservation parked so the
      * vfs_state conflict matrix treats this disconnected holder as
-     * courtesy-held: a compatible new open coexists (keep) and a write-cache
-     * holder is evicted by the caching-acquire path (purge).  The share-resv
-     * flag stops the sole-opener rule from capping a new opener's lease to R on
-     * account of a disconnected holder.  Cleared on reconnect. */
+     * courtesy-held: a compatible new open coexists (keep).  A durable-only
+     * write-cache holder is then evicted by the caching-acquire path (purge,
+     * the MS-SMB2 yield); a resilient/persistent holder within its timeout is
+     * spared by that path (chimera_smb_durable_parked_hold) so a conflicting
+     * open caps its own grant instead.  The share-resv flag stops the
+     * sole-opener rule from capping a new opener's lease to R on account of a
+     * disconnected holder.  Cleared on reconnect. */
     if (open_file->grant) {
         open_file->grant->lease.parked = 1;
     }
@@ -409,16 +440,54 @@ chimera_smb_durable_park(
     }
 } /* chimera_smb_durable_park */
 
+/* Classify how a parked durable holder (by persistent id) treats a conflicting
+ * fresh open -- see enum chimera_smb_durable_hold.  A durable-only holder, an
+ * expired holder (past its deadline, whether or not the sweep has reaped it
+ * yet), an unknown id, or a live (not-parked) entry all YIELD (NONE).  A
+ * resilient holder within its timeout is courtesy-held and CAPs the opener; a
+ * persistent holder within its timeout BLOCKs the opener (FILE_NOT_AVAILABLE).
+ * Persistent outranks resilient (a persistent+resilient holder BLOCKs). */
+SYMBOL_EXPORT enum chimera_smb_durable_hold
+chimera_smb_durable_parked_hold(
+    struct chimera_server_smb_shared *shared,
+    uint64_t                          persistent_id)
+{
+    struct chimera_smb_durable_entry *entry;
+    enum chimera_smb_durable_hold     hold = CHIMERA_SMB_DURABLE_HOLD_NONE;
+    struct timespec                   now;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+
+    pthread_mutex_lock(&shared->durable.lock);
+    HASH_FIND(hh, shared->durable.by_pid, &persistent_id, sizeof(persistent_id), entry);
+    if (entry && entry->parked && !entry->cold && entry->open_file) {
+        bool within = entry->never_expires ||
+            chimera_timespec_cmp(&now, &entry->deadline) < 0;
+        if (within) {
+            if (entry->persistent) {
+                hold = CHIMERA_SMB_DURABLE_HOLD_BLOCK;
+            } else if (entry->resilient) {
+                hold = CHIMERA_SMB_DURABLE_HOLD_CAP;
+            }
+        }
+    }
+    pthread_mutex_unlock(&shared->durable.lock);
+
+    return hold;
+} /* chimera_smb_durable_parked_hold */
+
 SYMBOL_EXPORT struct chimera_smb_open_file *
 chimera_smb_durable_claim(
     struct chimera_server_smb_shared *shared,
     uint64_t                          persistent_id,
     const uint8_t                    *create_guid,
     const uint8_t                    *client_guid,
+    uint32_t                          owner_uid,
     const char                       *name,
     uint32_t                          name_len,
     bool                              has_lease_ctx,
     const uint8_t                    *lease_key,
+    bool                              reconnect_persistent,
     bool                             *r_cold,
     bool                             *r_retry,
     uint32_t                         *status)
@@ -426,9 +495,12 @@ chimera_smb_durable_claim(
     struct chimera_smb_durable_entry *entry;
     struct chimera_smb_open_file     *open_file = NULL;
     bool                              had_lease;
+    struct timespec                   now;
 
     *r_cold  = false;
     *r_retry = false;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
 
     pthread_mutex_lock(&shared->durable.lock);
 
@@ -454,6 +526,14 @@ chimera_smb_durable_claim(
          * lapses into OBJECT_NAME_NOT_FOUND. */
         *r_retry = true;
         *status  = SMB2_STATUS_OBJECT_NAME_NOT_FOUND;
+    } else if (!entry->never_expires && !entry->cold &&
+               chimera_timespec_cmp(&now, &entry->deadline) >= 0) {
+        /* Lazy expiry: the parked handle has outlived its disconnect-survival
+         * deadline (durable timeout, or a shorter resiliency timeout).  Whether
+         * or not the grace-timer sweep has physically reaped it yet, it is gone
+         * for reclaim purposes -- OBJECT_NAME_NOT_FOUND.  The sweep frees the
+         * carcass (test_resiliency_*_after_timeout). */
+        *status = SMB2_STATUS_OBJECT_NAME_NOT_FOUND;
     } else if (entry->open_file &&
                (entry->open_file->flags & CHIMERA_SMB_OPEN_FILE_YIELDED)) {
         /* While disconnected, this open's write-caching oplock/lease was
@@ -464,6 +544,11 @@ chimera_smb_durable_claim(
         *status = SMB2_STATUS_OBJECT_NAME_NOT_FOUND;
     } else if (create_guid && memcmp(entry->create_guid, create_guid, 16) != 0) {
         *status = SMB2_STATUS_OBJECT_NAME_NOT_FOUND;
+    } else if (reconnect_persistent && !entry->persistent) {
+        /* MS-SMB2 3.3.5.9.12: the reconnect set SMB2_DHANDLE_FLAG_PERSISTENT but
+         * the surviving Open is not persistent (Open.IsPersistent == FALSE) ->
+         * STATUS_INVALID_PARAMETER (pike durable test_durable_reconnect_v2_fails). */
+        *status = SMB2_STATUS_INVALID_PARAMETER;
     } else if ((had_lease || entry->persistent) && client_guid &&
                memcmp(entry->client_guid, client_guid, 16) != 0) {
         /* Reconnect from a different client.  MS-SMB2 3.3.5.9.7 binds the
@@ -492,6 +577,13 @@ chimera_smb_durable_claim(
          * non-lease (oplock) reconnect both ignore the name entirely: the
          * handle's identity is its persistent id, plus the create_guid for v2. */
         *status = SMB2_STATUS_INVALID_PARAMETER;
+    } else if (!entry->cold && entry->owner_uid != owner_uid) {
+        /* MS-SMB2 3.3.5.9.7 step 9: the reconnecting session's user must be the
+         * same user that owns the durable/resilient open (Open.DurableOwner).  A
+         * reclaim by a different user is denied with STATUS_ACCESS_DENIED.  Cold
+         * (server-restart-recovered) entries carry no in-memory owner, so the
+         * check applies only to warm handles. */
+        *status = SMB2_STATUS_ACCESS_DENIED;
     } else if (entry->cold) {
         /* Recovered-after-restart entry: there is no live open to re-home.
          * Remove it and tell the caller to re-open the file (cold reclaim);
@@ -532,6 +624,13 @@ chimera_smb_durable_claim(
  *       replay collides with the still-open original and is rejected with
  *       STATUS_DUPLICATE_OBJECTID.  (durable-reconnect-replay2)
  *
+ *   CHIMERA_SMB_GUID_REPLAY_DENIED   - a *parked* durable open matches a replay
+ *       but the reclaim fails MS-SMB2 3.3.5.9.10 replay verification (the
+ *       surviving open holds a lease whose LeaseKey differs from the one named in
+ *       the replayed create, or the requested handle type oplock-vs-lease differs):
+ *       rejected with STATUS_ACCESS_DENIED.  (SMB2Model ReplayCreateDurableHandleV2
+ *       *PersistentTestCaseS54 / S1575.)
+ *
  *   CHIMERA_SMB_GUID_REPLAY_NONE     - no registry entry carries this guid (or
  *       the only live match is the requesting connection's own open, handled by
  *       the live open_files scan): the caller proceeds with a fresh create.
@@ -543,6 +642,8 @@ chimera_smb_durable_claim_by_guid(
     const uint8_t                    *client_guid,
     const struct chimera_smb_conn    *req_conn,
     int                               is_replay,
+    bool                              has_lease_ctx,
+    const uint8_t                    *lease_key,
     struct chimera_smb_open_file    **r_open_file)
 {
     struct chimera_smb_durable_entry   *entry, *tmp;
@@ -576,6 +677,22 @@ chimera_smb_durable_claim_by_guid(
                  * (parked) open of this client collides with it. */
                 result = CHIMERA_SMB_GUID_REPLAY_DUPLICATE;
                 break;
+            }
+            /* MS-SMB2 3.3.5.9.10 replay verification: a found Open is reclaimed
+             * only if the replayed create matches its handle type and (when
+             * leased) its LeaseKey -- otherwise STATUS_ACCESS_DENIED.  Mirrors
+             * the live-open replay check in chimera_smb_create_guid_replay; the
+             * DH2C/DHnC reconnect path enforces the same in chimera_smb_durable_claim. */
+            {
+                bool open_is_lease = entry->open_file->oplock_level ==
+                    SMB2_OPLOCK_LEVEL_LEASE;
+
+                if (has_lease_ctx != open_is_lease ||
+                    (has_lease_ctx && lease_key &&
+                     memcmp(entry->open_file->lease_key, lease_key, 16) != 0)) {
+                    result = CHIMERA_SMB_GUID_REPLAY_DENIED;
+                    break;
+                }
             }
             entry->parked = false;
             *r_open_file  = entry->open_file;
@@ -624,10 +741,11 @@ chimera_smb_durable_sweep(struct chimera_server_smb_thread *thread)
         if (!entry->parked) {
             continue;
         }
-        /* Persistent handles do not expire on the durable grace timer (they
-         * live until explicit close or admin action), and cold entries have no
-         * live open to tear down — skip both. */
-        if (entry->persistent || entry->cold || !entry->open_file) {
+        /* A pure persistent (CA) handle does not expire on the grace timer (it
+         * lives until explicit close or admin action), and cold entries have no
+         * live open to tear down — skip both.  A persistent+resilient handle is
+         * NOT never_expires: its resiliency timeout governs and it IS reaped. */
+        if (entry->never_expires || entry->cold || !entry->open_file) {
             continue;
         }
         if (chimera_timespec_cmp(&now, &entry->deadline) < 0) {

@@ -6,7 +6,7 @@ include_directories(${NFS_COMMON_INCLUDE_DIR})
 
 # Create libraries for NFSv3 and NFSv4
 add_library(chimera_nfs SHARED nfs.c nfs4_session.c nfs4_state.c nfs4_lease.c nfs4_recovery.c nfs4_drc.c nfs3_drc.c nfs4_v40_drc.c nfs_drc_reply.c nfs4_callback.c nfs_mount.c nfs_portmap.c nfs3_dump.c nfs4_dump.c
-            nfs_external_portmap.c nfs_nlm.c nfs_nlm_state.c nfs_nsm.c nfs_nsm_state.c
+            nfs_external_portmap.c nfs_nlm.c nfs_nlm_state.c nfs_nlm_granted.c nfs_nsm.c nfs_nsm_state.c
             nfs3_proc_null.c nfs3_proc_getattr.c nfs3_proc_setattr.c nfs3_proc_lookup.c 
             nfs3_proc_access.c nfs3_proc_readlink.c nfs3_proc_read.c nfs3_proc_write.c
             nfs3_proc_create.c nfs3_proc_mkdir.c nfs3_proc_remove.c nfs3_proc_mknod.c nfs3_proc_symlink.c
@@ -34,10 +34,11 @@ add_library(chimera_nfs SHARED nfs.c nfs4_session.c nfs4_state.c nfs4_lease.c nf
             nfs4_proc_open_downgrade.c nfs4_proc_release_lockowner.c
             nfs4_proc_getxattr.c nfs4_proc_setxattr.c
             nfs4_proc_listxattrs.c nfs4_proc_removexattr.c
-            nfs4_pnfs.c nfs4_cb.c nfs4_layout_table.c)
+            nfs4_pnfs.c nfs4_cb.c nfs4_layout_table.c
+            nfs_gss.c)
 
 target_compile_definitions(chimera_nfs PRIVATE XXH_INLINE_ALL)
-target_link_libraries(chimera_nfs chimera_nfs_common chimera_common evpl evpl_rpc2 pthread uuid urcu-qsbr urcu-common)
+target_link_libraries(chimera_nfs chimera_nfs_common chimera_common evpl evpl_rpc2 pthread uuid urcu-qsbr urcu-common gssapi_krb5)
 
 install(TARGETS chimera_nfs DESTINATION lib)
 
