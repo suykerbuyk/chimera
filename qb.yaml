@@ -451,10 +451,12 @@ tasks:
         -S /context -B /build
       - ninja --quiet
       - ninja kvm_${PLATFORM}_image
-      # KVM_FILTER carries the full ctest selector for this leg, e.g. "-R /xfstests/"
-      # or "-E /(xfstests|cthon|pnfs|nfstest|ltp)/".  It must stay UNQUOTED so it
-      # word-splits into separate args; empty (the default) runs every kvm test for
-      # the platform.
+      # KVM_FILTER carries the full ctest selector for this leg, e.g. "-R '/xfstests/'"
+      # or "-E '/(xfstests|cthon|pnfs|nfstest|ltp)/'".  qb substitutes it into this
+      # line textually, so the regex must be single-quoted within the value (an
+      # unquoted ( or | is a shell syntax error).  The ${KVM_FILTER} token here
+      # stays UNQUOTED so the flag and regex split into separate args; empty (the
+      # default) runs every kvm test for the platform.
       - ctest --output-on-failure -L kvm -L "^${PLATFORM}$" ${KVM_FILTER} -j 12
     dependencies:
       builder:

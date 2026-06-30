@@ -231,30 +231,35 @@ ctest_kvm:
       # "other" is the catch-all leg: every kvm test for the platform not covered
       # by a named leg (kerberos, nlm, reboot, ...).  Keep its -E exclude list in
       # sync with the named legs below.
+      #
+      # The regex is single-quoted INSIDE the value: qb pastes KVM_FILTER into the
+      # ctest command line textually, so an unquoted ( or | would be parsed as
+      # shell syntax ("syntax error: ( unexpected").  The flag and regex stay
+      # space-separated and outside the quotes so they split into two ctest args.
       - MODE: [ Release, Debug ]
         ARCH: [ amd64 ]
         KVM_NAME: [ other ]
-        KVM_FILTER: [ "-E /(xfstests|cthon|pnfs|nfstest|ltp)/" ]
+        KVM_FILTER: [ "-E '/(xfstests|cthon|pnfs|nfstest|ltp)/'" ]
       - MODE: [ Release, Debug ]
         ARCH: [ amd64 ]
         KVM_NAME: [ xfstests ]
-        KVM_FILTER: [ "-R /xfstests/" ]
+        KVM_FILTER: [ "-R '/xfstests/'" ]
       - MODE: [ Release, Debug ]
         ARCH: [ amd64 ]
         KVM_NAME: [ cthon ]
-        KVM_FILTER: [ "-R /cthon/" ]
+        KVM_FILTER: [ "-R '/cthon/'" ]
       - MODE: [ Release, Debug ]
         ARCH: [ amd64 ]
         KVM_NAME: [ pnfs ]
-        KVM_FILTER: [ "-R /pnfs/" ]
+        KVM_FILTER: [ "-R '/pnfs/'" ]
       - MODE: [ Release, Debug ]
         ARCH: [ amd64 ]
         KVM_NAME: [ nfstest ]
-        KVM_FILTER: [ "-R /nfstest/" ]
+        KVM_FILTER: [ "-R '/nfstest/'" ]
       - MODE: [ Release, Debug ]
         ARCH: [ amd64 ]
         KVM_NAME: [ ltp ]
-        KVM_FILTER: [ "-R /ltp/" ]
+        KVM_FILTER: [ "-R '/ltp/'" ]
   script:
     - ${RUN_QB} -a ${ARCH} -v ctest_kvm -V MODE="${MODE}" -V KVM_FILTER="${KVM_FILTER}" &> ctest_kvm_${MODE}_${ARCH}_${KVM_NAME}.log
   after_script:
