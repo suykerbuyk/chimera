@@ -337,7 +337,7 @@ tasks:
         -DREQUIRE_NETNS_TESTS=ON
         -DKVM_TESTING=OFF
         -S /context -B /build
-      - ninja
+      - ninja --quiet
       - ctest --output-on-failure --test-output-size-failed 65536 --timeout 300 -j 12 -L pynfs -E diskfs_
     dependencies:
       builder:
@@ -360,7 +360,7 @@ tasks:
         -DREQUIRE_NETNS_TESTS=ON
         -DKVM_TESTING=OFF
         -S /context -B /build
-      - ninja
+      - ninja --quiet
       - ctest --output-on-failure --test-output-size-failed 65536 --timeout 300 -j 12 -LE pynfs
     dependencies:
       builder:
@@ -383,7 +383,7 @@ tasks:
         -DREQUIRE_NETNS_TESTS=ON
         -DKVM_TESTING=OFF
         -S /context -B /build
-      - ninja
+      - ninja --quiet
       - ctest --output-on-failure --test-output-size-failed 65536 --timeout 300 -j 12 -L pynfs -E diskfs_
     dependencies:
       builder:
@@ -406,8 +406,56 @@ tasks:
         -DREQUIRE_NETNS_TESTS=ON
         -DKVM_TESTING=OFF
         -S /context -B /build
-      - ninja
+      - ninja --quiet
       - ctest --output-on-failure --test-output-size-failed 65536 --timeout 300 -j 12 -LE pynfs
+    dependencies:
+      builder:
+        project: chimera
+        task: chimera-dev
+        tag: develop
+
+  ctest_kvm:
+    type: run_container
+    architecture: [ amd64 ]
+    image: chimera-dev
+    context: .
+    empty_dir:
+      - /build
+    privileged: true
+    variables:
+      ORAS_VERSION: 1.2.0
+      ORAS_URL: "https://github.com/oras-project/oras/releases/download"
+      KVM_FILTER: ""
+      MODE: "Debug"
+      PLATFORM: "ubuntu2604"
+    commands:
+      - cd /build
+      - export LC_ALL=C
+      - echo "KVM_FILTER=${KVM_FILTER}"
+      - echo "MODE=${MODE}"
+      - echo "PLATFORM=${PLATFORM}"
+      # Fail fast if the runner has no KVM device: the guests cannot boot with
+      # acceleration without /dev/kvm, so there is no point building chimera and
+      # fetching the (~GB) image first.
+      - '[ -w /dev/kvm ] || { echo "ERROR: /dev/kvm not present -- this runner has no KVM passthrough"; exit 1; }'
+      - >
+        curl -sSL "${ORAS_URL}/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_$arch.tar.gz"
+        | tar -xz -C "/usr/local/bin" oras
+      - chmod +x "/usr/local/bin/oras"
+      - >
+        cmake -G Ninja -DCMAKE_BUILD_TYPE=${MODE}
+        -DREQUIRE_NETNS_TESTS=ON
+        -DKVM_IMAGE_REGISTRY=repository.mdh.quantum.com:5009/chimera-nas/kvm-test-base
+        -DKVM_TESTING=ON
+        -DKVM_FETCH_IMAGES=OFF
+        -S /context -B /build
+      - ninja --quiet
+      - ninja kvm_${PLATFORM}_image
+      # KVM_FILTER carries the full ctest selector for this leg, e.g. "-R /xfstests/"
+      # or "-E /(xfstests|cthon|pnfs|nfstest|ltp)/".  It must stay UNQUOTED so it
+      # word-splits into separate args; empty (the default) runs every kvm test for
+      # the platform.
+      - ctest --output-on-failure -L kvm -L "^${PLATFORM}$" ${KVM_FILTER} -j 12
     dependencies:
       builder:
         project: chimera
