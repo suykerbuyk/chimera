@@ -16,7 +16,7 @@ install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/chimera.default DESTINATION ${DESTDIR}
 # Glob the public headers but skip internal-only ones (internal helpers, the
 # RCU caches, and the proc dispatch table).
 file(GLOB VFS_HEADERS CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/vfs/*.h)
-list(FILTER VFS_HEADERS EXCLUDE REGEX "/(vfs_internal|vfs_procs|vfs_[^/]*_cache)\\.h$")
+list(FILTER VFS_HEADERS EXCLUDE REGEX "/(vfs_internal|vfs_[^/]*_cache)\\.h$")
 install(FILES ${VFS_HEADERS} DESTINATION include/vfs)
 install(FILES
 	${CMAKE_SOURCE_DIR}/ext/libevpl/ext/prometheus-c/prometheus-c.h
