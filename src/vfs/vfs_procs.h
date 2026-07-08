@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <stddef.h>
 #include "vfs.h"
 
 struct evpl_iovec;
@@ -34,6 +35,16 @@ chimera_vfs_mount(
     const char                    *options,
     chimera_vfs_mount_callback_t   callback,
     void                          *private_data);
+
+/* Synchronous, no-I/O syntactic check of a mount options string (the
+ * comma-separated key[=value] format). Returns 1 if the string is well-formed
+ * (or NULL/empty), 0 if it is invalid, in which case errbuf (when non-NULL) is
+ * filled with a specific reason (empty key / too many options / too long). */
+int
+chimera_vfs_mount_options_valid(
+    const char *options,
+    char       *errbuf,
+    size_t      errbuf_len);
 
 typedef void (*chimera_vfs_umount_callback_t)(
     struct chimera_vfs_thread *thread,
@@ -410,6 +421,17 @@ chimera_vfs_close(
     uint64_t                     fh_hash,
     chimera_vfs_close_callback_t callback,
     void                        *private_data);
+
+/*
+ * Release an open handle returned by chimera_vfs_open_fh()/open_at().  This is
+ * a non-inline export of the internal inline chimera_vfs_release(); out-of-tree
+ * consumers that link libchimera_vfs (e.g. in-process VFS module tests) use it
+ * to avoid pulling in the internal open-cache headers.
+ */
+void
+chimera_vfs_release_handle(
+    struct chimera_vfs_thread      *thread,
+    struct chimera_vfs_open_handle *handle);
 
 typedef void (*chimera_vfs_mkdir_at_callback_t)(
     enum chimera_vfs_error    error_code,
