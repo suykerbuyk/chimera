@@ -29,7 +29,6 @@ tasks:
       - mkdir -p ${DESTDIR} /dist
       - >
         cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug
-        -DDISABLE_TESTS=ON
         -DIO_URING_ENABLED=OFF
         -DCAIRN_ENABLED=OFF
         -DCMAKE_INSTALL_PREFIX=/opt/quantum/chimera
@@ -58,7 +57,6 @@ tasks:
       - mkdir -p ${DESTDIR} /dist
       - >
         cmake -G Ninja -DCMAKE_BUILD_TYPE=Release
-        -DDISABLE_TESTS=ON
         -DIO_URING_ENABLED=OFF
         -DCAIRN_ENABLED=OFF
         -DCMAKE_INSTALL_PREFIX=/opt/quantum/chimera
@@ -101,7 +99,6 @@ tasks:
       - mkdir -p ${DESTDIR} /dist
       - >
         cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug
-        -DDISABLE_TESTS=ON
         -DIO_URING_ENABLED=OFF
         -DCAIRN_ENABLED=OFF
         -DCMAKE_INSTALL_PREFIX=/opt/quantum/chimera
@@ -130,7 +127,6 @@ tasks:
       - mkdir -p ${DESTDIR} /dist
       - >
         cmake -G Ninja -DCMAKE_BUILD_TYPE=Release
-        -DDISABLE_TESTS=ON
         -DIO_URING_ENABLED=OFF
         -DCAIRN_ENABLED=OFF
         -DCMAKE_INSTALL_PREFIX=/opt/quantum/chimera
@@ -173,7 +169,6 @@ tasks:
       - mkdir -p ${DESTDIR} /dist
       - >
         cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug
-        -DDISABLE_TESTS=ON
         -DIO_URING_ENABLED=OFF
         -DCAIRN_ENABLED=OFF
         -DCMAKE_INSTALL_PREFIX=/opt/quantum/chimera
@@ -202,7 +197,6 @@ tasks:
       - mkdir -p ${DESTDIR} /dist
       - >
         cmake -G Ninja -DCMAKE_BUILD_TYPE=Release
-        -DDISABLE_TESTS=ON
         -DIO_URING_ENABLED=OFF
         -DCAIRN_ENABLED=OFF
         -DCMAKE_INSTALL_PREFIX=/opt/quantum/chimera
@@ -250,7 +244,6 @@ tasks:
       - mkdir -p ${DESTDIR} /dist
       - >
         cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug
-        -DDISABLE_TESTS=ON
         -DIO_URING_ENABLED=OFF
         -DCAIRN_ENABLED=OFF
         -DCMAKE_INSTALL_PREFIX=/opt/quantum/chimera
@@ -279,7 +272,6 @@ tasks:
       - mkdir -p ${DESTDIR} /dist
       - >
         cmake -G Ninja -DCMAKE_BUILD_TYPE=Release
-        -DDISABLE_TESTS=ON
         -DIO_URING_ENABLED=OFF
         -DCAIRN_ENABLED=OFF
         -DCMAKE_INSTALL_PREFIX=/opt/quantum/chimera
