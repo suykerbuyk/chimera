@@ -9,10 +9,21 @@ PKG_DIR="$(basename $PWD)"
 INSTALL_ROOT="$PWD"
 LIBDIR="${INSTALL_ROOT}/opt/quantum/chimera/lib"
 
+# Split the validation test suites into their own package (the Debian
+# equivalent of the quantum-chimera-tests RPM subpackage): move
+# opt/quantum/chimera/tests out of the server tree before it is packed.
+TESTS_PKG_DIR="quantum-chimera-tests_${VERSION}-${REVISION}_${ARCH}"
+TESTS_ROOT="$(dirname "${INSTALL_ROOT}")/${TESTS_PKG_DIR}"
+if [ -d "${INSTALL_ROOT}/opt/quantum/chimera/tests" ]; then
+    mkdir -p "${TESTS_ROOT}/opt/quantum/chimera"
+    mv "${INSTALL_ROOT}/opt/quantum/chimera/tests" \
+       "${TESTS_ROOT}/opt/quantum/chimera/tests"
+fi
+
 mkdir -p ./DEBIAN
 cp -r /context/qtm_build/debian/* ./DEBIAN/
-# control.tmpl is only an input template; do not ship it inside the package.
-rm -f ./DEBIAN/control.tmpl
+# *.tmpl are only input templates; do not ship them inside the package.
+rm -f ./DEBIAN/control.tmpl ./DEBIAN/control-tests.tmpl
 
 # Compute the shared-library dependencies automatically. This is the Debian
 # equivalent of RPM's automatic dependency generation: dpkg-deb --build does
@@ -73,6 +84,52 @@ echo "/opt/quantum/chimera/lib" > etc/ld.so.conf.d/chimera.conf
 cd ..
 dpkg-deb --build ${PKG_DIR}
 mv ${PKG_DIR}.deb /dist/
+
+# Build the quantum-chimera-tests package from the tree split off above.
+# Its binaries link the bundled chimera/evpl libs shipped by the server
+# package, so the shlibdeps scan resolves them against the server tree's
+# lib dir and the package depends on the exact server version.
+if [ -d "${TESTS_ROOT}" ]; then
+    TEST_OBJS=()
+    while IFS= read -r f; do
+        [ "$(dd if="$f" bs=1 count=4 2>/dev/null)" = "$ELF_MAGIC" ] && TEST_OBJS+=("$f")
+    done < <(find "${TESTS_ROOT}/opt/quantum/chimera/tests" -type f 2>/dev/null)
+
+    if [ "${#TEST_OBJS[@]}" -eq 0 ]; then
+        echo "ERROR: no ELF objects found under ${TESTS_ROOT}" >&2
+        exit 1
+    fi
+
+    WORK="$(mktemp -d)"
+    mkdir -p "${WORK}/debian"
+    cat > "${WORK}/debian/control" <<EOF
+Source: quantum-chimera-tests
+
+Package: quantum-chimera-tests
+Architecture: ${ARCH}
+EOF
+    RAW_DEPS="$(cd "${WORK}" && \
+        dpkg-shlibdeps -O --ignore-missing-info -l"${LIBDIR}" "${TEST_OBJS[@]}")"
+    rm -rf "${WORK}"
+    TESTS_SHLIB_DEPS="$(printf '%s\n' "${RAW_DEPS}" | sed -n 's/^shlibs:Depends=//p')"
+
+    if [ -z "${TESTS_SHLIB_DEPS}" ]; then
+        echo "ERROR: dpkg-shlibdeps produced no dependencies for the tests package" >&2
+        exit 1
+    fi
+
+    TESTS_DEPENDS="quantum-chimera-server (= ${VERSION}-${REVISION}), ${TESTS_SHLIB_DEPS}"
+
+    mkdir -p "${TESTS_ROOT}/DEBIAN"
+    sed -e "s/__VERSION__/${VERSION}/" \
+        -e "s/__REVISION__/${REVISION}/" \
+        -e "s/__ARCH__/${ARCH}/" \
+        -e "s|__DEPENDS__|${TESTS_DEPENDS}|" \
+        /context/qtm_build/debian/control-tests.tmpl > "${TESTS_ROOT}/DEBIAN/control"
+
+    dpkg-deb --build ${TESTS_PKG_DIR}
+    mv ${TESTS_PKG_DIR}.deb /dist/
+fi
 
 # Make the chimera Admin python module
 # use a Virtual env to have the correct

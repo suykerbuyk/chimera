@@ -1,0 +1,15 @@
+Package: quantum-chimera-tests
+Version: __VERSION__-__REVISION__
+Section: admin
+Priority: optional
+Maintainer: Quantum Corporation <support@quantum.com>
+Homepage: http://www.quantum.com/
+Rules-Requires-Root: no
+Architecture: __ARCH__
+Depends: __DEPENDS__
+Description: Quantum Chimera validation test suites
+ POSIX, client API and SMB test programs plus fio/elbencho benchmark
+ configs installed under /opt/quantum/chimera/tests. The test programs
+ run a Chimera stack in-process against a selectable VFS backend (-b),
+ which lets a deployed system validate VFS modules such as SNFS without
+ a development tree.

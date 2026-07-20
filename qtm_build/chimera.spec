@@ -31,6 +31,19 @@ This module links against the StorNext External API (libcvextapi) and
 therefore requires StorNext (cvfs) to be installed. Packaging it separately
 lets quantum-chimera-server install on nodes that do not have cvfs.
 
+%package -n quantum-chimera-tests
+Summary: Quantum Chimera POSIX validation test suite
+Requires: quantum-chimera-server = %{version}-%{release}
+
+%description -n quantum-chimera-tests
+Chimera validation test suites installed under /opt/quantum/chimera/tests:
+POSIX test programs (chimera POSIX suite, cthon and pjdfstest ports) and
+client API tests, which run a Chimera stack in-process against a
+selectable VFS backend (-b); SMB server tests with the WPTS/pike
+conformance fixtures and wrapper scripts; and fio/elbencho benchmark
+configs for the installed plugin libraries. These let a deployed system
+validate VFS modules such as snfs without a development tree.
+
 
 %build
 # nothing to build
@@ -75,3 +88,7 @@ exit 0
 %defattr(-,root,root)
 /opt/quantum/chimera/lib/libchimera_vfs_snfs.so
 %doc /opt/quantum/chimera/share/examples/chimera-snfs.json
+
+%files -n quantum-chimera-tests
+%defattr(-,root,root)
+/opt/quantum/chimera/tests
