@@ -310,11 +310,14 @@ tasks:
         task: chimera-dev
         tag: develop
 
-  # The ctest suites are split into two tasks each -- the pynfs label (the bulk
-  # of the runtime) and everything else (`-LE pynfs`) -- so they run as separate
-  # parallel CI jobs. Each task still configures and builds independently because
-  # qb tasks run in isolated containers with their own empty /build.
-  ctest_release_pynfs:
+  # CTEST_FILTER carries the ctest selector for a CI leg (e.g. "-L pynfs -E
+  # diskfs_" or "-LE pynfs") so one task serves every test group.  qb
+  # substitutes it into the ctest line textually and the token stays UNQUOTED
+  # so the flags and arguments split into separate args; empty (the default)
+  # runs the full suite.  Each invocation still configures and builds
+  # independently because qb tasks run in isolated containers with their own
+  # empty /build.
+  ctest_release:
     type: run_container
     architecture: [ amd64, arm64 ]
     image: chimera-dev
@@ -322,45 +325,28 @@ tasks:
     empty_dir:
       - /build
     privileged: true
+    variables:
+      CTEST_FILTER: ""
     commands:
       - cd /build
+      - export LC_ALL=C
+      - echo "CTEST_FILTER=${CTEST_FILTER}"
       - >
         cmake -G Ninja -DCMAKE_BUILD_TYPE=Release
         -DREQUIRE_NETNS_TESTS=ON
         -DKVM_TESTING=OFF
         -S /context -B /build
       - ninja --quiet
-      - ctest --output-on-failure --test-output-size-failed 65536 --timeout 300 -j 12 -L pynfs -E diskfs_
-    dependencies:
-      builder:
-        project: chimera
-        task: chimera-dev
-        tag: develop
-
-  ctest_release_other:
-    type: run_container
-    architecture: [ amd64, arm64 ]
-    image: chimera-dev
-    context: .
-    empty_dir:
-      - /build
-    privileged: true
-    commands:
-      - cd /build
       - >
-        cmake -G Ninja -DCMAKE_BUILD_TYPE=Release
-        -DREQUIRE_NETNS_TESTS=ON
-        -DKVM_TESTING=OFF
-        -S /context -B /build
-      - ninja --quiet
-      - ctest --output-on-failure --test-output-size-failed 65536 --timeout 300 -j 12 -LE pynfs
+        ctest --output-on-failure --test-output-size-failed 65536
+        --timeout 300 -j 12 ${CTEST_FILTER}
     dependencies:
       builder:
         project: chimera
         task: chimera-dev
         tag: develop
 
-  ctest_debug_pynfs:
+  ctest_debug:
     type: run_container
     architecture: [ amd64, arm64 ]
     image: chimera-dev
@@ -368,43 +354,84 @@ tasks:
     empty_dir:
       - /build
     privileged: true
+    variables:
+      CTEST_FILTER: ""
     commands:
       - cd /build
+      - export LC_ALL=C
+      - echo "CTEST_FILTER=${CTEST_FILTER}"
       - >
         cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug
         -DREQUIRE_NETNS_TESTS=ON
         -DKVM_TESTING=OFF
         -S /context -B /build
       - ninja --quiet
-      - ctest --output-on-failure --test-output-size-failed 65536 --timeout 300 -j 12 -L pynfs -E diskfs_
+      - >
+        ctest --output-on-failure --test-output-size-failed 65536
+        --timeout 300 -j 12 ${CTEST_FILTER}
     dependencies:
       builder:
         project: chimera
         task: chimera-dev
         tag: develop
 
-  ctest_debug_other:
+  # Coverage: run the suite against a clang source-based-coverage instrumented
+  # build (CMAKE_BUILD_TYPE=Coverage), then merge the per-process .profraw
+  # files with etc/coverage-report.sh and publish the llvm-cov text + HTML
+  # report as assets.  Mirrors ctest_debug; the report is produced even when
+  # tests fail (the ctest_debug/ctest_release legs are the pass/fail gate).
+  ctest_coverage:
     type: run_container
-    architecture: [ amd64, arm64 ]
+    architecture: [ amd64 ]
     image: chimera-dev
     context: .
     empty_dir:
       - /build
     privileged: true
+    variables:
+      CTEST_FILTER: ""
     commands:
       - cd /build
+      - export LC_ALL=C
+      - echo "CTEST_FILTER=${CTEST_FILTER}"
+      - mkdir -p /build/coverage/profraw /dist
       - >
-        cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug
+        cmake -G Ninja -DCMAKE_BUILD_TYPE=Coverage
+        -DCMAKE_C_COMPILER=clang
         -DREQUIRE_NETNS_TESTS=ON
         -DKVM_TESTING=OFF
         -S /context -B /build
       - ninja --quiet
-      - ctest --output-on-failure --test-output-size-failed 65536 --timeout 300 -j 12 -LE pynfs
+      # Each test process (and any daemon it spawns) writes its own raw
+      # profile via the %m/%p patterns; the path is absolute so it survives
+      # the cwd changes and netns hops the tests make.
+      - export LLVM_PROFILE_FILE=/build/coverage/profraw/%m-%p.profraw
+      # Two ctest passes feeding the same profraw dir (one merged report).
+      # pynfs re-runs the same NFS4 server code against every VFS backend, so
+      # for coverage purposes one backend (memfs) is enough -- the per-backend
+      # VFS code is still covered by the posix/cthon/fsx suites in the second
+      # pass.  Multiple -L options are ANDed by ctest.
+      - >
+        ctest --output-on-failure --test-output-size-failed 65536
+        --timeout 300 -j 12 -L pynfs -L memfs ${CTEST_FILTER} ||
+        echo "ctest (pynfs/memfs) reported failures; continuing"
+      - >
+        ctest --output-on-failure --test-output-size-failed 65536
+        --timeout 300 -j 12 -LE pynfs ${CTEST_FILTER} ||
+        echo "ctest (non-pynfs) reported failures; continuing"
+      - >
+        COVERAGE_HTML=1 bash /context/etc/coverage-report.sh /build
+        > /dist/coverage-report.txt 2>&1
+      - cat /dist/coverage-report.txt
+      - tar -C /build/coverage -czf /dist/report.tar.gz html
     dependencies:
       builder:
         project: chimera
         task: chimera-dev
         tag: develop
+    assets:
+      - from: /dist
+        to: coverage_report
 
   ctest_kvm:
     type: run_container
@@ -590,14 +617,15 @@ aliases:
     - build_release_Rocky9
   check:
     - chimera-dev
-    - ctest_debug_pynfs
-    - ctest_debug_other
-    - ctest_release_pynfs
-    - ctest_release_other
+    - ctest_debug
+    - ctest_release
+    - ctest_kvm
     - static_analysis_debug
     - static_analysis_release
     - syntax
+  coverage:
+    - chimera-dev
+    - ctest_coverage
   chimera:
     - builders
     - build
-    - check
