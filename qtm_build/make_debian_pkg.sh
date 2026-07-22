@@ -81,6 +81,13 @@ sed -e "s/__VERSION__/${VERSION}/" \
 mkdir -p etc/ld.so.conf.d/
 echo "/opt/quantum/chimera/lib" > etc/ld.so.conf.d/chimera.conf
 
+# Runtime state directory (CHIMERA_STATE_DIR): holds secrets persisted by the
+# server (NFS file-handle signing key, SMB server GUID), so keep it 0700.
+# dpkg-deb preserves empty directories, so shipping it here is enough for
+# fresh installs; postinst re-creates it for upgrades from older packages.
+mkdir -p opt/quantum/chimera/share/state
+chmod 700 opt/quantum/chimera/share/state
+
 cd ..
 dpkg-deb --build ${PKG_DIR}
 mv ${PKG_DIR}.deb /dist/
