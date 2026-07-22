@@ -200,17 +200,60 @@ ctest:
       - stuck_or_timeout_failure
   parallel:
     matrix:
+      # Each leg pairs a short GROUP (used for the log file name) with the full
+      # ctest selector in CTEST_FILTER.  One matrix entry per leg so the two
+      # stay paired (a single dict would cross-product them); MODE and ARCH are
+      # the 2-way axes.  The pynfs label is the bulk of the runtime, "other" is
+      # everything else, so the two run as separate parallel CI jobs.  qb
+      # pastes CTEST_FILTER into the ctest command line textually, so any shell
+      # metacharacters would need quoting INSIDE the value.
       - MODE: [ release, debug ]
         ARCH: [ arm64, amd64 ]
-        GROUP: [ pynfs, other ]
+        GROUP: [ pynfs ]
+        CTEST_FILTER: [ "-L pynfs -E diskfs_" ]
+      - MODE: [ release, debug ]
+        ARCH: [ arm64, amd64 ]
+        GROUP: [ other ]
+        CTEST_FILTER: [ "-LE pynfs" ]
   script:
-    - ${RUN_QB} -a ${ARCH} -v ctest_${MODE}_${GROUP} &> ctest_${MODE}_${GROUP}_${ARCH}.log
+    - ${RUN_QB} -a ${ARCH} -v ctest_${MODE} -V CTEST_FILTER="${CTEST_FILTER}" &> ctest_${MODE}_${GROUP}_${ARCH}.log
   after_script:
     - tail -1000 ctest_${MODE}_${GROUP}_${ARCH}.log || true
   artifacts:
     when: always
     paths:
       - ctest_${MODE}_${GROUP}_${ARCH}.log
+    expire_in: 1 week
+
+# Informational coverage leg: the qb task swallows test failures (the ctest
+# jobs above are the pass/fail gate), so a script failure here means a
+# build/report problem worth surfacing -- script_failure is deliberately not
+# retried.
+coverage:
+  stage: check
+  needs: [ chimera-dev ]
+  rules: *rules_full
+  retry:
+    max: 1
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
+  script:
+    - ${RUN_QB} -a amd64 -v ctest_coverage &> ctest_coverage_amd64.log
+    - qb assets download --strip -p ${QB_PROJECT} -t ${QB_TAG} --asset-name coverage_report/amd64/report.tar.gz --output-dir .
+    - qb assets download --strip -p ${QB_PROJECT} -t ${QB_TAG} --asset-name coverage_report/amd64/coverage-report.txt --output-dir .
+  after_script:
+    - tail -1000 ctest_coverage_amd64.log || true
+  # Scrape the line-coverage percentage from the llvm-cov TOTAL row (echoed by
+  # the after_script tail).  Columns with -show-region-summary=false are
+  # Functions/Lines/Branches; the second percentage is line coverage.
+  coverage: '/^\s*TOTAL(?:\s+\d+){2}\s+[\d.]+%(?:\s+\d+){2}\s+([\d.]+)%/'
+  artifacts:
+    when: always
+    paths:
+      - ctest_coverage_amd64.log
+      - coverage-report.txt
+      - report.tar.gz
     expire_in: 1 week
 
 ctest_kvm:
