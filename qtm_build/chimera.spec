@@ -54,6 +54,9 @@ mkdir -p %{buildroot}
 tar -xzf %{SOURCE0} -C %{buildroot}
 mkdir -p %{buildroot}/etc/ld.so.conf.d/
 echo "/opt/quantum/chimera/lib" > %{buildroot}/etc/ld.so.conf.d/chimera.conf
+# Runtime state directory (CHIMERA_STATE_DIR): holds secrets persisted by the
+# server (NFS file-handle signing key, SMB server GUID), so keep it 0700.
+mkdir -p %{buildroot}/opt/quantum/chimera/share/state
 
 
 %post
@@ -79,7 +82,12 @@ exit 0
 /opt/quantum/chimera/lib
 %exclude /opt/quantum/chimera/lib/libchimera_vfs_snfs.so
 /opt/quantum/chimera/sbin
-%doc /opt/quantum/chimera/share/*
+# share/ entries are listed explicitly rather than globbed so that
+# share/state is not swept up as %%doc (an --excludedocs install would
+# then not create it).
+%doc /opt/quantum/chimera/share/examples
+%doc /opt/quantum/chimera/share/man
+%dir %attr(0700,root,root) /opt/quantum/chimera/share/state
 %exclude /opt/quantum/chimera/share/examples/chimera-snfs.json
 %config(noreplace) /opt/quantum/chimera/etc/chimera.json
 %ghost /etc/chimera/chimera.json
