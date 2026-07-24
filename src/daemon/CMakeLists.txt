@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: 2025 Chimera-NAS Project Contributors
+# SPDX-FileCopyrightText: 2025-2026 Chimera-NAS Project Contributors
 #
 # SPDX-License-Identifier: LGPL-2.1-only
 
@@ -14,3 +14,5 @@ configure_file(
   ${CMAKE_CURRENT_BINARY_DIR}/daemon.h
 )
 include_directories(${CMAKE_CURRENT_BINARY_DIR})
+
+add_subdirectory(tests)

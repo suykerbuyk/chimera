@@ -551,6 +551,21 @@ uint32_t
 chimera_server_config_get_anonuid(
     const struct chimera_server_config *config);
 
+/* Concurrent NFS export count cap (default CHIMERA_NFS_MAX_EXPORTS_DEFAULT).
+ * Bounds how many exports may exist at once; the export id space
+ * (1..CHIMERA_NFS_EXPORT_ID_MAX) is fixed by the wire format and unaffected.
+ * Values outside 1..CHIMERA_NFS_EXPORT_ID_MAX are clamped into range with an
+ * error logged (0 would reject every create; a larger cap could never be
+ * reached, ids being unique per export). */
+void
+chimera_server_config_set_nfs_max_exports(
+    struct chimera_server_config *config,
+    uint32_t                      nfs_max_exports);
+
+uint32_t
+chimera_server_config_get_nfs_max_exports(
+    const struct chimera_server_config *config);
+
 void
 chimera_server_config_set_anongid(
     struct chimera_server_config *config,
@@ -678,22 +693,27 @@ chimera_server_share_set_force_level2_oplock(
 /*
  * Create an NFS export.  export_id pins the stable id embedded in wire file
  * handles (1..CHIMERA_NFS_EXPORT_ID_MAX); 0 auto-assigns the next free id.
- * Returns 0 on success, -EINVAL for an out-of-range id, -EEXIST if the id is
- * already in use, -ENOSPC if the id space is exhausted, -1 if the NFS
- * protocol is not initialized.
+ * opts (may be NULL) applies per-export settings atomically at creation, so
+ * the export is never live half-configured; see struct chimera_nfs_export_opts
+ * in nfs/nfs.h.  Returns 0 on success, -EINVAL for an out-of-range id,
+ * -EEXIST if an export with the same name exists, -EADDRINUSE if the id is
+ * already in use, -ENOSPC if the configured export limit (nfs_max_exports)
+ * is reached, -ENOMEM on allocation failure, -1 if the NFS protocol is not
+ * initialized.
  */
 int
 chimera_server_create_export(
-    struct chimera_server *server,
-    const char            *share_name,
-    const char            *share_path,
-    uint32_t               export_id);
+    struct chimera_server                *server,
+    const char                           *share_name,
+    const char                           *share_path,
+    uint32_t                              export_id,
+    const struct chimera_nfs_export_opts *opts);
 
 int
 chimera_server_export_set_options(
     struct chimera_server *server,
     const char            *name,
-    uint32_t               options,
+    uint32_t               access,
     uint32_t               squash,
     uint32_t               anonuid,
     uint32_t               anongid);

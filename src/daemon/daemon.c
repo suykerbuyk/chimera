@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: LGPL-2.1-only
 
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <signal.h>
 #include <string.h>
@@ -388,6 +389,23 @@ main(
     if (json_is_integer(json_value)) {
         int_value = json_integer_value(json_value);
         chimera_server_config_set_max_open_files(server_config, int_value);
+    }
+
+    /* Concurrent NFS export count cap.  A misconfigured limit silently
+     * ignored would defeat its purpose, so reject bad values outright.  The
+     * cap may not exceed the export id space (ids are unique per export, so
+     * a larger count could never be reached anyway). */
+    json_value = json_object_get(server_params, "nfs_max_exports");
+    if (json_value) {
+        json_int_t v = json_is_integer(json_value) ?
+            json_integer_value(json_value) : -1;
+
+        if (v < 1 || v > CHIMERA_NFS_EXPORT_ID_MAX) {
+            chimera_server_error("Invalid nfs_max_exports (expected integer "
+                                 "1..%u)", CHIMERA_NFS_EXPORT_ID_MAX);
+            exit(1);
+        }
+        chimera_server_config_set_nfs_max_exports(server_config, (uint32_t) v);
     }
 
     json_value = json_object_get(server_params, "sync_delegation");
@@ -1094,7 +1112,7 @@ main(
                 continue;
             }
 
-            json_t     *opt_j     = json_object_get(export, "options");
+            json_t     *access_j  = json_object_get(export, "access");
             json_t     *squash_j  = json_object_get(export, "squash");
             json_t     *rsq_j     = json_object_get(export, "root_squash");
             json_t     *norsq_j   = json_object_get(export, "no_root_squash");
@@ -1102,57 +1120,123 @@ main(
             json_t     *anonuid_j = json_object_get(export, "anonuid");
             json_t     *anongid_j = json_object_get(export, "anongid");
             uint32_t    export_id = 0;
-            const char *opt_s     = json_string_value(opt_j);
+            const char *access_s  = json_string_value(access_j);
             const char *squash_s  = json_string_value(squash_j);
-            uint32_t    options   = CHIMERA_NFS_EXPORT_OPT_RW;
+            uint32_t    access    = CHIMERA_NFS_EXPORT_ACCESS_RW;
             uint32_t    squash    = CHIMERA_NFS_SQUASH_NONE;
             uint32_t    anonuid   = chimera_server_config_get_anonuid(server_config);
             uint32_t    anongid   = chimera_server_config_get_anongid(server_config);
 
             path = json_string_value(json_object_get(export, "path"));
 
-            /* Access mode: "ro" | "rw" (default rw). */
-            if (opt_s) {
-                if (strcasecmp(opt_s, "ro") == 0) {
-                    options = CHIMERA_NFS_EXPORT_OPT_RO;
-                } else if (strcasecmp(opt_s, "rw") == 0) {
-                    options = CHIMERA_NFS_EXPORT_OPT_RW;
+            /* A missing or non-string path would otherwise flow into the
+             * export as the literal string "(null)" and boot an export that
+             * fails only when clients try to mount it. */
+            if (!path) {
+                chimera_server_error("Export '%s': missing or non-string "
+                                     "\"path\"", name);
+                exit(1);
+            }
+
+            /* The access mode key was renamed from "options" to "access".
+             * Ignoring the old key would silently turn an "options": "ro"
+             * export read-write, so reject it outright. */
+            if (json_object_get(export, "options")) {
+                chimera_server_error("Export '%s': \"options\" has been "
+                                     "renamed to \"access\"; update the config",
+                                     name);
+                exit(1);
+            }
+
+            /* Access mode: "ro" | "rw" (default rw).  A value that doesn't
+             * parse is fatal: booting anyway would silently turn a requested
+             * read-only export read-write. */
+            if (access_j) {
+                if (access_s && strcasecmp(access_s, "ro") == 0) {
+                    access = CHIMERA_NFS_EXPORT_ACCESS_RO;
+                } else if (access_s && strcasecmp(access_s, "rw") == 0) {
+                    access = CHIMERA_NFS_EXPORT_ACCESS_RW;
                 } else {
-                    chimera_server_error("Invalid export '%s' options value '%s' "
-                                         "(expected ro/rw)", name, opt_s);
+                    chimera_server_error("Invalid export '%s' access value '%s' "
+                                         "(expected ro/rw)", name,
+                                         access_s ? access_s : "(not a string)");
+                    exit(1);
                 }
             }
 
             /* Squash policy.  Default is no squashing.  An explicit "squash"
              * string takes precedence; otherwise the all_squash / root_squash /
              * no_root_squash booleans act as aliases. */
-            if (squash_s) {
-                if (strcasecmp(squash_s, "none") == 0 ||
-                    strcasecmp(squash_s, "no_root_squash") == 0) {
+            if (squash_j) {
+                if (squash_s && (strcasecmp(squash_s, "none") == 0 ||
+                                 strcasecmp(squash_s, "no_root_squash") == 0)) {
                     squash = CHIMERA_NFS_SQUASH_NONE;
-                } else if (strcasecmp(squash_s, "root") == 0 ||
-                           strcasecmp(squash_s, "root_squash") == 0) {
+                } else if (squash_s && (strcasecmp(squash_s, "root") == 0 ||
+                                        strcasecmp(squash_s, "root_squash") == 0)) {
                     squash = CHIMERA_NFS_SQUASH_ROOT;
-                } else if (strcasecmp(squash_s, "all") == 0 ||
-                           strcasecmp(squash_s, "all_squash") == 0) {
+                } else if (squash_s && (strcasecmp(squash_s, "all") == 0 ||
+                                        strcasecmp(squash_s, "all_squash") == 0)) {
                     squash = CHIMERA_NFS_SQUASH_ALL;
                 } else {
                     chimera_server_error("Invalid export '%s' squash value '%s' "
-                                         "(expected none/root/all)", name, squash_s);
+                                         "(expected none/root/all)", name,
+                                         squash_s ? squash_s : "(not a string)");
+                    exit(1);
                 }
-            } else if (allsq_j && json_is_true(allsq_j)) {
-                squash = CHIMERA_NFS_SQUASH_ALL;
-            } else if (rsq_j && json_is_true(rsq_j)) {
-                squash = CHIMERA_NFS_SQUASH_ROOT;
-            } else if (norsq_j && json_is_true(norsq_j)) {
-                squash = CHIMERA_NFS_SQUASH_NONE;
+            } else {
+                /* The aliases must actually be booleans: a value like
+                 * "root_squash": "true" (a string) or "all_squash": 1
+                 * silently ignored would leave the export unsquashed -- the
+                 * same silent-permissive fallback the string form above
+                 * rejects. */
+                if (allsq_j && !json_is_boolean(allsq_j)) {
+                    chimera_server_error("Export '%s': \"all_squash\" must be "
+                                         "a boolean", name);
+                    exit(1);
+                }
+                if (rsq_j && !json_is_boolean(rsq_j)) {
+                    chimera_server_error("Export '%s': \"root_squash\" must be "
+                                         "a boolean", name);
+                    exit(1);
+                }
+                if (norsq_j && !json_is_boolean(norsq_j)) {
+                    chimera_server_error("Export '%s': \"no_root_squash\" must "
+                                         "be a boolean", name);
+                    exit(1);
+                }
+                if (allsq_j && json_is_true(allsq_j)) {
+                    squash = CHIMERA_NFS_SQUASH_ALL;
+                } else if (rsq_j && json_is_true(rsq_j)) {
+                    squash = CHIMERA_NFS_SQUASH_ROOT;
+                } else if (norsq_j && json_is_true(norsq_j)) {
+                    squash = CHIMERA_NFS_SQUASH_NONE;
+                }
             }
 
+            /* Anon ids must be validated before the unsigned cast: a
+             * non-integer json value reads as 0, which would silently map
+             * squashed callers to uid/gid 0 (root). */
             if (anonuid_j) {
-                anonuid = (uint32_t) json_integer_value(anonuid_j);
+                json_int_t v = json_integer_value(anonuid_j);
+
+                if (!json_is_integer(anonuid_j) || v < 0 || v > UINT32_MAX) {
+                    chimera_server_error("Export '%s': invalid anonuid "
+                                         "(expected integer 0..%u)",
+                                         name, UINT32_MAX);
+                    exit(1);
+                }
+                anonuid = (uint32_t) v;
             }
             if (anongid_j) {
-                anongid = (uint32_t) json_integer_value(anongid_j);
+                json_int_t v = json_integer_value(anongid_j);
+
+                if (!json_is_integer(anongid_j) || v < 0 || v > UINT32_MAX) {
+                    chimera_server_error("Export '%s': invalid anongid "
+                                         "(expected integer 0..%u)",
+                                         name, UINT32_MAX);
+                    exit(1);
+                }
+                anongid = (uint32_t) v;
             }
 
             /* Stable export id: the id is embedded in wire file handles, so
@@ -1176,10 +1260,19 @@ main(
             /* Allowed security flavors: an optional array of
              * "sys"/"krb5"/"krb5i"/"krb5p".  Absent (mask 0) permits any
              * flavor, preserving historical behavior; a non-empty list
-             * restricts the export and rejects others with NFS4ERR_WRONGSEC. */
+             * restricts the export and rejects others with NFS4ERR_WRONGSEC.
+             * Every malformed shape is fatal: a typo'd flavor, non-string
+             * entry, or non-array value silently dropped would leave the
+             * mask at 0 -- "any flavor allowed" -- turning a requested
+             * Kerberos-only export wide open to AUTH_SYS. */
             json_t  *sec_j    = json_object_get(export, "sec");
             uint32_t sec_mask = 0;
-            if (sec_j && json_is_array(sec_j)) {
+            if (sec_j && !json_is_array(sec_j)) {
+                chimera_server_error("Export '%s': \"sec\" must be an array "
+                                     "of flavor strings", name);
+                exit(1);
+            }
+            if (sec_j) {
                 size_t  si;
                 json_t *flavor_j;
                 json_array_foreach(sec_j, si, flavor_j)
@@ -1187,7 +1280,9 @@ main(
                     const char *f = json_string_value(flavor_j);
 
                     if (!f) {
-                        continue;
+                        chimera_server_error("Export '%s': \"sec\" entry %zu "
+                                             "is not a string", name, si);
+                        exit(1);
                     }
                     if (strcasecmp(f, "sys") == 0 || strcasecmp(f, "auth_sys") == 0) {
                         sec_mask |= CHIMERA_NFS_SEC_SYS;
@@ -1200,6 +1295,7 @@ main(
                     } else {
                         chimera_server_error("Invalid export '%s' sec flavor '%s' "
                                              "(expected sys/krb5/krb5i/krb5p)", name, f);
+                        exit(1);
                     }
                 }
             }
@@ -1212,23 +1308,35 @@ main(
 
             chimera_server_info("Adding NFS export %s -> %s (%s, %s, export_id %s)",
                                 name, path,
-                                options & CHIMERA_NFS_EXPORT_OPT_RO ? "ro" : "rw",
+                                access & CHIMERA_NFS_EXPORT_ACCESS_RO ? "ro" : "rw",
                                 squash == CHIMERA_NFS_SQUASH_ALL ? "all_squash" :
                                 squash == CHIMERA_NFS_SQUASH_NONE ? "no_root_squash" :
                                 "root_squash",
                                 export_id_str);
-            if (chimera_server_create_export(server, name, path, export_id) != 0) {
-                /* Duplicate or unusable export_id: proceeding would mint file
-                 * handles under a different id than the operator pinned, which
-                 * breaks cluster failover in a way clients only notice later.
-                 * Fail hard like the mount-path errors above. */
+            /* All validated settings are applied atomically at creation, so
+             * the export is never live with permissive defaults while a
+             * follow-up set_options/set_sec call is pending. */
+            struct chimera_nfs_export_opts opts = {
+                .has_access  = 1,
+                .has_squash  = 1,
+                .has_anonuid = 1,
+                .has_anongid = 1,
+                .has_sec     = 1,
+                .access      = access,
+                .squash      = squash,
+                .anonuid     = anonuid,
+                .anongid     = anongid,
+                .sec_allowed = sec_mask,
+            };
+
+            if (chimera_server_create_export(server, name, path, export_id,
+                                             &opts) != 0) {
+                /* Duplicate name or unusable export_id: proceeding would mint
+                 * file handles under a different id than the operator pinned,
+                 * which breaks cluster failover in a way clients only notice
+                 * later.  Fail hard like the mount-path errors above. */
                 chimera_server_error("Failed to create export '%s'", name);
                 exit(1);
-            }
-            chimera_server_export_set_options(server, name, options, squash,
-                                              anonuid, anongid);
-            if (sec_mask) {
-                chimera_server_export_set_sec(server, name, sec_mask);
             }
         }
     }

@@ -38,11 +38,14 @@
 
 #include "common/macros.h"
 
-/* nfs.h defines the public id range without seeing nfs_common.h; if the two
- * constants ever drift apart, the range check in chimera_nfs_add_export()
- * would index exports_by_id[] out of bounds. */
-_Static_assert(CHIMERA_NFS_EXPORT_ID_MAX == CHIMERA_NFS_MAX_EXPORTS - 1,
-               "CHIMERA_NFS_EXPORT_ID_MAX must match the exports_by_id table size");
+/* Export ids are held in uint16_t fields and stamped into a 16-bit wire
+ * file-handle field; exports_by_id[] is sized by that id space, so any
+ * uint16_t value indexes it safely.  The count cap must fit in the id space
+ * or add_export() could admit more exports than there are ids to assign. */
+_Static_assert(CHIMERA_NFS_EXPORT_ID_MAX == 65535u,
+               "export id space must match the 16-bit wire file-handle field");
+_Static_assert(CHIMERA_NFS_MAX_EXPORTS_DEFAULT <= CHIMERA_NFS_EXPORT_ID_MAX,
+               "default export count cap must fit in the id space");
 
 #define NFS_PROGIDX_PORTMAP_V2 0
 #define NFS_PROGIDX_MOUNT_V3   1
@@ -182,6 +185,10 @@ nfs_server_init(
     shared = calloc(1, sizeof(*shared));
 
     shared->config = config;
+
+    /* Concurrent-export count cap (distinct from the id space; see
+     * exports_by_id commentary in nfs_common.h). */
+    shared->max_exports = chimera_server_config_get_nfs_max_exports(config);
 
     nfs_fh_key_init(shared, config);
 
@@ -914,13 +921,15 @@ nfs_server_thread_destroy(void *data)
 
 SYMBOL_EXPORT int
 chimera_nfs_add_export(
-    void       *nfs_shared,
-    const char *name,
-    const char *path,
-    uint32_t    export_id)
+    void                                 *nfs_shared,
+    const char                           *name,
+    const char                           *path,
+    uint32_t                              export_id,
+    const struct chimera_nfs_export_opts *opts)
 {
     struct chimera_server_nfs_shared *shared = nfs_shared;
     struct chimera_nfs_export        *export;
+    struct chimera_nfs_export        *existing;
 
     if (export_id > CHIMERA_NFS_EXPORT_ID_MAX) {
         chimera_nfs_error("Export '%s' id %u out of range (1..%u)",
@@ -928,23 +937,76 @@ chimera_nfs_add_export(
         return -EINVAL;
     }
 
+    /* This path is reachable from a runtime REST request, not just startup,
+     * so an allocation failure must surface as an error to the caller rather
+     * than crash the daemon on the dereference below. */
     export = calloc(1, sizeof(*export));
+
+    if (!export) {
+        chimera_nfs_error("Failed to allocate export '%s'", name);
+        return -ENOMEM;
+    }
 
     snprintf(export->name, sizeof(export->name), "%s", name);
     snprintf(export->path, sizeof(export->path), "%s", path);
 
     /* Defaults: read-write, no squashing (preserving historical behavior where
      * a client's credentials pass through unchanged); anon = configured global
-     * anonuid/anongid (65534 by default).  root_squash / all_squash are opt-in
-     * per export via chimera_nfs_export_set_options(). */
-    export->options = CHIMERA_NFS_EXPORT_OPT_RW;
+     * anonuid/anongid (65534 by default); any security flavor.  Callers
+     * override individual fields via opts so the export is published fully
+     * configured; a post-create set_options call would leave a window where
+     * NFS request threads see the permissive defaults. */
+    export->access  = CHIMERA_NFS_EXPORT_ACCESS_RW;
     export->squash  = CHIMERA_NFS_SQUASH_NONE;
     export->anonuid = shared->config ?
         chimera_server_config_get_anonuid(shared->config) : CHIMERA_VFS_ANON_UID;
     export->anongid = shared->config ?
         chimera_server_config_get_anongid(shared->config) : CHIMERA_VFS_ANON_GID;
 
+    if (opts) {
+        if (opts->has_access) {
+            export->access = opts->access;
+        }
+        if (opts->has_squash) {
+            export->squash = opts->squash;
+        }
+        if (opts->has_anonuid) {
+            export->anonuid = opts->anonuid;
+        }
+        if (opts->has_anongid) {
+            export->anongid = opts->anongid;
+        }
+        if (opts->has_sec) {
+            export->sec_allowed = opts->sec_allowed;
+        }
+    }
+
     pthread_mutex_lock(&shared->exports_lock);
+
+    /* Name uniqueness must be decided here, under the same lock as the
+     * insert: a caller-side check-then-create is a race in which two
+     * concurrent creates of the same name both succeed, leaving the second
+     * export unreachable (name lookups stop at the first match) and its id
+     * leaked. */
+    LL_FOREACH(shared->exports, existing)
+    {
+        if (strcmp(existing->name, name) == 0) {
+            pthread_mutex_unlock(&shared->exports_lock);
+            chimera_nfs_error("Export '%s' already exists", name);
+            free(export);
+            return -EEXIST;
+        }
+    }
+
+    /* Enforce the configured concurrent-export count cap (nfs_max_exports)
+     * before either id path, so explicitly-pinned ids are bounded too. */
+    if ((uint32_t) shared->num_exports >= shared->max_exports) {
+        pthread_mutex_unlock(&shared->exports_lock);
+        chimera_nfs_error("Export limit reached (%u); cannot create export '%s'",
+                          shared->max_exports, name);
+        free(export);
+        return -ENOSPC;
+    }
 
     /* Assign a stable, non-zero id and publish into the direct index used for
      * per-request attribution.  Ids start at 1 (slot 0 reserved as invalid).
@@ -960,26 +1022,30 @@ chimera_nfs_add_export(
                               shared->exports_by_id[export_id]->name);
             pthread_mutex_unlock(&shared->exports_lock);
             free(export);
-            return -EEXIST;
+            return -EADDRINUSE;
         }
         export->id = (uint16_t) export_id;
     } else {
         uint16_t id = shared->next_export_id;
 
-        if (id == 0 || id >= CHIMERA_NFS_MAX_EXPORTS) {
+        /* id 0 means "unset" (startup) or a wrap of the uint16_t cursor past
+         * the end of the id space; either way restart at 1. */
+        if (id == 0) {
             id = 1;
         }
-        for (int probes = 0; probes < CHIMERA_NFS_MAX_EXPORTS - 1; probes++) {
+        for (uint32_t probes = 0; probes < CHIMERA_NFS_EXPORT_ID_MAX; probes++) {
             if (!shared->exports_by_id[id]) {
                 break;
             }
-            id = (id == CHIMERA_NFS_MAX_EXPORTS - 1) ? 1 : id + 1;
+            id = (id == CHIMERA_NFS_EXPORT_ID_MAX) ? 1 : id + 1;
         }
         if (shared->exports_by_id[id]) {
+            /* Unreachable while max_exports <= the id space (asserted for the
+             * default, validated for configured values); kept as a backstop. */
             pthread_mutex_unlock(&shared->exports_lock);
-            chimera_nfs_error("Export id space exhausted (max %d); cannot "
+            chimera_nfs_error("Export id space exhausted (max %u); cannot "
                               "create export '%s'",
-                              CHIMERA_NFS_MAX_EXPORTS, name);
+                              CHIMERA_NFS_EXPORT_ID_MAX, name);
             free(export);
             return -ENOSPC;
         }
@@ -1000,7 +1066,7 @@ SYMBOL_EXPORT int
 chimera_nfs_export_set_options(
     void       *nfs_shared,
     const char *name,
-    uint32_t    options,
+    uint32_t    access,
     uint32_t    squash,
     uint32_t    anonuid,
     uint32_t    anongid)
@@ -1013,7 +1079,7 @@ chimera_nfs_export_set_options(
     LL_FOREACH(shared->exports, export)
     {
         if (strcmp(export->name, name) == 0) {
-            export->options = options;
+            export->access  = access;
             export->squash  = squash;
             export->anonuid = anonuid;
             export->anongid = anongid;
@@ -1057,7 +1123,9 @@ chimera_nfs_get_export_by_id(
 {
     struct chimera_server_nfs_shared *shared = nfs_shared;
 
-    if (id == 0 || id >= CHIMERA_NFS_MAX_EXPORTS) {
+    /* exports_by_id[] covers the full uint16_t id space, so any id indexes it
+     * safely; slot 0 is reserved as invalid. */
+    if (id == 0) {
         return NULL;
     }
 
@@ -1079,7 +1147,7 @@ chimera_nfs_remove_export(
     LL_FOREACH(shared->exports, export)
     {
         if (strcmp(export->name, name) == 0) {
-            if (export->id != 0 && export->id < CHIMERA_NFS_MAX_EXPORTS) {
+            if (export->id != 0) {
                 shared->exports_by_id[export->id] = NULL;
             }
             LL_DELETE(shared->exports, export);
@@ -1278,10 +1346,10 @@ chimera_nfs_export_get_id(const struct chimera_nfs_export *export)
 } /* chimera_nfs_export_get_id */
 
 SYMBOL_EXPORT uint32_t
-chimera_nfs_export_get_options(const struct chimera_nfs_export *export)
+chimera_nfs_export_get_access(const struct chimera_nfs_export *export)
 {
-    return export->options;
-} /* chimera_nfs_export_get_options */
+    return export->access;
+} /* chimera_nfs_export_get_access */
 
 SYMBOL_EXPORT uint32_t
 chimera_nfs_export_get_squash(const struct chimera_nfs_export *export)
@@ -1300,6 +1368,12 @@ chimera_nfs_export_get_anongid(const struct chimera_nfs_export *export)
 {
     return export->anongid;
 } /* chimera_nfs_export_get_anongid */
+
+SYMBOL_EXPORT uint32_t
+chimera_nfs_export_get_sec(const struct chimera_nfs_export *export)
+{
+    return export->sec_allowed;
+} /* chimera_nfs_export_get_sec */
 
 SYMBOL_EXPORT struct chimera_server_protocol nfs_protocol = {
     .init           = nfs_server_init,

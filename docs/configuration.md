@@ -30,7 +30,7 @@ reads the file:
 | Section | Type | Read by | Purpose |
 |---|---|---|---|
 | `common` | object | server + client | Shared transport, memory, and delegation settings. |
-| `server` | object | server | Daemon-wide settings (threads, protocols, ports, REST, pNFS…). |
+| `server` | object | server | Daemon-wide settings (threads, protocols, ports, REST, pNFS...). |
 | `mounts` | object | server | VFS backends to instantiate, keyed by name. |
 | `exports` | object | server | NFS exports. |
 | `shares` | object | server | SMB shares. |
@@ -74,17 +74,17 @@ the canonical place to set them.
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `tcp_flavor` | string | `"plain"` | TCP stream backend: `"plain"` (kernel sockets), `"io_uring"`, or `"xlio"` (Mellanox userspace TCP). |
-| `sync_delegation` | bool | — | Enable the synchronous VFS delegation thread pool. Overrides `server.sync_delegation` / `config.sync_delegation`. |
-| `sync_delegation_threads` | int | — | Size of the synchronous delegation pool. |
-| `async_delegation` | bool | — | Enable the asynchronous VFS delegation thread pool. |
-| `async_delegation_threads` | int | — | Size of the asynchronous delegation pool. |
+| `sync_delegation` | bool | - | Enable the synchronous VFS delegation thread pool. Overrides `server.sync_delegation` / `config.sync_delegation`. |
+| `sync_delegation_threads` | int | - | Size of the synchronous delegation pool. |
+| `async_delegation` | bool | - | Enable the asynchronous VFS delegation thread pool. |
+| `async_delegation_threads` | int | - | Size of the asynchronous delegation pool. |
 | `huge_pages` | bool | libevpl default | Allocate libevpl memory from huge pages. |
 | `huge_page_size` | size | libevpl default | Huge page size to request (e.g. `"2M"`, `"1G"`). |
 | `slab_size` | size | libevpl default | libevpl memory slab size. |
 | `preallocate_slabs` | int | libevpl default | Number of memory slabs to preallocate at startup. |
 | `preallocate_threads` | int | libevpl default | Threads used to preallocate slabs in parallel. |
-| `rdmacm_tos` | int | `0` | RoCEv2 traffic class stamped on every RDMA QP. ToS = DSCP × 4 (e.g. `104` for DSCP 26) so the fabric's lossless/PFC class carries Chimera traffic. |
-| `metrics_file` | string | — | On shutdown, write a final Prometheus scrape to this file (so short runs keep their metrics). |
+| `rdmacm_tos` | int | `0` | RoCEv2 traffic class stamped on every RDMA QP. ToS = DSCP x 4 (e.g. `104` for DSCP 26) so the fabric's lossless/PFC class carries Chimera traffic. |
+| `metrics_file` | string | - | On shutdown, write a final Prometheus scrape to this file (so short runs keep their metrics). |
 
 ---
 
@@ -103,29 +103,30 @@ the canonical place to set them.
 | `nfs_port` | int | `2049` | NFS (v3/v4) listen port. |
 | `lockmgr_port` | int | `32803` | NLM (NFSv3 lock manager) port. |
 | `rdma` | bool | `false` | Enable NFS-over-RDMA. |
-| `rdma_hostname` | string | — | Address to bind the RDMA listener to. |
+| `rdma_hostname` | string | - | Address to bind the RDMA listener to. |
 | `rdma_port` | int | `20049` | NFS-over-RDMA listen port. |
 | `external_portmap` | bool | `false` | Register with an external `rpcbind`/portmap instead of the built-in one. |
-| `portmap_hostname` | string | — | Hostname/IP to advertise in portmap registrations. |
+| `portmap_hostname` | string | - | Hostname/IP to advertise in portmap registrations. |
 | `nfs4_session_slots` | int | `64` | Max in-flight compounds per NFSv4.1 session. |
 | `nfs4_delegations` | bool | `false` | Hand out NFSv4 read/write delegations. |
 | `nfs4_lease_time` | int (s) | `90` | NFSv4 lease duration. |
 | `nfs4_grace_time` | int (s) | `180` | NFSv4 grace period after restart (state reclaim window). |
 | `nfs4_courtesy_time` | int (s) | `86400` | How long expired-but-courteous client state is retained. |
 | `nfs_server_scope` | int | `42` | NFSv4.1 `EXCHANGE_ID` server scope. Give independent servers (e.g. an MDS and a co-located DS) distinct values so clients don't coalesce them. |
+| `nfs_max_exports` | int | `4096` | Maximum number of NFS exports that may exist at once (1..65535). Distinct from the export id space, which is always 1..65535; creating an export past this cap fails. |
 | `data_server` | bool | `false` | pNFS data-server mode: bind only the NFSv4 service (no portmap/mount/NLM) so a DS can share a host with its MDS. |
-| `kv_module` | string | — | Key-value module used to persist server state. |
+| `kv_module` | string | - | Key-value module used to persist server state. |
 | `state_dir` | string | `<prefix>/share/state` | Directory for persisted NFS/SMB state. |
 | `smb_persistent_handles` | bool | `false` | Enable SMB durable/persistent handles (needed for Continuous Availability). |
 | `smb_named_streams` | bool | `false` | Enable SMB named streams (alternate data streams). |
 | `smb_encryption` | string/int | `"off"` | SMB3 transport encryption: `"off"`/`"disabled"` (0), `"enabled"`/`"on"` (1), or `"required"` (2). |
 | `smb_acl_inherited_canonicalize` | bool | `true` | Canonicalize inherited ACLs on SMB. |
 | `metrics_port` | int | `9000` | Prometheus metrics port (`/metrics`). Make it distinct when running multiple daemons per host. |
-| `rest_http_port` | int | — | HTTP port for the REST admin API. Set to enable it (examples use `8080`). |
+| `rest_http_port` | int | - | HTTP port for the REST admin API. Set to enable it (examples use `8080`). |
 | `rest_https_port` | int | `0` | HTTPS port for the REST API (`0` = disabled). |
-| `rest_ssl_cert` | string | — | TLS certificate path. Auto-generated (self-signed) if HTTPS is enabled and this is unset. |
-| `rest_ssl_key` | string | — | TLS private-key path. Auto-generated alongside the cert if unset. |
-| `rest_auth_enabled` | bool | `true` | Require authentication (JWT Bearer token or HTTP Basic credentials) on all `/api/v1/*` endpoints. Set to `false` to disable auth entirely — only safe on a trusted/loopback-only management network. |
+| `rest_ssl_cert` | string | - | TLS certificate path. Auto-generated (self-signed) if HTTPS is enabled and this is unset. |
+| `rest_ssl_key` | string | - | TLS private-key path. Auto-generated alongside the cert if unset. |
+| `rest_auth_enabled` | bool | `true` | Require authentication (JWT Bearer token or HTTP Basic credentials) on all `/api/v1/*` endpoints. Set to `false` to disable auth entirely - only safe on a trusted/loopback-only management network. |
 | `soft_fail_bad_req` | bool | `false` | Return a soft error on a malformed REST request instead of dropping the connection. |
 
 See [Advanced and testing options](#advanced-and-testing-options) for a small set
@@ -139,10 +140,10 @@ Domain-authentication backends for SMB.
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `winbind_enabled` | bool | `false` | Authenticate via Winbind (domain-joined). |
-| `winbind_domain` | string | — | Winbind domain name. |
+| `winbind_domain` | string | - | Winbind domain name. |
 | `kerberos_enabled` | bool | `false` | Enable Kerberos authentication. |
-| `kerberos_keytab` | string | — | Path to the Kerberos keytab. |
-| `kerberos_realm` | string | — | Kerberos realm. |
+| `kerberos_keytab` | string | - | Path to the Kerberos keytab. |
+| `kerberos_realm` | string | - | Kerberos realm. |
 
 #### `server.smb_multichannel`
 
@@ -165,14 +166,14 @@ Each entry of `data_servers`:
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `netid` | string | — | Transport: `"tcp"`, `"tcp6"`, `"rdma"`, or `"rdma6"`. |
+| `netid` | string | - | Transport: `"tcp"`, `"tcp6"`, `"rdma"`, or `"rdma6"`. |
 | `uaddr` | string | required | Data server address as `host` or `host:port`. |
 | `backing_path` | string | required | Chimera VFS path (an `nfs`-module mount) the MDS uses to create backing files on the DS. |
 | `version` | int/string | `3` | NFS version clients use to reach the DS: `3`, `4`, `"4.0"`, or `"4.1"`. |
 
-#### `server.vfs` — loading external VFS plugins
+#### `server.vfs` - loading external VFS plugins
 
-Built-in modules (`memfs`, `linux`, `diskfs`, `io_uring`, …) need no
+Built-in modules (`memfs`, `linux`, `diskfs`, `io_uring`, ...) need no
 registration. A VFS module shipped as a separate shared object (e.g. `cairn`)
 is registered here, keyed by module name, before it can be used in `mounts`:
 
@@ -199,19 +200,34 @@ becomes visible in the Chimera namespace at `/<name>`.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `module` | string | required | VFS module name (`memfs`, `linux`, `diskfs`, `cairn`, `io_uring`, `nfs`, …). |
+| `module` | string | required | VFS module name (`memfs`, `linux`, `diskfs`, `cairn`, `io_uring`, `nfs`, ...). |
 | `path` | string | required | Backend-specific root. For passthrough modules this is a host path; for `nfs` it's the upstream export; for in-memory modules it's typically `/`. |
-| `options` | string | — | Module-specific mount options (e.g. `"vers=4.1,rdma,port=20049"` for the `nfs` module). |
+| `options` | string | - | Module-specific mount options (e.g. `"vers=4.1,rdma,port=20049"` for the `nfs` module). |
 
-### `exports`, `shares`, `buckets`
+### `exports` (NFS)
 
-Each is an object keyed by the published name. All three take a `path` that
+An object keyed by export name. Each export publishes a VFS path
+(`/<mount-name>[/subdir]`) over NFSv3/NFSv4.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `path` | string | required | VFS path to export; a missing or non-string value fails startup. |
+| `export_id` | int | auto | Stable id (1..65535) embedded in every NFS file handle minted for this export; auto-assigned when omitted. Clustered servers exporting the same directory must pin the same id so file handles stay valid across failover. Startup fails on an out-of-range or already-used id. |
+| `access` | string | `"rw"` | Access mode, `"ro"` or `"rw"`; any other value fails startup. (Renamed from `options`; the old key is rejected at startup.) |
+| `squash` | string | `"none"` | Credential squashing policy: `"none"` (aka `"no_root_squash"`), `"root"` (aka `"root_squash"`), or `"all"` (aka `"all_squash"`); any other value fails startup. |
+| `root_squash` / `no_root_squash` / `all_squash` | bool | - | Boolean aliases for `squash`; an explicit `squash` string takes precedence. |
+| `anonuid` | int | `65534` | Anonymous uid that squashed callers are mapped to (0..4294967295; anything else fails startup). |
+| `anongid` | int | `65534` | Anonymous gid that squashed callers are mapped to (0..4294967295; anything else fails startup). |
+| `sec` | array | any | Allowed RPC security flavors: any of `"sys"` (aka `"auth_sys"`), `"krb5"`, `"krb5i"`, `"krb5p"`. Absent or empty permits any flavor; a non-empty list rejects others (NFSv4: `NFS4ERR_WRONGSEC`). An unknown flavor, non-string entry, or non-array value fails startup (silently dropping one would leave the export open to any flavor). |
+
+### `shares`, `buckets`
+
+Each is an object keyed by the published name. Both take a `path` that
 points into the Chimera namespace (`/<mount-name>[/subdir]`). `shares` also
 accepts one extra key.
 
 | Section | Key | Type | Default | Description |
 |---|---|---|---|---|
-| `exports` (NFS) | `path` | string | required | VFS path to export. |
 | `shares` (SMB) | `path` | string | required | VFS path to share. |
 | `shares` (SMB) | `continuous_availability` | bool | `false` | Advertise SMB Continuous Availability (requires `smb_persistent_handles`). |
 | `buckets` (S3) | `path` | string | required | VFS path backing the bucket. |
@@ -260,7 +276,15 @@ An **array** of S3 credentials. Both keys are required per entry.
     "mounts": {
         "data": { "module": "memfs", "path": "/" }
     },
-    "exports": { "/nfs": { "path": "/data" } },
+    "exports": {
+        "/nfs": {
+            "path": "/data",
+            "export_id": 1,
+            "access": "rw",
+            "squash": "root",
+            "sec": ["sys", "krb5"]
+        }
+    },
     "shares":  { "data": { "path": "/data", "continuous_availability": true } },
     "buckets": { "data": { "path": "/data" } },
     "users": [
@@ -291,8 +315,8 @@ read `server`/`mounts`/`exports`/`shares`/`buckets`.
 | `async_delegation_threads` | int | `8` | Asynchronous delegation pool size. |
 | `cache_ttl` | int (s) | `60` | Metadata (attribute) cache TTL. |
 | `max_fds` | int | `1024` | Maximum concurrent open file descriptors. |
-| `kv_module` | string | — | Key-value module for client-side state. |
-| `vfs` | object | — | Per-module config, keyed by module name; each value is `{ "path": …, "config": … }` (both strings). Used to register/point at VFS modules. |
+| `kv_module` | string | - | Key-value module for client-side state. |
+| `vfs` | object | - | Per-module config, keyed by module name; each value is `{ "path": ..., "config": ... }` (both strings). Used to register/point at VFS modules. |
 
 > The `common.*` delegation keys override the values in `config`, exactly as they
 > override `server` on the daemon side.
@@ -320,23 +344,23 @@ otherwise driven by fio job-file options rather than the `config` section:
 
 | fio option | Type | Default | Description |
 |---|---|---|---|
-| `chimera_config` | string | — | Path to a Chimera JSON config file (for its `common` section and module/mount definitions). |
-| `chimera_log` | string | — | Redirect Chimera/libevpl logging to this file. |
+| `chimera_config` | string | - | Path to a Chimera JSON config file (for its `common` section and module/mount definitions). |
+| `chimera_log` | string | - | Redirect Chimera/libevpl logging to this file. |
 | `chimera_debug` | bool | `false` | Enable debug-level logging. |
-| `chimera_buffer_size` | int | `0` (auto) | Override the libevpl buffer-pool size; `0` auto-sizes from the job's `iodepth × bs`. |
+| `chimera_buffer_size` | int | `0` (auto) | Override the libevpl buffer-pool size; `0` auto-sizes from the job's `iodepth x bs`. |
 
 ---
 
 ## VFS module options
 
-These keys go inside a module's `config` object — either the per-mount config or,
+These keys go inside a module's `config` object - either the per-mount config or,
 for plugins, the `config` under `server.vfs.<name>`.
 
 ### `memfs` (in-memory)
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `block_size` | int | `65536` | Block size in bytes (power of two, 4 KiB–1 MiB). |
+| `block_size` | int | `65536` | Block size in bytes (power of two, 4 KiB-1 MiB). |
 | `fsid` | int/string | random | Stable filesystem ID so handles survive a restart. |
 | `noatime` | bool | `false` | Disable atime updates (default keeps relatime semantics). |
 
@@ -351,7 +375,7 @@ for plugins, the `config` under `server.vfs.<name>`.
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `path` | string | required | Directory holding the `metadb`/`datadb` RocksDB stores. |
-| `cache` | int (MB) | `64` | Block-cache budget, split ~¼ metadb / ~¾ datadb. |
+| `cache` | int (MB) | `64` | Block-cache budget, split ~1/4 metadb / ~3/4 datadb. |
 | `compression` | bool | `true` | LZ4-compress `datadb` (`metadb` is always uncompressed). |
 | `bloom_filter` | bool | `true` | Enable bloom filters on both stores. |
 | `statistics` | bool | `false` | Collect RocksDB statistics (diagnostics). |
@@ -369,7 +393,7 @@ The `config` object takes a `devices` array plus filesystem-level knobs.
 | `noatime` | bool | `false` | Disable atime updates. |
 | `mtime_defer_ms` | int (ms) | `1000` | Coalescing window for deferred mtime updates (`0` writes mtime on every write). |
 | `intent_log_size` | int (bytes) | `1073741824` (1 GiB) | Size of the device-0 intent (redo) log; a larger log lets more redo records pipeline before the ring laps. Persisted in the superblock at format time (a remount uses the formatted value). Must fit device 0's first allocation group alongside the superblock and per-AG log; floored at 4 MiB. The block cache default scales with this. |
-| `block_cache_blocks` | int | `0` (2× the intent-log block count) | Resident block-buffer cap (`0` = default; floored at 1.5× the intent-log block count). |
+| `block_cache_blocks` | int | `0` (2x the intent-log block count) | Resident block-buffer cap (`0` = default; floored at 1.5x the intent-log block count). |
 | `inode_cache_inodes` | int | `262144` | Resident inode cap (`0` = default). |
 | `block_layout` | bool | `false` | Source RFC 5663 pNFS **block** layouts (mutually exclusive with `scsi_layout`). |
 | `scsi_layout` | bool | `false` | Source RFC 8154 pNFS **SCSI** layouts (mutually exclusive with `block_layout`). |
@@ -382,9 +406,9 @@ Each entry of `devices`:
 | `path` | string | required | Device path, file path, or PCI BDF (e.g. `"01:00.0"` for VFIO). |
 | `size` | int | auto | Device size in bytes (auto-detected for file-backed if omitted). |
 | `role` | string | `"local"` | `"local"`, or `"remote"` for a pNFS-only data device. |
-| `deviceid` | string | — | 16-byte hex device ID (remote devices). |
-| `signature` | object | — | SIMPLE-volume signature: `{ "offset": int, "bytes": "<hex>" }` (block layout). |
-| `scsi` | object | — | SCSI designator: `{ "designator_type": "naa"\|"eui64"\|"t10", "code_set": "binary"\|"ascii", "id": "<hex>", "pr_key": int }` (SCSI layout). |
+| `deviceid` | string | - | 16-byte hex device ID (remote devices). |
+| `signature` | object | - | SIMPLE-volume signature: `{ "offset": int, "bytes": "<hex>" }` (block layout). |
+| `scsi` | object | - | SCSI designator: `{ "designator_type": "naa"\|"eui64"\|"t10", "code_set": "binary"\|"ascii", "id": "<hex>", "pr_key": int }` (SCSI layout). |
 
 The `nfs` and `root` modules take no `config` object; the `nfs` module is
 configured through mount `options` instead.
@@ -394,7 +418,7 @@ configured through mount `options` instead.
 ## Advanced and testing options
 
 These keys exist for development, debugging, and benchmarking. They are **not**
-intended for production deployments — they either weaken durability guarantees or
+intended for production deployments - they either weaken durability guarantees or
 expose unauthenticated mutation endpoints. They are documented here for
 completeness; leave them at their defaults unless you understand the trade-off.
 
