@@ -1,0 +1,55 @@
+{
+    "name": "qtm-chimera",
+    "build": {
+        "dockerfile": "Dockerfile",
+        "args": {
+            "USERNAME": "${localEnv:USER}",
+            "DOCKER_MIRROR": "repository.mdh.quantum.com/",
+            "APT_MIRROR": "http://repository.mdh.quantum.com/repository/pkgs/ubuntu",
+            "ENABLE_XLIO": "0"
+        }
+    },
+    "initializeCommand": {
+        "mkdir-mounts": "mkdir -p \"${localEnv:HOME}/.claude\" \"${localEnv:HOME}/.kube\" \"${localEnv:HOME}/.ssh\"",
+        "history": "touch \"${localEnv:HOME}/.chimera.bash_history\"",
+        "dev-aliases": "touch \"${localEnv:HOME}/.dev_aliases\""
+    },
+    "containerEnv": {
+        "CHIMERA_BUILD_DIR": "/build",
+        "CCACHE_DIR": "/build/ccache"
+    },
+    "customizations": {
+        "vscode": {
+            "settings": {},
+            "extensions": [
+                "ms-vscode.cpptools",
+                "ms-vscode.cpptools-extension-pack",
+                "ms-vscode.cmake-tools",
+                "fredericbonnet.cmake-test-adapter",
+                "ms-azuretools.vscode-docker",
+                "anthropic.claude-code",
+                "zachflower.uncrustify"
+            ]
+        }
+    },
+    "mounts": [
+        "source=qtm-chimera-build,target=/build,type=volume",
+        "source=${localEnv:HOME}/.ssh,target=/home/${localEnv:USER}/.ssh,type=bind,readonly",
+        "source=${localEnv:HOME}/.claude,target=/home/${localEnv:USER}/.claude,type=bind,consistency=cached",
+        "source=${localEnv:HOME}/.kube,target=/home/${localEnv:USER}/.kube,type=bind,consistency=cached",
+        "source=${localEnv:HOME}/.chimera.bash_history,target=/home/${localEnv:USER}/.bash_history,type=bind,consistency=cached",
+        "source=${localEnv:HOME}/.dev_aliases,target=/home/${localEnv:USER}/.bash_aliases,type=bind,readonly,consistency=cached"
+    ],
+    "postCreateCommand": {
+        "chown-build": "sudo chown -R $(id -u):$(id -g) /build",
+        "glab-auth": "bash -c 'source ~/.bash_aliases; if [ -n \"$GITLAB_READ_TOKEN\" ]; then echo \"$GITLAB_READ_TOKEN\" | glab auth login --hostname gitlab.mdh.quantum.com --stdin && glab config set -g telemetry false; else echo \"GITLAB_READ_TOKEN not set in ~/.dev_aliases; skipping glab auth\"; fi'"
+    },
+    "remoteEnv": {
+        "TERM": "${localEnv:TERM}"
+    },
+    "privileged": true,
+    "remoteUser": "${localEnv:USER}",
+    "updateRemoteUserUID": true,
+    "workspaceMount": "source=${localWorkspaceFolder},target=/qtm-chimera,type=bind",
+    "workspaceFolder": "/qtm-chimera"
+}
