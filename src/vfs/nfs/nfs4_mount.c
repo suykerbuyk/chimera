@@ -25,6 +25,12 @@
 struct chimera_nfs4_mount_ctx {
     struct chimera_nfs_client_server_thread *server_thread;
     struct chimera_nfs_client_mount         *mount;
+    /* 1 when the mount compound carried an OP_LOOKUP (a path-bearing mount),
+     * 0 for a bare pseudo-fs root mount.  Recorded where the compound is
+     * built so the reply is indexed by what was requested rather than by how
+     * long the reply is: a compound stops at its first failing op, so
+     * num_resarray says nothing about which ops were sent. */
+    int                                      lookup_included;
 };
 
 /* Forward declarations */
@@ -169,6 +175,7 @@ chimera_nfs4_mount_get_root_fh_callback(
     int                              fh_fragment_len;
     int                              hostname_len;
     int                              op;
+    int                              expected_ops;
     XXH128_hash_t                    fsid_hash;
 
     if (status != 0) {
@@ -178,57 +185,90 @@ chimera_nfs4_mount_get_root_fh_callback(
         return;
     }
 
-    if (res->status != NFS4_OK) {
-        chimera_nfsclient_error("NFS4 mount get_root_fh compound failed: %d", res->status);
-        request->status = CHIMERA_VFS_EIO;
-        request->complete(request);
-        return;
-    }
-
-    /* Check individual operation results.  The compound is
-     * SEQUENCE + PUTROOTFH [+ LOOKUP] + GETFH + GETATTR; the LOOKUP is
-     * omitted when the mount targets the bare pseudo-fs root. */
-    if (res->num_resarray < 4) {
-        chimera_nfsclient_error("NFS4 mount get_root_fh: incomplete response");
-        request->status = CHIMERA_VFS_EIO;
-        request->complete(request);
-        return;
-    }
-
-    if (res->resarray[0].opsequence.sr_status != NFS4_OK) {
+    /* The compound is SEQUENCE + PUTROOTFH [+ LOOKUP] + GETFH + GETATTR; the
+     * LOOKUP is omitted when the mount targets the bare pseudo-fs root, which
+     * ctx->lookup_included records -- do not infer it from num_resarray.
+     *
+     * A compound stops at its first failing op, so a partial reply carries one
+     * result per op up to and including the one that failed.  Every op present
+     * is therefore inspected in order, before falling back to the compound
+     * status; checking the compound status first would collapse every per-op
+     * failure into one error, which is what let a mount of a nonexistent export
+     * report EIO rather than ENOENT.  Each access is bounds-checked
+     * individually because a partial reply is short by construction.
+     *
+     * The filesystem-level ops carry statuses that mean something to the
+     * caller, so they go through chimera_nfs4_status_to_errno.  SEQUENCE is the
+     * exception: its failures are session-level (BADSESSION, BADSLOT,
+     * SEQ_MISORDERED) with no faithful errno, and the mapper's default would
+     * report them as EINVAL, so it stays EIO. */
+    if (res->num_resarray >= 1 &&
+        res->resarray[0].opsequence.sr_status != NFS4_OK) {
         chimera_nfsclient_error("NFS4 SEQUENCE failed: %d", res->resarray[0].opsequence.sr_status);
         request->status = CHIMERA_VFS_EIO;
         request->complete(request);
         return;
     }
 
-    if (res->resarray[1].opputrootfh.status != NFS4_OK) {
+    if (res->num_resarray >= 2 &&
+        res->resarray[1].opputrootfh.status != NFS4_OK) {
+        /* Mapped rather than fixed at EIO for spec generality: RFC 7530 §8
+         * lets a server refuse PUTROOTFH for the client's security flavor with
+         * NFS4ERR_WRONGSEC.  chimera's own PUTROOTFH always succeeds and has no
+         * flavor check, so against chimera that status arrives on the LOOKUP
+         * below, not here. */
         chimera_nfsclient_error("NFS4 PUTROOTFH failed: %d", res->resarray[1].opputrootfh.status);
-        request->status = CHIMERA_VFS_EIO;
+        request->status = chimera_nfs4_status_to_errno(res->resarray[1].opputrootfh.status);
         request->complete(request);
         return;
     }
 
     op = 2;
 
-    if (res->num_resarray >= 5) {
-        if (res->resarray[op].oplookup.status != NFS4_OK) {
-            chimera_nfsclient_error("NFS4 LOOKUP failed: %d", res->resarray[op].oplookup.status);
-            request->status = chimera_nfs4_status_to_errno(res->resarray[op].oplookup.status);
+    if (ctx->lookup_included) {
+        if (res->num_resarray >= 3 &&
+            res->resarray[2].oplookup.status != NFS4_OK) {
+            /* Mounting an export the server does not have lands here: the
+             * LOOKUP's NFS4ERR_NOENT becomes ENOENT for the caller.  This is
+             * also where a chimera server's NFS4ERR_WRONGSEC arrives, raised
+             * from its pseudo-fs root when the export disallows the client's
+             * security flavor; the mapper turns that into EPERM rather than
+             * the EINVAL its default gave. */
+            chimera_nfsclient_error("NFS4 LOOKUP failed: %d", res->resarray[2].oplookup.status);
+            request->status = chimera_nfs4_status_to_errno(res->resarray[2].oplookup.status);
             request->complete(request);
             return;
         }
         op++;
     }
 
-    getfh_res = &res->resarray[op];
-    if (getfh_res->opgetfh.status != NFS4_OK) {
-        chimera_nfsclient_error("NFS4 GETFH failed: %d", getfh_res->opgetfh.status);
+    if (res->num_resarray > op &&
+        res->resarray[op].opgetfh.status != NFS4_OK) {
+        chimera_nfsclient_error("NFS4 GETFH failed: %d", res->resarray[op].opgetfh.status);
+        request->status = chimera_nfs4_status_to_errno(res->resarray[op].opgetfh.status);
+        request->complete(request);
+        return;
+    }
+
+    /* Anything the per-op checks above did not explain: a GETATTR failure, or a
+     * reply whose failing op carried no result of its own. */
+    if (res->status != NFS4_OK) {
+        chimera_nfsclient_error("NFS4 mount get_root_fh compound failed: %d", res->status);
+        request->status = chimera_nfs4_status_to_errno(res->status);
+        request->complete(request);
+        return;
+    }
+
+    expected_ops = 4 + ctx->lookup_included;
+
+    if (res->num_resarray < expected_ops) {
+        chimera_nfsclient_error("NFS4 mount get_root_fh: incomplete response");
         request->status = CHIMERA_VFS_EIO;
         request->complete(request);
         return;
     }
 
+    getfh_res = &res->resarray[op];
     remote_fh = &getfh_res->opgetfh.resok4.object;
 
     /*
@@ -313,6 +353,10 @@ chimera_nfs4_mount_get_root_fh(
         argarray[op].oplookup.objname.len  = pathlen;
         op++;
     }
+
+    /* Re-stamped on every slot-exhaustion replay: this function rebuilds args
+     * from scratch each time it runs, so the flag cannot go stale. */
+    ctx->lookup_included = pathlen > 0;
 
     /* GETFH */
     argarray[op++].argop = OP_GETFH;
