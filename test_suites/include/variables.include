@@ -1,5 +1,14 @@
 # Variables:
 #
+# AUTH Section
+#
+# AUTH_ADS = 1: (Default ADS auth to SNNAS-LAB)
+#   AD_DOMAIN    - AD domain to join                   (default: snnas-lab.mdh.quantum.com)
+#   AD_USER      - AD account used to join the domain  (default: nasadmin)
+#   AD_PASS      - password of the join account        (default: nasadmin)
+#   AD_REALM     - kerberos realm of the domain        (default: SNNAS-LAB.MDH.QUANTUM.COM)
+#   AD_WORKGROUP - short/NetBIOS domain name           (default: SNNAS-LAB)
+#
 #  * MDC_DISTRO:  rockyl(default)
 #    - Specific distribution to use
 #    - Optional.
@@ -33,6 +42,26 @@
 #    - default OS_VERSION
 #    - Optional.
 #
+
+%ifndef AD_AUTH
+%define AD_AUTH 1
+%endif
+
+%if AD_AUTH == 1
+%define AD_DOMAIN snnas-lab.mdh.quantum.com
+%define AD_USER nasadmin
+%define AD_PASS nasadmin
+%define AD_REALM SNNAS-LAB.MDH.QUANTUM.COM
+%define AD_WORKGROUP SNNAS-LAB
+%endif
+
+%if AD_AUTH == 2
+%define AD_DOMAIN mdh.quantum.com
+%define AD_USER nasadmin
+%define AD_PASS nasadmin
+%define AD_REALM MDH.QUANTUM.COM
+%define AD_WORKGROUP MDH
+%endif
 
 %ifndef MDC_DISTRO
 %define MDC_DISTRO rockyl

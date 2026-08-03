@@ -1,0 +1,191 @@
+%sntest chimera-ads-auth
+description install chimera on Ubuntu server joined to an ADS domain with winbind (RID idmapping)
+
+# Example:
+# sntest -b master -V PKG_TAG=develop -e chimera-ads-auth.snt
+#
+#
+# Notes (validated against the ads domain):
+#  * The join uses "adcli join --domain" so adcli discovers a DC by its real
+#    hostname.  Pointing --domain-controller at snnas-lab.mdh.quantum.com is
+#    unreliable: that name is a round-robin alias for snnas-dc1/snnas-dc2 and
+#    has no ldap/ SPN of its own, so the GSSAPI LDAP bind fails with
+#    "Message stream modified" whenever DNS and Kerberos pick different DCs.
+#  * net changesecretpw (called by adcli --add-samba-data, samba >= 4.16) can
+#    only upgrade an existing legacy machine password record, so dummy records
+#    are seeded with tdbtool first; the join then overwrites them with the
+#    real machine password so winbindd can establish its netlogon channel.
+
+%include ../include/variables.include
+%ifndef PKG_TAG
+%error need to provide a QB PKG_TAG
+%endif
+
+host srv1	distro:OS_DISTRO version:OS_VERSION arch:x86_64 cores:2 memory:8192
+
+hostgroup allhosts   srv1
+
+# share FS
+lun share_fs allhosts 100
+
+failstep 10m Capture debug info on failure
+command allhosts $sntest/bin/capture_debug_info $spool
+command srv1 journalctl -u chimera -o short-iso | sed 's/ snt.*message="/ /' | tee $spool/chimera_log.txt
+command srv1 journalctl -u winbind -o short-iso | tee $spool/winbind_log.txt
+command srv1 cp /etc/samba/smb.conf /etc/krb5.conf $spool/ || true
+
+
+step 1m extract the NAS sntest_utils
+command allhosts curl https://nexus.mdh.quantum.com/repository/snnas-binaries/sn_tests/sntest_utils.tar.gz | tar zxf - -C /
+
+
+step 5m install winbind and client packages
+command srv1 apt update && DEBIAN_FRONTEND=noninteractive apt install -y \
+	winbind libnss-winbind libpam-winbind adcli krb5-user \
+	samba-common-bin tdb-tools smbclient cifs-utils jq
+
+
+#  --------------------   join the ADS domain  ---------------
+step 2m check time sync and domain resolution
+command srv1 timedatectl status
+command srv1 getent hosts AD_DOMAIN
+
+step 2m show discovered AD domain info
+command srv1 /usr/sbin/adcli info AD_DOMAIN
+command srv1 net ads lookup -S AD_DOMAIN || true
+
+step 1m configure kerberos
+command srv1 /bin/echo -e "[libdefaults]\n\
+default_realm = __REALM__\n\
+dns_lookup_realm = false\n\
+dns_lookup_kdc = true\n\
+rdns = false\n\
+[domain_realm]\n\
+.__DOMAIN__ = __REALM__\n\
+__DOMAIN__ = __REALM__" > /etc/krb5.conf && \
+	sed -i -e s/__REALM__/AD_REALM/g -e s/__DOMAIN__/AD_DOMAIN/g /etc/krb5.conf
+command srv1 cat /etc/krb5.conf
+
+step 1m configure winbind with RID idmapping
+command srv1 /bin/echo -e "[global]\n\
+security = ads\n\
+realm = __REALM__\n\
+workgroup = __WORKGROUP__\n\
+kerberos method = secrets and keytab\n\
+winbind use default domain = yes\n\
+winbind refresh tickets = yes\n\
+winbind enum users = yes\n\
+winbind enum groups = yes\n\
+template shell = /bin/bash\n\
+idmap config * : backend = tdb\n\
+idmap config * : range = 3000-7999\n\
+idmap config __WORKGROUP__ : backend = rid\n\
+idmap config __WORKGROUP__ : range = 100000-999999" > /etc/samba/smb.conf && \
+	sed -i -e s/__REALM__/AD_REALM/g -e s/__WORKGROUP__/AD_WORKGROUP/g /etc/samba/smb.conf
+command srv1 testparm -s
+
+step 1m seed samba secrets so the join can store the machine password
+command srv1 tdbtool /var/lib/samba/private/secrets.tdb store SECRETS/MACHINE_PASSWORD/AD_WORKGROUP 'bootstrap\00'
+command srv1 tdbtool /var/lib/samba/private/secrets.tdb store SECRETS/MACHINE_LAST_CHANGE_TIME/AD_WORKGROUP '\01\00\00\00'
+
+step 2m join the AD domain with adcli
+command srv1 echo AD_PASS | /usr/sbin/adcli join --domain AD_DOMAIN --login-user AD_USER \
+	--service-name=cifs --dont-expire-password=true --ldap-passwd --stdin-password \
+	--add-samba-data --verbose
+command srv1 tdbdump /var/lib/samba/private/secrets.tdb | grep key
+
+step 1m enable winbind NSS lookups
+command srv1 sed -i -E 's/^(passwd|group):(.*)/\1:\2 winbind/' /etc/nsswitch.conf && \
+	grep -E '^(passwd|group):' /etc/nsswitch.conf
+
+step 2m enable winbind
+command srv1 systemctl enable winbind
+
+step 2m start winbind and Wait for connectivity with ADS.
+command srv1 while true ; do \
+	sleep 3  &&  systemctl restart winbind && sleep 3 ; \
+	if wbinfo -i AD_USER > /dev/null 2>&1 ; then \
+		break ; \
+	fi ; \
+	done && systemctl status winbind
+
+step 5m verify winbind domain connectivity and RID idmapping
+command srv1 wbinfo --ping-dc
+command srv1 wbinfo -u | head -20
+command srv1 wbinfo -g | head -20
+command srv1 ntlm_auth --username=AD_USER --domain=AD_WORKGROUP --password=AD_PASS
+command srv1 getent passwd AD_USER && id AD_USER
+
+
+#  --------------------   install Chimera  ---------------
+step 2m Download chimera pkg for QB_OS
+command srv1 /sntest_utils/get_qb_asset.py -p chimera -t PKG_TAG -d /chimera-repo -u release/QB_OS/amd64/repo-chimera.tar.gz
+
+step 2m install the chimera Packages for QB_OS
+command srv1 apt-get install -y /chimera-repo/*.deb
+
+step 5m setup share filesystem
+command srv1 echo $share_fs && \
+	parted /dev/sda mklabel gpt && \
+	parted /dev/sda mkpart "" ext4 0% 100% && \
+	sleep 5 && mkfs.ext4  /dev/sda1 && \
+	mkdir /shares && \
+	mount /dev/sda1 /shares && \
+	chmod 777 /shares
+
+step 1m Create base chimera.json file with winbind NTLM and kerberos SMB auth
+command srv1 cp /etc/chimera/chimera.json /etc/chimera/chimera.json.orig && \
+	     jq -n '{ \
+                 server: { \
+                    threads: 16, \
+                    external_portmap: true, \
+                    max_open_files: 1048576, \
+                    rest_http_port: 8080, \
+                    rest_auth_enabled: false, \
+                    smb_auth: { \
+                       winbind_enabled: true, \
+                       winbind_domain: "__WBDOM__", \
+                       kerberos_enabled: true, \
+                       kerberos_keytab: "/etc/krb5.keytab", \
+                       kerberos_realm: "__KRBREALM__" \
+                    } \
+                } }'  > /etc/chimera/chimera.json && \
+	sed -i -e s/__WBDOM__/AD_WORKGROUP/ -e s/__KRBREALM__/AD_REALM/ /etc/chimera/chimera.json
+
+step 5m enable and start chimera
+command srv1 cat /etc/default/chimera
+command srv1 jq . /etc/chimera/chimera.json
+command srv1 systemctl enable chimera && \
+	     systemctl start chimera && \
+	     sleep 5 && \
+	     systemctl status chimera
+
+
+step 5m add mount
+command srv1  python3 -m  chimera_admin mount create --module linux --path /shares sharefs
+
+step 5m Create SMB share
+command srv1  python3 -m  chimera_admin share create smb1 /sharefs
+
+step 5m validate the config
+command srv1 python3 -m  chimera_admin config
+
+
+step 5m test SMB auth with AD domain user via winbind NTLM
+command srv1 smbclient --use-kerberos=off -U AD_WORKGROUP/AD_USER%AD_PASS //127.0.0.1/smb1 -c "allinfo /"
+command srv1 smbclient --use-kerberos=off -U AD_USER%AD_PASS //127.0.0.1/smb1 -c "allinfo /"
+
+step 1m Create kerberos cache
+command srv1 echo AD_PASS | kinit AD_USER  -c /tmp/test_cache && klist -c /tmp/test_cache
+
+step 5m test SMB auth with AD domain user via kerberos (kinit cache)
+command srv1 smbclient --use-kerberos=required --use-krb5-ccache=/tmp/test_cache -U AD_USER \
+		//`hostname`/smb1 -c "allinfo /"
+
+step 5m test SMB auth with AD domain user via kerberos (smbclient password)
+command srv1 smbclient --use-kerberos=required -U AD_USER%AD_PASS //`hostname -f`/smb1 -c "allinfo /"
+
+
+step 5m gather logs
+command srv1 journalctl -u chimera -o short-iso | sed 's/ snt.*message="/ /' | tee $spool/chimera_log.txt
+command srv1 journalctl -u winbind -o short-iso | tee $spool/winbind_log.txt
