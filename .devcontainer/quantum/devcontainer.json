@@ -20,7 +20,9 @@
     },
     "customizations": {
         "vscode": {
-            "settings": {},
+            "settings": {
+                "cmake.cmakePath": "${workspaceFolder}/.devcontainer/quantum/sudo-cmake.sh"
+            },
             "extensions": [
                 "ms-vscode.cpptools",
                 "ms-vscode.cpptools-extension-pack",
