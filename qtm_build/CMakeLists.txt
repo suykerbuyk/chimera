@@ -14,13 +14,15 @@ install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/chimera.default DESTINATION ${DESTDIR}
 
 # Quantum-specific: install VFS headers consumed by downstream packaging.
 # Glob the public headers but skip internal-only ones (internal helpers, the
-# RCU caches, and the proc dispatch table).
+# RCU caches, the proc dispatch table, and the open-cache release inlines,
+# which include the excluded vfs_open_cache.h).
 file(GLOB VFS_HEADERS CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/vfs/*.h)
-list(FILTER VFS_HEADERS EXCLUDE REGEX "/(vfs_internal|vfs_[^/]*_cache)\\.h$")
+list(FILTER VFS_HEADERS EXCLUDE REGEX "/(vfs_internal|vfs_release|vfs_[^/]*_cache)\\.h$")
 install(FILES ${VFS_HEADERS} DESTINATION include/vfs)
 install(FILES
 	${CMAKE_SOURCE_DIR}/ext/libevpl/ext/prometheus-c/prometheus-c.h
 	${CMAKE_SOURCE_DIR}/ext/libevpl/ext/prometheus-c/ext/stopwatch/stopwatch.h
+	${CMAKE_SOURCE_DIR}/ext/libevpl/ext/oteltracing-c/oteltracing.h
 	DESTINATION include/vfs)
 
 # Quantum-specific: install the standalone test suites under <prefix>/tests
