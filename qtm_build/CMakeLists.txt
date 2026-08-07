@@ -22,7 +22,28 @@ install(FILES ${VFS_HEADERS} DESTINATION include/vfs)
 install(FILES
 	${CMAKE_SOURCE_DIR}/ext/libevpl/ext/prometheus-c/prometheus-c.h
 	${CMAKE_SOURCE_DIR}/ext/libevpl/ext/prometheus-c/ext/stopwatch/stopwatch.h
-	${CMAKE_SOURCE_DIR}/ext/libevpl/ext/oteltracing-c/oteltracing.h
+	DESTINATION include/vfs)
+
+# The packaged oteltracing.h must pin OTEL_TRACING to the value the packaged
+# binaries were compiled with: the header defaults to 1 (4 KiB otel_span
+# embedded in chimera_vfs_request) but chimera is built with OTEL_TRACING=0
+# (zero-size span) whenever protobuf-c is absent, and an out-of-tree VFS
+# module compiled with the other value gets a skewed request layout and
+# crashes at runtime.
+if(TARGET oteltracing-c)
+	set(QTM_OTEL_TRACING 1)
+else()
+	set(QTM_OTEL_TRACING 0)
+endif()
+file(READ ${CMAKE_SOURCE_DIR}/ext/libevpl/ext/oteltracing-c/oteltracing.h
+	QTM_OTEL_HEADER)
+file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/include/oteltracing.h
+	"/* OTEL_TRACING pinned by chimera packaging to match the packaged binaries. */
+#ifndef OTEL_TRACING
+#define OTEL_TRACING ${QTM_OTEL_TRACING}
+#endif
+${QTM_OTEL_HEADER}")
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/include/oteltracing.h
 	DESTINATION include/vfs)
 
 # Quantum-specific: install the standalone test suites under <prefix>/tests
