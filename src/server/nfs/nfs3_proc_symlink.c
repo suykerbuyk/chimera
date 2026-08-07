@@ -8,6 +8,7 @@
 #include "vfs/vfs_procs.h"
 #include "vfs/vfs_release.h"
 #include "nfs3_dump.h"
+#include "nfs3_trace.h"
 
 static void
 chimera_nfs3_symlink_complete(
@@ -122,9 +123,13 @@ chimera_nfs3_symlink(
     chimera_nfs_map_cred_req(req, cred);
 
     nfs3_dump_symlink(req, args);
+    nfs3_trace_symlink(req, args);
     req->args_symlink = args;
 
     res.status = chimera_nfs3_decode_fh(req, args->where.dir.data.data, args->where.dir.data.len);
+    if (res.status == NFS3_OK) {
+        res.status = chimera_nfs3_check_rofs(req, req->export_id);
+    }
     if (res.status != NFS3_OK) {
         nfsstat3 fh_status = res.status;
         memset(&res, 0, sizeof(res));

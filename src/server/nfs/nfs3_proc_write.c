@@ -10,6 +10,7 @@
 #include "vfs/vfs_procs.h"
 #include "vfs/vfs_release.h"
 #include "nfs3_dump.h"
+#include "nfs3_trace.h"
 
 static void
 chimera_nfs3_write_complete(
@@ -124,6 +125,7 @@ chimera_nfs3_write(
     chimera_nfs_map_cred_req(req, cred);
 
     nfs3_dump_write(req, args);
+    nfs3_trace_write(req, args);
 
     req->args_write = args;
 
@@ -136,6 +138,9 @@ chimera_nfs3_write(
     evpl_rpc2_encoding_take_read_chunk(req->encoding, NULL, NULL);
 
     res.status = chimera_nfs3_decode_fh(req, args->file.data.data, args->file.data.len);
+    if (res.status == NFS3_OK) {
+        res.status = chimera_nfs3_check_rofs(req, req->export_id);
+    }
     if (res.status != NFS3_OK) {
         nfsstat3 fh_status = res.status;
         memset(&res, 0, sizeof(res));

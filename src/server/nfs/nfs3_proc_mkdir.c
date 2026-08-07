@@ -11,6 +11,7 @@
 #include "vfs/vfs.h"
 #include "vfs/vfs_release.h"
 #include "nfs3_dump.h"
+#include "nfs3_trace.h"
 
 static void
 chimera_nfs3_mkdir_complete(
@@ -121,10 +122,14 @@ chimera_nfs3_mkdir(
     chimera_nfs_map_cred_req(req, cred);
 
     nfs3_dump_mkdir(req, args);
+    nfs3_trace_mkdir(req, args);
 
     req->args_mkdir = args;
 
     res.status = chimera_nfs3_decode_fh(req, args->where.dir.data.data, args->where.dir.data.len);
+    if (res.status == NFS3_OK) {
+        res.status = chimera_nfs3_check_rofs(req, req->export_id);
+    }
     if (res.status != NFS3_OK) {
         nfsstat3 fh_status = res.status;
         memset(&res, 0, sizeof(res));

@@ -10,6 +10,7 @@
 #include "nfs_fh_wrap.h"
 #include "evpl/evpl_rpc2.h"
 #include "portmap_xdr.h"
+#include "vfs/vfs.h"
 #include "vfs/vfs_cred.h"
 #include "nfs_gss.h"
 #include "nfs_mount_xdr.h"
@@ -74,6 +75,9 @@ struct nfs_nfs4_readdir_cursor {
 struct nfs_request {
     struct chimera_server_nfs_thread *thread;
     struct nfs4_session              *session;
+    struct otel_span                  otel;        /* compound (aggregate) span */
+    struct otel_span                  op_otel;     /* current op span, child of otel */
+    uint8_t                           op_span_active;
     struct chimera_vfs_cred           cred;
     /* The caller's credential as mapped from the RPC auth, before any export
      * squash.  req->cred is recomputed from this each time a file handle is
@@ -441,6 +445,12 @@ nfs_request_alloc(
     req->replay_slot_id = 0;
     req->replay_action  = NFS4_REPLAY_ACTION_NONE;
 
+    /* Root span for this NFS request (a single NFSv3 op, or a whole NFSv4
+     * COMPOUND).  Parent the VFS ops it issues under it; propagation in
+     * chimera_vfs_complete keeps the linkage across the request's async ops. */
+    otel_span_start(&req->otel, "nfs", OTEL_SPAN_SERVER);
+    thread->vfs_thread->otel_parent = &req->otel;
+
     thread->active_requests++;
 
     return req;
@@ -451,6 +461,11 @@ nfs_request_free(
     struct chimera_server_nfs_thread *thread,
     struct nfs_request               *req)
 {
+    /* End the request span and drop the trace parent so a later VFS op cannot
+     * attach to this (now recycled) request's span. */
+    otel_span_end(&req->otel);
+    thread->vfs_thread->otel_parent = NULL;
+
     thread->active_requests--;
     LL_PREPEND(thread->free_requests, req);
 } /* nfs_request_free */
@@ -530,6 +545,34 @@ chimera_nfs_export_sec_ok(
     }
     return (export->sec_allowed & sec_bit) != 0;
 } /* chimera_nfs_export_sec_ok */
+
+/*
+ * True iff export_id names a live export configured read-only.
+ *
+ * Export id 0 (pseudo-root / no export) returns false; the pseudo-root's own
+ * immutability is enforced elsewhere.  An unknown id also returns false, which
+ * is fail-open for this gate: the handle either fails at the VFS layer because
+ * its mount is gone, or -- if the mount survives because another export still
+ * references it -- is treated as unrestricted.  Removing an export unlinks only
+ * the export record (chimera_nfs_remove_export) and unmounts nothing, so a
+ * client holding handles minted under a deleted read-only export keeps them
+ * usable.  The same fail-open applies to the squash and sec policies; closing
+ * it means rejecting well-formed handles that name an unknown export at decode
+ * time, not patching each policy check.
+ */
+static inline int
+chimera_nfs_export_id_is_ro(
+    struct chimera_server_nfs_shared *shared,
+    uint16_t                          export_id)
+{
+    const struct chimera_nfs_export *export =
+        chimera_nfs_get_export_by_id(shared, export_id);
+
+    /* access is a CHIMERA_NFS_EXPORT_ACCESS_* bitmask (see nfs.h); test the RO
+     * bit rather than comparing the whole mask so an over-set value such as
+     * RO|RW fails closed instead of silently granting write access. */
+    return export && (export->access & CHIMERA_NFS_EXPORT_ACCESS_RO) != 0;
+} /* chimera_nfs_export_id_is_ro */
 
 /*
  * Map the RPC credential into a request and snapshot it as the pre-squash

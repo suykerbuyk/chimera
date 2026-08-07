@@ -7,6 +7,7 @@
 #include "nfs_common/nfs3_attr.h"
 #include "vfs/vfs_procs.h"
 #include "nfs3_dump.h"
+#include "nfs3_trace.h"
 static void
 chimera_nfs3_link_complete(
     enum chimera_vfs_error    error_code,
@@ -52,24 +53,33 @@ chimera_nfs3_link(
     struct chimera_server_nfs_shared *shared = thread->shared;
     struct nfs_request               *req;
     struct LINK3res                   res;
-    uint16_t                          linkdir_export_id;
+    uint16_t                          linkdir_export_id = 0;
     int                               rc;
 
     req = nfs_request_alloc(thread, conn, encoding);
     chimera_nfs_map_cred_req(req, cred);
 
     nfs3_dump_link(req, args);
+    nfs3_trace_link(req, args);
 
     /* Decode the existing-file handle (sets the request export + squash) and
      * the target-directory handle (authenticated into req->saved_fh).  The
      * target handle must outlive this (async) call, so it lives in the request
      * rather than on the stack (saved_fh is unused by NFSv3). */
     res.status = chimera_nfs3_decode_fh(req, args->file.data.data, args->file.data.len);
-    if (res.status != NFS3_OK ||
+    if (res.status == NFS3_OK &&
         chimera_nfs_fh_unwrap(args->link.dir.data.data, args->link.dir.data.len,
                               &linkdir_export_id, req->saved_fh, &req->saved_fhlen,
                               shared->fh_key, shared->fh_sign) != CHIMERA_NFS_FH_OK) {
-        nfsstat3 fh_status = res.status != NFS3_OK ? res.status : NFS3ERR_BADHANDLE;
+        res.status = NFS3ERR_BADHANDLE;
+    }
+    /* The link directory gains an entry and the file's nlink changes, so
+     * both exports must be writable. */
+    if (res.status == NFS3_OK) {
+        res.status = chimera_nfs3_check_rofs2(req, linkdir_export_id);
+    }
+    if (res.status != NFS3_OK) {
+        nfsstat3 fh_status = res.status;
         memset(&res, 0, sizeof(res));
         res.status = fh_status;
         rc         = shared->nfs_v3.send_reply_NFSPROC3_LINK(evpl, NULL, &res, req->encoding);

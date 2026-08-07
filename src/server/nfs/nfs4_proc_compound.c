@@ -10,7 +10,9 @@
 #include "evpl/evpl_rpc2_program.h"
 #include "evpl/evpl_bind.h"
 #include "nfs4_dump.h"
+#include "nfs4_trace.h"
 #include "nfs4_op_matrix.h"
+#include "nfs4_rofs.h"
 #include "nfs_drc_reply.h"
 
 static int
@@ -41,6 +43,90 @@ nfs4_release_write_args(
     }
 } /* nfs4_release_write_args */
 
+/*
+ * Enforce per-export read-only policy at dispatch time.  Extracts the inputs
+ * nfs4_rofs_check needs from the request and the op's arguments; that header
+ * carries the policy itself and the reasoning behind each branch.
+ *
+ * This gate covers only mutations reached through the current filehandle.  Ops
+ * that mutate a handle carried by a stateid cannot use it to escape: ALLOCATE,
+ * DEALLOCATE, and COPY call nfs_state_check_write_for_fh, and SETATTR performs
+ * the same stateid-vs-current-filehandle check inline, so the stateid must
+ * name the gated filehandle.  WRITE instead relies on its NFS4ERR_OPENMODE
+ * check: a write-mode open can only have been granted through a writable
+ * export.  (After a runtime flip to read-only, existing write-mode opens keep
+ * writing -- the same window the COMMIT rationale in nfs4_rofs.h accepts.)
+ *
+ * Only call this after nfs4_op_check_minor has accepted the op (argop is then a
+ * valid matrix index).
+ */
+static nfsstat4
+nfs4_rofs_gate(
+    struct nfs_request      *req,
+    const struct nfs_argop4 *argop)
+{
+    struct chimera_server_nfs_shared *shared = req->thread->shared;
+    struct nfs4_rofs_input            in     = {
+        .op            = argop->argop,
+        .export_ro     = chimera_nfs_export_id_is_ro(shared, req->export_id),
+        .have_saved_fh = req->saved_fhlen != 0,
+    };
+
+    if (in.have_saved_fh) {
+        in.saved_export_ro = chimera_nfs_export_id_is_ro(shared,
+                                                         req->saved_export_id);
+    }
+
+    if (argop->argop == OP_OPEN) {
+        in.open_writes =
+            (argop->opopen.share_access & OPEN4_SHARE_ACCESS_WRITE) != 0 ||
+            argop->opopen.openhow.opentype == OPEN4_CREATE;
+    } else if (argop->argop == OP_OPENATTR) {
+        in.openattr_creates = argop->opopenattr.createdir != 0;
+    }
+
+    return nfs4_rofs_check(&in);
+} /* nfs4_rofs_gate */
+
+/*
+ * Prepare the result slot of an op that failed before any handler ran.
+ *
+ * The per-op result union is uninitialized dbuf memory (xdr_dbuf_alloc_space
+ * does not zero), and some result types marshal fields even on the error
+ * branch -- SETATTR4res carries num_attrsset and attrsset outside any union --
+ * so an un-zeroed slot encodes heap contents onto the wire or crashes the
+ * encoder.  Zero it and set the discriminant.
+ *
+ * A WRITE that never dispatches also still holds the +1 the XDR unmarshal
+ * cloned onto its data iovecs: chimera_nfs4_compound_complete sweeps only the
+ * WRITEs past the failed op, and the release that normally happens in the
+ * WRITE completion will never run.  Releasing here is idempotent with that
+ * sweep and with the replay path, both of which skip a niov already zeroed.
+ *
+ * WRITE is the only op needing the release: xdr_iovecr appears only on
+ * WRITE4args.data, while SETXATTR, SETATTR and CREATE payloads are xdr_opaque
+ * in dbuf memory freed with the encoding.
+ */
+static void
+nfs4_fail_undispatched_op(
+    struct chimera_server_nfs_thread *thread,
+    struct nfs_argop4                *argop,
+    struct nfs_resop4                *resop,
+    nfsstat4                          status)
+{
+    memset(resop, 0, sizeof(*resop));
+
+    /* An out-of-range argop is not a valid result discriminant. */
+    resop->resop = (status == NFS4ERR_OP_ILLEGAL) ? OP_ILLEGAL : argop->argop;
+
+    if (argop->argop == OP_WRITE && argop->opwrite.data.niov) {
+        evpl_iovecs_release(thread->evpl,
+                            argop->opwrite.data.iov,
+                            argop->opwrite.data.niov);
+        argop->opwrite.data.niov = 0;
+    }
+} /* nfs4_fail_undispatched_op */
+
 void
 chimera_nfs4_compound_process(
     struct nfs_request *req,
@@ -53,6 +139,12 @@ chimera_nfs4_compound_process(
     int                               rc;
 
  again:
+
+    /* Close out the previous operation's span (if any).  Every continuation --
+     * the synchronous goto-again below and the async re-entry from
+     * compound_complete -- lands here with req->index already advanced, so this
+     * ends each op's span exactly once. */
+    nfs4_trace_op_end(req);
 
     /* SEQUENCE replay short-circuit: the SEQUENCE op detected a
      * retransmit on a CACHED slot.  Resend the cached COMPOUND body through
@@ -116,22 +208,33 @@ chimera_nfs4_compound_process(
 
     resop->resop = argop->argop;
 
+    /* Open a span for this operation (child of the compound span) and re-point
+     * the VFS parent at it so the op's VFS work nests under the op, not the
+     * whole compound. */
+    nfs4_trace_op_begin(req, argop);
+
     thread->active = 1;
 
-    /* If the response buffer is running low, fail early with RESOURCE
-     * rather than letting individual procs abort on allocation failure */
-    if (req->encoding->dbuf->size - req->encoding->dbuf->used < 8192) {
-        chimera_nfs4_compound_complete(req, NFS4ERR_RESOURCE);
-    } else {
-        nfsstat4 gate = nfs4_op_check_minor(argop->argop,
-                                            req->minorversion,
-                                            (uint32_t) req->index,
-                                            req->seen_sequence);
+    {
+        nfsstat4 gate;
+
+        /* If the response buffer is running low, fail early with RESOURCE
+         * rather than letting individual procs abort on allocation failure */
+        if (req->encoding->dbuf->size - req->encoding->dbuf->used < 8192) {
+            gate = NFS4ERR_RESOURCE;
+        } else {
+            gate = nfs4_op_check_minor(argop->argop,
+                                       req->minorversion,
+                                       (uint32_t) req->index,
+                                       req->seen_sequence);
+
+            if (gate == NFS4_OK) {
+                gate = nfs4_rofs_gate(req, argop);
+            }
+        }
 
         if (gate != NFS4_OK) {
-            if (gate == NFS4ERR_OP_ILLEGAL) {
-                resop->resop = OP_ILLEGAL;
-            }
+            nfs4_fail_undispatched_op(thread, argop, resop, gate);
             chimera_nfs4_compound_complete(req, gate);
         } else {
             /* NFS4.1 current-stateid lifecycle (RFC 8881 §16.2.3.1.2):
@@ -424,6 +527,7 @@ chimera_nfs4_compound(
     }
 
     nfs4_dump_compound(req, args);
+    nfs4_trace_compound(req, args);
 
     /* The conn caches its bound nfs4_session in private_data.  The conn
      * holds a refcount on it (set up by nfs4_session_bind_conn) so the
@@ -442,9 +546,13 @@ chimera_nfs4_compound(
     /* RFC 7530 §16.2.4: the server MUST echo the request tag back to the
      * client unchanged. xdr_opaque .data is owned by the request msg buffer
      * which lives until the response is sent. */
-    req->res_compound.tag            = args->tag;
-    req->fhlen                       = 0;
-    req->saved_fhlen                 = 0;
+    req->res_compound.tag = args->tag;
+    req->fhlen            = 0;
+    req->saved_fhlen      = 0;
+    /* Requests are recycled from a per-thread free list without being zeroed,
+     * and only SAVEFH ever writes saved_export_id -- reset it so a policy
+     * check on the saved side cannot read a previous compound's export. */
+    req->saved_export_id             = 0;
     req->minorversion                = (uint8_t) args->minorversion;
     req->seen_sequence               = false;
     req->current_stateid_valid       = false;

@@ -10,6 +10,7 @@
 #include "vfs/vfs_acl.h"
 #include "vfs/vfs_access.h"
 #include "nfs3_dump.h"
+#include "nfs3_trace.h"
 
 /* Map the meaningful ACCESS3_* request bits to the canonical ACE mask. */
 static uint32_t
@@ -85,6 +86,12 @@ chimera_nfs3_access_complete(
         if ((args->access & ACCESS3_EXECUTE) && (granted & CHIMERA_ACE_EXECUTE)) {
             res.resok.access |= ACCESS3_EXECUTE;
         }
+
+        /* A read-only export never grants write-class access, regardless of
+         * what the ACL/mode would allow. */
+        if (chimera_nfs_export_id_is_ro(shared, req->export_id)) {
+            res.resok.access &= ~(ACCESS3_MODIFY | ACCESS3_EXTEND | ACCESS3_DELETE);
+        }
     } else {
         chimera_nfs3_set_post_op_attr(&res.resfail.obj_attributes, attr);
     }
@@ -145,6 +152,7 @@ chimera_nfs3_access(
     chimera_nfs_map_cred_req(req, cred);
 
     nfs3_dump_access(req, args);
+    nfs3_trace_access(req, args);
 
     req->args_access = args;
 
