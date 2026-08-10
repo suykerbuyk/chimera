@@ -129,6 +129,7 @@ chimera_vfs_remove_at_dispatch(
     const uint8_t                   *child_fh,
     int                              child_fh_len,
     int                              match_child_fh,
+    unsigned int                     flags,
     uint64_t                         pre_attr_mask,
     uint64_t                         post_attr_mask,
     const uint8_t                   *parent_lease_skip,
@@ -150,6 +151,7 @@ chimera_vfs_remove_at_dispatch(
     request->remove_at.name           = name;
     request->remove_at.namelen        = namelen;
     request->remove_at.name_hash      = chimera_vfs_hash(name, namelen);
+    request->remove_at.flags          = flags;
     request->remove_at.child_fh       = child_fh;
     request->remove_at.child_fh_len   = child_fh_len;
     request->remove_at.match_child_fh = match_child_fh ? 1 : 0;
@@ -194,6 +196,7 @@ struct chimera_vfs_remove_at_gate {
     const uint8_t                   *child_fh;
     int                              child_fh_len;
     int                              match_child_fh;
+    unsigned int                     flags;
     uint64_t                         pre_attr_mask;
     uint64_t                         post_attr_mask;
     uint8_t                          parent_lease_skip[16];
@@ -218,6 +221,7 @@ chimera_vfs_remove_at_gate_complete(
     chimera_vfs_remove_at_dispatch(gate->thread, gate->cred, gate->handle,
                                    gate->name, gate->namelen, gate->child_fh,
                                    gate->child_fh_len, gate->match_child_fh,
+                                   gate->flags,
                                    gate->pre_attr_mask,
                                    gate->post_attr_mask,
                                    gate->parent_lease_skip_valid ?
@@ -237,6 +241,7 @@ chimera_vfs_remove_at_common(
     const uint8_t                   *child_fh,
     int                              child_fh_len,
     int                              match_child_fh,
+    unsigned int                     flags,
     uint64_t                         pre_attr_mask,
     uint64_t                         post_attr_mask,
     const uint8_t                   *parent_lease_skip,
@@ -271,6 +276,7 @@ chimera_vfs_remove_at_common(
         gate->child_fh       = child_fh;
         gate->child_fh_len   = child_fh_len;
         gate->match_child_fh = match_child_fh;
+        gate->flags          = flags;
         gate->pre_attr_mask  = pre_attr_mask;
         gate->post_attr_mask = post_attr_mask;
         if (parent_lease_skip) {
@@ -299,13 +305,68 @@ chimera_vfs_remove_at_common(
 
     chimera_vfs_remove_at_dispatch(thread, cred, handle, name, namelen,
                                    child_fh, child_fh_len, match_child_fh,
-                                   pre_attr_mask,
+                                   flags, pre_attr_mask,
                                    post_attr_mask, parent_lease_skip,
                                    callback, private_data);
 } /* chimera_vfs_remove_at_common */
 
+/*
+ * Recall pre-step for a by-name remove.  An NFSv3/NFSv4 REMOVE/RMDIR (and the
+ * SMB namespace deletes) arrive with a parent handle and a name but no handle
+ * for the victim, so the VFS cannot recall a delegation/oplock/lease held on
+ * it before the unlink -- io_recall keys on the FH.  When a caching protocol
+ * is enabled we resolve the name to its FH here, once, in the VFS, rather than
+ * making every by-name caller do it.  A failed lookup is not fatal: the by-name
+ * remove then produces the authoritative error.
+ */
+struct chimera_vfs_remove_recall_ctx {
+    struct chimera_vfs_thread       *thread;
+    const struct chimera_vfs_cred   *cred;
+    struct chimera_vfs_open_handle  *handle;
+    const char                      *name;
+    int                              namelen;
+    unsigned int                     flags;
+    uint64_t                         pre_attr_mask;
+    uint64_t                         post_attr_mask;
+    const uint8_t                   *parent_lease_skip;
+    chimera_vfs_remove_at_callback_t callback;
+    void                            *private_data;
+    uint8_t                          child_fh[CHIMERA_VFS_FH_SIZE];
+    int                              child_fh_len;
+};
+
+static void
+chimera_vfs_remove_recall_lookup_complete(
+    enum chimera_vfs_error    error_code,
+    struct chimera_vfs_attrs *attr,
+    struct chimera_vfs_attrs *dir_attr,
+    void                     *private_data)
+{
+    struct chimera_vfs_remove_recall_ctx *ctx          = private_data;
+    const uint8_t                        *child_fh     = NULL;
+    int                                   child_fh_len = 0;
+
+    if (error_code == CHIMERA_VFS_OK &&
+        (attr->va_set_mask & CHIMERA_VFS_ATTR_FH)) {
+        memcpy(ctx->child_fh, attr->va_fh, attr->va_fh_len);
+        ctx->child_fh_len = attr->va_fh_len;
+        child_fh          = ctx->child_fh;
+        child_fh_len      = ctx->child_fh_len;
+    }
+
+    chimera_vfs_remove_at_common(ctx->thread, ctx->cred, ctx->handle,
+                                 ctx->name, ctx->namelen, child_fh, child_fh_len,
+                                 0 /* match_child_fh */, ctx->flags,
+                                 ctx->pre_attr_mask, ctx->post_attr_mask,
+                                 ctx->parent_lease_skip, ctx->callback,
+                                 ctx->private_data);
+    free(ctx);
+} /* chimera_vfs_remove_recall_lookup_complete */
+
 /* Remove a name in a directory (unconditional by-name unlink).  child_fh, when
  * supplied, is used for delegation/oplock recall and change-notify, NOT to guard
+ * the unlink.  When it is NOT supplied and a caching protocol is enabled, the
+ * VFS resolves it first (above) so a cross-protocol holder is recalled before
  * the unlink. */
 SYMBOL_EXPORT void
 chimera_vfs_remove_at(
@@ -316,15 +377,46 @@ chimera_vfs_remove_at(
     int                              namelen,
     const uint8_t                   *child_fh,
     int                              child_fh_len,
+    unsigned int                     flags,
     uint64_t                         pre_attr_mask,
     uint64_t                         post_attr_mask,
     const uint8_t                   *parent_lease_skip,
     chimera_vfs_remove_at_callback_t callback,
     void                            *private_data)
 {
+    /* Resolve the victim's FH first so a cross-protocol caching holder is
+     * recalled before the unlink.  Only when the caller opted in
+     * (CHIMERA_VFS_REMOVE_RECALL), a caching protocol is enabled, the caller
+     * has not already supplied the FH, and the name is a real component
+     * ("." / ".." are rejected by _common). */
+    if ((flags & CHIMERA_VFS_REMOVE_RECALL) && thread->vfs->caching_enabled &&
+        !child_fh && namelen >= 1 && namelen < CHIMERA_VFS_NAME_MAX &&
+        !(namelen == 1 && name[0] == '.') &&
+        !(namelen == 2 && name[0] == '.' && name[1] == '.')) {
+        struct chimera_vfs_remove_recall_ctx *ctx = malloc(sizeof(*ctx));
+
+        ctx->thread            = thread;
+        ctx->cred              = cred;
+        ctx->handle            = handle;
+        ctx->name              = name;
+        ctx->namelen           = namelen;
+        ctx->flags             = flags;
+        ctx->pre_attr_mask     = pre_attr_mask;
+        ctx->post_attr_mask    = post_attr_mask;
+        ctx->parent_lease_skip = parent_lease_skip;
+        ctx->callback          = callback;
+        ctx->private_data      = private_data;
+        ctx->child_fh_len      = 0;
+
+        chimera_vfs_lookup_at(thread, cred, handle, name, namelen,
+                              CHIMERA_VFS_ATTR_FH, 0,
+                              chimera_vfs_remove_recall_lookup_complete, ctx);
+        return;
+    }
+
     chimera_vfs_remove_at_common(thread, cred, handle, name, namelen,
                                  child_fh, child_fh_len, 0 /* match_child_fh */,
-                                 pre_attr_mask, post_attr_mask, parent_lease_skip,
+                                 flags, pre_attr_mask, post_attr_mask, parent_lease_skip,
                                  callback, private_data);
 } /* chimera_vfs_remove_at */
 
@@ -352,6 +444,6 @@ chimera_vfs_remove_at_match_fh(
 {
     chimera_vfs_remove_at_common(thread, cred, handle, name, namelen,
                                  child_fh, child_fh_len, 1 /* match_child_fh */,
-                                 pre_attr_mask, post_attr_mask, parent_lease_skip,
+                                 0 /* flags */, pre_attr_mask, post_attr_mask, parent_lease_skip,
                                  callback, private_data);
 } /* chimera_vfs_remove_at_match_fh */

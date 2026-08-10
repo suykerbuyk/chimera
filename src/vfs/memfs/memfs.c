@@ -2542,6 +2542,18 @@ memfs_remove_at(
         }
     }
 
+    /* Enforce the caller's type assertion: RMDIR/rmdir(2) sets ISDIR (a
+     * non-directory is ENOTDIR); REMOVE/unlink(2) sets ISNOTDIR (a directory
+     * is EISDIR).  Neither set removes whichever kind is present. */
+    if (((request->remove_at.flags & CHIMERA_VFS_REMOVE_ISDIR) && !S_ISDIR(inode->mode)) ||
+        ((request->remove_at.flags & CHIMERA_VFS_REMOVE_ISNOTDIR) && S_ISDIR(inode->mode))) {
+        pthread_mutex_unlock(&parent_inode->lock);
+        pthread_mutex_unlock(&inode->lock);
+        request->status = S_ISDIR(inode->mode) ? CHIMERA_VFS_EISDIR : CHIMERA_VFS_ENOTDIR;
+        request->complete(request);
+        return;
+    }
+
     if (S_ISDIR(inode->mode) && !rb_tree_empty(&inode->dir.dirents)) {
         pthread_mutex_unlock(&parent_inode->lock);
         pthread_mutex_unlock(&inode->lock);
@@ -4864,13 +4876,40 @@ memfs_rename_at(
             return;
         }
 
-        /* Destination exists - check if we can replace it */
-        existing_inode = memfs_inode_get_inum(shared, existing_dirent->inum, existing_dirent->gen);
+        /* Destination exists - check if we can replace it.
+         *
+         * The destination name may resolve to a directory we already hold
+         * locked -- e.g. renaming X into a name that currently points at X's
+         * own parent directory.  Re-locking it via memfs_inode_get_inum()
+         * would self-deadlock (wedging this thread while it holds the parent
+         * locks).  Reuse the already-held pointer in that case.  Such an
+         * existing target is always one of the parent directories, hence a
+         * non-empty directory, so the checks below reject the rename
+         * (EISDIR/ENOTDIR on a non-directory source, ENOTEMPTY otherwise)
+         * without ever reaching the replace path -- so existing_inode is
+         * never unlinked or unlocked here when it aliases a parent (the
+         * parent-unlock sites below own that lock). */
+        int existing_is_parent = 0;
+
+        if (existing_dirent->inum == old_parent_inode->inum &&
+            existing_dirent->gen == old_parent_inode->gen) {
+            existing_inode     = old_parent_inode;
+            existing_is_parent = 1;
+        } else if (cmp != 0 &&
+                   existing_dirent->inum == new_parent_inode->inum &&
+                   existing_dirent->gen == new_parent_inode->gen) {
+            existing_inode     = new_parent_inode;
+            existing_is_parent = 1;
+        } else {
+            existing_inode = memfs_inode_get_inum(shared, existing_dirent->inum, existing_dirent->gen);
+        }
 
         if (existing_inode) {
             /* Cannot rename a directory over a non-directory or vice versa */
             if (S_ISDIR(child_inode->mode) != S_ISDIR(existing_inode->mode)) {
-                pthread_mutex_unlock(&existing_inode->lock);
+                if (!existing_is_parent) {
+                    pthread_mutex_unlock(&existing_inode->lock);
+                }
                 pthread_mutex_unlock(&child_inode->lock);
                 pthread_mutex_unlock(&old_parent_inode->lock);
                 if (cmp != 0) {
@@ -4884,7 +4923,9 @@ memfs_rename_at(
             /* Cannot replace non-empty directory */
             if (S_ISDIR(existing_inode->mode) &&
                 !rb_tree_empty(&existing_inode->dir.dirents)) {
-                pthread_mutex_unlock(&existing_inode->lock);
+                if (!existing_is_parent) {
+                    pthread_mutex_unlock(&existing_inode->lock);
+                }
                 pthread_mutex_unlock(&child_inode->lock);
                 pthread_mutex_unlock(&old_parent_inode->lock);
                 if (cmp != 0) {
@@ -4895,11 +4936,24 @@ memfs_rename_at(
                 return;
             }
 
-            /* Remove the existing destination entry and decrement link count */
+            /* Remove the existing destination entry and drop its link.  If that
+             * was its last link and no open handle still references it, free the
+             * clobbered inode -- bumping its generation so a stale handle to it
+             * returns ENOENT, exactly as unlink does (memfs_remove_at).  Without
+             * this the clobbered inode leaked and its file handle kept resolving
+             * after the rename that replaced it. */
             rb_tree_remove(&new_parent_inode->dir.dirents, &existing_dirent->node);
-            existing_inode->nlink--;
             if (S_ISDIR(existing_inode->mode)) {
                 new_parent_inode->nlink--;
+                existing_inode->nlink = 0;
+            } else {
+                existing_inode->nlink--;
+            }
+            if (existing_inode->nlink == 0) {
+                --existing_inode->refcnt;
+                if (existing_inode->refcnt == 0) {
+                    memfs_inode_free(thread, existing_inode);
+                }
             }
             pthread_mutex_unlock(&existing_inode->lock);
             memfs_dirent_free(thread, existing_dirent);
@@ -4989,6 +5043,20 @@ memfs_link_at(
     if (!S_ISDIR(parent_inode->mode)) {
         pthread_mutex_unlock(&parent_inode->lock);
         request->status = CHIMERA_VFS_ENOTDIR;
+        request->complete(request);
+        return;
+    }
+
+    /* If the link target's handle is the parent directory itself, the
+     * memfs_inode_get_fh() below would re-lock parent_inode's non-recursive
+     * mutex and self-deadlock (wedging this thread while it holds the lock).
+     * The parent passed the S_ISDIR check above, so the target is a
+     * directory: reject it as EISDIR (as the S_ISDIR(inode->mode) path below
+     * would) without taking the lock a second time. */
+    if (request->fh_len == request->link_at.dir_fhlen &&
+        memcmp(request->fh, request->link_at.dir_fh, request->fh_len) == 0) {
+        pthread_mutex_unlock(&parent_inode->lock);
+        request->status = CHIMERA_VFS_EISDIR;
         request->complete(request);
         return;
     }

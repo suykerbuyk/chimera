@@ -138,6 +138,23 @@ struct chimera_vfs_mount_options {
  * symlink-leaf semantics. */
 #define CHIMERA_VFS_OPEN_STOP_SYMLINK   (1U << 9)
 
+/* remove_at flags: an optional assertion about the target's type, letting the
+ * single VFS remove op express the rmdir(2)/RMDIR vs unlink(2)/REMOVE
+ * distinction the callers know but the op otherwise loses.  Enforcing backends
+ * (memfs, cairn, diskfs) reject a mismatch (ENOTDIR when ISDIR is set on a
+ * non-directory, EISDIR when ISNOTDIR is set on a directory); passthrough
+ * backends (linux, io_uring) use it to choose unlinkat's AT_REMOVEDIR flag.
+ * With neither set the op removes whatever the name resolves to (legacy
+ * behavior). */
+#define CHIMERA_VFS_REMOVE_ISDIR        (1U << 0)  /* target must be a directory */
+#define CHIMERA_VFS_REMOVE_ISNOTDIR     (1U << 1)  /* target must not be a directory */
+/* The caller wants the VFS to recall any cross-protocol caching holder on the
+ * victim before the unlink.  When set (and caching is enabled and no child_fh
+ * was supplied), the remove path resolves the name to its FH and drives a
+ * synchronous recall.  Callers with their own recall scheme (e.g. NFSv4, which
+ * breaks the delegation and returns NFS4ERR_DELAY) leave it clear. */
+#define CHIMERA_VFS_REMOVE_RECALL       (1U << 2)
+
 /* Allocate flags */
 #define CHIMERA_VFS_ALLOCATE_DEALLOCATE 0x01
 
@@ -573,6 +590,7 @@ struct chimera_vfs_request {
             int                             pathlen;
             int                             parent_len;
             int                             name_offset;
+            unsigned int                    flags; /* CHIMERA_VFS_REMOVE_* type assertion */
             struct chimera_vfs_open_handle *parent_handle;
             chimera_vfs_remove_callback_t   callback;
             void                           *private_data;
@@ -855,6 +873,7 @@ struct chimera_vfs_request {
             const char                     *name;
             int                             namelen;
             uint64_t                        name_hash;
+            uint32_t                        flags;        /* CHIMERA_VFS_REMOVE_* type assertion */
             const uint8_t                  *child_fh;     /* Optional: child FH if known */
             int                             child_fh_len; /* 0 if child_fh not provided */
             /* Inode-scoped removal: when set (with child_fh), the backend MUST
@@ -911,8 +930,11 @@ struct chimera_vfs_request {
             uint64_t                 new_name_hash;
             const char              *new_name;
             int                      new_namelen;
+            unsigned int             flags;  /* CHIMERA_VFS_REMOVE_* (RECALL) */
             const uint8_t           *target_fh; /* Optional: target FH if known (for silly rename) */
             int                      target_fh_len; /* 0 if target_fh not provided */
+            /* Backing store for a target FH the VFS resolved itself (RECALL). */
+            uint8_t                  resolved_target_fh[CHIMERA_VFS_FH_SIZE];
             uint8_t                  source_fh[CHIMERA_VFS_FH_SIZE]; /* resolved source FH, for delegation recall */
             int                      source_fh_len; /* 0 if source FH could not be resolved */
             /* SMB3 directory-lease self-exemption (see link_at): spare the dir
@@ -1552,6 +1574,12 @@ struct chimera_vfs {
     struct chimera_vfs_close_thread       close_thread;
     struct chimera_vfs_metrics            metrics;
     enum chimera_tcp_flavor               tcp_flavor;
+    /* True when any cross-protocol caching lease can exist (NFSv4
+     * delegations, SMB2 leases, or SMB oplocks are enabled).  Gates the
+     * name->FH resolution the remove/rename paths do so that an unlink of a
+     * name another protocol caches recalls that holder first.  When clear
+     * (single-protocol deployments) the extra lookup is skipped. */
+    int                                   caching_enabled;
     int                                   machine_name_len;
     char                                  machine_name[256];
 };
@@ -1620,6 +1648,15 @@ void
 chimera_vfs_set_tcp_flavor(
     struct chimera_vfs     *vfs,
     enum chimera_tcp_flavor flavor);
+
+/* Declare whether any cross-protocol caching lease can exist (NFSv4
+ * delegations / SMB2 leases / SMB oplocks enabled).  When set, the VFS
+ * remove/rename paths resolve a by-name victim to its FH so a caching holder
+ * is recalled before the namespace change; when clear the lookup is skipped. */
+void
+chimera_vfs_set_caching_enabled(
+    struct chimera_vfs *vfs,
+    int                 enabled);
 
 /* Get the root pseudo-filesystem's file handle */
 void

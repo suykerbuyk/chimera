@@ -321,6 +321,7 @@ chimera_s3_part_destroy_open_dir_callback(
         0,
         0,
         0,
+        0,
         NULL,
         chimera_s3_part_destroy_remove_callback,
         ctx);
@@ -2451,6 +2452,7 @@ chimera_s3_complete_finalize(struct chimera_s3_complete_ctx *ctx)
             request->name,
             request->name_len,
             NULL,
+            0,
             0,
             0,
             0,
