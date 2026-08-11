@@ -433,6 +433,115 @@ tasks:
       - from: /dist
         to: coverage_report
 
+  # smbtorture_explore: the FULL smbtorture matrix as a measurement, not a gate.
+  # The ctest legs only ever run the enabled baseline -- add_smbtorture_backend_
+  # tests() registers a ctest only for subtests listed in SMBTORTURE_ENABLED_
+  # <backend> -- so the currently-failing cells are not ctests at all and CI
+  # retains nothing about them.  This leg runs every (backend, subtest) cell via
+  # tools/smbtorture/regen.sh --report-only and publishes results.txt, a
+  # baseline-drift report, and one log per non-passing cell, so the gap between
+  # the gate and the catalog is a downloadable artifact instead of something a
+  # human has to reproduce locally.
+  #
+  # Informational, like ctest_coverage: regen.sh's exit status is swallowed and
+  # `compare` runs without --fail-on-newly-failing, so a red cell never fails the
+  # leg (ctest_debug/ctest_release remain the pass/fail gate).  It is also far too
+  # expensive for an MR -- ~3900 cells, each with a 300s ceiling -- so the gitlab
+  # job runs it only on a dedicated schedule (see .gitlab-ci.yml rules_explore).
+  #
+  # Retrieve the results with:
+  #   qb assets download --strip -p chimera -t <QB_TAG> \
+  #       --asset-name smbtorture_explore/amd64/results.tar.gz --output-dir .
+  #
+  # Scope a narrow investigation instead of paying for the whole matrix with:
+  #   qb -V SMBTORTURE_BACKENDS=memfs -V SMBTORTURE_FILTER='smb2\.streams' \
+  #       smbtorture_explore
+  #
+  # NEVER commit a regen of the generated block in
+  # src/server/smb/tests/CMakeLists.txt from the gitlab side.  Both forks track
+  # ubuntu 26.04 / samba 4.23, so the catalog and the ENABLED_* lists agree
+  # exactly; a gitlab-side regen that diffs SMBTORTURE_SUITES or
+  # SMBTORTURE_ENABLED_<upstream backend> is a signal to push the change upstream
+  # -- or a symptom of Samba drift between builders/dev/Dockerfile and upstream's
+  # .devcontainer/Dockerfile -- not something to land locally.  This leg passes
+  # --report-only, which leaves CMakeLists.txt untouched.
+  smbtorture_explore:
+    type: run_container
+    architecture: [ amd64 ]
+    image: chimera-dev
+    context: .
+    empty_dir:
+      - /build
+    privileged: true
+    variables:
+      SMBTORTURE_BACKENDS: ""
+      SMBTORTURE_FILTER: ""
+      SMBTORTURE_PARALLEL: ""
+    commands:
+      - cd /build
+      - export LC_ALL=C
+      # regen.sh reads these as env fallbacks (SMBTORTURE_BACKENDS /
+      # SMBTORTURE_FILTER / SMBTORTURE_PARALLEL), each via ${VAR:-default}, so an
+      # empty value means "the documented default": the whole backend list, no
+      # filter, parallel=12.  Unlike the CTEST_FILTER convention (where the value
+      # is pasted unquoted onto a ctest command line and the CALLER has to
+      # single-quote any shell metacharacter), the quotes live here -- so a filter
+      # regex containing ( or | is inert no matter how it was passed to qb.
+      - export SMBTORTURE_BACKENDS='${SMBTORTURE_BACKENDS}'
+      - export SMBTORTURE_FILTER='${SMBTORTURE_FILTER}'
+      - export SMBTORTURE_PARALLEL='${SMBTORTURE_PARALLEL}'
+      - echo "SMBTORTURE_BACKENDS=${SMBTORTURE_BACKENDS} SMBTORTURE_FILTER=${SMBTORTURE_FILTER} SMBTORTURE_PARALLEL=${SMBTORTURE_PARALLEL}"
+      - mkdir -p /dist /out
+      # REQUIRE_NETNS_TESTS doubles as an assertion that this container is
+      # privileged enough for the netns wrapper every cell runs through.
+      - >
+        cmake -G Ninja -DCMAKE_BUILD_TYPE=Release
+        -DREQUIRE_NETNS_TESTS=ON
+        -DKVM_TESTING=OFF
+        -S /context -B /build
+      # regen.sh drives the smbtorture_test binary directly rather than ctest, so
+      # the driver is the only target the matrix needs.
+      - ninja --quiet smbtorture_test
+      # Absolute path on purpose: regen.sh derives the repo root from $0 and cds
+      # there.  --build-dir is mandatory here -- its own probe looks for
+      # build/Release and /build/Release, but this task configures with -B /build,
+      # so the binary is at /build/src/server/smb/tests/smbtorture_test.
+      - >
+        /context/tools/smbtorture/regen.sh --report-only
+        --build-dir /build --out-dir /out ||
+        echo "regen.sh reported failures; continuing"
+      # --subs makes the catalog this run actually covered the denominator,
+      # instead of the SMBTORTURE_SUITES checked into CMakeLists.txt.  regen.sh
+      # writes measured-catalog.txt on every run, scoped or not, so the file is
+      # always there.  Two reasons it matters: a SMBTORTURE_FILTER/BACKENDS run
+      # otherwise reports "15/551 cells measured" against the whole catalog, and
+      # -- the real one -- a subtest the container's smbtorture lists but the
+      # checked-in catalog lacks is invisible without it, since compare only
+      # walks the catalog.  That is exactly the Samba drift this leg is here to
+      # surface.
+      - >
+        python3 /context/tools/smbtorture/regen.py compare
+        --results /out/results.txt
+        --subs /out/measured-catalog.txt
+        --cmake /context/src/server/smb/tests/CMakeLists.txt
+        > /dist/smbtorture-report.txt 2>&1 ||
+        echo "regen.py compare reported drift; continuing"
+      - cat /dist/smbtorture-report.txt
+      # /out holds one smbt-fail.<backend>.<subtest>.log per non-passing cell --
+      # hundreds of files, and everything under the assets dir is published
+      # individually.  So publish three named artifacts instead: the raw
+      # classifications, the drift report, and a tarball of the whole run.
+      - cp /out/results.txt /dist/results.txt
+      - tar -C /out -czf /dist/results.tar.gz .
+    dependencies:
+      builder:
+        project: chimera
+        task: chimera-dev
+        tag: develop
+    assets:
+      - from: /dist
+        to: smbtorture_explore
+
   ctest_kvm:
     type: run_container
     architecture: [ amd64 ]
@@ -626,6 +735,9 @@ aliases:
   coverage:
     - chimera-dev
     - ctest_coverage
+  smbtorture:
+    - chimera-dev
+    - smbtorture_explore
   chimera:
     - builders
     - build

@@ -35,6 +35,12 @@ workflow:
 #   rules_full  -- the gate: runs automatically in the merge train (which tests
 #                  the merged result) and nightly, and is available as an opt-in
 #                  (manual) job on an MR push.  Used by ctest.
+#   rules_explore -- nightly only: the full smbtorture matrix, ~3900 cells and
+#                  purely informational.  None of the sets above fits because
+#                  they all also fire on MR or train events, and a full matrix
+#                  has no business gating a merge.  A measured run is ~28min
+#                  (3930 cells at parallel=12, no cell reaching its 300s
+#                  ceiling), so it sits comfortably in the nightly.
 #
 # chimera-dev has its own rules (below): it is both a test dependency (MR push,
 # train, nightly) AND the image published on develop, so it also runs on the
@@ -59,6 +65,9 @@ workflow:
   - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     when: manual
     allow_failure: true
+
+.rules_explore: &rules_explore
+  - if: '$CI_PIPELINE_SOURCE == "schedule"'
 
 stages:
   - builders
@@ -254,6 +263,57 @@ coverage:
       - ctest_coverage_amd64.log
       - coverage-report.txt
       - report.tar.gz
+    expire_in: 1 week
+
+# Full-matrix smbtorture measurement.  The gating ctest legs only run the enabled
+# baseline, so this is the only thing in CI that measures the currently-failing
+# cells; it publishes results.txt, a baseline-drift report, and one log per
+# non-passing cell.  Informational (the qb task swallows cell failures), so as
+# with coverage a script failure means a build/report problem and is not retried.
+#
+# Nightly only -- never on an MR or in the train, since a full matrix has no
+# business gating a merge.  A narrow run can be driven from the schedule by
+# setting SMBTORTURE_BACKENDS / SMBTORTURE_FILTER (scheduled-pipeline variables
+# outrank the job-level defaults below).
+#
+# Retrieve the results outside CI with:
+#   qb assets download --strip -p chimera -t <QB_TAG> \
+#       --asset-name smbtorture_explore/amd64/results.tar.gz --output-dir .
+smbtorture_explore:
+  stage: check
+  needs: [ chimera-dev ]
+  rules: *rules_explore
+  # A measured full matrix is ~28min (3930 cells at parallel=12, no cell hitting
+  # its 300s ceiling), so this is ~4x headroom rather than a real expectation --
+  # enough that a slow runner never trips it, tight enough that a wedged leg
+  # fails the same night instead of holding a runner until morning.
+  timeout: 2h
+  retry:
+    max: 1
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
+  variables:
+    SMBTORTURE_BACKENDS: ""
+    SMBTORTURE_FILTER: ""
+    SMBTORTURE_PARALLEL: ""
+  script:
+    - >
+      ${RUN_QB} -a amd64 -v smbtorture_explore
+      -V SMBTORTURE_BACKENDS="${SMBTORTURE_BACKENDS}"
+      -V SMBTORTURE_FILTER="${SMBTORTURE_FILTER}"
+      -V SMBTORTURE_PARALLEL="${SMBTORTURE_PARALLEL}"
+      &> smbtorture_explore_amd64.log
+    - qb assets download --strip -p ${QB_PROJECT} -t ${QB_TAG} --asset-name smbtorture_explore/amd64/results.tar.gz --output-dir .
+    - qb assets download --strip -p ${QB_PROJECT} -t ${QB_TAG} --asset-name smbtorture_explore/amd64/smbtorture-report.txt --output-dir .
+  after_script:
+    - tail -1000 smbtorture_explore_amd64.log || true
+  artifacts:
+    when: always
+    paths:
+      - smbtorture_explore_amd64.log
+      - smbtorture-report.txt
+      - results.tar.gz
     expire_in: 1 week
 
 ctest_kvm:
