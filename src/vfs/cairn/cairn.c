@@ -9,7 +9,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/stat.h>
-#include <endian.h>
+#include "common/platform.h"
 #include <rocksdb/c.h>
 #include "rocksdb_compat.h"
 
@@ -183,6 +183,10 @@ struct cairn_inode {
     struct timespec btime;
     uint32_t        dos_attributes;
     uint64_t        change;       /* native monotonic change counter */
+    /* SMB AllocationSize reservation (see cairn_apply_attrs).  Extends the
+     * stored record; the format is unversioned and pre-existing databases are
+     * not migrated. */
+    uint64_t        alloc_size;
 };
 
 struct cairn_inode_handle {
@@ -1214,6 +1218,7 @@ cairn_init(
         inode.gen         = 1;
         inode.size        = 4096;
         inode.space_used  = 4096;
+        inode.alloc_size  = 0;
         inode.refcnt      = 1;
         inode.uid         = 0;
         inode.gid         = 0;
@@ -1679,6 +1684,9 @@ cairn_alloc_inum(
     inode->inum   = (id << 8) + thread->thread_id;
     inode->gen    = 1;
     inode->change = 0;
+    /* Creation sites initialize the remaining fields individually; a fresh
+     * inode starts with no AllocationSize reservation. */
+    inode->alloc_size = 0;
 } /* cairn_alloc_inum */
 
 static inline void
@@ -1696,19 +1704,23 @@ cairn_map_attrs(
     }
 
     if (attr->va_req_mask & CHIMERA_VFS_ATTR_MASK_STAT) {
-        attr->va_set_mask  |= CHIMERA_VFS_ATTR_MASK_STAT;
-        attr->va_mode       = inode->mode;
-        attr->va_nlink      = inode->nlink;
-        attr->va_uid        = inode->uid;
-        attr->va_gid        = inode->gid;
-        attr->va_size       = inode->size;
-        attr->va_space_used = inode->space_used;
-        attr->va_atime      = inode->atime;
-        attr->va_mtime      = inode->mtime;
-        attr->va_ctime      = inode->ctime;
-        attr->va_ino        = inode->inum;
-        attr->va_dev        = (42UL << 32) | 42;
-        attr->va_rdev       = inode->rdev;
+        attr->va_set_mask |= CHIMERA_VFS_ATTR_MASK_STAT;
+        attr->va_mode      = inode->mode;
+        attr->va_nlink     = inode->nlink;
+        attr->va_uid       = inode->uid;
+        attr->va_gid       = inode->gid;
+        attr->va_size      = inode->size;
+        /* An SMB AllocationSize reservation is reported as space consumed
+         * (smb_alloc_size derives from va_space_used) even before writes
+         * materialize it, matching memfs. */
+        attr->va_space_used = inode->space_used > inode->alloc_size ?
+            inode->space_used : inode->alloc_size;
+        attr->va_atime = inode->atime;
+        attr->va_mtime = inode->mtime;
+        attr->va_ctime = inode->ctime;
+        attr->va_ino   = inode->inum;
+        attr->va_dev   = (42UL << 32) | 42;
+        attr->va_rdev  = inode->rdev;
 
         /* cairn persists DOS attributes natively, so report them alongside
          * stat (matching memfs). */
@@ -1838,9 +1850,36 @@ cairn_apply_attrs(
         inode->gid         = attr->va_gid;
     }
 
+    /* POSIX chown(): changing (or restating) a regular file's owner or group
+    * clears set-user-ID, and set-group-ID when group-executable (a S_ISGID
+    * bit without group-exec marks mandatory locking and is preserved).  This
+    * applies to privileged callers too, matching Linux.  An explicit mode in
+    * the same setattr wins outright, so the clear only fires without one. */
+    if ((set_mask & (CHIMERA_VFS_ATTR_UID | CHIMERA_VFS_ATTR_GID)) &&
+        !(set_mask & CHIMERA_VFS_ATTR_MODE) &&
+        S_ISREG(inode->mode)) {
+        inode->mode &= ~(uint32_t) S_ISUID;
+        if (inode->mode & S_IXGRP) {
+            inode->mode &= ~(uint32_t) S_ISGID;
+        }
+    }
+
     if (set_mask & CHIMERA_VFS_ATTR_SIZE) {
         attr->va_set_mask |= CHIMERA_VFS_ATTR_SIZE;
         inode->size        = attr->va_size;
+        /* A reservation only holds while it exceeds the live data; once EOF is
+         * set at/above it the reservation is subsumed and no longer separate. */
+        if (inode->alloc_size <= inode->size) {
+            inode->alloc_size = 0;
+        }
+    }
+
+    if (set_mask & CHIMERA_VFS_ATTR_ALLOC_SIZE) {
+        attr->va_set_mask |= CHIMERA_VFS_ATTR_ALLOC_SIZE;
+        /* Reserve only the part of the allocation beyond the current EOF; a
+         * request at/below EOF is already satisfied by real usage. */
+        inode->alloc_size = attr->va_alloc_size > inode->size ?
+            attr->va_alloc_size : 0;
     }
 
     if (set_mask & CHIMERA_VFS_ATTR_ATIME) {
@@ -1953,6 +1992,13 @@ cairn_setattr(
         uint64_t old_size = inode->size;
 
         cairn_punch_hole(thread, shared, inode, new_size, old_size - new_size);
+    }
+
+    /* POSIX kill-priv: truncation by an unprivileged caller clears
+     * set-user-ID (and set-group-ID when group-executable), exactly like
+     * the write path does. */
+    if (request->setattr.set_attr->va_set_mask & CHIMERA_VFS_ATTR_SIZE) {
+        inode->mode = chimera_vfs_killpriv_mode(request->cred, inode->mode);
     }
 
     /* cairn_apply_attrs() rewrites set_attr->va_set_mask down to the scalar
@@ -2318,13 +2364,17 @@ cairn_mkdir_at(
     inode.size        = 4096;
     inode.space_used  = 4096;
     inode.uid         = request->cred->uid;
-    inode.gid         = request->cred->gid;
-    inode.nlink       = 2;
-    inode.rdev        = 0;
-    inode.mode        = S_IFDIR | 0755;
-    inode.atime       = now;
-    inode.mtime       = now;
-    inode.ctime       = now;
+    /* POSIX: a set-group-ID parent directory forces the new node's group. */
+    inode.gid = (parent_inode->mode & S_ISGID) ?
+        parent_inode->gid : request->cred->gid;
+    inode.nlink  = 2;
+    inode.refcnt = 1;        /* open reference; without it rmdir underflows the
+                              * count and never frees the inode (stale handle) */
+    inode.rdev   = 0;
+    inode.mode   = S_IFDIR | 0755;
+    inode.atime  = now;
+    inode.mtime  = now;
+    inode.ctime  = now;
     inode.change++;
     inode.btime          = now;
     inode.dos_attributes = 0;
@@ -2432,12 +2482,16 @@ cairn_mknod_at(
     inode.size        = 0;
     inode.space_used  = 0;
     inode.uid         = request->cred->uid;
-    inode.gid         = request->cred->gid;
-    inode.nlink       = 1;
-    inode.rdev        = 0;
-    inode.atime       = now;
-    inode.mtime       = now;
-    inode.ctime       = now;
+    /* POSIX: a set-group-ID parent directory forces the new node's group. */
+    inode.gid = (parent_inode->mode & S_ISGID) ?
+        parent_inode->gid : request->cred->gid;
+    inode.nlink  = 1;
+    inode.refcnt = 1;        /* open reference (see cairn_open_at); without it
+                              * unlink underflows the count and leaks the inode */
+    inode.rdev   = 0;
+    inode.atime  = now;
+    inode.mtime  = now;
+    inode.ctime  = now;
     inode.change++;
     inode.btime          = now;
     inode.dos_attributes = 0;
@@ -2968,13 +3022,16 @@ cairn_open_at(
         new_inode.size       = 0;
         new_inode.space_used = 0;
         new_inode.uid        = request->cred->uid;
-        new_inode.gid        = request->cred->gid;
-        new_inode.nlink      = 1;
-        new_inode.rdev       = 0;
-        new_inode.mode       = S_IFREG |  0644;
-        new_inode.atime      = now;
-        new_inode.mtime      = now;
-        new_inode.ctime      = now;
+        /* POSIX: a set-group-ID parent directory forces the new file's
+         * group. */
+        new_inode.gid = (parent_inode->mode & S_ISGID) ?
+            parent_inode->gid : request->cred->gid;
+        new_inode.nlink = 1;
+        new_inode.rdev  = 0;
+        new_inode.mode  = S_IFREG |  0644;
+        new_inode.atime = now;
+        new_inode.mtime = now;
+        new_inode.ctime = now;
         new_inode.change++;
         new_inode.btime          = now;
         new_inode.dos_attributes = 0;
@@ -3126,7 +3183,15 @@ cairn_close(
     struct cairn_inode       *inode;
     int                       rc;
 
-    rc = cairn_inode_get_fh(thread, request->fh, request->fh_len, &ih);
+    /* Close names an open instance, not a path, so resolve it through the
+     * vfs_private cookie this backend returned from open -- for cairn, the
+     * inode number -- rather than through request->fh, which names the object
+     * the handle was opened on.
+     *
+     * Resolving by inum alone (no generation check) is sound because an open
+     * handle holds a refcnt and the branch below only removes an inode once
+     * that reaches zero, so an inum cannot be recycled under a live handle. */
+    rc = cairn_inode_get_inum(thread, request->close.vfs_private, &ih);
 
     if (rc) {
         request->status = CHIMERA_VFS_ENOENT;
@@ -3275,7 +3340,7 @@ cairn_read(
         }
 
         uint64_t extent_start = be64toh(extent_key->offset);
-        uint64_t extent_length;
+        size_t   extent_length;
         rocksdb_iter_value(iter, &extent_length);
         uint64_t extent_end = extent_start + extent_length;
 
@@ -3408,7 +3473,7 @@ cairn_punch_hole(
 
     while (rocksdb_iter_valid(iter)) {
         extent_key = (struct cairn_extent_key *) rocksdb_iter_key(iter, &klen);
-        uint64_t    extent_length;
+        size_t      extent_length;
         const char *extent_data = rocksdb_iter_value(iter, &extent_length);
 
         // Stop if we've moved past this inode
@@ -3872,13 +3937,17 @@ cairn_symlink_at(
     new_inode.size       = request->symlink_at.targetlen;
     new_inode.space_used = request->symlink_at.targetlen;
     new_inode.uid        = request->cred->uid;
-    new_inode.gid        = request->cred->gid;
-    new_inode.nlink      = 1;
-    new_inode.rdev       = 0;
-    new_inode.mode       = S_IFLNK | 0755;
-    new_inode.atime      = now;
-    new_inode.mtime      = now;
-    new_inode.ctime      = now;
+    /* POSIX: a set-group-ID parent directory forces the new node's group. */
+    new_inode.gid = (parent_inode->mode & S_ISGID) ?
+        parent_inode->gid : request->cred->gid;
+    new_inode.nlink  = 1;
+    new_inode.refcnt = 1;       /* open reference (see cairn_open_at); without it
+                                 * unlink underflows the count and leaks the inode */
+    new_inode.rdev   = 0;
+    new_inode.mode   = S_IFLNK | 0755;
+    new_inode.atime  = now;
+    new_inode.mtime  = now;
+    new_inode.ctime  = now;
     new_inode.change++;
     new_inode.btime          = now;
     new_inode.dos_attributes = 0;
@@ -4025,8 +4094,6 @@ cairn_rename_at(
      * commit window.  Neither is in this change; for now we rely on the
      * fh-hash routing for correctness and document the gap.
      */
-    (void) shared;
-
     clock_gettime(CLOCK_REALTIME, &now);
     cmp = cairn_fh_compare(request->fh,
                            request->fh_len,
@@ -4189,6 +4256,12 @@ cairn_rename_at(
         // Target exists
         // Per POSIX: if old and new refer to same file, return success with no action
         if (new_dh.dirent->inum == old_dirent_value->inum) {
+            /* No-op rename (onto itself or a hardlink pair): nothing changes,
+            * so the dir WCC before == after == the parents' current attrs. */
+            cairn_map_attrs(shared, &request->rename_at.r_fromdir_pre_attr, old_parent_inode);
+            cairn_map_attrs(shared, &request->rename_at.r_todir_pre_attr, new_parent_inode);
+            cairn_map_attrs(shared, &request->rename_at.r_fromdir_post_attr, old_parent_inode);
+            cairn_map_attrs(shared, &request->rename_at.r_todir_post_attr, new_parent_inode);
             cairn_dirent_handle_release(&old_dh);
             cairn_dirent_handle_release(&new_dh);
             cairn_inode_handle_release(&target_ih);
@@ -4285,6 +4358,12 @@ cairn_rename_at(
     new_dirent_value.name_len = request->rename_at.new_namelen;
     memcpy(new_dirent_value.name, request->rename_at.new_name, request->rename_at.new_namelen);
 
+    /* Snapshot both parents before the rename mutates their mtime/ctime, for
+     * the RENAME dir WCC (before).  For a same-directory rename both handles
+     * name the same inode. */
+    cairn_map_attrs(shared, &request->rename_at.r_fromdir_pre_attr, old_parent_inode);
+    cairn_map_attrs(shared, &request->rename_at.r_todir_pre_attr, new_parent_inode);
+
     // Update directory entries and parent inodes
     cairn_remove_dirent(thread, &old_dirent_key);
     cairn_put_dirent(thread, &new_dirent_key, &new_dirent_value);
@@ -4300,6 +4379,10 @@ cairn_rename_at(
         old_parent_inode->nlink--;
         new_parent_inode->nlink++;
     }
+
+    /* Post-rename dir WCC (after). */
+    cairn_map_attrs(shared, &request->rename_at.r_fromdir_post_attr, old_parent_inode);
+    cairn_map_attrs(shared, &request->rename_at.r_todir_post_attr, new_parent_inode);
 
     cairn_put_inode(thread, old_parent_inode);
     if (cmp != 0) {
@@ -4392,12 +4475,21 @@ cairn_link_at(
     dirent_value.name_len = request->link_at.namelen;
     memcpy(dirent_value.name, request->link_at.name, request->link_at.namelen);
 
+    /* Directory WCC (before), captured while the parent's mtime is still the
+     * pre-link value. */
+    cairn_map_attrs(shared, &request->link_at.r_dir_pre_attr, parent_inode);
+
     target_inode->nlink++;
     target_inode->ctime = now;
     target_inode->change++;
     parent_inode->mtime = now;
     parent_inode->ctime = now;
     parent_inode->change++;
+
+    /* The linked file's post-op attributes (new nlink) and the directory WCC
+     * (after). */
+    cairn_map_attrs(shared, &request->link_at.r_attr, target_inode);
+    cairn_map_attrs(shared, &request->link_at.r_dir_post_attr, parent_inode);
 
     cairn_put_dirent(thread, &dirent_key, &dirent_value);
     cairn_put_inode(thread, parent_inode);
@@ -4434,11 +4526,27 @@ cairn_commit_op(
     struct chimera_vfs_request *request,
     void                       *private_data)
 {
-    (void) shared;
+    struct cairn_inode_handle ih;
+    int                       rc;
+
     (void) private_data;
     thread->data_needs_sync      = 1;
     thread->needs_data_wal_flush = 1;
-    request->status              = CHIMERA_VFS_OK;
+
+    /* COMMIT does not modify the file, so its pre- and post-op file WCC are
+     * both the file's current attributes.  Resolve the handle to fill them (and
+     * to reject a stale handle). */
+    rc = cairn_inode_get_fh(thread, request->fh, request->fh_len, &ih);
+    if (unlikely(rc)) {
+        request->status = CHIMERA_VFS_ENOENT;
+        request->complete(request);
+        return;
+    }
+    cairn_map_attrs(shared, &request->commit.r_pre_attr, ih.inode);
+    cairn_map_attrs(shared, &request->commit.r_post_attr, ih.inode);
+    cairn_inode_handle_release(&ih);
+
+    request->status = CHIMERA_VFS_OK;
     cairn_queue_request(thread, request);
 } /* cairn_commit_op */
 

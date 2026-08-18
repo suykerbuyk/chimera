@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2025 Chimera-NAS Project Contributors
+// SPDX-FileCopyrightText: 2025-2026 Chimera-NAS Project Contributors
 //
 // SPDX-License-Identifier: LGPL-2.1-only
 
@@ -90,16 +90,21 @@ chimera_posix_dup2(
     /* Increment the opencnt on the source handle */
     chimera_dup_handle(worker->client_thread, handle);
 
-    /* Set up the new fd entry */
+    /* Set up the new fd entry. */
     pthread_mutex_lock(&new_entry->lock);
     new_entry->handle      = handle;
-    new_entry->offset      = 0;
     new_entry->flags       = 0;
     new_entry->refcnt      = 0;
     new_entry->eof_flag    = 0;
     new_entry->error_flag  = 0;
     new_entry->ungetc_char = -1;
     pthread_mutex_unlock(&new_entry->lock);
+
+    /* POSIX: the duplicate SHARES the source's open file description --
+     * one file offset, one set of status flags -- releasing whatever
+     * description the target slot held (a reclaimed free-list slot holds
+     * none; an implicitly-closed target's description is dropped here). */
+    chimera_posix_ofd_adopt(posix, new_entry, old_entry);
 
     chimera_posix_fd_release(old_entry, 0);
 

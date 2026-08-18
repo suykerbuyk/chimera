@@ -43,7 +43,7 @@ chimera_nfs4_lockt_probe(
      * type is NFS4ERR_INVAL. */
     if ((attr->va_set_mask & CHIMERA_VFS_ATTR_MODE) && !S_ISREG(attr->va_mode)) {
         chimera_vfs_release(req->thread->vfs_thread, handle);
-        res->status = S_ISDIR(attr->va_mode) ? NFS4ERR_ISDIR : NFS4ERR_INVAL;
+        res->status = chimera_nfs4_data_nonreg_status(attr->va_mode);
         chimera_nfs4_compound_complete(req, res->status);
         return;
     }
@@ -88,9 +88,9 @@ chimera_nfs4_lockt_probe(
         res->denied.length   = conflict ? conflict->length : UINT64_MAX;
         res->denied.locktype = (conflict && (conflict->mode.granted & CHIMERA_VFS_LEASE_MODE_W))
                                ? WRITE_LT : READ_LT;
-        res->denied.owner.clientid   = 0;
-        res->denied.owner.owner.len  = 0;
-        res->denied.owner.owner.data = NULL;
+        nfs4_fill_denied_owner(&req->thread->shared->nfs4_shared_clients,
+                               conflict, &res->denied.owner,
+                               req->encoding->dbuf);
     }
 
     chimera_vfs_state_put(vfs_state, file_state);

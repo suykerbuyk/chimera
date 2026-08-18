@@ -96,6 +96,7 @@ chimera_nfs_init(
     shared->servers_map = NULL;
 
     /* Default until the common tcp_flavor is observed at mount time. */
+    shared->tcp_flavor   = CHIMERA_TCP_FLAVOR_PLAIN;
     shared->tcp_protocol = EVPL_STREAM_SOCKET_TCP;
 
     PORTMAP_V2_init(&shared->portmap_v2);
@@ -167,6 +168,12 @@ chimera_nfs_protocol_to_string(enum evpl_protocol_id protocol)
             return "RDMA-RC";
         case EVPL_STREAM_SOCKET_TLS:
             return "TLS";
+        case EVPL_STREAM_SOCKET_UNIX:
+            return "UNIX";
+        case EVPL_STREAM_INPROC:
+            return "INPROC";
+        case EVPL_DATAGRAM_INPROC:
+            return "INPROC-DGRAM";
         case EVPL_NUM_PROTO:
             return "UNKNOWN";
     } /* switch */
@@ -312,7 +319,8 @@ chimera_nfs_dispatch(
     if (request->opcode == CHIMERA_VFS_OP_MOUNT) {
         /* Resolve the common TCP flavor for outbound connections from the
          * VFS once we have a thread/vfs in hand. Constant per process. */
-        shared->tcp_protocol = chimera_tcp_flavor_to_protocol(request->thread->vfs->tcp_flavor);
+        shared->tcp_flavor   = request->thread->vfs->tcp_flavor;
+        shared->tcp_protocol = chimera_tcp_flavor_to_protocol(shared->tcp_flavor);
 
         nfsvers = chimera_nfs_get_mount_version(&request->mount.options);
         if (nfsvers < 0) {
@@ -382,7 +390,7 @@ SYMBOL_EXPORT struct chimera_vfs_module vfs_nfs = {
      * by its upstream RPC reply (it reassigns request->read.iov), so the VFS
      * core must not pre-allocate buffers for it. */
     .capabilities   = CHIMERA_VFS_CAP_OPEN_FILE_REQUIRED | CHIMERA_VFS_CAP_FS | CHIMERA_VFS_CAP_FS_RELATIVE_OP |
-        CHIMERA_VFS_CAP_FS_LOCK | CHIMERA_VFS_CAP_READ_PROVIDES_BUFFERS,
+        CHIMERA_VFS_CAP_FS_LOCK | CHIMERA_VFS_CAP_READ_PROVIDES_BUFFERS | CHIMERA_VFS_CAP_DELEGATES_DAC,
     .init           = chimera_nfs_init,
     .destroy        = chimera_nfs_destroy,
     .thread_init    = chimera_nfs_thread_init,

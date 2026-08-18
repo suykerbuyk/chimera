@@ -789,8 +789,11 @@ diskfs_mkdir_at_alloc_cb(
 
     inode->size       = 4096;
     inode->space_used = 4096;
+    inode->alloc_size = 0;
     inode->uid        = request->cred->uid;
-    inode->gid        = request->cred->gid;
+    /* POSIX: a set-group-ID parent directory forces the new node's group. */
+    inode->gid = (parent->mode & S_ISGID) ?
+        parent->gid : request->cred->gid;
     inode->nlink      = 2;
     inode->mode       = S_IFDIR | 0755;
     inode->atime_sec  = now.tv_sec;
@@ -976,8 +979,11 @@ diskfs_mknod_at_alloc_cb(
 
     inode->size       = 0;
     inode->space_used = 0;
+    inode->alloc_size = 0;
     inode->uid        = request->cred->uid;
-    inode->gid        = request->cred->gid;
+    /* POSIX: a set-group-ID parent directory forces the new node's group. */
+    inode->gid = (parent->mode & S_ISGID) ?
+        parent->gid : request->cred->gid;
     inode->nlink      = 1;
     inode->rdev       = 0;
     inode->atime_sec  = now.tv_sec;
@@ -1880,8 +1886,11 @@ diskfs_open_at_alloc_cb(
 
     inode->size       = 0;
     inode->space_used = 0;
+    inode->alloc_size = 0;
     inode->uid        = request->cred->uid;
-    inode->gid        = request->cred->gid;
+    /* POSIX: a set-group-ID parent directory forces the new node's group. */
+    inode->gid = (parent->mode & S_ISGID) ?
+        parent->gid : request->cred->gid;
     inode->nlink      = 1;
     inode->mode       = S_IFREG | 0644;
     inode->atime_sec  = now.tv_sec;
@@ -2065,6 +2074,7 @@ diskfs_create_unlinked_alloc_cb(
 
     inode->size       = 0;
     inode->space_used = 0;
+    inode->alloc_size = 0;
     inode->uid        = request->cred->uid;
     inode->gid        = request->cred->gid;
     inode->nlink      = 0;         /* anonymous; orphan-recorded below */
@@ -2263,8 +2273,11 @@ diskfs_symlink_at_alloc_cb(
 
     inode->size       = request->symlink_at.targetlen;
     inode->space_used = request->symlink_at.targetlen;
+    inode->alloc_size = 0;
     inode->uid        = request->cred->uid;
-    inode->gid        = request->cred->gid;
+    /* POSIX: a set-group-ID parent directory forces the new node's group. */
+    inode->gid = (parent->mode & S_ISGID) ?
+        parent->gid : request->cred->gid;
     inode->nlink      = 1;
     inode->mode       = S_IFLNK | 0755;
     inode->atime_sec  = now.tv_sec;

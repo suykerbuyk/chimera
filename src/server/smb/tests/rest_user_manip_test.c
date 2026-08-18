@@ -396,8 +396,8 @@ main(
 
     /* Check prerequisites */
     if (system("which smbclient >/dev/null 2>&1") != 0) {
-        fprintf(stderr, "\nERROR: smbclient not found in PATH\n");
-        return EXIT_FAILURE;
+        fprintf(stderr, "\nSKIP: smbclient not found in PATH\n");
+        return 77;   /* ctest SKIP_RETURN_CODE */
     }
     if (system("which curl >/dev/null 2>&1") != 0) {
         fprintf(stderr, "\nERROR: curl not found in PATH\n");
@@ -416,6 +416,7 @@ main(
 
     /* Initialize server configuration */
     config = chimera_server_config_init();
+    chimera_server_config_set_smb_enabled(config, 1);
     chimera_server_config_set_rest_http_port(config, REST_PORT);
 
     /* Initialize server */

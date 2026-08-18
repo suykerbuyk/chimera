@@ -44,6 +44,8 @@
 #include <xxhash.h>     /* XXH_INLINE_ALL set in CMakeLists; header-only */
 
 
+#include "common/platform.h"
+
 #include "common/varint.h"
 
 #include "common/rbtree.h"
@@ -569,6 +571,7 @@ struct diskfs_inode {
     uint32_t                    refcnt;
     uint64_t                    size;
     uint64_t                    space_used;
+    uint64_t                    alloc_size;  /* SMB AllocationSize reservation */
     uint32_t                    mode;
     uint32_t                    nlink;
     uint32_t                    uid;
@@ -867,6 +870,10 @@ struct diskfs_dinode {
     uint64_t change;          /* native monotonic change counter */
     uint64_t ea_size;         /* cached SMB EaSize aggregate (sans +4 overhead) */
     uint32_t ea_count;        /* number of user.* xattrs */
+    /* SMB AllocationSize reservation (see diskfs_apply_attrs).  Appended
+     * within the dinode block; images written before this field read stale
+     * block bytes here (the format is unversioned and not migrated). */
+    uint64_t alloc_size;
 };
 
 
@@ -4863,13 +4870,17 @@ diskfs_map_attrs(
     }
 
     if (attr->va_req_mask & CHIMERA_VFS_ATTR_MASK_STAT) {
-        attr->va_set_mask     |= CHIMERA_VFS_ATTR_MASK_STAT;
-        attr->va_mode          = inode->mode;
-        attr->va_nlink         = inode->nlink;
-        attr->va_uid           = inode->uid;
-        attr->va_gid           = inode->gid;
-        attr->va_size          = inode->size;
-        attr->va_space_used    = inode->space_used;
+        attr->va_set_mask |= CHIMERA_VFS_ATTR_MASK_STAT;
+        attr->va_mode      = inode->mode;
+        attr->va_nlink     = inode->nlink;
+        attr->va_uid       = inode->uid;
+        attr->va_gid       = inode->gid;
+        attr->va_size      = inode->size;
+        /* An SMB AllocationSize reservation is reported as space consumed
+         * (smb_alloc_size derives from va_space_used) even before writes
+         * materialize it, matching memfs. */
+        attr->va_space_used = inode->space_used > inode->alloc_size ?
+            inode->space_used : inode->alloc_size;
         attr->va_atime.tv_sec  = inode->atime_sec;
         attr->va_atime.tv_nsec = inode->atime_nsec;
         attr->va_mtime.tv_sec  = inode->mtime_sec;
@@ -4983,9 +4994,36 @@ diskfs_apply_attrs(
         inode->gid         = attr->va_gid;
     }
 
+    /* POSIX chown(): changing (or restating) a regular file's owner or group
+    * clears set-user-ID, and set-group-ID when group-executable (a S_ISGID
+    * bit without group-exec marks mandatory locking and is preserved).  This
+    * applies to privileged callers too, matching Linux.  An explicit mode in
+    * the same setattr wins outright, so the clear only fires without one. */
+    if ((set_mask & (CHIMERA_VFS_ATTR_UID | CHIMERA_VFS_ATTR_GID)) &&
+        !(set_mask & CHIMERA_VFS_ATTR_MODE) &&
+        S_ISREG(inode->mode)) {
+        inode->mode &= ~(uint32_t) S_ISUID;
+        if (inode->mode & S_IXGRP) {
+            inode->mode &= ~(uint32_t) S_ISGID;
+        }
+    }
+
     if (set_mask & CHIMERA_VFS_ATTR_SIZE) {
         attr->va_set_mask |= CHIMERA_VFS_ATTR_SIZE;
         inode->size        = attr->va_size;
+        /* A reservation only holds while it exceeds the live data; once EOF is
+         * set at/above it the reservation is subsumed and no longer separate. */
+        if (inode->alloc_size <= inode->size) {
+            inode->alloc_size = 0;
+        }
+    }
+
+    if (set_mask & CHIMERA_VFS_ATTR_ALLOC_SIZE) {
+        attr->va_set_mask |= CHIMERA_VFS_ATTR_ALLOC_SIZE;
+        /* Reserve only the part of the allocation beyond the current EOF; a
+         * request at/below EOF is already satisfied by real usage. */
+        inode->alloc_size = attr->va_alloc_size > inode->size ?
+            attr->va_alloc_size : 0;
     }
 
     if (set_mask & CHIMERA_VFS_ATTR_ATIME) {

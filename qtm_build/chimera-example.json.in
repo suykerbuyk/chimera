@@ -1,5 +1,8 @@
 {
     "server": {
+	"nfs_enabled": true,
+	"smb_enabled": true,
+	"s3_enabled": false,
 	"threads": 16,
 	"delegation_threads": 64,
 	"external_portmap": true,
@@ -45,13 +48,5 @@
         "/nfs2": {
             "path": "/memfs_dir/nfs_dir"
         }
-    },
-    "buckets": {
-	"bucket1": {
-	    "path": "/snfs1/buckets"
-	},
-	"bucker2": {
-	    "path": "/memfs_dir/buckets"
-	}
     }
 }

@@ -14,15 +14,70 @@
 
 #include "vfs/vfs.h"
 #include "vfs/vfs_fh.h"
+#include "vfs/vfs_acl.h"
 #include "vfs/vfs_mount_table.h"
 #include "common/logging.h"
 #include "common/misc.h"
 #include "metrics/metrics.h"
 #include "vfs/vfs_dump.h"
 
+/* Canonical access bits an open with the given flags requires against
+ * the target file. */
+static inline uint32_t
+chimera_vfs_open_required_access(unsigned int flags)
+{
+    uint32_t required = 0;
+
+    /* Access intent is signalled positively: O_RDONLY -> READ_ONLY,
+     * O_WRONLY -> WRITE_ONLY, O_RDWR -> both.  A raw open with neither bit
+     * (e.g. an O_PATH-style handle open) requests no data access and is not
+     * gated. */
+    if (flags & CHIMERA_VFS_OPEN_READ_ONLY) {
+        required |= CHIMERA_ACE_READ_DATA;
+    }
+    if (flags & CHIMERA_VFS_OPEN_WRITE_ONLY) {
+        required |= CHIMERA_ACE_WRITE_DATA;
+    }
+    if (flags & CHIMERA_VFS_OPEN_TRUNCATE) {
+        required |= CHIMERA_ACE_WRITE_DATA;
+    }
+    return required;
+} /* chimera_vfs_open_required_access */
+
+/* Record an open-time effective-access grant on a handle.  POSIX (and the
+ * NFSv4/SMB stateful-open models) bind I/O rights when the file is opened;
+ * the I/O paths consult granted_access instead of re-deriving from the
+ * file's current mode, so later chmods do not revoke existing descriptors.
+ * The open cache shards handles by (fh, access_mode, cred_hash), so grants
+ * from same-credential opens of one file share a handle: union them --
+ * a successful open never narrows what an earlier open of the same handle
+ * legitimately obtained. */
+static inline void
+chimera_vfs_handle_stamp_access(
+    struct chimera_vfs_open_handle *handle,
+    uint32_t                        granted)
+{
+    if (handle->granted_valid) {
+        handle->granted_access |= granted;
+    } else {
+        handle->granted_access = granted;
+        handle->granted_valid  = 1;
+    }
+} /* chimera_vfs_handle_stamp_access */
+
 /* Size of the per-request scratch buffer used by VFS modules.
  * Must be large enough for the largest operation (symlink: name + target + 2 NULs). */
-#define CHIMERA_VFS_PLUGIN_DATA_SIZE 8192
+#define CHIMERA_VFS_PLUGIN_DATA_SIZE            8192
+
+/* Default period between close-thread cache sweeps (open-path/open-file
+ * cache LRU tick + NFSv4 idle-state reap). Every wake the timer walks the
+ * caches unconditionally, so on an otherwise idle pod this is the dominant
+ * source of baseline CPU (~180m/pod at 100ms). 1s keeps the deferred-close
+ * / idle-state reap latency well inside a typical NFS lease/DRC window
+ * while cutting idle CPU by ~10x. Callers who need aggressive close
+ * reclamation can override via the CHIMERA_CLOSE_SWEEP_INTERVAL_MS env
+ * var (units: milliseconds; clamped to [10, 60000]). */
+#define CHIMERA_CLOSE_SWEEP_INTERVAL_US_DEFAULT 1000000UL
 
 #ifndef container_of
 #define container_of(ptr, type, member) ({            \
@@ -202,6 +257,55 @@ chimera_vfs_kv_route_fh(
         route->ns       = module ? module->fh_magic : (uint8_t) CHIMERA_VFS_FH_MAGIC_ROOT;
     }
 } /* chimera_vfs_kv_route_fh */
+
+/*
+ * Take a request off the thread's free list purely as storage for a gated
+ * operation's resume context (the `gate` arm of chimera_vfs_request).
+ *
+ * This deliberately bypasses chimera_vfs_request_alloc_common: a gate-scratch
+ * request is never dispatched, so it wants none of the per-operation
+ * accounting -- no opcode, no module or capability check, no trace span, no
+ * latency stopwatch, and no place on thread->active_requests (where it would
+ * show up as an operation in flight that no backend is working on).  It is
+ * bookkeeping-free storage that happens to be pooled, which is the whole
+ * point: a gated operation now allocates nothing.
+ *
+ * Alloc and free must run on the same thread, which they do: the free list is
+ * per-thread and unlocked, and a gate's completion is delivered on the thread
+ * that started it (chimera_vfs_process_completion drains onto the owning
+ * thread), exactly as chimera_vfs_request_free already relies on.
+ *
+ * Returns the scratch area itself; chimera_vfs_gate_scratch_free() recovers
+ * the request from it.
+ */
+static inline void *
+chimera_vfs_gate_scratch_alloc(struct chimera_vfs_thread *thread)
+{
+    struct chimera_vfs_request *request;
+
+    if (thread->free_requests) {
+        request = thread->free_requests;
+        LL_DELETE(thread->free_requests, request);
+    } else {
+        request              = calloc(1, sizeof(struct chimera_vfs_request));
+        request->thread      = thread;
+        request->plugin_data = malloc(CHIMERA_VFS_PLUGIN_DATA_SIZE);
+    }
+
+    return request->gate.data;
+} /* chimera_vfs_gate_scratch_alloc */
+
+static inline void
+chimera_vfs_gate_scratch_free(
+    struct chimera_vfs_thread *thread,
+    void                      *scratch)
+{
+    struct chimera_vfs_request *request;
+
+    request = container_of(scratch, struct chimera_vfs_request, gate.data);
+
+    LL_PREPEND(thread->free_requests, request);
+} /* chimera_vfs_gate_scratch_free */
 
 /*
  * Common request allocation helper with capability enforcement.

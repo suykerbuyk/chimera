@@ -47,6 +47,7 @@ command lsrv echo '{\
         }\
     }, \
     "server": {\
+        "smb_enabled": true, \
         "external_portmap": true, \
         "delegation_threads": 1, \
         "threads": 16\

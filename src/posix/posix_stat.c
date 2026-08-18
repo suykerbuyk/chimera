@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2025 Chimera-NAS Project Contributors
+// SPDX-FileCopyrightText: 2025-2026 Chimera-NAS Project Contributors
 //
 // SPDX-License-Identifier: LGPL-2.1-only
 
@@ -63,6 +63,13 @@ chimera_posix_stat(
 
     if (!err) {
         chimera_posix_fill_stat(st, &req.sync_stat);
+
+        /* XBD 4.16: a pathname with a trailing slash must resolve to a
+         * directory; anything else is ENOTDIR. */
+        if (path_len > 1 && path[path_len - 1] == '/' &&
+            !S_ISDIR(st->st_mode)) {
+            err = ENOTDIR;
+        }
     }
 
     chimera_posix_completion_destroy(&comp);

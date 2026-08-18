@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2025 Chimera-NAS Project Contributors
+// SPDX-FileCopyrightText: 2025-2026 Chimera-NAS Project Contributors
 //
 // SPDX-License-Identifier: LGPL-2.1-only
 
@@ -38,6 +38,11 @@ chimera_posix_dup(int oldfd)
         errno = EMFILE;
         return -1;
     }
+
+    /* POSIX: the duplicate SHARES the open file description -- one file
+     * offset, one set of status flags -- so an lseek or F_SETFL through
+     * either descriptor is visible through the other. */
+    chimera_posix_ofd_adopt(posix, &posix->fds[newfd], entry);
 
     chimera_posix_fd_release(entry, 0);
 

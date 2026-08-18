@@ -2,10 +2,12 @@
 //
 // SPDX-License-Identifier: LGPL-2.1-only
 
+#include <inttypes.h>
 #include <xxhash.h>
 
 #include "nfs4_procs.h"
 #include "nfs4_status.h"
+#include "nfs4_attr.h"
 #include "server/server.h"
 #include "nfs_internal.h"
 #include "vfs/vfs_procs.h"
@@ -86,7 +88,7 @@ nfs4_remove_ds_root_opened(
 
     ctx->ds_root_handle = handle;
 
-    snprintf(ctx->backing_name, sizeof(ctx->backing_name), "%016lx", ctx->fileid);
+    snprintf(ctx->backing_name, sizeof(ctx->backing_name), "%016" PRIx64, ctx->fileid);
 
     chimera_nfs_info("pNFS: deleting data-server backing file %s for removed file",
                      ctx->backing_name);
@@ -108,11 +110,17 @@ nfs4_remove_mds_complete(
     struct nfs4_remove_ctx      *ctx = private_data;
     struct chimera_vfs          *vfs = ctx->req->thread->shared->vfs;
     const struct chimera_vfs_ds *ds;
+    struct REMOVE4res           *res =
+        &ctx->req->res_compound.resarray[ctx->req->index].opremove;
 
     if (error_code != CHIMERA_VFS_OK) {
         nfs4_remove_finish(ctx, chimera_nfs4_errno_to_nfsstat4(error_code));
         return;
     }
+
+    /* change_info4 for the parent directory (RFC 7530 §16.25.5), from its
+     * change attribute pre/post the unlink. */
+    chimera_nfs4_set_changeinfo(&res->resok4.cinfo, pre_attr, post_attr);
 
     if (!ctx->have_layout) {
         nfs4_remove_finish(ctx, NFS4_OK);
@@ -140,7 +148,10 @@ nfs4_remove_mds(struct nfs4_remove_ctx *ctx)
     chimera_vfs_remove_at(req->thread->vfs_thread, &req->cred,
                           ctx->parent_handle,
                           args->target.data, args->target.len,
-                          NULL, 0, 0, 0, 0, NULL,
+                          NULL, 0, 0,
+                          CHIMERA_VFS_ATTR_CHANGE | CHIMERA_VFS_ATTR_CTIME,
+                          CHIMERA_VFS_ATTR_CHANGE | CHIMERA_VFS_ATTR_CTIME,
+                          NULL,
                           nfs4_remove_mds_complete, ctx);
 } /* nfs4_remove_mds */
 

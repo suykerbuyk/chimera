@@ -1,5 +1,8 @@
 {
     "server": {
+	"nfs_enabled": true,
+	"smb_enabled": true,
+	"s3_enabled": false,
 	"delegation_threads": 1,
 	"external_portmap": true,
 	"max_open_files": 1048576,
@@ -28,10 +31,5 @@
         "/nfs1": {
             "path": "/snfs1/nfs1"
         }
-    },
-    "buckets": {
-	"bucket1": {
-	    "path": "/snfs1/buckets"
-	}
     }
 }

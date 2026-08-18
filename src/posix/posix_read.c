@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2025 Chimera-NAS Project Contributors
+// SPDX-FileCopyrightText: 2025-2026 Chimera-NAS Project Contributors
 //
 // SPDX-License-Identifier: LGPL-2.1-only
 
@@ -74,13 +74,19 @@ chimera_posix_read(
         return -1;
     }
 
+    if (!chimera_posix_fd_may_read(entry)) {
+        chimera_posix_fd_release(entry, CHIMERA_POSIX_FD_IO_ACTIVE);
+        errno = EBADF;
+        return -1;
+    }
+
     chimera_posix_completion_init(&comp, &req);
 
     req.opcode            = CHIMERA_CLIENT_OP_READ;
     req.read.callback     = chimera_posix_read_callback;
     req.read.private_data = &comp;
     req.read.handle       = entry->handle;
-    req.read.offset       = entry->offset;
+    req.read.offset       = entry->ofd->offset;
     req.read.length       = count;
     req.read.buf          = buf;
 
@@ -89,7 +95,7 @@ chimera_posix_read(
     int     err = chimera_posix_wait(&comp);
 
     if (!err && req.sync_result >= 0) {
-        entry->offset += (uint64_t) req.sync_result;
+        entry->ofd->offset += (uint64_t) req.sync_result;
     }
 
     ssize_t ret = req.sync_result;

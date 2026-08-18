@@ -132,16 +132,39 @@ chimera_s3_request_alloc(struct chimera_server_s3_thread *thread)
         request->thread = thread;
     }
 
+    /* The HTTP layer's reference, held until libevpl reports the request over
+     * one way or the other.  Everything else that outlives the call it was
+     * made from takes its own; see chimera_s3_request_get. */
+    request->refcount  = 1;
+    request->abandoned = 0;
+
     return request;
 } /* chimera_s3_request_alloc */
 
-static inline void
-chimera_s3_request_free(
+/*
+ * Drop a reference, and tear the request down when the last one goes.
+ *
+ * VFS handles the request may still hold are deliberately not released here.
+ * Several handler paths drop their reference without clearing the pointer (see
+ * the note in s3_server_dispatch), so a handle pointer at teardown may already
+ * be dead -- releasing it again would be the use-after-free this is meant to
+ * prevent.  They are released where they are acquired, as before.
+ */
+void
+chimera_s3_request_put(
     struct chimera_server_s3_thread *thread,
     struct chimera_s3_request       *request)
 {
+    if (--request->refcount > 0) {
+        return;
+    }
+
+    chimera_s3_tagging_request_cleanup(request);
+
+    otel_span_end(&request->otel);
+
     DL_PREPEND(thread->free_requests, request);
-} /* chimera_s3_request_free */
+} /* chimera_s3_request_put */
 
 void
 s3_server_respond(
@@ -164,6 +187,14 @@ s3_server_respond(
      * connection, so dispatch the status line + headers only on the first
      * call. (GET streams its body via later WANT_DATA notifications, which is
      * why we cannot key this off vfs_state.) */
+    /* Nobody to answer.  Marked responded all the same, so the several paths
+     * that can race to respond all take this exit rather than the first one
+     * taking it and the rest walking into a NULL http_request. */
+    if (request->abandoned) {
+        request->responded = 1;
+        return;
+    }
+
     if (request->responded) {
         return;
     }
@@ -190,7 +221,8 @@ s3_server_respond(
 
         if (request->file_offset != 0 || request->file_length != request->file_real_length) {
 
-            snprintf(range_header, sizeof(range_header), "bytes %ld-%ld/%ld",
+            snprintf(range_header, sizeof(range_header),
+                     "bytes %" PRId64 "-%" PRId64 "/%" PRId64,
                      request->file_offset, request->file_offset + request->file_length - 1,
                      request->file_real_length);
 
@@ -209,7 +241,7 @@ s3_server_respond(
         if (request->status == CHIMERA_S3_STATUS_INVALID_RANGE) {
             /* S3 echoes the object size on a 416 so the client can re-request a
              * satisfiable range. */
-            snprintf(range_header, sizeof(range_header), "bytes */%ld",
+            snprintf(range_header, sizeof(range_header), "bytes */%" PRId64,
                      request->file_real_length);
             evpl_http_request_add_header(request->http_request, "Content-Range", range_header);
         }
@@ -375,9 +407,32 @@ s3_server_notify(
 
             chimera_s3_dump_response(s3_request);
 
-            chimera_s3_tagging_request_cleanup(s3_request);
+            /* The HTTP layer is done with the request.  Any VFS work still in
+             * flight holds its own reference, so this only tears the request
+             * down when there is none. */
+            chimera_s3_request_put(thread, s3_request);
+            break;
+        case EVPL_HTTP_NOTIFY_FAILED:
+            /*
+             * The connection went away, so there is no response to send and no
+             * peer to send it to.  libevpl frees the evpl_http_request as soon
+             * as this returns, so the pointer to it goes now: a VFS completion
+             * still in flight would otherwise reach s3_server_respond and
+             * write into freed memory.
+             *
+             * The request itself cannot be released here -- that same
+             * completion is still holding it -- so this only drops the HTTP
+             * layer's reference.  Whichever callback lands last tears it down,
+             * finding it abandoned and unwinding without a response.
+             */
+            s3_request->abandoned    = 1;
+            s3_request->http_request = NULL;
 
-            chimera_s3_request_free(thread, s3_request);
+            otel_span_set_status(&s3_request->otel, OTEL_STATUS_ERROR,
+                                 "connection lost");
+            thread->vfs->otel_parent = NULL;
+
+            chimera_s3_request_put(thread, s3_request);
             break;
         default:
             /* no action required */
@@ -392,6 +447,7 @@ chimera_s3_dispatch_callback(
     struct chimera_vfs_attrs *attr,
     void                     *private_data)
 {
+    CHIMERA_S3_HOLD_REQUEST(private_data);
     struct chimera_s3_request       *s3_request = private_data;
     struct chimera_server_s3_thread *thread     = s3_request->thread;
     struct evpl                     *evpl       = thread->evpl;
@@ -1022,6 +1078,8 @@ s3_server_dispatch(
          * request issues) under the S3 span. */
         thread->vfs->otel_parent = &s3_request->otel;
 
+        chimera_s3_request_get(s3_request);
+
         chimera_vfs_lookup(thread->vfs,
                            &thread->shared->cred,
                            shared->root_fh,
@@ -1155,16 +1213,26 @@ s3_server_init(
 {
     struct chimera_server_s3_shared *shared;
 
+    if (!chimera_server_config_get_s3_enabled(config)) {
+        chimera_s3_info("S3 server disabled (not enabled in config)");
+        return NULL;
+    }
+
     shared = calloc(1, sizeof(*shared));
 
     shared->config = calloc(1, sizeof(*shared->config));
 
-    shared->tcp_protocol = chimera_server_config_get_tcp_stream_protocol(config);
+    shared->tcp_flavor   = chimera_server_config_get_tcp_flavor(config);
+    shared->tcp_protocol = chimera_tcp_flavor_to_protocol(shared->tcp_flavor);
 
     shared->config->port    = chimera_server_config_get_s3_port(config);
     shared->config->io_size = 128 * 1024;
 
-    shared->endpoint = evpl_endpoint_create("0.0.0.0", shared->config->port);
+    /* Built from the same flavor tcp_protocol came from: a protocol and an
+     * endpoint that disagree about whether they are a socket is a listen
+     * failure at startup. */
+    shared->endpoint = chimera_tcp_flavor_endpoint_create(shared->tcp_flavor, "0.0.0.0",
+                                                          shared->config->port);
 
     shared->listener = evpl_listener_create();
 
@@ -1182,7 +1250,7 @@ s3_server_init(
     chimera_vfs_get_root_fh(shared->root_fh, &shared->root_fh_len);
 
     return shared;
-} /* s3_server_init */ /* s3_server_init */
+} /* s3_server_init */
 
 static void
 s3_server_stop(void *data)
@@ -1212,8 +1280,10 @@ static void
 s3_server_start(void *data)
 {
     struct chimera_server_s3_shared *shared = data;
+    int                              rc;
 
-    evpl_listen(shared->listener, shared->tcp_protocol, shared->endpoint);
+    rc = evpl_listen(shared->listener, shared->tcp_protocol, shared->endpoint);
+    chimera_s3_abort_if(rc, "failed to listen for S3");
 } /* s3_server_start */
 
 static void *

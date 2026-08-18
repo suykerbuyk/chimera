@@ -988,14 +988,6 @@ nfs_open_owner_find_state(
     return state;
 } /* nfs_open_owner_find_state */
 
-static uint32_t
-nfs_open_share_history(uint32_t share)
-{
-    share &= (OPEN4_SHARE_ACCESS_READ | OPEN4_SHARE_ACCESS_WRITE);
-    return share == (OPEN4_SHARE_ACCESS_READ | OPEN4_SHARE_ACCESS_WRITE) ?
-           0x04 : share;
-} /* nfs_open_share_history */
-
 struct nfs_open_state *
 nfs_open_state_create(
     struct nfs_open_owner          *owner,
@@ -1037,17 +1029,16 @@ nfs_open_state_create(
                principal_machinename_len);
     }
     memcpy(state->fh, fh, fh_len);
-    state->fh_len            = fh_len;
-    state->share_access      = share_access;
-    state->share_deny        = share_deny;
-    state->share_access_hist = nfs_open_share_history(share_access);
-    state->share_deny_hist   = nfs_open_share_history(share_deny);
-    state->seqid             = 1;
-    state->shard             = shard;
-    state->slot_idx          = slot_idx;
-    state->generation        = gen;
-    state->handle            = handle_dup;
-    state->locks             = NULL;
+    state->fh_len       = fh_len;
+    state->share_access = share_access;
+    state->share_deny   = share_deny;
+    state->share_combos = nfs_open_combo_bit(share_access, share_deny);
+    state->seqid        = 1;
+    state->shard        = shard;
+    state->slot_idx     = slot_idx;
+    state->generation   = gen;
+    state->handle       = handle_dup;
+    state->locks        = NULL;
     atomic_init(&state->refcount, 1);
     atomic_init(&state->destroyed, 0);
 
@@ -1177,6 +1168,92 @@ nfs_client_check_io_denied(
     return status;
 } /* nfs_client_check_io_denied */
 
+bool
+nfs_client_has_open_state_for_fh(
+    struct nfs_client *client,
+    const uint8_t     *fh,
+    uint16_t           fh_len)
+{
+    struct nfs_open_owner *oo, *oo_tmp;
+    bool                   found = false;
+
+    if (fh_len > NFS4_FHSIZE) {
+        return false;
+    }
+
+    pthread_mutex_lock(&client->lock);
+
+    HASH_ITER(hh, client->open_owners_by_str, oo, oo_tmp)
+    {
+        struct nfs_open_state *state = NULL;
+
+        pthread_mutex_lock(&oo->lock);
+        HASH_FIND(hh, oo->states_by_fh, fh, fh_len, state);
+        pthread_mutex_unlock(&oo->lock);
+
+        if (state) {
+            found = true;
+            break;
+        }
+    }
+
+    pthread_mutex_unlock(&client->lock);
+    return found;
+} /* nfs_client_has_open_state_for_fh */
+
+/* Does this client hold any leased state at all -- opens, locks, delegations
+ * or layouts?  DESTROY_CLIENTID (RFC 8881 §18.50.3) must answer
+ * NFS4ERR_CLIENTID_BUSY while any of it remains.
+ *
+ * The owner hashes are deliberately NOT the test: an open/lock owner record
+ * outlives its last CLOSE/LOCKU (it caches the 4.0 seqid and replay slot), so
+ * a non-empty owner hash does not mean the client still holds state.  Walk
+ * down to the per-owner state containers instead.
+ *
+ * Lock order is client->lock then owner->lock, matching
+ * nfs_client_has_open_state_for_fh; callers may hold nfs4_ct_lock, as
+ * nfs4_clients_check_io_denied already does. */
+bool
+nfs_client_has_leased_state(struct nfs_client *client)
+{
+    struct nfs_open_owner *oo, *oo_tmp;
+    struct nfs_lock_owner *lo, *lo_tmp;
+    bool                   found;
+
+    pthread_mutex_lock(&client->lock);
+
+    found = (client->delegations != NULL) || (client->layouts_by_fh != NULL);
+
+    if (!found) {
+        HASH_ITER(hh, client->open_owners_by_str, oo, oo_tmp)
+        {
+            pthread_mutex_lock(&oo->lock);
+            found = (oo->states_by_fh != NULL);
+            pthread_mutex_unlock(&oo->lock);
+
+            if (found) {
+                break;
+            }
+        }
+    }
+
+    if (!found) {
+        HASH_ITER(hh, client->lock_owners_by_str, lo, lo_tmp)
+        {
+            pthread_mutex_lock(&lo->lock);
+            found = (lo->states != NULL);
+            pthread_mutex_unlock(&lo->lock);
+
+            if (found) {
+                break;
+            }
+        }
+    }
+
+    pthread_mutex_unlock(&client->lock);
+    return found;
+} /* nfs_client_has_leased_state */
+
 nfsstat4
 nfs_open_state_check_io_denied(
     struct nfs_open_state *requesting_state,
@@ -1197,11 +1274,10 @@ nfs_open_state_coalesce(
     struct nfs_state_table *table,
     struct stateid4        *out_stateid)
 {
-    state->share_access      |= share_access;
-    state->share_deny        |= share_deny;
-    state->share_access_hist |= nfs_open_share_history(share_access);
-    state->share_deny_hist   |= nfs_open_share_history(share_deny);
-    state->seqid             += 1;
+    state->share_access |= share_access;
+    state->share_deny   |= share_deny;
+    state->share_combos |= nfs_open_combo_bit(share_access, share_deny);
+    state->seqid        += 1;
 
     nfs4_stateid_encode(out_stateid, state->seqid,
                         NFS4_STATEID_TYPE_OPEN,

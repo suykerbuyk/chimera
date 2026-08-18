@@ -155,6 +155,8 @@ command srv1 sed -i.back 's/\/chimera.json/\/sntest-chimera.json/'  /etc/default
 	     cat /etc/default/chimera && \
 	     jq -n '{ \
                  server: { \
+                    nfs_enabled: true, \
+                    smb_enabled: true, \
                     threads: 16, \
                     external_portmap: true, \
                     max_open_files: 1048576, \

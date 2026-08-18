@@ -137,6 +137,8 @@ step 1m Create base chimera.json file with winbind NTLM and kerberos SMB auth
 command srv1 cp /etc/chimera/chimera.json /etc/chimera/chimera.json.orig && \
 	     jq -n '{ \
                  server: { \
+                    nfs_enabled: true, \
+                    smb_enabled: true, \
                     threads: 16, \
                     external_portmap: true, \
                     max_open_files: 1048576, \

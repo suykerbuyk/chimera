@@ -707,9 +707,9 @@ main(
 
     /* Check if smbclient is available */
     if (system("which smbclient >/dev/null 2>&1") != 0) {
-        fprintf(stderr, "\nERROR: smbclient not found in PATH\n");
+        fprintf(stderr, "\nSKIP: smbclient not found in PATH\n");
         fprintf(stderr, "Install with: apt-get install smbclient\n");
-        return EXIT_FAILURE;
+        return 77;   /* ctest SKIP_RETURN_CODE */
     }
 
     /* Initialize logging */
@@ -736,6 +736,7 @@ main(
 
     /* Initialize server configuration */
     config = chimera_server_config_init();
+    chimera_server_config_set_smb_enabled(config, 1);
 
     /* Configure authentication based on environment */
     const char *keytab = getenv("KRB5_KTNAME");

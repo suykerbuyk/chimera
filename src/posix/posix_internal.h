@@ -46,12 +46,30 @@ struct chimera_posix_completion {
 #define CHIMERA_POSIX_FD_CLOSING   0x02
 #define CHIMERA_POSIX_FD_CLOSED    0x04
 
+/* One open file description (POSIX XBD): the file offset and status flags
+ * shared by every descriptor duplicated from one open() -- dup/dup2/
+ * F_DUPFD return descriptors referencing the SAME description, so an
+ * lseek or F_SETFL through one duplicate is visible through the others.
+ * Independent open() calls create independent descriptions.
+ *
+ * refcnt counts fd entries referencing the description and is managed
+ * under the client's fd_lock.  offset/oflags carry the same (loose)
+ * concurrency discipline the per-entry fields had: the per-descriptor
+ * IO_ACTIVE gate serializes offset-consuming I/O on one descriptor;
+ * concurrent I/O through two duplicates of one description is not
+ * additionally serialized here. */
+struct chimera_posix_ofd {
+    uint64_t     offset;
+    unsigned int oflags;     // Raw open(2) flags (for O_ACCMODE checks)
+    int          refcnt;
+};
+
 struct chimera_posix_fd_entry {
     pthread_mutex_t                 lock;
     pthread_cond_t                  cond;
     struct chimera_vfs_open_handle *handle;
     struct chimera_posix_fd_entry  *next;
-    uint64_t                        offset;
+    struct chimera_posix_ofd       *ofd;
     unsigned int                    flags;
     int                             refcnt;
     int                             io_waiters;
@@ -60,7 +78,6 @@ struct chimera_posix_fd_entry {
     int                             eof_flag;    // For FILE* feof() support
     int                             error_flag;  // For FILE* ferror() support
     int                             ungetc_char; // For FILE* ungetc() support (-1 = none)
-    unsigned int                    oflags;      // Raw open(2) flags (for O_ACCMODE checks)
 } __attribute__((aligned(64)));
 
 // CHIMERA_FILE is a pointer to an fd_entry for FILE* operations
@@ -125,14 +142,74 @@ chimera_posix_get_global(void)
     return chimera_posix_global;
 } // chimera_posix_get_global
 
+/* Drop an fd entry's reference on its open file description, freeing the
+ * description when the last duplicate goes.  Caller holds fd_lock. */
+static FORCE_INLINE void
+chimera_posix_ofd_release_locked(struct chimera_posix_fd_entry *entry)
+{
+    if (entry->ofd && --entry->ofd->refcnt == 0) {
+        free(entry->ofd);
+    }
+    entry->ofd = NULL;
+} // chimera_posix_ofd_release_locked
+
+/* Point `entry` at `src`'s open file description (dup/dup2/F_DUPFD: the
+ * duplicate SHARES the description), releasing whatever description the
+ * entry held. */
+static FORCE_INLINE void
+chimera_posix_ofd_adopt(
+    struct chimera_posix_client   *posix,
+    struct chimera_posix_fd_entry *entry,
+    struct chimera_posix_fd_entry *src)
+{
+    pthread_mutex_lock(&posix->fd_lock);
+    chimera_posix_ofd_release_locked(entry);
+    entry->ofd = src->ofd;
+    entry->ofd->refcnt++;
+    pthread_mutex_unlock(&posix->fd_lock);
+} // chimera_posix_ofd_adopt
+
+/* chimera_vfs_error values are a protocol enum whose numbers happen to follow
+ * the Linux errno layout; the host's errno numbering differs on other
+ * platforms (Darwin: ENAMETOOLONG is 63, 36 is EINPROGRESS), so map through
+ * the host macros rather than casting the raw value. */
 static FORCE_INLINE int
 chimera_posix_errno_from_status(enum chimera_vfs_error status)
 {
-    if (status == CHIMERA_VFS_OK) {
-        return 0;
-    }
-
-    return (int) status;
+    switch (status) {
+        case CHIMERA_VFS_OK:           return 0;
+        case CHIMERA_VFS_EPERM:        return EPERM;
+        case CHIMERA_VFS_ENOENT:       return ENOENT;
+        case CHIMERA_VFS_EIO:          return EIO;
+        case CHIMERA_VFS_ENXIO:        return ENXIO;
+        case CHIMERA_VFS_EAGAIN:       return EAGAIN;
+        case CHIMERA_VFS_EACCES:       return EACCES;
+        case CHIMERA_VFS_EFAULT:       return EFAULT;
+        case CHIMERA_VFS_EEXIST:       return EEXIST;
+        case CHIMERA_VFS_EXDEV:        return EXDEV;
+        case CHIMERA_VFS_ENOTDIR:      return ENOTDIR;
+        case CHIMERA_VFS_EISDIR:       return EISDIR;
+        case CHIMERA_VFS_EINVAL:       return EINVAL;
+        case CHIMERA_VFS_EMFILE:       return EMFILE;
+        case CHIMERA_VFS_EFBIG:        return EFBIG;
+        case CHIMERA_VFS_ENOSPC:       return ENOSPC;
+        case CHIMERA_VFS_EROFS:        return EROFS;
+        case CHIMERA_VFS_EMLINK:       return EMLINK;
+        case CHIMERA_VFS_ENAMETOOLONG: return ENAMETOOLONG;
+        case CHIMERA_VFS_ENOTEMPTY:    return ENOTEMPTY;
+        case CHIMERA_VFS_ELOOP:        return ELOOP;
+        case CHIMERA_VFS_EOVERFLOW:    return EOVERFLOW;
+        case CHIMERA_VFS_EBADF:        return EBADF;
+        case CHIMERA_VFS_ENOTSUP:      return ENOTSUP;
+        case CHIMERA_VFS_EDQUOT:       return EDQUOT;
+        case CHIMERA_VFS_ESTALE:       return ESTALE;
+        case CHIMERA_VFS_ENODATA:      return ENODATA;
+        case CHIMERA_VFS_ERANGE:       return ERANGE;
+        /* Internal statuses with no host errno equivalent. */
+        case CHIMERA_VFS_ESYMLINK:     return ELOOP;
+        case CHIMERA_VFS_EBADCOOKIE:   return EINVAL;
+        default:                       return EIO;
+    } // switch
 } // chimera_posix_errno_from_status
 
 static FORCE_INLINE void
@@ -222,19 +299,21 @@ chimera_posix_fill_stat(
     struct stat               *dst,
     const struct chimera_stat *src)
 {
-    dst->st_dev     = src->st_dev;
-    dst->st_ino     = src->st_ino;
-    dst->st_mode    = src->st_mode;
-    dst->st_nlink   = src->st_nlink;
-    dst->st_uid     = src->st_uid;
-    dst->st_gid     = src->st_gid;
-    dst->st_rdev    = src->st_rdev;
-    dst->st_size    = src->st_size;
-    dst->st_atim    = src->st_atim;
-    dst->st_mtim    = src->st_mtim;
-    dst->st_ctim    = src->st_ctim;
-    dst->st_blksize = 4096;
-    dst->st_blocks  = (src->st_size + 511) / 512;
+    dst->st_dev   = src->st_dev;
+    dst->st_ino   = src->st_ino;
+    dst->st_mode  = src->st_mode;
+    dst->st_nlink = src->st_nlink;
+    dst->st_uid   = src->st_uid;
+    dst->st_gid   = src->st_gid;
+    dst->st_rdev  = src->st_rdev;
+    dst->st_size  = src->st_size;
+    /* dst is the host struct stat, whose nanosecond timestamps are not spelled
+     * the same on every platform; src is chimera's own. */
+    CHIMERA_STAT_ATIM(*dst) = src->st_atim;
+    CHIMERA_STAT_MTIM(*dst) = src->st_mtim;
+    CHIMERA_STAT_CTIM(*dst) = src->st_ctim;
+    dst->st_blksize         = 4096;
+    dst->st_blocks          = (src->st_size + 511) / 512;
 } // chimera_posix_fill_stat
 
 static FORCE_INLINE void
@@ -335,32 +414,60 @@ chimera_posix_check_path(const char *path)
     return (int) len;
 } /* chimera_posix_check_path */
 
+/* Allocate the lowest free descriptor slot with index >= minfd (POSIX
+ * open()/dup() require the lowest available descriptor; F_DUPFD the lowest
+ * >= its argument).  The free list is unordered, so scan it for the best
+ * index; it holds at most max_fds entries and allocation is not a hot
+ * path in this compatibility layer. */
 static FORCE_INLINE int
-chimera_posix_fd_alloc(
+chimera_posix_fd_alloc_at_least(
     struct chimera_posix_client    *posix,
-    struct chimera_vfs_open_handle *handle)
+    struct chimera_vfs_open_handle *handle,
+    int                             minfd)
 {
-    struct chimera_posix_fd_entry *entry;
-    int                            fd;
+    struct chimera_posix_fd_entry  *entry;
+    struct chimera_posix_fd_entry **pp, **best_pp = NULL;
+    int                             fd, best = posix->max_fds;
 
     pthread_mutex_lock(&posix->fd_lock);
 
-    entry = posix->free_list;
+    for (pp = &posix->free_list; *pp; pp = &(*pp)->next) {
+        int idx = (int) (*pp - posix->fds);
 
-    if (!entry) {
+        if (idx >= minfd && idx < best) {
+            best    = idx;
+            best_pp = pp;
+        }
+    }
+
+    if (!best_pp) {
         pthread_mutex_unlock(&posix->fd_lock);
         return -1;
     }
 
-    posix->free_list = entry->next;
-    entry->next      = NULL;
+    entry       = *best_pp;
+    *best_pp    = entry->next;
+    entry->next = NULL;
 
     pthread_mutex_unlock(&posix->fd_lock);
 
     fd = (int) (entry - posix->fds);
 
+    /* A fresh open gets a fresh open file description (not shared with
+     * anyone yet, so no lock needed for the refcount). */
+    entry->ofd = calloc(1, sizeof(*entry->ofd));
+
+    if (!entry->ofd) {
+        pthread_mutex_lock(&posix->fd_lock);
+        entry->next      = posix->free_list;
+        posix->free_list = entry;
+        pthread_mutex_unlock(&posix->fd_lock);
+        return -1;
+    }
+
+    entry->ofd->refcnt = 1;
+
     entry->handle        = handle;
-    entry->offset        = 0;
     entry->flags         = 0;
     entry->refcnt        = 0;
     entry->io_waiters    = 0;
@@ -369,9 +476,16 @@ chimera_posix_fd_alloc(
     entry->eof_flag      = 0;
     entry->error_flag    = 0;
     entry->ungetc_char   = -1;
-    entry->oflags        = 0;
 
     return fd;
+} // chimera_posix_fd_alloc_at_least
+
+static FORCE_INLINE int
+chimera_posix_fd_alloc(
+    struct chimera_posix_client    *posix,
+    struct chimera_vfs_open_handle *handle)
+{
+    return chimera_posix_fd_alloc_at_least(posix, handle, 0);
 } // chimera_posix_fd_alloc
 
 static FORCE_INLINE void
@@ -388,12 +502,12 @@ chimera_posix_fd_free(
     entry = &posix->fds[fd];
 
     entry->handle      = NULL;
-    entry->offset      = 0;
     entry->eof_flag    = 0;
     entry->error_flag  = 0;
     entry->ungetc_char = -1;
 
     pthread_mutex_lock(&posix->fd_lock);
+    chimera_posix_ofd_release_locked(entry);
     entry->next      = posix->free_list;
     posix->free_list = entry;
     pthread_mutex_unlock(&posix->fd_lock);
@@ -507,6 +621,23 @@ chimera_posix_fd_release(
     pthread_mutex_unlock(&entry->lock);
 } // chimera_posix_fd_release
 
+/* POSIX ties I/O rights to the descriptor's access mode, checked at open
+ * and carried in the shared description's oflags: read-family calls need a
+ * descriptor open for reading and write-family calls one open for writing,
+ * otherwise EBADF (read()/write() ERRORS). */
+static FORCE_INLINE int
+chimera_posix_fd_may_read(const struct chimera_posix_fd_entry *entry)
+{
+    return (entry->ofd->oflags & O_ACCMODE) != O_WRONLY;
+} /* chimera_posix_fd_may_read */
+
+static FORCE_INLINE int
+chimera_posix_fd_may_write(const struct chimera_posix_fd_entry *entry)
+{
+    return (entry->ofd->oflags & O_ACCMODE) != O_RDONLY;
+} /* chimera_posix_fd_may_write */
+
+
 static FORCE_INLINE off_t
 chimera_posix_fd_lseek(
     struct chimera_posix_client *posix,
@@ -554,7 +685,7 @@ chimera_posix_fd_lseek(
             new_offset = offset;
             break;
         case SEEK_CUR:
-            new_offset = (off_t) entry->offset + offset;
+            new_offset = (off_t) entry->ofd->offset + offset;
             break;
         case SEEK_END:
             new_offset = file_size + offset;
@@ -572,12 +703,20 @@ chimera_posix_fd_lseek(
         return -1;
     }
 
-    entry->offset = (uint64_t) new_offset;
+    entry->ofd->offset = (uint64_t) new_offset;
 
     pthread_mutex_unlock(&entry->lock);
 
     return new_offset;
 } // chimera_posix_fd_lseek
+
+/* Resolve the current EOF of the file behind an fd entry, for O_APPEND
+ * write placement.  Returns 0 and fills *eof, or an errno value.
+ * Defined in posix_write.c. */
+int chimera_posix_fd_eof(
+    struct chimera_posix_worker   *worker,
+    struct chimera_posix_fd_entry *entry,
+    uint64_t                      *eof);
 
 void * chimera_posix_worker_init(
     struct evpl *evpl,

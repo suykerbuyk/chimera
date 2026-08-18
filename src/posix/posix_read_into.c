@@ -60,13 +60,19 @@ chimera_posix_read_into_common(
         return -1;
     }
 
+    if (!chimera_posix_fd_may_read(entry)) {
+        chimera_posix_fd_release(entry, CHIMERA_POSIX_FD_IO_ACTIVE);
+        errno = EBADF;
+        return -1;
+    }
+
     chimera_posix_completion_init(&comp, &req);
 
     req.opcode                 = CHIMERA_CLIENT_OP_READ;
     req.read_into.callback     = chimera_posix_read_into_callback;
     req.read_into.private_data = &comp;
     req.read_into.handle       = entry->handle;
-    req.read_into.offset       = use_fd_offset ? entry->offset : (uint64_t) offset;
+    req.read_into.offset       = use_fd_offset ? entry->ofd->offset : (uint64_t) offset;
     req.read_into.length       = count;
     req.read_into.dest_niov    = niov;
 
@@ -79,7 +85,7 @@ chimera_posix_read_into_common(
     int     err = chimera_posix_wait(&comp);
 
     if (!err && use_fd_offset && req.sync_result >= 0) {
-        entry->offset += (uint64_t) req.sync_result;
+        entry->ofd->offset += (uint64_t) req.sync_result;
     }
 
     ssize_t ret = req.sync_result;

@@ -26,6 +26,27 @@
 #include "nfs_nsm_state.h"
 #include "sm_inter_xdr.h"
 
+#include "common/tcp_flavor.h"
+
+/*
+ * Transport for server-initiated callbacks: the NLM GRANTED delivery and the
+ * NSM reboot notify, both of which connect *out* to a peer.  They run from
+ * contexts that carry no config pointer, and the flavor is a process-wide
+ * setting, so it is cached at server init in the same spirit as
+ * portmap_set_nlm_port().
+ *
+ * Over the socket transports these dial the client's own address.  Under the
+ * in-process transport there is no such address -- so they resolve to the
+ * port-derived name, which in a single-process test lands on this server's own
+ * portmap and NLM.  That is exactly what happened over loopback before, where
+ * "the client's portmap at 127.0.0.1:111" was in fact this server's.
+ */
+void nfs_set_callback_tcp_flavor(
+    enum chimera_tcp_flavor flavor);
+
+enum chimera_tcp_flavor nfs_callback_tcp_flavor(
+    void);
+
 struct chimera_server_nfs_thread;
 
 /*
@@ -71,6 +92,16 @@ struct nfs_nfs4_readdir_cursor {
     struct entry4 *entries;
     struct entry4 *last;
 };
+
+struct nfs_request;
+struct chimera_server_nfs_thread;
+
+/* Continuation for nfs4_root_junction_check: at_root_export is nonzero when
+ * the request's current filehandle is the root of the "/" export. */
+typedef void (*nfs4_root_junction_resume_t)(
+    struct chimera_server_nfs_thread *thread,
+    struct nfs_request               *req,
+    int                               at_root_export);
 
 struct nfs_request {
     struct chimera_server_nfs_thread *thread;
@@ -148,6 +179,13 @@ struct nfs_request {
      * by chimera_nfs4_lock_finish. */
     struct nfs_open_owner            *lock_4_0_open_owner;
     struct nfs_lock_owner            *lock_4_0_lock_owner;
+    /* A new_lock_owner (open_to_lock_owner) LOCK that re-establishes an
+     * existing but emptied lock stateid reuses that stateid rather than
+     * minting a fresh one (RFC 7530 §9.1.4.2: the stateid "other" is stable
+     * for its life).  When set, the LOCK's error/seqid paths treat the
+     * lock_state as pre-existing (bump its seqid, do not destroy it) even
+     * though new_lock_owner is true. */
+    bool                              lock_reused;
     struct evpl_rpc2_conn            *conn;
     struct evpl_rpc2_encoding        *encoding;
     struct nlm_lock_entry            *nlm_pending_entry; /* in-flight NLM lock/test */
@@ -158,6 +196,9 @@ struct nfs_request {
     struct nfs4_replay_slot          *replay_slot;
     uint32_t                          replay_slot_id;
     uint8_t                           replay_action;
+    /* Continuation parked while nfs4_root_junction_check resolves the "/"
+     * export's root FH asynchronously; NULL outside that window. */
+    nfs4_root_junction_resume_t       root_junction_resume;
     struct nfs_request               *next;
     /* Park slot used while this request is awaiting a 4.0 callback-channel
      * CB_NULL probe completion (see nfs4_callback.c probe-defer path).
@@ -309,6 +350,25 @@ struct chimera_server_nfs_shared {
      * guarded by exports_lock). */
     uint16_t                            next_export_id;
     struct chimera_nfs_export          *exports_by_id[CHIMERA_NFS_EXPORT_ID_MAX + 1];
+
+    /* Root ("/") export state.  When a "/" export exists the NFSv4 namespace
+     * root is that export's real backend directory rather than the synthetic
+     * pseudo-root, and sibling exports are grafted over it as junctions at
+     * LOOKUP (the NFS-Ganesha Pseudo="/" model).
+     *
+     * root_export_id is the live "/" export's id (0 = none).  Written under
+     * exports_lock; read locklessly on the LOOKUP/LOOKUPP/SECINFO fast path
+     * under the same publication rules as exports_by_id.
+     *
+     * root_export_fh is the resolved backend root FH for that export, primed
+     * by PUTROOTFH (and the lazy resolve in nfs4_root_export_fh_get) and used
+     * to recognize "the current FH is the namespace root".  Valid only while
+     * root_export_fh_id == root_export_id; all three fields are guarded by
+     * exports_lock. */
+    uint16_t                            root_export_id;
+    uint16_t                            root_export_fh_id;
+    uint32_t                            root_export_fh_len;
+    uint8_t                             root_export_fh[CHIMERA_VFS_FH_SIZE];
 
     /* File-handle signing.  fh_sign gates the SipHash MAC appended to every
      * wire file handle (default on); fh_key is the 128-bit server secret used

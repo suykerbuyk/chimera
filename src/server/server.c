@@ -56,6 +56,10 @@ struct chimera_server_config {
     int                                   nfs_nsm_port;
     int                                   nfs_port;
     int                                   s3_port;
+    int                                   smb_port;
+    int                                   nfs_enabled;
+    int                                   smb_enabled;
+    int                                   s3_enabled;
     int                                   nfs_data_server;
     uint64_t                              nfs_server_scope;
     int                                   external_portmap;
@@ -98,6 +102,8 @@ struct chimera_server_config {
     int                                   smb_notify_disabled;
     int                                   smb_acl_inherited_canonicalize;
     int                                   smb2_max_async_credits;
+    uint32_t                              smb_fs_physical_bytes_per_sector;
+    uint32_t                              smb_fs_sector_size_flags;
     int                                   smb_num_nic_info;
     uint32_t                              anonuid;
     uint32_t                              anongid;
@@ -233,6 +239,11 @@ chimera_server_config_init(void)
      * 512 matches the value smb2.credits.*_ipc_max_async_credits asserts. */
     config->smb2_max_async_credits = 512;
 
+    /* FileFsSectorSizeInformation defaults: report 4KiB physical sectors and
+     * aligned + partition-aligned flags for modern storage. */
+    config->smb_fs_physical_bytes_per_sector = 4096;
+    config->smb_fs_sector_size_flags         = 0x300;
+
     // SMB auth config defaults - local NTLM only
     config->smb_auth.winbind_enabled    = 0;
     config->smb_auth.kerberos_enabled   = 0;
@@ -259,10 +270,20 @@ chimera_server_config_init(void)
     config->pnfs_enabled = 0;
     config->pnfs_num_ds  = 0;
 
+    /* Every protocol is opt-in: a server serves nothing until its config
+     * explicitly enables a protocol, so an instance brought up for one
+     * purpose (a test fixture, a data server, an admin-only daemon) never
+     * surprise-binds the others' well-known ports.  The port fields keep the
+     * customary defaults and take effect only once the protocol is enabled. */
+    config->nfs_enabled = 0;
+    config->smb_enabled = 0;
+    config->s3_enabled  = 0;
+
     /* NFS service port (default 2049); data-server mode binds only the NFSv4
      * service so a pNFS data server can coexist with an MDS on one host. */
     config->nfs_port        = 2049;
     config->s3_port         = 5000;
+    config->smb_port        = 445;
     config->nfs_data_server = 0;
 
     /* NFSv4.1 server identity (EXCHANGE_ID eir_server_scope).  Clients treat two
@@ -353,18 +374,28 @@ chimera_server_config_init(void)
     config->modules[2].config_data[0] = '\0';
     config->modules[2].module_path[0] = '\0';
 
-    strncpy(config->modules[3].module_name, "linux", sizeof(config->modules[3].module_name));
-    config->modules[3].config_data[0] = '\0';
-    config->modules[3].module_path[0] = '\0';
+    config->num_modules = 3;
 
-    config->num_modules = 4;
+    /* The passthrough backends below are Linux-only (see src/vfs/CMakeLists.txt)
+     * and are not built elsewhere, so do not ask the VFS to load them there --
+     * a missing module symbol is fatal at init.  Indices follow num_modules so
+     * the list stays contiguous whichever ones are present. */
+#ifdef __linux__
+    strncpy(config->modules[config->num_modules].module_name, "linux",
+            sizeof(config->modules[config->num_modules].module_name));
+    config->modules[config->num_modules].config_data[0] = '\0';
+    config->modules[config->num_modules].module_path[0] = '\0';
+
+    config->num_modules++;
+#endif /* ifdef __linux__ */
 
 #ifdef HAVE_IO_URING
-    strncpy(config->modules[4].module_name, "io_uring", sizeof(config->modules[4].module_name));
-    config->modules[4].config_data[0] = '\0';
-    config->modules[4].module_path[0] = '\0';
+    strncpy(config->modules[config->num_modules].module_name, "io_uring",
+            sizeof(config->modules[config->num_modules].module_name));
+    config->modules[config->num_modules].config_data[0] = '\0';
+    config->modules[config->num_modules].module_path[0] = '\0';
 
-    config->num_modules = 5;
+    config->num_modules++;
 #endif /* ifdef HAVE_IO_URING */
 
     /* The default KV module (memkv) is auto-registered by chimera_vfs_init; it
@@ -566,6 +597,34 @@ chimera_server_config_get_smb2_max_async_credits(const struct chimera_server_con
 {
     return config->smb2_max_async_credits;
 } /* chimera_server_config_get_smb2_max_async_credits */
+
+SYMBOL_EXPORT void
+chimera_server_config_set_smb_fs_physical_bytes_per_sector(
+    struct chimera_server_config *config,
+    uint32_t                      value)
+{
+    config->smb_fs_physical_bytes_per_sector = value;
+} /* chimera_server_config_set_smb_fs_physical_bytes_per_sector */
+
+SYMBOL_EXPORT uint32_t
+chimera_server_config_get_smb_fs_physical_bytes_per_sector(const struct chimera_server_config *config)
+{
+    return config->smb_fs_physical_bytes_per_sector;
+} /* chimera_server_config_get_smb_fs_physical_bytes_per_sector */
+
+SYMBOL_EXPORT void
+chimera_server_config_set_smb_fs_sector_size_flags(
+    struct chimera_server_config *config,
+    uint32_t                      value)
+{
+    config->smb_fs_sector_size_flags = value;
+} /* chimera_server_config_set_smb_fs_sector_size_flags */
+
+SYMBOL_EXPORT uint32_t
+chimera_server_config_get_smb_fs_sector_size_flags(const struct chimera_server_config *config)
+{
+    return config->smb_fs_sector_size_flags;
+} /* chimera_server_config_get_smb_fs_sector_size_flags */
 
 SYMBOL_EXPORT void
 chimera_server_config_set_max_open_files(
@@ -842,6 +901,62 @@ chimera_server_config_get_s3_port(const struct chimera_server_config *config)
 {
     return config->s3_port;
 } /* chimera_server_config_get_s3_port */
+
+SYMBOL_EXPORT void
+chimera_server_config_set_smb_port(
+    struct chimera_server_config *config,
+    int                           port)
+{
+    config->smb_port = port;
+} /* chimera_server_config_set_smb_port */
+
+SYMBOL_EXPORT int
+chimera_server_config_get_smb_port(const struct chimera_server_config *config)
+{
+    return config->smb_port;
+} /* chimera_server_config_get_smb_port */
+
+SYMBOL_EXPORT void
+chimera_server_config_set_nfs_enabled(
+    struct chimera_server_config *config,
+    int                           enabled)
+{
+    config->nfs_enabled = enabled;
+} /* chimera_server_config_set_nfs_enabled */
+
+SYMBOL_EXPORT int
+chimera_server_config_get_nfs_enabled(const struct chimera_server_config *config)
+{
+    return config->nfs_enabled;
+} /* chimera_server_config_get_nfs_enabled */
+
+SYMBOL_EXPORT void
+chimera_server_config_set_smb_enabled(
+    struct chimera_server_config *config,
+    int                           enabled)
+{
+    config->smb_enabled = enabled;
+} /* chimera_server_config_set_smb_enabled */
+
+SYMBOL_EXPORT int
+chimera_server_config_get_smb_enabled(const struct chimera_server_config *config)
+{
+    return config->smb_enabled;
+} /* chimera_server_config_get_smb_enabled */
+
+SYMBOL_EXPORT void
+chimera_server_config_set_s3_enabled(
+    struct chimera_server_config *config,
+    int                           enabled)
+{
+    config->s3_enabled = enabled;
+} /* chimera_server_config_set_s3_enabled */
+
+SYMBOL_EXPORT int
+chimera_server_config_get_s3_enabled(const struct chimera_server_config *config)
+{
+    return config->s3_enabled;
+} /* chimera_server_config_get_s3_enabled */
 
 SYMBOL_EXPORT void
 chimera_server_config_set_nfs_data_server(
@@ -1343,6 +1458,11 @@ chimera_server_thread_init(
     chimera_tracing_thread_register();
 
     for (int i = 0; i < server->num_protocols; i++) {
+        /* A protocol whose init returned NULL is disabled. */
+        if (!server->protocol_private[i]) {
+            thread->protocol_private[i] = NULL;
+            continue;
+        }
         thread->protocol_private[i] = server->protocols[i]->thread_init(evpl,
                                                                         thread->vfs_thread,
                                                                         server->
@@ -1548,8 +1668,12 @@ chimera_mkpath_lookup_cb(
         ctx->set_attr.va_set_mask = CHIMERA_VFS_ATTR_MODE |
             CHIMERA_VFS_ATTR_UID | CHIMERA_VFS_ATTR_GID;
         ctx->set_attr.va_mode = S_IFDIR | (ctx->mode & 07777);
-        ctx->set_attr.va_uid  = 0;
-        ctx->set_attr.va_gid  = 0;
+        /* Own created dirs as the server identity (0/0 when running as root,
+         * as CI does).  Hardcoding 0/0 would make the next component's
+         * ADD_SUBDIRECTORY gate deny an unprivileged server its own
+         * freshly-created parent. */
+        ctx->set_attr.va_uid = chimera_vfs_get_server_cred()->uid;
+        ctx->set_attr.va_gid = chimera_vfs_get_server_cred()->gid;
 
         chimera_vfs_mkdir_at(ctx->thread, chimera_vfs_get_server_cred(), ctx->oh,
                              ctx->comp, ctx->complen, &ctx->set_attr,
@@ -2301,6 +2425,9 @@ chimera_server_thread_shutdown(
     chimera_vfs_thread_drain(thread->vfs_thread);
 
     for (i = 0; i < server->num_protocols; i++) {
+        if (!thread->protocol_private[i]) {
+            continue;
+        }
         server->protocols[i]->thread_destroy(thread->protocol_private[i]);
     }
 
@@ -2459,6 +2586,9 @@ chimera_server_start(struct chimera_server *server)
     pthread_mutex_unlock(&server->lock);
 
     for (i = 0; i < server->num_protocols; i++) {
+        if (!server->protocol_private[i]) {
+            continue;
+        }
         server->protocols[i]->start(server->protocol_private[i]);
     }
 
@@ -2473,6 +2603,9 @@ chimera_server_destroy(struct chimera_server *server)
     int i;
 
     for (i = 0; i < server->num_protocols; i++) {
+        if (!server->protocol_private[i]) {
+            continue;
+        }
         server->protocols[i]->stop(server->protocol_private[i]);
     }
 
@@ -2482,6 +2615,9 @@ chimera_server_destroy(struct chimera_server *server)
 
     /* Destroy protocols before VFS so they can release any open handles */
     for (i = 0; i < server->num_protocols; i++) {
+        if (!server->protocol_private[i]) {
+            continue;
+        }
         server->protocols[i]->destroy(server->protocol_private[i]);
     }
 

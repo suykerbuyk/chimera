@@ -8,7 +8,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <sys/random.h>
+#include "common/platform.h"
 #include <pthread.h>
 #include <arpa/inet.h>
 #include <gssapi/gssapi.h>
@@ -84,7 +84,7 @@ chimera_smb_server_guid_init(
         }
     }
 
-    if (getrandom(shared->guid, SMB2_GUID_SIZE, 0) != (ssize_t) SMB2_GUID_SIZE) {
+    if (chimera_getrandom(shared->guid, SMB2_GUID_SIZE) != 0) {
         /* Last-resort fallback: derive from a per-host identity so two distinct
          * hosts still differ even if getrandom is unavailable. */
         XXH128_hash_t h = XXH3_128bits(shared->config.identity,
@@ -133,9 +133,16 @@ chimera_smb_server_init(
         return NULL;
     }
 
-    shared->tcp_protocol = chimera_server_config_get_tcp_stream_protocol(config);
+    if (!chimera_server_config_get_smb_enabled(config)) {
+        chimera_smb_info("SMB server disabled (not enabled in config)");
+        free(shared);
+        return NULL;
+    }
 
-    shared->config.port      = 445;
+    shared->tcp_flavor   = chimera_server_config_get_tcp_flavor(config);
+    shared->tcp_protocol = chimera_tcp_flavor_to_protocol(shared->tcp_flavor);
+
+    shared->config.port      = chimera_server_config_get_smb_port(config);
     shared->config.rdma_port = 445;
 
     shared->config.capabilities = SMB2_GLOBAL_CAP_LARGE_MTU | SMB2_GLOBAL_CAP_MULTI_CHANNEL |
@@ -222,18 +229,20 @@ chimera_smb_server_init(
     smb_ntlm_resolve_server_identity(&shared->config.auth,
                                      &shared->config.auth.server_identity);
 
-    shared->config.soft_fail_bad_req          = chimera_server_config_get_soft_fail_bad_req(config);
-    shared->config.persistent_handles         = chimera_server_config_get_smb_persistent_handles(config);
-    shared->config.directory_leases           = chimera_server_config_get_smb_directory_leases(config);
-    shared->config.named_streams              = chimera_server_config_get_smb_named_streams(config);
-    shared->config.signing_required           = chimera_server_config_get_smb_signing_required(config);
-    shared->config.encryption                 = chimera_server_config_get_smb_encryption(config);
-    shared->config.compression                = chimera_server_config_get_smb_compression(config);
-    shared->config.leases                     = chimera_server_config_get_smb_leases(config);
-    shared->config.oplocks                    = chimera_server_config_get_smb_oplocks(config);
-    shared->config.notify_disabled            = chimera_server_config_get_smb_notify_disabled(config);
-    shared->config.acl_inherited_canonicalize = chimera_server_config_get_smb_acl_inherited_canonicalize(config);
-    shared->config.smb2_max_async_credits     = chimera_server_config_get_smb2_max_async_credits(config);
+    shared->config.soft_fail_bad_req            = chimera_server_config_get_soft_fail_bad_req(config);
+    shared->config.persistent_handles           = chimera_server_config_get_smb_persistent_handles(config);
+    shared->config.directory_leases             = chimera_server_config_get_smb_directory_leases(config);
+    shared->config.named_streams                = chimera_server_config_get_smb_named_streams(config);
+    shared->config.signing_required             = chimera_server_config_get_smb_signing_required(config);
+    shared->config.encryption                   = chimera_server_config_get_smb_encryption(config);
+    shared->config.compression                  = chimera_server_config_get_smb_compression(config);
+    shared->config.leases                       = chimera_server_config_get_smb_leases(config);
+    shared->config.oplocks                      = chimera_server_config_get_smb_oplocks(config);
+    shared->config.notify_disabled              = chimera_server_config_get_smb_notify_disabled(config);
+    shared->config.acl_inherited_canonicalize   = chimera_server_config_get_smb_acl_inherited_canonicalize(config);
+    shared->config.smb2_max_async_credits       = chimera_server_config_get_smb2_max_async_credits(config);
+    shared->config.fs_physical_bytes_per_sector = chimera_server_config_get_smb_fs_physical_bytes_per_sector(config);
+    shared->config.fs_sector_size_flags         = chimera_server_config_get_smb_fs_sector_size_flags(config);
 
     if (shared->config.persistent_handles) {
         chimera_smb_info("SMB3 durable/persistent handles enabled (in-memory state)");
@@ -305,10 +314,12 @@ chimera_smb_server_init(
     gss_import_name(&min, &name, GSS_C_NT_HOSTBASED_SERVICE, &shared->svc);
     //gss_acquire_cred(&min, shared->svc, 0, GSS_C_NO_OID_SET, GSS_C_ACCEPT, &shared->srv_cred, NULL, NULL);
 
-    shared->endpoint = evpl_endpoint_create("0.0.0.0", shared->config.port);
+    shared->endpoint = chimera_tcp_flavor_endpoint_create(shared->tcp_flavor, "0.0.0.0",
+                                                          shared->config.port);
 
     if (rdma) {
-        shared->endpoint_rdma = evpl_endpoint_create("0.0.0.0", shared->config.rdma_port);
+        shared->endpoint_rdma = chimera_tcp_flavor_endpoint_create(shared->tcp_flavor, "0.0.0.0",
+                                                                   shared->config.rdma_port);
     }
 
     shared->listener = evpl_listener_create();
@@ -387,11 +398,16 @@ static void
 chimera_smb_server_start(void *data)
 {
     struct chimera_server_smb_shared *shared = data;
+    int                               rc;
 
-    evpl_listen(shared->listener, shared->tcp_protocol, shared->endpoint);
+    rc = evpl_listen(shared->listener, shared->tcp_protocol, shared->endpoint);
+    chimera_smb_abort_if(rc, "failed to listen for SMB");
 
     if (shared->endpoint_rdma) {
-        evpl_listen(shared->listener, EVPL_DATAGRAM_RDMACM_RC, shared->endpoint_rdma);
+        rc = evpl_listen(shared->listener,
+                         chimera_tcp_flavor_to_rdma_protocol(shared->tcp_flavor, 0),
+                         shared->endpoint_rdma);
+        chimera_smb_abort_if(rc, "failed to listen for SMB over RDMA");
     }
 } /* smb_server_start */
 
@@ -425,7 +441,10 @@ chimera_smb_compound_reply(struct chimera_smb_compound *compound)
      * stream from the first message (seen as a fresh smbtorture connection
      * failing NEGOTIATE with NT_STATUS_INVALID_NETWORK_RESPONSE).  The client
      * this reply was for is gone; drop it and just release the compound. */
-    if (unlikely(conn->generation != compound->conn_generation)) {
+    if (unlikely(conn->generation != compound->conn_generation ||
+                 conn->disconnecting ||
+                 !conn->bind ||
+                 evpl_bind_is_closing(conn->bind))) {
         chimera_smb_compound_free(thread, compound);
         return;
     }
@@ -2095,7 +2114,16 @@ chimera_smb_server_handle_smb1(
 
     request = chimera_smb_request_alloc(thread);
 
-    evpl_iovec_cursor_copy(&request_cursor, &request->smb1_hdr, sizeof(request->smb1_hdr));
+    /* Every field below is parsed from an untrusted, attacker-framed message;
+     * the unchecked cursor readers abort() the whole shared process on a short
+     * read, so use the checked variants and reject a malformed frame cleanly. */
+    if (evpl_iovec_cursor_try_copy(&request_cursor, &request->smb1_hdr,
+                                   sizeof(request->smb1_hdr))) {
+        chimera_smb_error("Received truncated SMB1 header; closing connection");
+        chimera_smb_request_free(thread, request);
+        evpl_close(evpl, conn->bind);
+        return;
+    }
 
     if (request->smb1_hdr.command != SMB1_NEGOTIATE) {
         chimera_smb_error("Received SMB1 message with invalid command");
@@ -2104,13 +2132,32 @@ chimera_smb_server_handle_smb1(
         return;
     } /* switch */
 
-    evpl_iovec_cursor_get_uint8(&request_cursor, &wct);
+    if (evpl_iovec_cursor_try_get_uint8(&request_cursor, &wct)) {
+        chimera_smb_error("Received truncated SMB1 NEGOTIATE (word count); closing connection");
+        chimera_smb_request_free(thread, request);
+        evpl_close(evpl, conn->bind);
+        return;
+    }
     evpl_iovec_cursor_reset_consumed(&request_cursor);
-    evpl_iovec_cursor_get_uint16(&request_cursor, &bcc);
+    if (evpl_iovec_cursor_try_get_uint16(&request_cursor, &bcc)) {
+        chimera_smb_error("Received truncated SMB1 NEGOTIATE (byte count); closing connection");
+        chimera_smb_request_free(thread, request);
+        evpl_close(evpl, conn->bind);
+        return;
+    }
 
     dialects = alloca(bcc + 1);
 
-    evpl_iovec_cursor_copy(&request_cursor, dialects, bcc);
+    /* bcc is a client-declared byte count.  The unchecked copy that used to live
+     * here aborted the whole shared process when the frame carried fewer bytes
+     * than declared; fence the copy to what the frame actually holds. */
+    if (evpl_iovec_cursor_try_copy(&request_cursor, dialects, bcc)) {
+        chimera_smb_error("SMB1 NEGOTIATE byte count %u exceeds frame; closing connection",
+                          (unsigned int) bcc);
+        chimera_smb_request_free(thread, request);
+        evpl_close(evpl, conn->bind);
+        return;
+    }
 
     dialects[bcc] = 0;
 
@@ -2460,6 +2507,19 @@ chimera_smb_server_handle_tcp(
     struct netbios_header    netbios_hdr;
     uint32_t                 smb_hdr;
 
+    /* The segment layer delivers exactly 4 (the NBSS header) + the NBSS-declared
+     * length, enforcing no minimum, but the protocol-id peek below reads a
+     * 4-byte SMB id unconditionally.  A frame declaring 0..3 payload bytes would
+     * leave that read short and abort the whole (shared) process -- a single
+     * pre-auth packet DoS.  Drop any frame too short to contain both the NBSS
+     * header and the protocol id. */
+    if (length < (int) (sizeof(netbios_hdr) + sizeof(smb_hdr))) {
+        chimera_smb_error("Received short SMB frame (%d bytes); closing connection",
+                          length);
+        evpl_close(evpl, conn->bind);
+        return;
+    }
+
     evpl_iovec_cursor_init(&request_cursor, iov, niov);
     evpl_iovec_cursor_copy(&request_cursor, &netbios_hdr, sizeof(netbios_hdr));
 
@@ -2608,8 +2668,11 @@ chimera_smb_server_segment(
 
     len = evpl_peek(evpl, bind, &hdr, 4);
 
+    /* Not enough buffered yet to read the NBSS length prefix.  Zero means
+    * "no complete segment available", which leaves the connection alone
+    * until more arrives; a negative return would ask evpl to close it. */
     if (len < 4) {
-        return -1;
+        return 0;
     }
 
     hdr = __builtin_bswap32(hdr);

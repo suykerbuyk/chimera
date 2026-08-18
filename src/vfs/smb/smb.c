@@ -380,6 +380,7 @@ chimera_smb_client_init(
 
     shared->max_servers  = CHIMERA_SMB_CLIENT_MAX_SERVERS;
     shared->servers      = calloc(shared->max_servers, sizeof(*shared->servers));
+    shared->tcp_flavor   = CHIMERA_TCP_FLAVOR_PLAIN;
     shared->tcp_protocol = EVPL_STREAM_SOCKET_TCP;
 
     return shared;
@@ -832,8 +833,11 @@ chimera_smb_client_segment(
     (void) private_data;
 
     len = evpl_peek(evpl, bind, &hdr, 4);
+
+    /* Zero, not negative: the NBSS length prefix has not arrived in full yet,
+     * which is a wait-for-more condition rather than a request to close. */
     if (len < 4) {
-        return -1;
+        return 0;
     }
 
     hdr  = __builtin_bswap32(hdr);

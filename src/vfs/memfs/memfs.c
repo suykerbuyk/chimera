@@ -245,6 +245,18 @@ struct memfs_shared {
     uint32_t                 block_shift;
     uint32_t                 block_mask;
     int                      noatime;     /* config: disable atime updates on read */
+    /* Pre-op / post-op ("before"/"after") attribute returns on mutating
+     * operations.  memfs snapshots the affected object's (or parent
+     * directory's) attributes before and after the change, under the inode
+     * lock, and returns them to the caller.  Populating them is optional for
+     * every caller -- config "enable_pre_attr" / "enable_post_attr", both
+     * default on; when a flag is off memfs leaves the corresponding struct
+     * unpopulated (va_set_mask stays as the VFS layer zeroed it) so the caller
+     * learns the attributes were not provided.  Only these pre/post structs are
+     * gated; the object attributes returned by getattr/lookup/create/read are
+     * always populated. */
+    int                      enable_pre_attr;
+    int                      enable_post_attr;
     /* Optional capacity (config "size", bytes).  0 = unlimited (the default --
      * memfs reports a synthetic, never-shrinking size).  When non-zero, memfs
      * accounts live data blocks against this limit and returns ENOSPC when full;
@@ -1005,6 +1017,10 @@ memfs_init(
     /* Generate a random 64-bit filesystem ID */
     shared->fsid = chimera_rand64();
 
+    /* WCC pre/post attribute returns default on (see struct memfs_shared). */
+    shared->enable_pre_attr  = 1;
+    shared->enable_post_attr = 1;
+
     if (cfgdata && cfgdata[0] != '\0') {
         json_error_t json_error;
         json_t      *cfg = json_loads(cfgdata, 0, &json_error);
@@ -1046,6 +1062,17 @@ memfs_init(
         /* noatime disables read atime updates entirely; default (off) keeps
          * relatime semantics. */
         shared->noatime = json_is_true(json_object_get(cfg, "noatime"));
+
+        /* Optionally suppress the pre-op / post-op attribute returns on
+         * mutating operations (both default on); see struct memfs_shared. */
+        json_t *pre_cfg = json_object_get(cfg, "enable_pre_attr");
+        if (pre_cfg) {
+            shared->enable_pre_attr = json_is_true(pre_cfg);
+        }
+        json_t *post_cfg = json_object_get(cfg, "enable_post_attr");
+        if (post_cfg) {
+            shared->enable_post_attr = json_is_true(post_cfg);
+        }
 
         /* Optional capacity in bytes; 0/absent means unlimited. */
         json_t *size_cfg = json_object_get(cfg, "size");
@@ -1453,6 +1480,62 @@ memfs_map_attrs_fork(
     }
 } /* memfs_map_attrs_fork */
 
+/* Pre-op / post-op attribute fills on mutating operations are optional for
+ * every caller.  Routing them through these wrappers lets the enable_pre_attr /
+ * enable_post_attr config flags suppress either half: when off, the struct
+ * keeps the va_set_mask the VFS layer zeroed before dispatch, so the caller
+ * sees the attributes as not provided.  Object/lookup/read attrs call
+ * memfs_map_attrs* directly and are always populated. */
+static inline void
+memfs_map_pre_attr(
+    struct memfs_shared      *shared,
+    struct chimera_vfs_attrs *attr,
+    struct memfs_inode       *inode,
+    const void               *parent_fh)
+{
+    if (shared->enable_pre_attr) {
+        memfs_map_attrs(shared, attr, inode, parent_fh);
+    }
+} /* memfs_map_pre_attr */
+
+static inline void
+memfs_map_post_attr(
+    struct memfs_shared      *shared,
+    struct chimera_vfs_attrs *attr,
+    struct memfs_inode       *inode,
+    const void               *parent_fh)
+{
+    if (shared->enable_post_attr) {
+        memfs_map_attrs(shared, attr, inode, parent_fh);
+    }
+} /* memfs_map_post_attr */
+
+static inline void
+memfs_map_pre_attr_fork(
+    struct memfs_shared       *shared,
+    struct chimera_vfs_attrs  *attr,
+    struct memfs_inode        *inode,
+    struct memfs_named_stream *stream,
+    const void                *base_fh)
+{
+    if (shared->enable_pre_attr) {
+        memfs_map_attrs_fork(shared, attr, inode, stream, base_fh);
+    }
+} /* memfs_map_pre_attr_fork */
+
+static inline void
+memfs_map_post_attr_fork(
+    struct memfs_shared       *shared,
+    struct chimera_vfs_attrs  *attr,
+    struct memfs_inode        *inode,
+    struct memfs_named_stream *stream,
+    const void                *base_fh)
+{
+    if (shared->enable_post_attr) {
+        memfs_map_attrs_fork(shared, attr, inode, stream, base_fh);
+    }
+} /* memfs_map_post_attr_fork */
+
 static inline void
 memfs_apply_attrs(
     struct memfs_inode       *inode,
@@ -1478,6 +1561,20 @@ memfs_apply_attrs(
     if (set_mask & CHIMERA_VFS_ATTR_GID) {
         attr->va_set_mask |= CHIMERA_VFS_ATTR_GID;
         inode->gid         = attr->va_gid;
+    }
+
+    /* POSIX chown(): changing (or restating) a regular file's owner or group
+    * clears set-user-ID, and set-group-ID when group-executable (a S_ISGID
+    * bit without group-exec marks mandatory locking and is preserved).  This
+    * applies to privileged callers too, matching Linux.  An explicit mode in
+    * the same setattr wins outright, so the clear only fires without one. */
+    if ((set_mask & (CHIMERA_VFS_ATTR_UID | CHIMERA_VFS_ATTR_GID)) &&
+        !(set_mask & CHIMERA_VFS_ATTR_MODE) &&
+        S_ISREG(inode->mode)) {
+        inode->mode &= ~(uint32_t) S_ISUID;
+        if (inode->mode & S_IXGRP) {
+            inode->mode &= ~(uint32_t) S_ISGID;
+        }
     }
 
     if (set_mask & CHIMERA_VFS_ATTR_SIZE) {
@@ -1692,8 +1789,8 @@ memfs_commit(
         return;
     }
 
-    memfs_map_attrs(shared, &request->commit.r_pre_attr, inode, request->fh);
-    memfs_map_attrs(shared, &request->commit.r_post_attr, inode, request->fh);
+    memfs_map_pre_attr(shared, &request->commit.r_pre_attr, inode, request->fh);
+    memfs_map_post_attr(shared, &request->commit.r_post_attr, inode, request->fh);
 
     pthread_mutex_unlock(&inode->lock);
 
@@ -1747,7 +1844,7 @@ memfs_setattr(
     p_size       = stream ? &stream->size : &inode->size;
     p_space_used = stream ? &stream->space_used : &inode->space_used;
 
-    memfs_map_attrs_fork(shared, &request->setattr.r_pre_attr, inode, stream, request->fh);
+    memfs_map_pre_attr_fork(shared, &request->setattr.r_pre_attr, inode, stream, request->fh);
 
     /* Handle truncation: free blocks past new EOF and zero partial block */
     if ((attr->va_set_mask & CHIMERA_VFS_ATTR_SIZE) &&
@@ -1847,6 +1944,10 @@ memfs_setattr(
             request->cred->flavor != CHIMERA_VFS_AUTH_ATTR) {
             chimera_vfs_realtime(&inode->mtime);
         }
+        /* POSIX kill-priv: truncation by an unprivileged writer clears
+         * set-user-ID (and set-group-ID when group-executable), exactly
+         * like the write path does. */
+        inode->mode        = chimera_vfs_killpriv_mode(request->cred, inode->mode);
         attr->va_set_mask &= ~CHIMERA_VFS_ATTR_SIZE;
         memfs_apply_attrs(inode, attr);
         attr->va_set_mask |= CHIMERA_VFS_ATTR_SIZE;
@@ -1854,7 +1955,7 @@ memfs_setattr(
         memfs_apply_attrs(inode, attr);
     }
 
-    memfs_map_attrs_fork(shared, &request->setattr.r_post_attr, inode, stream, request->fh);
+    memfs_map_post_attr_fork(shared, &request->setattr.r_post_attr, inode, stream, request->fh);
 
     pthread_mutex_unlock(&inode->lock);
 
@@ -2302,13 +2403,18 @@ memfs_mkdir_at(
     inode->dir.parent_inum = parent_inode->inum;
     inode->dir.parent_gen  = parent_inode->gen;
 
+    /* POSIX: a set-group-ID parent directory forces the new node's group. */
+    if (parent_inode->mode & S_ISGID) {
+        inode->gid = parent_inode->gid;
+    }
+
     /* Inherit the parent's inheritable ACEs (or seed a Windows default DACL for
      * SMB creates); refresh the child's attrs since the mode may have changed. */
     memfs_inherit_acl(inode, parent_inode,
                       request->cred->flavor == CHIMERA_VFS_AUTH_ATTR);
     memfs_map_attrs(shared, r_attr, inode, request->fh);
 
-    memfs_map_attrs(shared, r_dir_pre_attr, parent_inode, request->fh);
+    memfs_map_pre_attr(shared, r_dir_pre_attr, parent_inode, request->fh);
 
     rb_tree_query_exact(
         &parent_inode->dir.dirents,
@@ -2321,7 +2427,7 @@ memfs_mkdir_at(
         existing_inode = memfs_inode_get_inum(shared, existing_dirent->inum, existing_dirent->gen);
 
         memfs_map_attrs(shared, r_attr, existing_inode, request->fh);
-        memfs_map_attrs(shared, r_dir_post_attr, parent_inode, request->fh);
+        memfs_map_post_attr(shared, r_dir_post_attr, parent_inode, request->fh);
 
         pthread_mutex_unlock(&parent_inode->lock);
         pthread_mutex_unlock(&existing_inode->lock);
@@ -2341,7 +2447,7 @@ memfs_mkdir_at(
     parent_inode->ctime = now;
     parent_inode->change++;
 
-    memfs_map_attrs(shared, r_dir_post_attr, parent_inode, request->fh);
+    memfs_map_post_attr(shared, r_dir_post_attr, parent_inode, request->fh);
 
     pthread_mutex_unlock(&parent_inode->lock);
 
@@ -2426,7 +2532,13 @@ memfs_mknod_at(
         return;
     }
 
-    memfs_map_attrs(shared, r_dir_pre_attr, parent_inode, request->fh);
+    /* POSIX: a set-group-ID parent directory forces the new node's group. */
+    if (parent_inode->mode & S_ISGID) {
+        inode->gid = parent_inode->gid;
+        memfs_map_attrs(shared, r_attr, inode, request->fh);
+    }
+
+    memfs_map_pre_attr(shared, r_dir_pre_attr, parent_inode, request->fh);
 
     rb_tree_query_exact(
         &parent_inode->dir.dirents,
@@ -2439,7 +2551,7 @@ memfs_mknod_at(
         existing_inode = memfs_inode_get_inum(shared, existing_dirent->inum, existing_dirent->gen);
 
         memfs_map_attrs(shared, r_attr, existing_inode, request->fh);
-        memfs_map_attrs(shared, r_dir_post_attr, parent_inode, request->fh);
+        memfs_map_post_attr(shared, r_dir_post_attr, parent_inode, request->fh);
 
         pthread_mutex_unlock(&parent_inode->lock);
         pthread_mutex_unlock(&existing_inode->lock);
@@ -2457,7 +2569,7 @@ memfs_mknod_at(
     parent_inode->ctime = now;
     parent_inode->change++;
 
-    memfs_map_attrs(shared, r_dir_post_attr, parent_inode, request->fh);
+    memfs_map_post_attr(shared, r_dir_post_attr, parent_inode, request->fh);
 
     pthread_mutex_unlock(&parent_inode->lock);
 
@@ -2489,7 +2601,7 @@ memfs_remove_at(
         return;
     }
 
-    memfs_map_attrs(shared, &request->remove_at.r_dir_pre_attr, parent_inode, request->fh);
+    memfs_map_pre_attr(shared, &request->remove_at.r_dir_pre_attr, parent_inode, request->fh);
 
     if (!S_ISDIR(parent_inode->mode)) {
         pthread_mutex_unlock(&parent_inode->lock);
@@ -2598,7 +2710,7 @@ memfs_remove_at(
             memfs_inode_free(thread, inode);
         }
     }
-    memfs_map_attrs(shared, &request->remove_at.r_dir_post_attr, parent_inode, request->fh);
+    memfs_map_post_attr(shared, &request->remove_at.r_dir_post_attr, parent_inode, request->fh);
 
     pthread_mutex_unlock(&parent_inode->lock);
     pthread_mutex_unlock(&inode->lock);
@@ -2833,7 +2945,7 @@ memfs_open_at(
         return;
     }
 
-    memfs_map_attrs(shared, &request->open_at.r_dir_pre_attr, parent_inode, request->fh);
+    memfs_map_pre_attr(shared, &request->open_at.r_dir_pre_attr, parent_inode, request->fh);
 
     rb_tree_query_exact(&parent_inode->dir.dirents, hash, hash, dirent);
 
@@ -2889,12 +3001,15 @@ memfs_open_at(
         inode->size       = 0;
         inode->space_used = 0;
         inode->uid        = request->cred->uid;
-        inode->gid        = request->cred->gid;
-        inode->nlink      = 1;
-        inode->mode       = S_IFREG |  0644;
-        inode->atime      = now;
-        inode->mtime      = now;
-        inode->ctime      = now;
+        /* POSIX: a set-group-ID parent directory forces the new file's
+         * group; the parent lock is held throughout the create. */
+        inode->gid = (parent_inode->mode & S_ISGID) ?
+            parent_inode->gid : request->cred->gid;
+        inode->nlink = 1;
+        inode->mode  = S_IFREG |  0644;
+        inode->atime = now;
+        inode->mtime = now;
+        inode->ctime = now;
         inode->change++;
         inode->file.blocks     = NULL;
         inode->file.max_blocks = 0;
@@ -3014,7 +3129,7 @@ memfs_open_at(
         request->open_at.r_vfs_private = (uint64_t) inode;
     }
 
-    memfs_map_attrs(shared, &request->open_at.r_dir_post_attr, parent_inode, request->fh);
+    memfs_map_post_attr(shared, &request->open_at.r_dir_post_attr, parent_inode, request->fh);
 
     pthread_mutex_unlock(&parent_inode->lock);
 
@@ -3188,6 +3303,15 @@ memfs_read(
         return;
     }
 
+    /* read() of a directory is EISDIR (the previous behavior fabricated
+     * zero-filled bytes from the empty data fork). */
+    if (unlikely(!stream && S_ISDIR(inode->mode))) {
+        pthread_mutex_unlock(&inode->lock);
+        request->status = CHIMERA_VFS_EISDIR;
+        request->complete(request);
+        return;
+    }
+
     fork      = stream ? &stream->fork : &inode->file;
     fork_size = stream ? stream->size : inode->size;
 
@@ -3354,13 +3478,13 @@ memfs_write(
     /* Write access is enforced at the VFS layer (credential-keyed gate); see
      * the note in memfs_open_at. */
 
-    memfs_map_attrs_fork(shared, &request->write.r_pre_attr, inode, stream, request->fh);
+    memfs_map_pre_attr_fork(shared, &request->write.r_pre_attr, inode, stream, request->fh);
 
     if (request->write.length == 0) {
         /* A zero-length write changes nothing. Returning early also avoids
          * the (offset + length - 1) underflow above, which drives last_block
          * to a huge value and spins the 32-bit block-growth loop forever. */
-        memfs_map_attrs_fork(shared, &request->write.r_post_attr, inode, stream, request->fh);
+        memfs_map_post_attr_fork(shared, &request->write.r_post_attr, inode, stream, request->fh);
         pthread_mutex_unlock(&inode->lock);
         request->status         = CHIMERA_VFS_OK;
         request->write.r_length = 0;
@@ -3491,7 +3615,7 @@ memfs_write(
      * streams share the parent inode's mode, so this applies on either path. */
     inode->mode = chimera_vfs_killpriv_mode(request->cred, inode->mode);
 
-    memfs_map_attrs_fork(shared, &request->write.r_post_attr, inode, stream, request->fh);
+    memfs_map_post_attr_fork(shared, &request->write.r_post_attr, inode, stream, request->fh);
 
     pthread_mutex_unlock(&inode->lock);
 
@@ -3536,7 +3660,7 @@ memfs_allocate(
     p_size       = stream ? &stream->size : &inode->size;
     p_space_used = stream ? &stream->space_used : &inode->space_used;
 
-    memfs_map_attrs_fork(shared, &request->allocate.r_pre_attr, inode, stream, request->fh);
+    memfs_map_pre_attr_fork(shared, &request->allocate.r_pre_attr, inode, stream, request->fh);
 
     if (request->allocate.flags & CHIMERA_VFS_ALLOCATE_DEALLOCATE) {
         /* DEALLOCATE: punch hole in [offset, offset+length) */
@@ -3620,15 +3744,16 @@ memfs_allocate(
         /* ALLOCATE: reserve space for [offset, offset+length) and extend size. */
         uint64_t new_end = request->allocate.offset + request->allocate.length;
 
-        /* In capacity mode, materialize zero blocks across the range so the
-         * space is actually consumed -- and charged at the block alloc/free
-         * choke points.  This keeps the accounting honest under the operations
-         * the reservation model got wrong: a later write reuses these blocks
-         * (alloc-new + free-old nets to zero, so no double charge), and a
-         * DEALLOCATE frees them (releasing the space).  block_alloc returns
+        /* Materialize zero blocks across the range so the space is actually
+         * allocated: an ALLOCATE'd region is *data* (allocated space), not a
+         * hole, so SEEK_DATA/SEEK_HOLE and sr_eof must see it as data (RFC 7862
+         * §11.1/§15.11).  Materializing is also what keeps capacity accounting
+         * honest -- the space is charged at the block alloc/free choke points;
+         * a later write reuses these blocks (alloc-new + free-old nets to zero,
+         * so no double charge) and DEALLOCATE frees them.  block_alloc returns
          * NULL (ENOSPC) when the filesystem is full.  Streams keep the cheap
          * size-only path (memfs_grow_blocks operates on the base fork). */
-        if (shared->fs_size && !stream && request->allocate.length) {
+        if (!stream && request->allocate.length) {
             const uint32_t block_size  = shared->block_size;
             const uint32_t block_shift = shared->block_shift;
             uint64_t       first_block = request->allocate.offset >> block_shift;
@@ -3679,7 +3804,7 @@ memfs_allocate(
     inode->ctime = now;
     inode->change++;
 
-    memfs_map_attrs_fork(shared, &request->allocate.r_post_attr, inode, stream, request->fh);
+    memfs_map_post_attr_fork(shared, &request->allocate.r_post_attr, inode, stream, request->fh);
 
     pthread_mutex_unlock(&inode->lock);
 
@@ -3828,8 +3953,32 @@ memfs_copy_range(
         return;
     }
 
-    src_inode = (struct memfs_inode *) request->copy_range.src_handle->vfs_private;
-    dst_inode = (struct memfs_inode *) request->copy_range.dst_handle->vfs_private;
+    /* The handle's vfs_private points at the inode for a real backend open, but
+    * memfs advertises no OPEN_FILE_REQUIRED, so a caller that only needs to
+    * read (e.g. an O_RDONLY copy_file_range source) can hold a no-backend-open
+    * handle whose vfs_private is 0.  Fall back to resolving the inode from the
+    * handle's file handle, exactly as memfs_resolve_io does for read/write;
+    * without this the source resolves to NULL and a valid copy fails EINVAL. */
+    src_inode = (struct memfs_inode *) (uintptr_t) request->copy_range.src_handle->vfs_private;
+    if (!src_inode) {
+        /* memfs_inode_get_fh returns the inode locked and gen-validated, but
+         * copy_range takes both inode locks itself in address order below (to
+         * avoid AB/BA deadlock), so drop the lock and let that path re-take it. */
+        src_inode = memfs_inode_get_fh(shared, request->copy_range.src_handle->fh,
+                                       request->copy_range.src_handle->fh_len);
+        if (src_inode) {
+            pthread_mutex_unlock(&src_inode->lock);
+        }
+    }
+
+    dst_inode = (struct memfs_inode *) (uintptr_t) request->copy_range.dst_handle->vfs_private;
+    if (!dst_inode) {
+        dst_inode = memfs_inode_get_fh(shared, request->copy_range.dst_handle->fh,
+                                       request->copy_range.dst_handle->fh_len);
+        if (dst_inode) {
+            pthread_mutex_unlock(&dst_inode->lock);
+        }
+    }
 
     if (!src_inode || !dst_inode) {
         request->status = CHIMERA_VFS_EINVAL;
@@ -3892,8 +4041,8 @@ memfs_copy_range(
         pthread_mutex_lock(&src_inode->lock);
     }
 
-    memfs_map_attrs(shared, &request->copy_range.r_pre_attr, dst_inode,
-                    request->copy_range.dst_handle->fh);
+    memfs_map_pre_attr(shared, &request->copy_range.r_pre_attr, dst_inode,
+                       request->copy_range.dst_handle->fh);
 
     /* Clamp length to what's available in source */
     if (src_offset >= src_inode->size) {
@@ -3906,8 +4055,8 @@ memfs_copy_range(
     }
 
     if (src_eof_len == 0) {
-        memfs_map_attrs(shared, &request->copy_range.r_post_attr, dst_inode,
-                        request->copy_range.dst_handle->fh);
+        memfs_map_post_attr(shared, &request->copy_range.r_post_attr, dst_inode,
+                            request->copy_range.dst_handle->fh);
         if (src_inode != dst_inode) {
             pthread_mutex_unlock(&src_inode->lock);
         }
@@ -3945,6 +4094,45 @@ memfs_copy_range(
         }
 
         old_block = dst_inode->file.blocks[bi];
+
+        /* Full-destination-block copies preserve source holes: when every
+         * source block covering this destination block is absent, drop the
+         * destination block instead of materializing zeroes, so SEEK_HOLE
+         * still sees the hole after the copy.  (Partial edges keep the
+         * copy-through-zeroes behavior; byte overlap between source and
+         * destination was rejected above, so freeing here cannot free a
+         * block the source side still needs.)  This is POSIX
+         * copy_file_range() semantics, requested via CHIMERA_VFS_COPY_PRESERVE_HOLES;
+         * SMB copychunk, NFS4 COPY and S3 copy leave the flag clear and get
+         * the materializing behavior their conformance suites expect. */
+        if ((request->copy_range.flags & CHIMERA_VFS_COPY_PRESERVE_HOLES) &&
+            block_offset == 0 && block_len == block_size) {
+            uint64_t s_off  = src_offset + copied;
+            uint64_t s_bi   = s_off >> block_shift;
+            uint64_t s_last = (s_off + block_len - 1) >> block_shift;
+            int      hole   = 1;
+
+            for (uint64_t sb = s_bi; sb <= s_last; sb++) {
+                if (sb < src_inode->file.num_blocks &&
+                    src_inode->file.blocks &&
+                    src_inode->file.blocks[sb]) {
+                    hole = 0;
+                    break;
+                }
+            }
+
+            if (hole) {
+                if (old_block) {
+                    memfs_block_free(thread, old_block);
+                    dst_inode->file.blocks[bi] = NULL;
+                }
+                copied      += block_len;
+                left        -= block_len;
+                block_offset = 0;
+                continue;
+            }
+        }
+
         new_block = memfs_block_alloc(thread);
 
         if (!new_block) {
@@ -4010,8 +4198,8 @@ memfs_copy_range(
     dst_inode->change++;
     src_inode->atime = now;
 
-    memfs_map_attrs(shared, &request->copy_range.r_post_attr, dst_inode,
-                    request->copy_range.dst_handle->fh);
+    memfs_map_post_attr(shared, &request->copy_range.r_post_attr, dst_inode,
+                        request->copy_range.dst_handle->fh);
 
     if (src_inode != dst_inode) {
         pthread_mutex_unlock(&src_inode->lock);
@@ -4103,8 +4291,8 @@ memfs_move_range(
         pthread_mutex_lock(&src_inode->lock);
     }
 
-    memfs_map_attrs(shared, &request->move_range.r_dst_pre_attr, dst_inode,
-                    request->move_range.dst_handle->fh);
+    memfs_map_pre_attr(shared, &request->move_range.r_dst_pre_attr, dst_inode,
+                       request->move_range.dst_handle->fh);
 
     first_block     = dst_offset >> block_shift;
     last_block      = (dst_offset + length - 1) >> block_shift;
@@ -4159,10 +4347,10 @@ memfs_move_range(
     src_inode->ctime = now;
     src_inode->change++;
 
-    memfs_map_attrs(shared, &request->move_range.r_dst_post_attr, dst_inode,
-                    request->move_range.dst_handle->fh);
-    memfs_map_attrs(shared, &request->move_range.r_src_post_attr, src_inode,
-                    request->move_range.src_handle->fh);
+    memfs_map_post_attr(shared, &request->move_range.r_dst_post_attr, dst_inode,
+                        request->move_range.dst_handle->fh);
+    memfs_map_post_attr(shared, &request->move_range.r_src_post_attr, src_inode,
+                        request->move_range.src_handle->fh);
 
     if (src_inode != dst_inode) {
         pthread_mutex_unlock(&src_inode->lock);
@@ -4260,8 +4448,21 @@ memfs_clone_range(
         pthread_mutex_lock(&src_inode->lock);
     }
 
-    memfs_map_attrs(shared, &request->clone_range.r_pre_attr, dst_inode,
-                    request->clone_range.dst_handle->fh);
+    /* The source range must lie within the source file (FICLONERANGE
+     * contract: EINVAL otherwise).  Checked under the inode lock so the
+     * size cannot move underneath the decision. */
+    if (src_offset + length > src_inode->size) {
+        if (src_inode != dst_inode) {
+            pthread_mutex_unlock(&src_inode->lock);
+        }
+        pthread_mutex_unlock(&dst_inode->lock);
+        request->status = CHIMERA_VFS_EINVAL;
+        request->complete(request);
+        return;
+    }
+
+    memfs_map_pre_attr(shared, &request->clone_range.r_pre_attr, dst_inode,
+                       request->clone_range.dst_handle->fh);
 
     first_block  = dst_offset >> block_shift;
     block_offset = dst_offset & block_mask;
@@ -4402,8 +4603,8 @@ memfs_clone_range(
     dst_inode->change++;
     src_inode->atime = now;
 
-    memfs_map_attrs(shared, &request->clone_range.r_post_attr, dst_inode,
-                    request->clone_range.dst_handle->fh);
+    memfs_map_post_attr(shared, &request->clone_range.r_post_attr, dst_inode,
+                        request->clone_range.dst_handle->fh);
 
     if (src_inode != dst_inode) {
         pthread_mutex_unlock(&src_inode->lock);
@@ -4589,6 +4790,12 @@ memfs_symlink_at(
         return;
     }
 
+    /* POSIX: a set-group-ID parent directory forces the new node's group. */
+    if (parent_inode->mode & S_ISGID) {
+        inode->gid = parent_inode->gid;
+        memfs_map_attrs(shared, &request->symlink_at.r_attr, inode, request->fh);
+    }
+
     rb_tree_query_exact(&parent_inode->dir.dirents, hash, hash, existing_dirent);
 
     if (existing_dirent) {
@@ -4600,7 +4807,7 @@ memfs_symlink_at(
         return;
     }
 
-    memfs_map_attrs(shared, &request->symlink_at.r_dir_pre_attr, parent_inode, request->fh);
+    memfs_map_pre_attr(shared, &request->symlink_at.r_dir_pre_attr, parent_inode, request->fh);
 
     rb_tree_insert(&parent_inode->dir.dirents, hash, dirent);
 
@@ -4608,7 +4815,7 @@ memfs_symlink_at(
     parent_inode->ctime = now;
     parent_inode->change++;
 
-    memfs_map_attrs(shared, &request->symlink_at.r_dir_post_attr, parent_inode, request->fh);
+    memfs_map_post_attr(shared, &request->symlink_at.r_dir_post_attr, parent_inode, request->fh);
 
     pthread_mutex_unlock(&parent_inode->lock);
 
@@ -4775,8 +4982,8 @@ memfs_rename_at(
         }
     }
 
-    memfs_map_attrs(shared, &request->rename_at.r_fromdir_pre_attr, old_parent_inode, request->fh);
-    memfs_map_attrs(shared, &request->rename_at.r_todir_pre_attr, new_parent_inode, request->rename_at.new_fh);
+    memfs_map_pre_attr(shared, &request->rename_at.r_fromdir_pre_attr, old_parent_inode, request->fh);
+    memfs_map_pre_attr(shared, &request->rename_at.r_todir_pre_attr, new_parent_inode, request->rename_at.new_fh);
 
     rb_tree_query_exact(&old_parent_inode->dir.dirents, hash, hash, old_dirent);
 
@@ -4861,8 +5068,9 @@ memfs_rename_at(
         if (existing_dirent->inum == old_dirent->inum &&
             existing_dirent->gen == old_dirent->gen) {
             /* Same inode - do nothing, just return success */
-            memfs_map_attrs(shared, &request->rename_at.r_fromdir_post_attr, old_parent_inode, request->fh);
-            memfs_map_attrs(shared, &request->rename_at.r_todir_post_attr, new_parent_inode, request->rename_at.new_fh);
+            memfs_map_post_attr(shared, &request->rename_at.r_fromdir_post_attr, old_parent_inode, request->fh);
+            memfs_map_post_attr(shared, &request->rename_at.r_todir_post_attr, new_parent_inode, request->rename_at.
+                                new_fh);
             pthread_mutex_unlock(&child_inode->lock);
             if (cmp != 0) {
                 pthread_mutex_unlock(&old_parent_inode->lock);
@@ -4949,11 +5157,21 @@ memfs_rename_at(
             } else {
                 existing_inode->nlink--;
             }
+            int existing_freed = 0;
             if (existing_inode->nlink == 0) {
                 --existing_inode->refcnt;
                 if (existing_inode->refcnt == 0) {
                     memfs_inode_free(thread, existing_inode);
+                    existing_freed = 1;
                 }
+            }
+            /* POSIX: dropping a link is a status change on the clobbered
+             * inode.  If it survives (a remaining hard link, or unlinked but
+             * still open) its ctime/change must advance so a handle that still
+             * resolves to it observes the update. */
+            if (!existing_freed) {
+                existing_inode->ctime = now;
+                existing_inode->change++;
             }
             pthread_mutex_unlock(&existing_inode->lock);
             memfs_dirent_free(thread, existing_dirent);
@@ -4993,8 +5211,8 @@ memfs_rename_at(
     child_inode->ctime = now;
     child_inode->change++;
 
-    memfs_map_attrs(shared, &request->rename_at.r_fromdir_post_attr, old_parent_inode, request->fh);
-    memfs_map_attrs(shared, &request->rename_at.r_todir_post_attr, new_parent_inode, request->rename_at.new_fh);
+    memfs_map_post_attr(shared, &request->rename_at.r_fromdir_post_attr, old_parent_inode, request->fh);
+    memfs_map_post_attr(shared, &request->rename_at.r_todir_post_attr, new_parent_inode, request->rename_at.new_fh);
 
     pthread_mutex_unlock(&child_inode->lock);
 
@@ -5038,7 +5256,7 @@ memfs_link_at(
         return;
     }
 
-    memfs_map_attrs(shared, &request->link_at.r_dir_pre_attr, parent_inode, request->link_at.dir_fh);
+    memfs_map_pre_attr(shared, &request->link_at.r_dir_pre_attr, parent_inode, request->link_at.dir_fh);
 
     if (!S_ISDIR(parent_inode->mode)) {
         pthread_mutex_unlock(&parent_inode->lock);
@@ -5107,8 +5325,8 @@ memfs_link_at(
             parent_inode->mtime = now;
             parent_inode->ctime = now;
             parent_inode->change++;
-            memfs_map_attrs(shared, &request->link_at.r_dir_post_attr,
-                            parent_inode, request->link_at.dir_fh);
+            memfs_map_post_attr(shared, &request->link_at.r_dir_post_attr,
+                                parent_inode, request->link_at.dir_fh);
             memfs_map_attrs(shared, &request->link_at.r_attr, inode,
                             request->fh);
             pthread_mutex_unlock(&parent_inode->lock);
@@ -5164,7 +5382,7 @@ memfs_link_at(
     parent_inode->ctime = now;
     parent_inode->change++;
 
-    memfs_map_attrs(shared, &request->link_at.r_dir_post_attr, parent_inode, request->link_at.dir_fh);
+    memfs_map_post_attr(shared, &request->link_at.r_dir_post_attr, parent_inode, request->link_at.dir_fh);
     memfs_map_attrs(shared, &request->link_at.r_attr, inode, request->fh);
 
     pthread_mutex_unlock(&parent_inode->lock);
@@ -5250,7 +5468,7 @@ memfs_set_xattr(
         return;
     }
 
-    memfs_map_attrs(shared, &request->set_xattr.r_pre_attr, inode, request->fh);
+    memfs_map_pre_attr(shared, &request->set_xattr.r_pre_attr, inode, request->fh);
 
     xattr = memfs_xattr_find(inode, request->set_xattr.name,
                              request->set_xattr.namelen);
@@ -5291,7 +5509,7 @@ memfs_set_xattr(
     inode->ctime = now;
     inode->change++;
 
-    memfs_map_attrs(shared, &request->set_xattr.r_post_attr, inode, request->fh);
+    memfs_map_post_attr(shared, &request->set_xattr.r_post_attr, inode, request->fh);
 
     pthread_mutex_unlock(&inode->lock);
 
@@ -5363,7 +5581,7 @@ memfs_remove_xattr(
         return;
     }
 
-    memfs_map_attrs(shared, &request->remove_xattr.r_pre_attr, inode, request->fh);
+    memfs_map_pre_attr(shared, &request->remove_xattr.r_pre_attr, inode, request->fh);
 
     pprev = &inode->xattrs;
     for (xattr = inode->xattrs; xattr; xattr = xattr->next) {
@@ -5391,7 +5609,7 @@ memfs_remove_xattr(
     inode->ctime = now;
     inode->change++;
 
-    memfs_map_attrs(shared, &request->remove_xattr.r_post_attr, inode, request->fh);
+    memfs_map_post_attr(shared, &request->remove_xattr.r_post_attr, inode, request->fh);
 
     pthread_mutex_unlock(&inode->lock);
 
@@ -5596,7 +5814,7 @@ memfs_remove_stream(
         return;
     }
 
-    memfs_map_attrs(shared, &request->remove_stream.r_pre_attr, inode, request->fh);
+    memfs_map_pre_attr(shared, &request->remove_stream.r_pre_attr, inode, request->fh);
 
     pprev = &inode->streams;
     for (stream = inode->streams; stream; stream = stream->next) {
@@ -5632,7 +5850,7 @@ memfs_remove_stream(
     inode->ctime = now;
     inode->change++;
 
-    memfs_map_attrs(shared, &request->remove_stream.r_post_attr, inode, request->fh);
+    memfs_map_post_attr(shared, &request->remove_stream.r_post_attr, inode, request->fh);
 
     pthread_mutex_unlock(&inode->lock);
 

@@ -9,6 +9,7 @@
 #include <time.h>
 #include <uthash.h>
 
+#include "common/platform.h"
 #include "nfs4_xdr.h"
 #include "nfs_internal.h"
 
@@ -51,7 +52,11 @@ enum nfs4_slot_state {
  * another connection/thread; it is arbitrated by the CAS in
  * nfs4_replay_slot_acquire.  cached_buf/cached_len are written by the (rare)
  * cachethis capture path on the owning thread and published via the release
- * store in nfs4_replay_slot_finalize.
+ * store in nfs4_replay_slot_finalize.  A retransmit that replays those bytes
+ * first claims the slot CACHED -> IN_PROGRESS with that same CAS (restored by
+ * nfs4_replay_slot_replay_done after the send): holding IN_PROGRESS excludes a
+ * concurrent advance (seqid+1) from freeing cached_buf mid-replay, so the
+ * buffer is only ever read or freed by the single thread that owns the slot.
  */
 struct nfs4_replay_slot {
     _Atomic uint64_t state_word;       /* (seqid << NFS4_SLOT_SEQID_SHIFT) | state */
@@ -144,6 +149,11 @@ struct nfs4_client {
      * possession of the clientid via a successful CREATE_SESSION; only then
      * is it "confirmed". */
     uint8_t               nfs4_client_confirmed;
+    /* Whether this record currently occupies the by-owner hash slot.  A
+     * superseding (reboot) registration lives in the by-id table only until
+     * it is confirmed; removal paths must not HASH_DELETE a record from a
+     * table it was never added to (uthash corruption). */
+    uint8_t               nfs4_client_in_owner_table;
     /* Principal that created the record (see nfs4_client_principal).  Under
      * SP4_MACH_CRED this is the bound "machine credential": state-management
      * operations must be issued with this same (RPCSEC_GSS) principal. */
@@ -206,6 +216,9 @@ struct nfs4_exchange_id_result {
     uint64_t           clientid;
     uint32_t           confirmed;
     struct nfs_client *destroy_unified;
+    /* A second hierarchy to tear down: replacing a principal-mismatched
+     * confirmed record also destroys its in-flight superseding record. */
+    struct nfs_client *destroy_unified2;
 };
 
 struct nfs4_session {
@@ -418,9 +431,12 @@ nfs4_client_reclaim_complete(
     struct nfs4_client_table *table,
     uint64_t                  client_id);
 
-/* DESTROY_CLIENTID (RFC 8881 §18.50): returns NFS4ERR_STALE_CLIENTID if no
- * such client, NFS4ERR_CLIENTID_BUSY if it still owns sessions, else removes
- * the record (tearing down its unified state hierarchy) and returns NFS4_OK. */
+/*
+ * DESTROY_CLIENTID (RFC 8881 §18.50): returns NFS4ERR_STALE_CLIENTID if no
+ * such client, NFS4ERR_CLIENTID_BUSY if it still owns sessions or any leased
+ * state (opens, locks, delegations, layouts) per §18.50.3, else removes the
+ * record (tearing down its unified state hierarchy) and returns NFS4_OK.
+ */
 nfsstat4
 nfs4_client_destroy_clientid(
     struct nfs4_client_table  *table,
@@ -433,6 +449,50 @@ nfs4_client_destroy_clientid(
  * sessions are torn down and its state hierarchy is returned via
  * *destroy_unified for teardown outside the table lock.  Returns false when no
  * such client exists (caller maps to NFS4ERR_STALE_CLIENTID). */
+struct nfs_open_owner;
+
+nfsstat4
+nfs4_clients_check_io_denied(
+    struct nfs4_client_table *table,
+    const uint8_t            *fh,
+    uint16_t                  fh_len,
+    uint32_t                  requested_access);
+
+/* True if any client holds `fh` open; keeps a removed-but-open file's
+ * handle valid regardless of which connection issues the PUTFH. */
+bool
+nfs4_clients_have_open_state(
+    struct nfs4_client_table *table,
+    const uint8_t            *fh,
+    uint16_t                  fh_len);
+/* Recover an NFSv4 lock-owner byte-string from the (clientid, XXH3 owner
+ * hash) the VFS range-lease layer records, for a LOCK/LOCKT DENIED reply.
+ * Returns true and fills out_owner/out_len on a hit. */
+bool
+nfs4_client_lookup_lock_owner(
+    struct nfs4_client_table *table,
+    uint64_t                  clientid,
+    uint64_t                  owner_hash,
+    uint8_t                  *out_owner,
+    uint32_t                  out_cap,
+    uint32_t                 *out_len);
+
+/* Fill a LOCK4denied / LOCKT4res owner from a conflicting VFS range lease.
+ * For an NFSv4 conflict the clientid and (reconstructed) owner byte-string
+ * name the holder (RFC 7530 §16.10.5 / §16.11.5); a non-NFSv4 conflict has
+ * no NFSv4 lock-owner, so the owner is left empty but the clientid still
+ * reflects the holder's client_key.  `dbuf` allocates the owner copy from
+ * the reply buffer. */
+struct chimera_vfs_lease;
+struct state_owner4;
+struct xdr_dbuf;
+void
+nfs4_fill_denied_owner(
+    struct nfs4_client_table       *table,
+    const struct chimera_vfs_lease *conflict,
+    struct state_owner4            *denied_owner,
+    struct xdr_dbuf                *dbuf);
+
 bool
 nfs4_client_confirm(
     struct nfs4_client_table *table,
@@ -485,6 +545,14 @@ nfsstat4 nfs4_replay_slot_acquire(
  * Phase 1 this advances IN_PROGRESS -> COMPLETED.  Phase 2 will optionally
  * capture the encoded reply bytes and transition to CACHED. */
 void nfs4_replay_slot_finalize(
+    struct nfs_request *req);
+
+/* Called by the compound dispatcher after a cached reply has been replayed for
+ * a retransmit.  Releases the slot the retransmit path claimed (CACHED ->
+ * IN_PROGRESS) back to CACHED, keeping its seqid and cached buffer so the
+ * buffer stays pinned for the whole replay and no concurrent advance can free
+ * it mid-send. */
+void nfs4_replay_slot_replay_done(
     struct nfs_request *req);
 
 /* Record the delegation callback path on a client's unified state record.

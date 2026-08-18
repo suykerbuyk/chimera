@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -39,9 +40,17 @@
  * userspace lock or its holder -- the decisive datum for a post-fork
  * lock-family wedge), then abort().  The SIGABRT unblocks the parent's
  * waitpid, so the test fails fast WITH diagnostics instead of timing out
- * silently.  The handler knowingly calls async-signal-unsafe functions: the
- * process is wedged and about to abort, so a lost dump costs nothing over
- * the status quo.
+ * silently.
+ *
+ * The handler must not allocate: it can interrupt a thread that is holding
+ * the sanitizer allocator lock (observed in practice with the main thread
+ * inside LSan's exit-time stop-the-world), and a dprintf/fprintf here
+ * mallocs a stdio buffer, spinning forever on that lock -- which converts a
+ * transient stall into a permanent wedge that ctest only clears at its
+ * 300s timeout, losing every diagnostic.  So: re-arm SIGALRM with the
+ * default (fatal) action FIRST as a dead-man switch, write() preformatted
+ * buffers instead of using stdio, and pre-warm backtrace() at arm time so
+ * its one-time dlopen/malloc happens outside the handler.
  */
 static void
 posix_test_child_watchdog_fire(int sig)
@@ -49,12 +58,23 @@ posix_test_child_watchdog_fire(int sig)
     void *frames[64];
     int   nframes;
     DIR  *taskdir;
+    char  buf[512];
+    int   len;
 
     (void) sig;
 
-    dprintf(STDERR_FILENO,
-            "child-watchdog: pid %d stuck; dumping thread states\n",
-            (int) getpid());
+    /* Dead-man switch: even if the dump below wedges, the next SIGALRM
+     * kills the process outright (12s keeps 45+12 under the smallest 60s
+     * ctest timeout in the lock family). */
+    signal(SIGALRM, SIG_DFL);
+    alarm(12);
+
+    len = snprintf(buf, sizeof(buf),
+                   "child-watchdog: pid %d stuck; dumping thread states\n",
+                   (int) getpid());
+    if (len > 0 && write(STDERR_FILENO, buf, (size_t) len) < 0) {
+        /* nothing actionable */
+    }
 
     taskdir = opendir("/proc/self/task");
     if (taskdir) {
@@ -76,13 +96,19 @@ posix_test_child_watchdog_fire(int sig)
                 close(wfd);
             }
             wchan[m > 0 ? m : 0] = '\0';
-            dprintf(STDERR_FILENO, "child-watchdog: tid %s wchan %s\n",
-                    de->d_name, wchan);
+            len                  = snprintf(buf, sizeof(buf), "child-watchdog: tid %s wchan %s\n",
+                                            de->d_name, wchan);
+            if (len > 0 && write(STDERR_FILENO, buf, (size_t) len) < 0) {
+                /* nothing actionable */
+            }
         }
         closedir(taskdir);
     }
 
-    dprintf(STDERR_FILENO, "child-watchdog: signaled thread backtrace:\n");
+    len = snprintf(buf, sizeof(buf), "child-watchdog: signaled thread backtrace:\n");
+    if (len > 0 && write(STDERR_FILENO, buf, (size_t) len) < 0) {
+        /* nothing actionable */
+    }
     nframes = backtrace(frames, 64);
     backtrace_symbols_fd(frames, nframes, STDERR_FILENO);
 
@@ -95,11 +121,15 @@ posix_test_child_watchdog_fire(int sig)
          * identifies the offending lock and its holder.  Best-effort: gstack
          * (gdb) may be unavailable, in which case the wchan dump above stands. */
         char cmd[160];
+        int  clen;
 
         snprintf(cmd, sizeof(cmd),
                  "command -v gstack >/dev/null 2>&1 && gstack %d 1>&2",
                  (int) getpid());
-        dprintf(STDERR_FILENO, "child-watchdog: gstack all threads:\n");
+        clen = snprintf(buf, sizeof(buf), "child-watchdog: gstack all threads:\n");
+        if (clen > 0 && write(STDERR_FILENO, buf, (size_t) clen) < 0) {
+            /* nothing actionable */
+        }
         /* Best-effort: the watchdog is already aborting, so a failed dump is
          * harmless.  A plain (void) cast does not silence glibc's
          * warn_unused_result on system(), so consume the result explicitly. */
@@ -116,6 +146,7 @@ static inline void
 posix_test_child_watchdog(unsigned int seconds)
 {
     struct sigaction sa;
+    void            *warm[4];
 
     const char      *ovr = getenv("CHIMERA_TEST_WATCHDOG_SECONDS");
 
@@ -126,11 +157,63 @@ posix_test_child_watchdog(unsigned int seconds)
         }
     }
 
+    /* backtrace()'s first call dlopens libgcc and allocates; do that now so
+     * the signal handler's call is allocation-free. */
+    (void) backtrace(warm, 4);
+
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = posix_test_child_watchdog_fire;
     sigaction(SIGALRM, &sa, NULL);
     alarm(seconds);
 } /* posix_test_child_watchdog */
+
+/* Mark a parent-only pipe end close-on-exec so a re-exec'ed child never
+ * inherits it (keeps the EOF semantics of the sync pipes identical to the
+ * plain-fork arrangement without the child having to know the fd numbers). */
+static inline void
+posix_test_cloexec(int fd)
+{
+    int flags = fcntl(fd, F_GETFD, 0);
+
+    if (flags >= 0) {
+        (void) fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+    }
+} /* posix_test_cloexec */
+
+/*
+ * Spawn the cross-process test child by re-exec'ing this same binary.
+ *
+ * A plain fork() hands the child a copy of the parent's address space,
+ * including every lock any parent thread happens to hold at that instant.
+ * The visible ones (the chimera log flusher's) are handled by atfork
+ * handlers, but locks inside opaque runtimes are not: gcc-13's ASan takes a
+ * per-size-class allocator region mutex inside the malloc/free that glibc
+ * stdio performs under the flusher's locks and does not force-unlock it
+ * across fork, so a child forked at the wrong instant inherits it held and
+ * every thread it creates wedges inside AsanThread::Init (the lock-family
+ * flakes in #733).  exec() resets the address space, so the child starts
+ * with no inherited lock state at all, from any runtime, forever.
+ *
+ * The child re-enters main() with argv crafted by the caller (a -C child
+ * mode flag plus the sync-pipe fds and session paths); pipe fds survive
+ * exec unless marked FD_CLOEXEC.  Only async-signal-safe work happens
+ * between fork and exec.
+ */
+static inline pid_t
+posix_test_fork_exec(char *const cargv[])
+{
+    pid_t pid = fork();
+
+    if (pid == 0) {
+        execv("/proc/self/exe", cargv);
+        /* exec failed; this address space is still the parent's copy, so
+         * exit without running atexit handlers. */
+        perror("posix_test_fork_exec: execv");
+        _exit(127);
+    }
+
+    return pid;
+} /* posix_test_fork_exec */
 
 struct posix_test_env {
     struct chimera_posix_client *posix;
@@ -215,15 +298,26 @@ posix_test_is_ext_module(const char *backend)
     return ext && strcmp(backend, ext) == 0;
 } // posix_test_is_ext_module
 
-/* Session-dir root: CHIMERA_TEST_ROOT when set, else /build/test.  Used by
+/* Session-dir root: CHIMERA_TEST_ROOT when set, else /build/test (the
+ * CI/devcontainer layout), else /tmp/chimera_test for hosts without a /build
+ * (e.g. the serialized unprivileged fallback on macOS).  Used by
  * posix_test_init and by the lock-family tests that do their own pre-fork
  * setup. */
 static inline const char *
 posix_test_session_root(void)
 {
     const char *root = getenv("CHIMERA_TEST_ROOT");
+    struct stat st;
 
-    return root ? root : "/build/test";
+    if (root) {
+        return root;
+    }
+
+    if (stat("/build", &st) == 0 && S_ISDIR(st.st_mode)) {
+        return "/build/test";
+    }
+
+    return "/tmp/chimera_test";
 } // posix_test_session_root
 
 /* Emit the external-module client config into a posix.json "config" object:
@@ -313,12 +407,12 @@ static int posix_test_ro_access_export __attribute__ ((unused)) = 0;
 
 /* Name of the subdirectory (relative to the backend root) that the read-only
  * export is mounted at; the read-write export sees it as "/share/ro". */
-#define POSIX_TEST_RO_SUBDIR             "ro"
+#define POSIX_TEST_RO_SUBDIR "ro"
 
 /* Explicit export id above the default nfs_max_exports count cap (4096),
  * so tests cover pinned-id file-handle attribution across the whole 16-bit
  * id space rather than only small auto-assigned ids. */
-#define POSIX_TEST_EXPORT_ID             4242
+#define POSIX_TEST_EXPORT_ID 4242
 
 /* When non-zero (set before posix_test_init), posix_test_start_nfs_server
  * creates this many EXTRA exports alongside "/share", each its own mount of
@@ -335,6 +429,16 @@ static int posix_test_ro_access_export __attribute__ ((unused)) = 0;
  * string prefix of another: chimera_nfs_find_export_path matches export names
  * by prefix, the same collision the "roshare" note below avoids. */
 static int posix_test_extra_exports __attribute__ ((unused)) = 0;
+
+/* When non-zero (set before posix_test_init), posix_test_start_nfs_server
+ * also creates a root export "/" backed by the same "/share" mount.  The
+ * NFSv4 namespace root is then the share's real backend directory rather
+ * than the synthetic pseudo-root, and the other exports remain reachable as
+ * junctions grafted over it at LOOKUP (see nfs4_root_junction_check). */
+static int posix_test_root_export __attribute__ ((unused)) = 0;
+
+/* Pinned id for the root export, clear of the other pinned ids here. */
+#define POSIX_TEST_ROOT_EXPORT_ID        (POSIX_TEST_EXPORT_ID + 3)
 
 /* Name of the i'th extra export and its mount (fixed width, see above). */
 #define POSIX_TEST_EXTRA_EXPORT_NAME_FMT "page%02d"
@@ -454,6 +558,22 @@ posix_test_configure_cairn(
 } // posix_test_configure_cairn
 
 // Helper to start NFS server with the given backend and mount it as "share"
+/*
+ * Which transport the in-process server and its client should use.
+ *
+ * The in-process one by default: it binds nothing, so any number of test
+ * binaries run at once without a namespace to separate them.  A test that
+ * fork()s must opt out with CHIMERA_TEST_TRANSPORT=tcp, because an inproc name
+ * is reachable only from the process that registered it.
+ */
+static inline int
+posix_test_transport_is_inproc(void)
+{
+    const char *t = getenv("CHIMERA_TEST_TRANSPORT");
+
+    return !(t && strcasecmp(t, "tcp") == 0);
+} /* posix_test_transport_is_inproc */
+
 static inline void
 posix_test_start_nfs_server(struct posix_test_env *env)
 {
@@ -464,6 +584,26 @@ posix_test_start_nfs_server(struct posix_test_env *env)
 
     server_config = chimera_server_config_init();
     chimera_server_config_set_state_dir(server_config, env->session_dir);
+
+    /* Serve over the in-process transport rather than a socket.  The client is
+     * in this same process, so nothing here needs a port -- which is the point:
+     * an inproc name is private to the process, so any number of these test
+     * binaries can run at once without colliding, and without a network
+     * namespace to keep them apart.
+     *
+     * A test that fork()s is the exception and sets CHIMERA_TEST_TRANSPORT=tcp:
+     * an inproc name reaches only the process that registered it, so a child
+     * that initialises its own client after fork() could never find a server
+     * living in its parent.  Those keep a real socket, and the namespace that
+     * isolates it. */
+    chimera_server_config_set_tcp_flavor(server_config,
+                                         posix_test_transport_is_inproc()
+                                         ? CHIMERA_TCP_FLAVOR_INPROC
+                                         : CHIMERA_TCP_FLAVOR_PLAIN);
+
+    /* The posix suite only talks NFS; the other protocols stay at their
+     * default of disabled. */
+    chimera_server_config_set_nfs_enabled(server_config, 1);
 
     if (posix_test_is_diskfs(nfs_backend_name)) {
         posix_test_configure_diskfs(env->session_dir,
@@ -568,6 +708,18 @@ posix_test_start_nfs_server(struct posix_test_env *env)
                                      POSIX_TEST_EXPORT_ID, NULL) != 0) {
         fprintf(stderr, "Failed to create /share export\n");
         exit(EXIT_FAILURE);
+    }
+
+    if (posix_test_root_export) {
+        /* Root export backed by the same "/share" mount: the NFSv4 namespace
+         * root becomes the share's real backend directory, with the other
+         * exports reachable as junctions grafted over it. */
+        if (chimera_server_create_export(env->server, "/", "/share",
+                                         POSIX_TEST_ROOT_EXPORT_ID,
+                                         NULL) != 0) {
+            fprintf(stderr, "Failed to create / export\n");
+            exit(EXIT_FAILURE);
+        }
     }
 
     if (posix_test_ro_access_export) {
@@ -716,10 +868,17 @@ posix_test_init(
     (void) mkdir(session_root, 0755);
     (void) mkdir(env->session_dir, 0755);
 
-    rc = chown(env->session_dir, env->cred.uid, env->cred.gid);
-    if (rc < 0) {
-        fprintf(stderr, "Failed to set session_dir uid/gid: %s\n", strerror(errno));
-        exit(EXIT_FAILURE);
+    /* Ownership by the test identity matters for the passthrough (linux)
+     * backend, whose server side writes into the dir as cred.uid; chown needs
+     * privilege.  Unprivileged (serialized-fallback) runs only use
+     * engine-managed backends, where ownership by the invoking user is
+     * already right. */
+    if (geteuid() == 0) {
+        rc = chown(env->session_dir, env->cred.uid, env->cred.gid);
+        if (rc < 0) {
+            fprintf(stderr, "Failed to set session_dir uid/gid: %s\n", strerror(errno));
+            exit(EXIT_FAILURE);
+        }
     }
 
     if (is_nfs) {
@@ -762,6 +921,16 @@ posix_test_init(
         }
 
         json_object_set_new(posix_json_root, "config", posix_json_config);
+
+        /* Match the server (see posix_test_start_nfs_server).  Read from the
+         * top-level "common" section, not from "config". */
+        if (posix_test_transport_is_inproc()) {
+            json_t *common = json_object();
+
+            json_object_set_new(common, "tcp_flavor", json_string("inproc"));
+            json_object_set_new(posix_json_root, "common", common);
+        }
+
         chimera_test_write_users_json(posix_json_root);
 
         snprintf(posix_json_path, sizeof(posix_json_path), "%s/posix.json", env->session_dir);
@@ -831,6 +1000,9 @@ posix_test_mount(struct posix_test_env *env)
     if (env->nfs_version > 0) {
         // NFS backend: mount via NFS client
         // Mount path format: hostname:path
+        /* The host half is ignored under the in-process transport -- the peer
+         * is addressed by name, not by address -- but the mount path grammar
+         * still requires it. */
         snprintf(nfs_mount_path, sizeof(nfs_mount_path), "127.0.0.1:/share");
         if (env->use_nfs_rdma) {
             // Use RDMA protocol and port for NFS3 over TCP-RDMA
