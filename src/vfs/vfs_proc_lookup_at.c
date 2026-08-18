@@ -169,6 +169,7 @@ chimera_vfs_lookup_at_dispatch(
  * name-cache fast path in the dispatch is only reached once search is granted.
  */
 struct chimera_vfs_lookup_at_gate {
+    struct chimera_vfs_gate_ctx      gate_ctx;
     struct chimera_vfs_thread       *thread;
     const struct chimera_vfs_cred   *cred;
     struct chimera_vfs_open_handle  *handle;
@@ -180,6 +181,9 @@ struct chimera_vfs_lookup_at_gate {
     void                            *private_data;
 };
 
+_Static_assert(sizeof(struct chimera_vfs_lookup_at_gate) <= CHIMERA_VFS_GATE_SCRATCH_SIZE,
+               "lookup_at gate context outgrew the request gate scratch area");
+
 static void
 chimera_vfs_lookup_at_gate_complete(
     enum chimera_vfs_error status,
@@ -189,7 +193,7 @@ chimera_vfs_lookup_at_gate_complete(
 
     if (status != CHIMERA_VFS_OK) {
         gate->callback(status, NULL, NULL, gate->private_data);
-        free(gate);
+        chimera_vfs_gate_scratch_free(gate->thread, gate);
         return;
     }
 
@@ -197,7 +201,7 @@ chimera_vfs_lookup_at_gate_complete(
                                    gate->name, gate->namelen, gate->attr_mask,
                                    gate->dir_attr_mask, gate->callback,
                                    gate->private_data);
-    free(gate);
+    chimera_vfs_gate_scratch_free(gate->thread, gate);
 } /* chimera_vfs_lookup_at_gate_complete */
 
 SYMBOL_EXPORT void
@@ -214,13 +218,24 @@ chimera_vfs_lookup_at(
 {
     struct chimera_vfs_lookup_at_gate *gate;
 
+    /* A single component may not exceed {NAME_MAX}.  Every other _at proc
+     * (mkdir_at, remove_at, open_at, ...) rejects an over-long name here; lookup
+     * was the sole gap, letting an attacker-sized NFSv3 LOOKUP component (bounded
+     * only by the ~4 MB RPC limit) reach a passthrough backend that copies it
+     * into a fixed CHIMERA_VFS_PLUGIN_DATA_SIZE (8 KB) request buffer and overrun
+     * the heap.  Bound it before dispatch. */
+    if (namelen >= CHIMERA_VFS_NAME_MAX) {
+        callback(CHIMERA_VFS_ENAMETOOLONG, NULL, NULL, private_data);
+        return;
+    }
+
     /* Path-prefix search (EXECUTE) is enforced by the engine even for
      * DELEGATES_DAC (passthrough) backends when the caller is a POSIX (AUTH_UNIX)
      * client: they resolve each component by file handle (open_by_handle_at),
      * which bypasses the kernel's directory-search DAC, so the prefix would
      * otherwise never be checked.  SMB keeps its own model (see gate_needed_dac). */
     if (chimera_vfs_gate_needed_dac(handle->vfs_module->capabilities, cred)) {
-        gate                = malloc(sizeof(*gate));
+        gate                = chimera_vfs_gate_scratch_alloc(thread);
         gate->thread        = thread;
         gate->cred          = cred;
         gate->handle        = handle;
@@ -231,7 +246,8 @@ chimera_vfs_lookup_at(
         gate->callback      = callback;
         gate->private_data  = private_data;
 
-        chimera_vfs_gate_fh_dac(thread, cred, handle->fh, handle->fh_len,
+        chimera_vfs_gate_fh_dac(&gate->gate_ctx, thread, cred,
+                                handle->fh, handle->fh_len,
                                 CHIMERA_ACE_EXECUTE,
                                 chimera_vfs_lookup_at_gate_complete, gate);
         return;

@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2025 Chimera-NAS Project Contributors
+// SPDX-FileCopyrightText: 2025-2026 Chimera-NAS Project Contributors
 //
 // SPDX-License-Identifier: LGPL-2.1-only
 
@@ -111,13 +111,19 @@ chimera_posix_readv_internal(
         return -1;
     }
 
+    if (!chimera_posix_fd_may_read(entry)) {
+        chimera_posix_fd_release(entry, flags);
+        errno = EBADF;
+        return -1;
+    }
+
     chimera_posix_completion_init(&comp, &req);
 
     req.opcode            = CHIMERA_CLIENT_OP_READ;
     req.read.callback     = chimera_posix_readv_callback;
     req.read.private_data = &comp;
     req.read.handle       = entry->handle;
-    req.read.offset       = use_fd_offset ? entry->offset : (uint64_t) offset;
+    req.read.offset       = use_fd_offset ? entry->ofd->offset : (uint64_t) offset;
     req.read.length       = total_len;
     req.read.buf          = (void *) iov;  // Store user iovec pointer
     req.read.niov         = iovcnt;        // Store user iovec count
@@ -127,7 +133,7 @@ chimera_posix_readv_internal(
     int     err = chimera_posix_wait(&comp);
 
     if (!err && req.sync_result >= 0 && use_fd_offset) {
-        entry->offset += (uint64_t) req.sync_result;
+        entry->ofd->offset += (uint64_t) req.sync_result;
     }
 
     ssize_t ret = req.sync_result;

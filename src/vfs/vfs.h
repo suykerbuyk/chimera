@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <sys/time.h>
 #include <uthash.h>
+#include "vfs_fh_magic.h"
 #include "vfs_attrs.h"
 #include "vfs_dump.h"
 #include "vfs_error.h"
@@ -18,8 +19,12 @@
 #include "common/tcp_flavor.h"
 #include "oteltracing.h"
 
-#define CHIMERA_VFS_PATH_MAX 4096
-#define CHIMERA_VFS_NAME_MAX 256
+#define CHIMERA_VFS_PATH_MAX    4096
+#define CHIMERA_VFS_NAME_MAX    256
+
+/* Module tables are indexed by the one-byte fh_magic, so they span the
+ * full 8-bit range (see vfs_fh_magic.h for reserved values). */
+#define CHIMERA_VFS_MAX_MODULES 256
 struct evpl;
 
 struct chimera_vfs;
@@ -157,6 +162,15 @@ struct chimera_vfs_mount_options {
 
 /* Allocate flags */
 #define CHIMERA_VFS_ALLOCATE_DEALLOCATE 0x01
+
+/* Copy-range flags */
+/* Preserve source holes: when a full destination block's source is entirely a
+ * hole, drop the destination block rather than materializing zeroes, so
+ * SEEK_HOLE still sees the hole after the copy.  This is POSIX
+ * copy_file_range() semantics; the POSIX client sets it.  SMB copychunk, NFS4
+ * COPY and S3 copy leave it clear and get the materializing behavior their
+ * conformance suites expect. */
+#define CHIMERA_VFS_COPY_PRESERVE_HOLES 0x01
 
 /* Lock types */
 #define CHIMERA_VFS_LOCK_READ           0 /* shared / read lock */
@@ -405,6 +419,13 @@ struct chimera_vfs_request_handle {
  * and the child + parent statx. */
 #define CHIMERA_VFS_REQUEST_MAX_HANDLES 4
 
+/* Size of the gate resume area carved out of a pooled request (see the `gate`
+ * arm of chimera_vfs_request).  Each gated wrapper static-asserts its own
+ * resume struct against this; raise it if one legitimately outgrows it.  It is
+ * a union member, so it costs nothing until it is the largest arm -- and the
+ * request union is already an order of magnitude bigger than this. */
+#define CHIMERA_VFS_GATE_SCRATCH_SIZE   384
+
 /* One enumerated named stream, packed back-to-back in the list_streams reply
  * buffer.  `name_len` bytes of (un-terminated) stream name follow this header;
  * the next record begins at the following 8-byte-aligned offset. */
@@ -525,6 +546,28 @@ struct chimera_vfs_request {
         struct chimera_vfs_open_handle *handle);
 
     union {
+        /*
+         * Resume state for an asynchronous access gate.
+         *
+         * A gated operation has to park its arguments somewhere while the
+         * gate's own nested requests (open, getattr) run, and it cannot use
+         * either of them: those come and go underneath it, and the real
+         * operation's request does not exist yet.  It can, however, have a
+         * request of its own.  A request holding this arm is never dispatched
+         * and never joins the active list -- chimera_vfs_gate_scratch_alloc()
+         * takes it straight off the thread's free list and
+         * chimera_vfs_gate_scratch_free() returns it -- which is what keeps a
+         * gated operation off the heap entirely.
+         *
+         * Each gated wrapper defines its own resume layout in its own
+         * translation unit and asserts that it fits; the union member gives the
+         * storage its alignment.
+         */
+        union {
+            uint64_t align;
+            uint8_t  data[CHIMERA_VFS_GATE_SCRATCH_SIZE];
+        } gate;
+
         struct {
             char                           *path;
             char                           *pathc;
@@ -565,6 +608,12 @@ struct chimera_vfs_request {
             void                           *private_data;
             uint8_t                         parent_fh[CHIMERA_VFS_FH_SIZE];
             int                             parent_fh_len;
+            /* Open-time effective-access grant computed by the lookup gate,
+             * stamped onto the handle at completion (POSIX rights bind at
+             * open).  granted_valid is 0 unless the gated non-create path
+             * ran the access check. */
+            uint32_t                        granted_access;
+            uint8_t                         granted_valid;
             /* Zeroed stand-in handed to open_at when the caller passes no
              * set_attr (a non-create open) -- open_at requires a non-NULL
              * set_attr that the backend only consults when creating. */
@@ -876,6 +925,13 @@ struct chimera_vfs_request {
             uint32_t                        flags;        /* CHIMERA_VFS_REMOVE_* type assertion */
             const uint8_t                  *child_fh;     /* Optional: child FH if known */
             int                             child_fh_len; /* 0 if child_fh not provided */
+            /* Owned copy of the child FH.  The source pointer may not outlive
+             * this async op -- a name-resolved sticky FH lives in a gate struct
+             * that is freed the moment dispatch returns -- so dispatch copies
+             * the FH here and points child_fh at it.  (The completion path
+             * hashes child_fh for the FILE_DELETE notify, well after the gate
+             * is gone.) */
+            uint8_t                         child_fh_store[CHIMERA_VFS_FH_SIZE];
             /* Inode-scoped removal: when set (with child_fh), the backend MUST
              * only unlink the name while it still resolves to child_fh -- if the
              * original object was removed and a new one created with the same
@@ -1012,6 +1068,7 @@ struct chimera_vfs_request {
             uint64_t                        dst_offset;
             uint64_t                        length;
             uint64_t                        r_length;
+            uint32_t                        flags;
             struct chimera_vfs_attrs        r_pre_attr;
             struct chimera_vfs_attrs        r_post_attr;
         } copy_range;
@@ -1167,38 +1224,6 @@ struct chimera_vfs_request {
 
 
 
-
-/* Each module must have a unique FH_MAGIC value
- * that can never be changed.  They can be reserved
- * here.
- *
- * The 1-byte magic must be the first byte of all
- * file handles returned by the plugin to ensure
- * uniqueness across plugins.
- *
- */
-
-enum CHIMERA_FS_FH_MAGIC {
-    /* Reserved for internal use by chimera */
-    CHIMERA_VFS_FH_MAGIC_ROOT     = 0,
-    CHIMERA_VFS_FH_MAGIC_MEMFS    = 1,
-    CHIMERA_VFS_FH_MAGIC_LINUX    = 2,
-    CHIMERA_VFS_FH_MAGIC_IO_URING = 3,
-    CHIMERA_VFS_FH_MAGIC_CAIRN    = 4,
-    CHIMERA_VFS_FH_MAGIC_DISKFS   = 5,
-    CHIMERA_VFS_FH_MAGIC_NFS      = 6,
-    /* KV-only backends (no filesystem; never serve a file handle, but occupy a
-     * module slot so they can be selected as the default KV module). */
-    CHIMERA_VFS_FH_MAGIC_MEMKV    = 7,
-    CHIMERA_VFS_FH_MAGIC_SQLITE   = 8,
-    CHIMERA_VFS_FH_MAGIC_SMB      = 9,
-    // Extra value for QuantumFS
-    CHIMERA_VFS_FH_MAGIC_MYRIAD   = 100,
-    CHIMERA_VFS_FH_MAGIC_SNFS     = 101,
-    // Magic number is limited to 1 byte
-    CHIMERA_VFS_FH_MAGIC_MAX      = 256
-
-};
 
 /* If set, module requires open handles for path operations
  * such as mkdir, remove, open_at, etc.  Equivalent to POSIX open
@@ -1401,7 +1426,7 @@ struct chimera_vfs_module {
     const char *name;
 
     /* Required
-     * Set to CHIMERA_FS_FH_MAGIC value reserved above
+     * Set to CHIMERA_FS_FH_MAGIC value reserved in vfs_fh_magic.h
      */
 
     uint8_t     fh_magic;
@@ -1554,8 +1579,8 @@ struct chimera_vfs_state;
 struct chimera_vfs_pnfs;
 
 struct chimera_vfs {
-    struct chimera_vfs_module            *modules[CHIMERA_VFS_FH_MAGIC_MAX];
-    void                                 *module_private[CHIMERA_VFS_FH_MAGIC_MAX];
+    struct chimera_vfs_module            *modules[CHIMERA_VFS_MAX_MODULES];
+    void                                 *module_private[CHIMERA_VFS_MAX_MODULES];
     struct chimera_vfs_module            *kv_module;
     struct vfs_open_cache                *vfs_open_path_cache;
     struct vfs_open_cache                *vfs_open_file_cache;
@@ -1587,7 +1612,7 @@ struct chimera_vfs {
 struct chimera_vfs_thread {
     struct evpl                         *evpl;
     struct chimera_vfs                  *vfs;
-    void                                *module_private[CHIMERA_VFS_FH_MAGIC_MAX];
+    void                                *module_private[CHIMERA_VFS_MAX_MODULES];
     /* Thread-local recycle magazines for the fungible RCU caches. */
     struct chimera_rcu_magazine          rcu_magazines[CHIMERA_RCU_POOL_COUNT];
     struct chimera_vfs_find_result      *free_find_results;

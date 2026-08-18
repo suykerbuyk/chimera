@@ -127,17 +127,100 @@ chimera_smb_emit_stream_info(
             if (name16_len > 0) {
                 evpl_iovec_cursor_append_blob_unaligned(cursor, name16, name16_len);
             }
-            for (p = entry_size; p < aligned; p++) {
-                evpl_iovec_cursor_append_uint8(cursor, 0);
+            /* Only an entry that is followed by another carries the pad that
+             * 8-byte-aligns its successor. */
+            if (next) {
+                for (p = entry_size; p < aligned; p++) {
+                    evpl_iovec_cursor_append_uint8(cursor, 0);
+                }
             }
         }
 
-        out += aligned;
+        /* The last entry ends after its name: padding it would overstate the
+         * reply against clients that size their buffer to the exact Windows
+         * length (MS-FSA BVT_AlternateDataStream_ListStreams_File offers 150
+         * bytes for a default fork plus two 8-character streams, which is what
+         * Windows and Samba's marshall_stream_info return to the byte). */
+        out += next ? aligned : entry_size;
         in  += (sizeof(entry) + entry.name_len + 7) & ~7u;
     }
 
     return out;
 } /* chimera_smb_emit_stream_info */
+
+/* Finish a FileStreamInformation query from `count` packed stream records held
+ * in request->query_info.stream_records: measure the wire form, apply the
+ * MS-SMB2 3.3.5.20.1 buffer-length rules, and complete.  The records stay put
+ * for the reply builder to emit. */
+static void
+chimera_smb_query_stream_info_complete(
+    struct chimera_smb_request *request,
+    uint32_t                    records_len,
+    uint32_t                    count)
+{
+    uint32_t status = SMB2_STATUS_SUCCESS;
+
+    request->query_info.stream_record_len   = records_len;
+    request->query_info.stream_record_count = count;
+
+    request->query_info.output_length = chimera_smb_emit_stream_info(
+        &request->compound->thread->iconv_ctx,
+        request->query_info.stream_records,
+        records_len,
+        count,
+        NULL);
+
+    if (request->query_info.max_response_size < SMB2_FILE_STREAM_INFO_FIXED_SIZE) {
+        status = SMB2_STATUS_INFO_LENGTH_MISMATCH;
+    } else if (request->query_info.max_response_size < request->query_info.output_length) {
+        status                            = SMB2_STATUS_BUFFER_OVERFLOW;
+        request->query_info.output_length = request->query_info.max_response_size;
+    }
+
+    chimera_smb_open_file_release(request, request->query_info.open_file);
+    chimera_smb_complete_request(request, status);
+} /* chimera_smb_query_stream_info_complete */
+
+/* A backend without named-stream support still has the file's unnamed data
+ * fork, and MS-FSCC 2.4.43 counts that fork as a stream: Windows on NTFS and
+ * Samba on a plain filesystem (vfswrap_fstreaminfo, the default VFS op used
+ * when no vfs_streams_* module is loaded) both answer FileStreamInformation
+ * with a single synthesized "::$DATA" entry describing the file itself rather
+ * than failing the level.  Synthesize the same entry from the file's size so a
+ * client probing for streams gets the conformant answer instead of an error.
+ * A directory has no data fork and yields an empty list, as on both. */
+static void
+chimera_smb_query_stream_info_default_callback(
+    enum chimera_vfs_error    error_code,
+    struct chimera_vfs_attrs *attr,
+    void                     *private_data)
+{
+    struct chimera_smb_request     *request = private_data;
+    struct chimera_vfs_stream_entry entry;
+    uint32_t                        records_len = 0;
+    uint32_t                        count       = 0;
+
+    if (error_code != CHIMERA_VFS_OK) {
+        chimera_smb_open_file_release(request, request->query_info.open_file);
+        chimera_smb_complete_request(request, SMB2_STATUS_INTERNAL_ERROR);
+        return;
+    }
+
+    if ((attr->va_mode & S_IFMT) != S_IFDIR) {
+        /* A zero-length name is what makes the emitter spell the default fork
+         * ":" + "" + ":$DATA". */
+        entry.size     = attr->va_size;
+        entry.alloc    = attr->va_space_used;
+        entry.name_len = 0;
+
+        memcpy(request->query_info.stream_records, &entry, sizeof(entry));
+
+        records_len = sizeof(entry);
+        count       = 1;
+    }
+
+    chimera_smb_query_stream_info_complete(request, records_len, count);
+} /* chimera_smb_query_stream_info_default_callback */
 
 static void
 chimera_smb_query_stream_info_list_callback(
@@ -165,18 +248,8 @@ chimera_smb_query_stream_info_list_callback(
     }
 
     memcpy(request->query_info.stream_records, records, records_len);
-    request->query_info.stream_record_len   = records_len;
-    request->query_info.stream_record_count = count;
 
-    request->query_info.output_length = chimera_smb_emit_stream_info(
-        &request->compound->thread->iconv_ctx,
-        request->query_info.stream_records,
-        records_len,
-        count,
-        NULL);
-
-    chimera_smb_open_file_release(request, request->query_info.open_file);
-    chimera_smb_complete_request(request, SMB2_STATUS_SUCCESS);
+    chimera_smb_query_stream_info_complete(request, records_len, count);
 } /* chimera_smb_query_stream_info_list_callback */
 
 static void
@@ -215,12 +288,17 @@ chimera_smb_query_stream_info(struct chimera_smb_request *request)
     const uint8_t                    *base_fh;
     uint32_t                          base_fh_len;
 
-    /* Gate: named streams must be enabled and the backend must support them;
-     * otherwise behave as before (class not implemented). */
+    /* Gate: named streams must be enabled and the backend must support them.
+     * Without them the object still has its default data fork, so report that
+     * one synthesized "::$DATA" stream instead of failing the level. */
     if (!thread->shared->config.named_streams ||
         !(open_file->handle->vfs_module->capabilities & CHIMERA_VFS_CAP_NAMED_STREAMS)) {
-        chimera_smb_open_file_release(request, open_file);
-        chimera_smb_complete_request(request, SMB2_STATUS_NOT_IMPLEMENTED);
+        chimera_vfs_getattr(thread->vfs_thread,
+                            &request->session_handle->session->cred,
+                            open_file->handle,
+                            CHIMERA_VFS_ATTR_MASK_STAT,
+                            chimera_smb_query_stream_info_default_callback,
+                            request);
         return;
     }
 
@@ -503,6 +581,76 @@ chimera_smb_query_info(struct chimera_smb_request *request)
         return;
     }
 
+    /* Named-pipe FIDs on IPC$ (srvsvc / lsarpc / samr / wkssvc) carry
+     * open_file->handle == NULL -- see chimera_smb_create_gen_open_file_pipe.
+     * Dispatching chimera_vfs_getattr through the normal path would deref that
+     * NULL and crash the server (Windows Explorer hits this when browsing a
+     * share: after TREE_CONNECT it opens srvsvc and issues
+     * FILE_STANDARD_INFO / FILE_BASIC_INFO on it before starting RPC).
+     *
+     * Serve QUERY_INFO on a pipe FID synthetically: reasonable regular-file
+     * defaults are enough for the info classes Windows queries on named
+     * pipes (STANDARD_INFO, BASIC_INFO, NETWORK_OPEN_INFO, ALL_INFO).  Route
+     * through the existing getattr callback so all supported info classes
+     * marshal uniformly; unsupported classes still hit the callback's abort
+     * as before (no regression). */
+    if (request->query_info.open_file->type == CHIMERA_SMB_OPEN_FILE_TYPE_PIPE) {
+        struct chimera_vfs_attrs pipe_attrs;
+
+        memset(&pipe_attrs, 0, sizeof(pipe_attrs));
+        pipe_attrs.va_mode  = S_IFREG | 0666;
+        pipe_attrs.va_nlink = 1;
+        /* FileInternalInformation (and FileAllInformation) marshal
+         * IndexNumber directly from va_ino (smb_attr.h); leaving it 0 would
+         * report every pipe FID with the same all-zero index number.  There
+         * is no real inode backing a pipe FID, so use the open's persistent
+         * id (unique and stable for the life of this open) as a synthetic
+         * one instead. */
+        pipe_attrs.va_ino      = request->query_info.open_file->file_id.pid;
+        pipe_attrs.va_set_mask = CHIMERA_VFS_ATTR_MASK_STAT;
+
+        /* Set output_length based on info class before completing (the reply
+         * path reads it verbatim into the wire header). */
+        switch (request->query_info.info_type) {
+            case SMB2_INFO_FILE:
+                switch (request->query_info.info_class) {
+                    case SMB2_FILE_BASIC_INFO:
+                        request->query_info.output_length = SMB2_FILE_BASIC_INFO_SIZE;
+                        break;
+                    case SMB2_FILE_STANDARD_INFO:
+                        request->query_info.output_length = SMB2_FILE_STANDARD_INFO_SIZE;
+                        break;
+                    case SMB2_FILE_INTERNAL_INFO:
+                        request->query_info.output_length = SMB2_FILE_INTERNAL_INFO_SIZE;
+                        break;
+                    case SMB2_FILE_EA_INFO:
+                        request->query_info.output_length = SMB2_FILE_EA_INFO_SIZE;
+                        break;
+                    case SMB2_FILE_NETWORK_OPEN_INFO:
+                        request->query_info.output_length = SMB2_FILE_NETWORK_OPEN_INFO_SIZE;
+                        break;
+                    case SMB2_FILE_ATTRIBUTE_TAG_INFO:
+                        request->query_info.output_length = SMB2_FILE_ATTRIBUTE_TAG_INFO_SIZE;
+                        break;
+                    default:
+                        /* Info classes we don't synthesize for pipes: fail
+                         * cleanly rather than falling through to the VFS path. */
+                        chimera_smb_open_file_release(request, request->query_info.open_file);
+                        chimera_smb_complete_request(request, SMB2_STATUS_INVALID_INFO_CLASS);
+                        return;
+                } /* switch */
+                break;
+            default:
+                /* FILESYSTEM / SECURITY info on a pipe FID: not supported. */
+                chimera_smb_open_file_release(request, request->query_info.open_file);
+                chimera_smb_complete_request(request, SMB2_STATUS_INVALID_DEVICE_REQUEST);
+                return;
+        } /* switch */
+
+        chimera_smb_query_info_getattr_callback(CHIMERA_VFS_OK, &pipe_attrs, request);
+        return;
+    }
+
     /* min_length is the info level's fixed minimum size: a request whose
      * OutputBufferLength is smaller than this must fail INFO_LENGTH_MISMATCH
      * (MS-SMB2 3.3.5.20.1 / smb2.getinfo.q*_buffercheck).  For fixed-size
@@ -727,7 +875,8 @@ chimera_smb_query_info_reply(
     struct evpl_iovec_cursor   *reply_cursor,
     struct chimera_smb_request *request)
 {
-    uint16_t namebuf[8];
+    struct chimera_server_smb_thread *thread = request->compound->thread;
+    uint16_t                          namebuf[8];
 
     if (request->query_info.info_type == SMB2_INFO_SECURITY) {
         chimera_smb_query_security_reply(reply_cursor, request);
@@ -919,10 +1068,10 @@ chimera_smb_query_info_reply(
                 case SMB2_FILE_FS_SECTOR_SIZE_INFO:
                     /* MS-FSCC 2.5.7 FileFsSectorSizeInformation. */
                     evpl_iovec_cursor_append_uint32(reply_cursor, 512); /* LogicalBytesPerSector */
-                    evpl_iovec_cursor_append_uint32(reply_cursor, 512); /* PhysicalBytesPerSectorForAtomicity */
-                    evpl_iovec_cursor_append_uint32(reply_cursor, 512); /* PhysicalBytesPerSectorForPerformance */
-                    evpl_iovec_cursor_append_uint32(reply_cursor, 512); /* FSEffPhysicalBytesPerSectorForAtomicity */
-                    evpl_iovec_cursor_append_uint32(reply_cursor, 0); /* Flags */
+                    evpl_iovec_cursor_append_uint32(reply_cursor, thread->shared->config.fs_physical_bytes_per_sector); /* PhysicalBytesPerSectorForAtomicity */
+                    evpl_iovec_cursor_append_uint32(reply_cursor, thread->shared->config.fs_physical_bytes_per_sector); /* PhysicalBytesPerSectorForPerformance */
+                    evpl_iovec_cursor_append_uint32(reply_cursor, thread->shared->config.fs_physical_bytes_per_sector); /* FSEffPhysicalBytesPerSectorForAtomicity */
+                    evpl_iovec_cursor_append_uint32(reply_cursor, thread->shared->config.fs_sector_size_flags); /* Flags: aligned + partition aligned */
                     evpl_iovec_cursor_append_uint32(reply_cursor, 0); /* ByteOffsetForSectorAlignment */
                     evpl_iovec_cursor_append_uint32(reply_cursor, 0); /* ByteOffsetForPartitionAlignment */
                     break;

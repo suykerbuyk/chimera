@@ -146,6 +146,69 @@ test_unbounded_default(void)
 } /* test_unbounded_default */
 
 /* ------------------------------------------------------------------ *
+*  Pre-dispatch frame bounds (chimera_smb_server_handle_tcp)         *
+* ------------------------------------------------------------------ */
+
+/* Regression: a frame carrying only the 4-byte NBSS header (NBSS-declared
+ * length 0) leaves no bytes for the 4-byte SMB protocol id the TCP handler
+ * peeks before dispatch.  The unchecked peek used to abort the whole process
+ * on such a short frame -- a single 4-byte pre-auth packet.  Reproduce the
+ * exact read sequence and confirm the shortfall is reported, not aborted. */
+static void
+test_short_nbss_frame_protocol_id(void)
+{
+    uint8_t                  frame[4] = { 0 }; /* NBSS header only, no payload */
+    struct evpl_iovec        iov;
+    struct evpl_iovec_cursor cur;
+    struct netbios_header    nb;
+    uint32_t                 proto;
+
+    cursor_over(&cur, &iov, frame, sizeof(frame));
+
+    /* The handler now drops frames shorter than NBSS header + protocol id. */
+    CHECK((int) sizeof(frame) < (int) (sizeof(nb) + sizeof(proto)),
+          "short frame is below the NBSS header + protocol id minimum");
+
+    /* And the underlying peek, if reached, reports the shortfall rather than
+     * aborting: consume the 4-byte NBSS header, then a checked protocol-id
+     * read must fail cleanly. */
+    evpl_iovec_cursor_copy(&cur, &nb, sizeof(nb));
+    CHECK(evpl_iovec_cursor_try_get_uint32(&cur, &proto) == -1,
+          "short NBSS frame: protocol-id peek rejected (no abort)");
+} /* test_short_nbss_frame_protocol_id */
+
+/* Regression: the SMB1 NEGOTIATE byte count (bcc) is client-declared and was
+ * used as both an alloca size and an unchecked copy length for the dialect
+ * buffer, so declaring more bytes than the frame carries aborted the whole
+ * shared process.  Reproduce the parse layout -- NBSS header (4) + SMB1 header
+ * (32) + word count (1) + byte count (2) -- with a bcc that overruns the frame
+ * and confirm the checked dialect copy rejects it instead of aborting. */
+static void
+test_smb1_negotiate_bad_bcc(void)
+{
+    uint8_t                  frame[41] = { 0 }; /* header fields + 2 dialect bytes */
+    struct evpl_iovec        iov;
+    struct evpl_iovec_cursor cur;
+    uint8_t                  wct;
+    uint16_t                 bcc;
+    uint8_t                  dialects[16];
+
+    put_le16(frame, 37, 200); /* bcc: far more than the 2 bytes the frame holds */
+
+    cursor_over(&cur, &iov, frame, sizeof(frame));
+
+    /* NBSS header + SMB1 header, then the word count and byte count. */
+    CHECK(evpl_iovec_cursor_try_skip(&cur, 4 + 32) == 0, "skip NBSS + SMB1 header");
+    CHECK(evpl_iovec_cursor_try_get_uint8(&cur, &wct) == 0, "read word count");
+    evpl_iovec_cursor_reset_consumed(&cur);
+    CHECK(evpl_iovec_cursor_try_get_uint16(&cur, &bcc) == 0, "read byte count");
+    CHECK(bcc == 200, "byte count decoded");
+
+    CHECK(evpl_iovec_cursor_try_copy(&cur, dialects, bcc) == -1,
+          "SMB1 NEGOTIATE oversized byte count: dialect copy rejected (no abort)");
+} /* test_smb1_negotiate_bad_bcc */
+
+/* ------------------------------------------------------------------ *
 *  smb_cursor_seek_to                                                *
 * ------------------------------------------------------------------ */
 
@@ -292,6 +355,10 @@ main(
     test_try_copy_past_end_rejected();
     test_limit_fences_reads();
     test_unbounded_default();
+
+    fprintf(stderr, "=== SMB parse hardening: pre-dispatch frame bounds ===\n");
+    test_short_nbss_frame_protocol_id();
+    test_smb1_negotiate_bad_bcc();
 
     fprintf(stderr, "=== SMB parse hardening: smb_cursor_seek_to ===\n");
     test_seek_to();

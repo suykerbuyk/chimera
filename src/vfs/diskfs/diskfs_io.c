@@ -846,6 +846,7 @@ diskfs_inode_load_complete(
         inode->rdev           = di->rdev;
         inode->size           = di->size;
         inode->space_used     = di->space_used;
+        inode->alloc_size     = di->alloc_size;
         inode->atime_sec      = di->atime_sec;
         inode->atime_nsec     = di->atime_nsec;
         inode->mtime_sec      = di->mtime_sec;
@@ -1336,8 +1337,11 @@ diskfs_read_inode_cb(
         return;
     }
 
+    /* read() of a directory is EISDIR; other non-regular types are EINVAL. */
     if (unlikely(!S_ISREG(inode->mode))) {
-        diskfs_op_fail(request, diskfs_private->txn, CHIMERA_VFS_EINVAL);
+        diskfs_op_fail(request, diskfs_private->txn,
+                       S_ISDIR(inode->mode) ?
+                       CHIMERA_VFS_EISDIR : CHIMERA_VFS_EINVAL);
         return;
     }
 
@@ -4021,6 +4025,13 @@ diskfs_commit_acquired_cb(
         return;
     }
 
+    /* Report WCC before == after from the write-locked inode (COMMIT changes no
+     * metadata).  A deferred mtime is already reflected in these in-memory
+     * fields; finish_write_pin() below only makes it durable, so mapping here
+     * covers both the inline and the deferred-flush completion. */
+    diskfs_map_attrs(thread, &request->commit.r_pre_attr, inode);
+    diskfs_map_attrs(thread, &request->commit.r_post_attr, inode);
+
     shard = diskfs_inode_shard(thread->shared, inode->inum);
     pthread_mutex_lock(&shard->lock);
     if (inode->mtime_dirty) {
@@ -4061,6 +4072,15 @@ diskfs_commit(
 
     if (!warm || shared->mtime_defer_us == 0) {
         cp->txn = diskfs_txn_begin(thread, DISKFS_TXN_READ);
+        if (warm) {
+            /* COMMIT mutates no metadata, so report WCC before == after from
+             * the pinned inode.  The read is lock-free: that is acceptable for
+             * weak cache consistency (a torn read at worst costs the client one
+             * spurious revalidation) and keeps the fast path free of an inode
+             * acquire or write txn -- the whole point of this path. */
+            diskfs_map_attrs(thread, &request->commit.r_pre_attr, warm);
+            diskfs_map_attrs(thread, &request->commit.r_post_attr, warm);
+        }
         diskfs_op_ok(request, cp->txn);
         return;
     }

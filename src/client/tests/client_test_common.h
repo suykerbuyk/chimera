@@ -103,21 +103,52 @@ client_test_init(
 
     evpl_set_log_fn(chimera_vlog, chimera_log_flush);
 
+    /* Session-dir root: CHIMERA_TEST_ROOT when set, else /build/test (the
+     * CI/devcontainer layout), else /tmp/chimera_test for hosts without a
+     * /build (e.g. macOS) -- the same resolution as posix_test_common.h. */
+    const char *test_root = getenv("CHIMERA_TEST_ROOT");
+    if (test_root == NULL) {
+        struct stat root_st;
+        test_root = (stat("/build", &root_st) == 0 &&
+                     S_ISDIR(root_st.st_mode)) ? "/build/test"
+                                               : "/tmp/chimera_test";
+    }
     snprintf(env->session_dir, sizeof(env->session_dir),
-             "/build/test/session_%d_%lu_%lu",
+             "%s/session_%d_%lu_%lu", test_root,
              getpid(), tv.tv_sec, tv.tv_nsec);
 
     fprintf(stderr, "Creating session directory %s\n", env->session_dir);
 
-    (void) mkdir("/build/test", 0755);
+    (void) mkdir(test_root, 0755);
     (void) mkdir(env->session_dir, 0755);
-    rc = chown(env->session_dir, env->cred.uid, env->cred.gid);
-    if (rc < 0) {
-        fprintf(stderr, "to set session_dir uid/gid: %s\n", strerror(errno));
-        exit(EXIT_FAILURE);
+    /* Hand the dir to the test credential so the linux-passthrough backend,
+     * where the server acts on the host fs as that uid, can create in it.
+     * Needs CAP_CHOWN, which only the privileged CI runs have; everywhere
+     * else the backends in play are virtual and access the dir as the
+     * invoking user, so ownership does not matter. */
+    if (geteuid() == 0) {
+        rc = chown(env->session_dir, env->cred.uid, env->cred.gid);
+        if (rc < 0) {
+            fprintf(stderr, "to set session_dir uid/gid: %s\n", strerror(errno));
+            exit(EXIT_FAILURE);
+        }
     }
     if (env->use_nfs || env->use_smb) {
         server_config = chimera_server_config_init();
+
+        /* Protocols are opt-in; serve only what this test will mount. */
+        if (env->use_nfs) {
+            chimera_server_config_set_nfs_enabled(server_config, 1);
+        }
+        if (env->use_smb) {
+            chimera_server_config_set_smb_enabled(server_config, 1);
+        }
+
+        /* Serve over the in-process transport: the client below lives in this
+         * same process, so there is no reason to bind a port, and an inproc
+         * name is private to the process -- so concurrent copies of this test
+         * cannot collide and need no network namespace to separate them. */
+        chimera_server_config_set_tcp_flavor(server_config, CHIMERA_TCP_FLAVOR_INPROC);
 
         if (strcmp(backend, "diskfs_io_uring") == 0 ||
             strcmp(backend, "diskfs_aio") == 0) {
@@ -329,6 +360,16 @@ client_test_init(
         }
 
         json_object_set_new(client_json_root, "config", client_json_config);
+
+        /* Match the server started above.  The transport is read from the
+         * top-level "common" section rather than from "config". */
+        {
+            json_t *common = json_object();
+
+            json_object_set_new(common, "tcp_flavor", json_string("inproc"));
+            json_object_set_new(client_json_root, "common", common);
+        }
+
         chimera_test_write_users_json(client_json_root);
 
         snprintf(client_json_path, sizeof(client_json_path), "%s/client.json", env->session_dir);

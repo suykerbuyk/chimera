@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <uuid/uuid.h>
+#include <xxhash.h>
 #include "prometheus-c.h"
 #include "nfs4_session.h"
 #include "nfs4_state.h"
@@ -16,6 +17,7 @@
 #include "nfs_common.h"
 #include "evpl/evpl_rpc2.h"
 #include "vfs/vfs_release.h"
+#include "vfs/vfs_state.h"
 
 /* Bump a replay-cache counter on the shared struct.  Safe when the
  * thread/shared are not set up (e.g. in the unit test). */
@@ -291,12 +293,14 @@ nfs4_client_new_locked(
     c->unified = nfs_client_alloc(c->nfs4_client_id, owner, owner_len,
                                   verifier, minorversion);
 
-    /* A by-id-only record (add_to_owner=false) is an unconfirmed SETCLIENTID
-     * reboot record that coexists with a still-confirmed record holding the
-     * by-owner slot; it joins the by-owner table when it is confirmed. */
+    /* A by-id-only record (add_to_owner=false) is an unconfirmed superseding
+     * (reboot) record -- SETCLIENTID or EXCHANGE_ID -- that coexists with a
+     * still-confirmed record holding the by-owner slot; it joins the
+     * by-owner table when it is confirmed. */
     if (add_to_owner) {
         HASH_ADD(nfs4_client_hh_by_owner, table->nfs4_ct_clients_by_owner,
                  nfs4_client_owner, c->nfs4_client_owner_len, c);
+        c->nfs4_client_in_owner_table = 1;
     }
     HASH_ADD(nfs4_client_hh_by_id, table->nfs4_ct_clients_by_id,
              nfs4_client_id, sizeof(c->nfs4_client_id), c);
@@ -304,11 +308,11 @@ nfs4_client_new_locked(
     return c;
 } /* nfs4_client_new_locked */
 
-/* Caller must hold table->nfs4_ct_lock.  Unhashes a record from both tables
- * and frees the bookkeeping struct, returning its unified state hierarchy for
- * the caller to tear down once the lock is dropped.  The record must be
- * present in both hash tables (i.e. not a superseded record, which has
- * already left the by-owner table). */
+/* Caller must hold table->nfs4_ct_lock.  Unhashes a record from the tables
+ * it is actually a member of and frees the bookkeeping struct, returning its
+ * unified state hierarchy for the caller to tear down once the lock is
+ * dropped.  A by-id-only record (an in-flight superseding registration) is
+ * also unlinked from its confirmed record's pending pointer. */
 static struct nfs_client *
 nfs4_client_remove_locked(
     struct nfs4_client_table *table,
@@ -316,12 +320,32 @@ nfs4_client_remove_locked(
 {
     struct nfs_client *unified = c->unified;
 
-    HASH_DELETE(nfs4_client_hh_by_owner, table->nfs4_ct_clients_by_owner, c);
+    if (c->nfs4_client_in_owner_table) {
+        HASH_DELETE(nfs4_client_hh_by_owner, table->nfs4_ct_clients_by_owner,
+                    c);
+        c->nfs4_client_in_owner_table = 0;
+    } else {
+        /* If a confirmed record for this owner names us as its in-flight
+         * superseding registration, clear the reference. */
+        struct nfs4_client *owner_rec;
+
+        HASH_FIND(nfs4_client_hh_by_owner, table->nfs4_ct_clients_by_owner,
+                  c->nfs4_client_owner, c->nfs4_client_owner_len, owner_rec);
+        if (owner_rec &&
+            owner_rec->nfs4_client_scid_pending_id == c->nfs4_client_id) {
+            owner_rec->nfs4_client_scid_pending_id = 0;
+        }
+    }
     HASH_DELETE(nfs4_client_hh_by_id, table->nfs4_ct_clients_by_id, c);
     c->unified = NULL;
     free(c);
     return unified;
 } /* nfs4_client_remove_locked */
+
+static struct nfs_client *
+nfs4_client_remove_byid_locked(
+    struct nfs4_client_table *table,
+    struct nfs4_client       *c);
 
 /* Caller must hold table->nfs4_ct_lock. */
 static int
@@ -353,10 +377,11 @@ nfs4_client_exchange_id(
 {
     struct nfs4_client *existing, *nc;
 
-    out->status          = NFS4_OK;
-    out->clientid        = 0;
-    out->confirmed       = 0;
-    out->destroy_unified = NULL;
+    out->status           = NFS4_OK;
+    out->clientid         = 0;
+    out->confirmed        = 0;
+    out->destroy_unified  = NULL;
+    out->destroy_unified2 = NULL;
 
     pthread_mutex_lock(&table->nfs4_ct_lock);
 
@@ -397,37 +422,67 @@ nfs4_client_exchange_id(
         goto out_unlock;
     }
 
-    /* Confirmed record below. */
+    /* Confirmed record below.  It keeps the by-owner slot (and stays fully
+     * usable) throughout; a reboot registration lives in the by-id table
+     * only, referenced via scid_pending_id, until CREATE_SESSION confirms
+     * it (RFC 8881 §18.35.4; same structure as the 4.0 SETCLIENTID path). */
     if (nfs4_principal_matches(existing, principal)) {
         if (existing->nfs4_client_verifier == verifier) {
             /* Case 2: identical owner+verifier+principal -- return the same
-             * clientid, leaving existing state intact. */
+             * confirmed clientid with CONFIRMED_R, leaving every record
+             * (including an in-flight superseding one) intact: case 2
+             * mandates no state disturbance. */
             out->clientid  = existing->nfs4_client_id;
             out->confirmed = 1;
             goto out_unlock;
         }
 
         /* Case 5: same principal, new boot verifier -- the client rebooted.
-         * Issue a new clientid via a superseding unconfirmed record but keep
-         * the old record (and its sessions) live until the new one is
-         * confirmed at CREATE_SESSION. */
-        HASH_DELETE(nfs4_client_hh_by_owner, table->nfs4_ct_clients_by_owner,
-                    existing);
+         * Any earlier in-flight superseding record is replaced; the fresh
+         * unconfirmed record is by-id-only and the confirmed record (and
+         * its sessions) stay live until CREATE_SESSION confirms the new
+         * one. */
+        if (existing->nfs4_client_scid_pending_id) {
+            struct nfs4_client *pending;
+
+            HASH_FIND(nfs4_client_hh_by_id, table->nfs4_ct_clients_by_id,
+                      &existing->nfs4_client_scid_pending_id,
+                      sizeof(existing->nfs4_client_scid_pending_id), pending);
+            existing->nfs4_client_scid_pending_id = 0;
+            if (pending) {
+                out->destroy_unified =
+                    nfs4_client_remove_byid_locked(table, pending);
+            }
+        }
         nc = nfs4_client_new_locked(table, owner, owner_len, verifier,
-                                    principal, minorversion, true);
-        nc->nfs4_client_supersedes_id = existing->nfs4_client_id;
-        out->clientid                 = nc->nfs4_client_id;
+                                    principal, minorversion, false);
+        nc->nfs4_client_supersedes_id         = existing->nfs4_client_id;
+        existing->nfs4_client_scid_pending_id = nc->nfs4_client_id;
+        out->clientid                         = nc->nfs4_client_id;
         goto out_unlock;
     }
 
     /* Confirmed record owned by a different principal (RFC 8881 §18.35.4
      * case 3).  If the old client still holds session state this is a
-     * collision (CLID_INUSE); otherwise the stale record is replaced. */
+     * collision (CLID_INUSE); otherwise the stale record -- and any
+     * in-flight superseding record it carries -- is replaced. */
     if (nfs4_client_has_session_locked(table, existing->nfs4_client_id)) {
         out->status = NFS4ERR_CLID_INUSE;
         goto out_unlock;
     }
 
+    if (existing->nfs4_client_scid_pending_id) {
+        struct nfs4_client *pending;
+
+        HASH_FIND(nfs4_client_hh_by_id, table->nfs4_ct_clients_by_id,
+                  &existing->nfs4_client_scid_pending_id,
+                  sizeof(existing->nfs4_client_scid_pending_id), pending);
+        existing->nfs4_client_scid_pending_id = 0;
+        if (pending) {
+            out->destroy_unified2 =
+                nfs4_client_remove_byid_locked(table, pending);
+        }
+    }
     out->destroy_unified = nfs4_client_remove_locked(table, existing);
     nc                   = nfs4_client_new_locked(table, owner, owner_len,
                                                   verifier, principal, minorversion, true);
@@ -475,6 +530,22 @@ nfs4_client_has_state(const struct nfs4_client *c)
            (c->unified->open_owners_by_str != NULL ||
             c->unified->lock_owners_by_str != NULL);
 } /* nfs4_client_has_state */
+
+/* Does the client hold any *leased* state?  DESTROY_CLIENTID (RFC 8881
+ * §18.50.3) must refuse while any opens, locks, delegations or layouts remain,
+ * which is a wider set than nfs4_client_has_state() tests -- that one serves
+ * the SETCLIENTID CLID_INUSE rule (RFC 7530 §16.33.5) and deliberately looks
+ * only at open/lock owners, which is the right test there.
+ *
+ * The owner hashes are not usable as the leased-state test: an owner record
+ * outlives its last CLOSE/LOCKU (it caches the 4.0 seqid and replay slot), so
+ * testing them reports BUSY for a client that has already released everything.
+ * nfs_client_has_leased_state walks down to the actual state containers. */
+static int
+nfs4_client_has_leased_state(const struct nfs4_client *c)
+{
+    return c->unified && nfs_client_has_leased_state(c->unified);
+} /* nfs4_client_has_leased_state */
 
 void
 nfs4_client_setclientid(
@@ -630,8 +701,11 @@ nfs4_client_setclientid_confirm(
                 }
 
                 old->nfs4_client_scid_pending_id = 0;
-                HASH_DELETE(nfs4_client_hh_by_owner,
-                            table->nfs4_ct_clients_by_owner, old);
+                if (old->nfs4_client_in_owner_table) {
+                    HASH_DELETE(nfs4_client_hh_by_owner,
+                                table->nfs4_ct_clients_by_owner, old);
+                    old->nfs4_client_in_owner_table = 0;
+                }
                 HASH_DELETE(nfs4_client_hh_by_id,
                             table->nfs4_ct_clients_by_id, old);
                 *destroy_unified = old->unified;
@@ -641,6 +715,7 @@ nfs4_client_setclientid_confirm(
 
             HASH_ADD(nfs4_client_hh_by_owner, table->nfs4_ct_clients_by_owner,
                      nfs4_client_owner, r->nfs4_client_owner_len, r);
+            r->nfs4_client_in_owner_table = 1;
         }
         r->nfs4_client_confirmed = 1;
     }
@@ -839,6 +914,18 @@ nfs4_client_destroy_clientid(
         return NFS4ERR_CLIENTID_BUSY;
     }
 
+    /* Sessions are only half the rule: §18.50.3 makes CLIENTID_BUSY a MUST
+     * while opens, locks, delegations, layouts and/or wants remain on the
+     * clientid's unexpired lease, not merely while sessions do.  Destroying
+     * the record here would tear that leased state down underneath its
+     * holder, which is exactly what the error exists to prevent -- a client
+     * that DESTROY_SESSIONs and then DESTROY_CLIENTIDs must be refused while
+     * it still holds opens. */
+    if (nfs4_client_has_leased_state(c)) {
+        pthread_mutex_unlock(&table->nfs4_ct_lock);
+        return NFS4ERR_CLIENTID_BUSY;
+    }
+
     unified = nfs4_client_remove_locked(table, c);
 
     pthread_mutex_unlock(&table->nfs4_ct_lock);
@@ -895,8 +982,15 @@ nfs4_client_confirm(
                 }
             }
 
-            /* The superseded record already left the by-owner table at reboot
-            * time; drop it from by-id and hand its state out for teardown. */
+            /* The superseded confirmed record held the by-owner slot until
+             * this confirmation; unhash it everywhere and hand its state
+             * out for teardown. */
+            old->nfs4_client_scid_pending_id = 0;
+            if (old->nfs4_client_in_owner_table) {
+                HASH_DELETE(nfs4_client_hh_by_owner,
+                            table->nfs4_ct_clients_by_owner, old);
+                old->nfs4_client_in_owner_table = 0;
+            }
             HASH_DELETE(nfs4_client_hh_by_id, table->nfs4_ct_clients_by_id,
                         old);
             *destroy_unified = old->unified;
@@ -905,9 +999,168 @@ nfs4_client_confirm(
         }
     }
 
+    /* A promoted superseding record takes over the by-owner slot. */
+    if (!c->nfs4_client_in_owner_table) {
+        HASH_ADD(nfs4_client_hh_by_owner, table->nfs4_ct_clients_by_owner,
+                 nfs4_client_owner, c->nfs4_client_owner_len, c);
+        c->nfs4_client_in_owner_table = 1;
+    }
+
     pthread_mutex_unlock(&table->nfs4_ct_lock);
     return true;
 } /* nfs4_client_confirm */
+
+/* Cross-client aggregation of the per-client share-reservation checks in
+ * nfs4_state.c: share reservations constrain EVERY accessor of a file, not
+ * just other owners of one client (RFC 7530 §9.10 / RFC 8881 §9.7).  The
+ * table lock orders before per-client locks; nothing acquires the table
+ * lock while holding a client lock (nfs_client_destroy runs outside it by
+ * design). */
+SYMBOL_EXPORT nfsstat4
+nfs4_clients_check_io_denied(
+    struct nfs4_client_table *table,
+    const uint8_t            *fh,
+    uint16_t                  fh_len,
+    uint32_t                  requested_access)
+{
+    struct nfs4_client *c, *tmp;
+    nfsstat4            status = NFS4_OK;
+
+    pthread_mutex_lock(&table->nfs4_ct_lock);
+
+    HASH_ITER(nfs4_client_hh_by_id, table->nfs4_ct_clients_by_id, c, tmp)
+    {
+        if (!c->unified) {
+            continue;
+        }
+        status = nfs_client_check_io_denied(c->unified, NULL, fh, fh_len,
+                                            requested_access);
+        if (status != NFS4_OK) {
+            break;
+        }
+    }
+
+    pthread_mutex_unlock(&table->nfs4_ct_lock);
+    return status;
+} /* nfs4_clients_check_io_denied */
+
+/* Cross-client analogue of nfs_client_has_open_state_for_fh: true if ANY
+ * client holds this file open.  A removed-but-open file keeps its filehandle
+ * valid until the last CLOSE regardless of which client opened it (RFC 7530
+ * §16.2.5), so PUTFH must consult every client's open state, not just the one
+ * bound to the querying connection. */
+SYMBOL_EXPORT bool
+nfs4_clients_have_open_state(
+    struct nfs4_client_table *table,
+    const uint8_t            *fh,
+    uint16_t                  fh_len)
+{
+    struct nfs4_client *c, *tmp;
+    bool                found = false;
+
+    pthread_mutex_lock(&table->nfs4_ct_lock);
+
+    HASH_ITER(nfs4_client_hh_by_id, table->nfs4_ct_clients_by_id, c, tmp)
+    {
+        if (!c->unified) {
+            continue;
+        }
+        if (nfs_client_has_open_state_for_fh(c->unified, fh, fh_len)) {
+            found = true;
+            break;
+        }
+    }
+
+    pthread_mutex_unlock(&table->nfs4_ct_lock);
+    return found;
+} /* nfs4_clients_have_open_state */
+
+/* Recover the byte-string of an NFSv4 lock-owner from the (clientid,
+ * owner-hash) pair the VFS range-lease layer stores.  The lease layer
+ * keeps only XXH3_64bits(owner) (see nfs4_proc_lock's lease acquisition),
+ * so a LOCK/LOCKT NFS4ERR_DENIED reply reconstructs the conflicting
+ * lock_owner4 by scanning the owning client's lock owners for a matching
+ * hash (RFC 7530 §16.10.5 / §16.11.5 require the holder's owner in the
+ * denied structure).  Returns true and fills out_owner/out_len on a hit.
+ * A non-NFSv4 (SMB/NLM) conflict has no NFSv4 lock-owner and returns
+ * false; the caller leaves the owner empty. */
+SYMBOL_EXPORT bool
+nfs4_client_lookup_lock_owner(
+    struct nfs4_client_table *table,
+    uint64_t                  clientid,
+    uint64_t                  owner_hash,
+    uint8_t                  *out_owner,
+    uint32_t                  out_cap,
+    uint32_t                 *out_len)
+{
+    struct nfs4_client    *c;
+    struct nfs_lock_owner *lo, *lo_tmp;
+    bool                   found = false;
+
+    pthread_mutex_lock(&table->nfs4_ct_lock);
+
+    HASH_FIND(nfs4_client_hh_by_id, table->nfs4_ct_clients_by_id,
+              &clientid, sizeof(clientid), c);
+
+    if (c && c->unified) {
+        struct nfs_client *uc = c->unified;
+
+        pthread_mutex_lock(&uc->lock);
+        HASH_ITER(hh, uc->lock_owners_by_str, lo, lo_tmp)
+        {
+            if (XXH3_64bits(lo->owner, lo->owner_len) == owner_hash) {
+                uint32_t n = lo->owner_len < out_cap ? lo->owner_len : out_cap;
+                memcpy(out_owner, lo->owner, n);
+                *out_len = n;
+                found    = true;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&uc->lock);
+    }
+
+    pthread_mutex_unlock(&table->nfs4_ct_lock);
+    return found;
+} /* nfs4_client_lookup_lock_owner */
+
+void
+nfs4_fill_denied_owner(
+    struct nfs4_client_table       *table,
+    const struct chimera_vfs_lease *conflict,
+    struct state_owner4            *denied_owner,
+    struct xdr_dbuf                *dbuf)
+{
+    uint8_t  owner_buf[NFS4_OPAQUE_LIMIT];
+    uint32_t owner_len = 0;
+
+    denied_owner->clientid   = 0;
+    denied_owner->owner.len  = 0;
+    denied_owner->owner.data = NULL;
+
+    if (!conflict) {
+        return;
+    }
+
+    /* The clientid is directly recoverable; for an NFSv4 holder the owner
+     * byte-string is reconstructed from its hash. */
+    denied_owner->clientid = conflict->owner.client_key;
+
+    if (conflict->owner.protocol == CHIMERA_VFS_LEASE_PROTO_NFSV4 &&
+        nfs4_client_lookup_lock_owner(table,
+                                      conflict->owner.client_key,
+                                      conflict->owner.owner_lo,
+                                      owner_buf, sizeof(owner_buf),
+                                      &owner_len) &&
+        owner_len > 0) {
+        void *copy = xdr_dbuf_alloc_space(owner_len, dbuf);
+
+        if (copy) {
+            memcpy(copy, owner_buf, owner_len);
+            denied_owner->owner.data = copy;
+            denied_owner->owner.len  = owner_len;
+        }
+    }
+} /* nfs4_fill_denied_owner */
 
 void
 nfs4_client_unregister(
@@ -926,12 +1179,7 @@ nfs4_client_unregister(
 
     if (client) {
         chimera_nfs_info("NFS4 Unregistered client %lu", client_id);
-        HASH_DELETE(nfs4_client_hh_by_owner, table->nfs4_ct_clients_by_owner,
-                    client);
-        HASH_DELETE(nfs4_client_hh_by_id, table->nfs4_ct_clients_by_id, client);
-        unified         = client->unified;
-        client->unified = NULL;
-        free(client);
+        unified = nfs4_client_remove_locked(table, client);
     }
 
     pthread_mutex_unlock(&table->nfs4_ct_lock);
@@ -1425,15 +1673,34 @@ nfs4_replay_slot_acquire(
                     nfs4_replay_arm_capture(req);
                 }
             } else if (seqid == cseq) {
-                /* Retransmit. */
-                if (state == NFS4_SLOT_CACHED && slot->cached_buf) {
-                    req->replay_slot    = slot;
-                    req->replay_slot_id = slotid;
-                    req->replay_action  = NFS4_REPLAY_ACTION_FROM_CACHE;
-                    *out_is_replay      = true;
+                /* Retransmit.  A CACHED slot always has a live cached_buf
+                 * (finalize promotes to CACHED only when bytes were captured),
+                 * so claim it CACHED -> IN_PROGRESS with the *same* CAS the
+                 * advance path uses to win the right to free that buffer.
+                 * Winning here excludes a concurrent advance (seqid+1) on
+                 * another connection from freeing cached_buf out from under the
+                 * replay read in nfs4_send_cached_reply -- the use-after-free
+                 * the old lock-free reader path allowed.  The compound
+                 * dispatcher restores the slot to CACHED via
+                 * nfs4_replay_slot_replay_done once the bytes are on the wire.
+                 * Reading cached_buf only after the CAS also keeps that plain
+                 * field free of a concurrent free/read data race. */
+                if (state == NFS4_SLOT_CACHED) {
+                    if (!atomic_compare_exchange_weak_explicit(
+                            &slot->state_word, &cur,
+                            nfs4_slot_word(cseq, NFS4_SLOT_IN_PROGRESS),
+                            memory_order_acq_rel, memory_order_acquire)) {
+                        continue;  /* lost the race; re-read and re-evaluate */
+                    }
+                    req->replay_slot        = slot;
+                    req->replay_slot_id     = slotid;
+                    req->replay_action      = NFS4_REPLAY_ACTION_FROM_CACHE;
+                    *out_is_replay          = true;
+                    slot->in_progress_since = nfs4_slot_now();
+                    slot->last_stuck_report = 0;
                 } else {
-                    /* Original ran with cachethis=false (or was demoted
-                     * for size).  We cannot replay the bytes. */
+                    /* COMPLETED: original ran with cachethis=false (or was
+                     * demoted for size).  We cannot replay the bytes. */
                     status = NFS4ERR_RETRY_UNCACHED_REP;
                 }
             } else {
@@ -1543,6 +1810,31 @@ nfs4_replay_slot_finalize(struct nfs_request *req)
 
     req->replay_slot = NULL;
 } /* nfs4_replay_slot_finalize */
+
+void
+nfs4_replay_slot_replay_done(struct nfs_request *req)
+{
+    struct nfs4_replay_slot *slot = req->replay_slot;
+    uint64_t                 cur;
+
+    if (!slot) {
+        return;
+    }
+
+    /* Release a slot claimed by the retransmit path (nfs4_replay_slot_acquire
+     * moved it CACHED -> IN_PROGRESS to pin cached_buf across the replay send)
+     * back to CACHED, preserving its seqid and cached buffer and re-publishing
+     * them with a release store for the next reader.  The slot has been
+     * IN_PROGRESS and owned by this request for the whole replay, so no other
+     * thread has advanced the word -- a plain load of the seqid bits is safe. */
+    cur = atomic_load_explicit(&slot->state_word, memory_order_relaxed);
+    atomic_store_explicit(&slot->state_word,
+                          nfs4_slot_word((uint32_t) (cur >> NFS4_SLOT_SEQID_SHIFT),
+                                         NFS4_SLOT_CACHED),
+                          memory_order_release);
+
+    req->replay_slot = NULL;
+} /* nfs4_replay_slot_replay_done */
 
 /*
  * Record the delegation callback path for a client onto its unified state

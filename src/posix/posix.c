@@ -170,7 +170,7 @@ chimera_posix_init(
         pthread_mutex_init(&posix->fds[i].lock, NULL);
         pthread_cond_init(&posix->fds[i].cond, NULL);
         posix->fds[i].handle        = NULL;
-        posix->fds[i].offset        = 0;
+        posix->fds[i].ofd           = NULL;
         posix->fds[i].flags         = CHIMERA_POSIX_FD_CLOSED;
         posix->fds[i].refcnt        = 0;
         posix->fds[i].io_waiters    = 0;
@@ -264,7 +264,7 @@ chimera_posix_init_json(
         pthread_mutex_init(&posix->fds[i].lock, NULL);
         pthread_cond_init(&posix->fds[i].cond, NULL);
         posix->fds[i].handle        = NULL;
-        posix->fds[i].offset        = 0;
+        posix->fds[i].ofd           = NULL;
         posix->fds[i].flags         = CHIMERA_POSIX_FD_CLOSED;
         posix->fds[i].refcnt        = 0;
         posix->fds[i].io_waiters    = 0;
@@ -315,6 +315,21 @@ chimera_posix_shutdown(void)
 
     if (!posix) {
         return;
+    }
+
+    /* Close any descriptors the application leaked: their open handles
+     * otherwise keep the VFS close-thread handshake in chimera_vfs_destroy
+     * from ever completing, hanging shutdown forever.  Must run while the
+     * workers are still alive to process the closes. */
+    if (posix->fds) {
+        for (int i = 0; i < posix->max_fds; i++) {
+            struct chimera_posix_fd_entry *entry = &posix->fds[i];
+
+            if (entry->handle &&
+                !(entry->flags & CHIMERA_POSIX_FD_CLOSED)) {
+                (void) chimera_posix_close(i);
+            }
+        }
     }
 
     chimera_posix_global = NULL;

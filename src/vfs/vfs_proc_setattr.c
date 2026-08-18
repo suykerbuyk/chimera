@@ -301,6 +301,9 @@ struct chimera_vfs_setattr_gate {
     void                           *private_data;
 };
 
+_Static_assert(sizeof(struct chimera_vfs_setattr_gate) <= CHIMERA_VFS_GATE_SCRATCH_SIZE,
+               "setattr gate context outgrew the request gate scratch area");
+
 static void
 chimera_vfs_setattr_gate_complete(
     enum chimera_vfs_error    error_code,
@@ -312,7 +315,7 @@ chimera_vfs_setattr_gate_complete(
 
     if (error_code != CHIMERA_VFS_OK) {
         gate->callback(error_code, NULL, NULL, NULL, gate->private_data);
-        free(gate);
+        chimera_vfs_gate_scratch_free(gate->thread, gate);
         return;
     }
 
@@ -322,17 +325,33 @@ chimera_vfs_setattr_gate_complete(
 
     /* POSIX: the file's owner (and the super-user) may always update its
      * timestamps -- to an explicit value or to "now" -- regardless of write
-     * permission.  For a setattr that changes only atime/mtime, the owner is
-     * therefore unconditionally authorized. */
+     * permission.  For a setattr that changes only timestamps, the owner is
+     * therefore unconditionally authorized.
+     *
+     * The exempt set includes BTIME and DOS_ATTRIBUTES: the SMB
+     * SetInfo(FileBasicInformation) path always carries all four timestamps
+     * plus DOS attributes (the extras typically as TIME_OMIT / no-op
+     * sentinels), so an owner's plain `touch` arrives with BTIME and
+     * DOS_ATTRIBUTES in set_mask.  Excluding them made the exemption miss,
+     * leaving required=WRITE_ATTRIBUTES -- a right the mode-only owner is not
+     * granted (mode_access_check withholds it, Windows-style) -- so the
+     * owner's own touch was denied (STATUS_INTERNAL_ERROR over SMB).  NFS
+     * never sets BTIME on a touch, which is why it was unaffected. */
     {
-        uint64_t m     = gate->set_attr->va_set_mask;
-        int      owner = (gate->cred->uid == 0) ||
+        uint64_t       m     = gate->set_attr->va_set_mask;
+        int            owner = (gate->cred->uid == 0) ||
             ((attr->va_set_mask & CHIMERA_VFS_ATTR_UID) &&
              (uint64_t) gate->cred->uid == attr->va_uid);
 
-        if (owner && (m & (CHIMERA_VFS_ATTR_ATIME | CHIMERA_VFS_ATTR_MTIME)) &&
-            !(m & ~(CHIMERA_VFS_ATTR_ATIME | CHIMERA_VFS_ATTR_MTIME |
-                    CHIMERA_VFS_ATTR_CTIME))) {
+        const uint64_t time_trigger = CHIMERA_VFS_ATTR_ATIME |
+            CHIMERA_VFS_ATTR_MTIME |
+            CHIMERA_VFS_ATTR_BTIME;
+        const uint64_t owner_exempt = time_trigger |
+            CHIMERA_VFS_ATTR_CTIME |
+            CHIMERA_VFS_ATTR_DOS_ATTRIBUTES;
+
+        /* Owner setting only timestamps (+ benign SMB sentinels): skip ACL. */
+        if (owner && (m & time_trigger) && !(m & ~owner_exempt)) {
             required = 0;
         }
     }
@@ -342,7 +361,7 @@ chimera_vfs_setattr_gate_complete(
     if (chimera_vfs_gate(attr, gate->cred, required & ~CHIMERA_ACE_WRITE_OWNER) != CHIMERA_VFS_OK) {
         gate->callback(chimera_vfs_setattr_denied_error(gate->set_attr),
                        NULL, NULL, NULL, gate->private_data);
-        free(gate);
+        chimera_vfs_gate_scratch_free(gate->thread, gate);
         return;
     }
 
@@ -374,7 +393,7 @@ chimera_vfs_setattr_gate_complete(
         if (has_write_owner) {
             if (chimera_vfs_setattr_write_owner_check(gate->cred, gate->set_attr, attr) != CHIMERA_VFS_OK) {
                 gate->callback(CHIMERA_VFS_EPERM, NULL, NULL, NULL, gate->private_data);
-                free(gate);
+                chimera_vfs_gate_scratch_free(gate->thread, gate);
                 return;
             }
         } else {
@@ -387,7 +406,7 @@ chimera_vfs_setattr_gate_complete(
                 ((required & CHIMERA_ACE_WRITE_OWNER) && !is_owner && gate->cred->uid != 0 &&
                  chimera_vfs_gate(attr, gate->cred, CHIMERA_ACE_WRITE_OWNER) != CHIMERA_VFS_OK)) {
                 gate->callback(CHIMERA_VFS_EPERM, NULL, NULL, NULL, gate->private_data);
-                free(gate);
+                chimera_vfs_gate_scratch_free(gate->thread, gate);
                 return;
             }
         }
@@ -432,17 +451,18 @@ chimera_vfs_setattr_gate_complete(
                                  gate->set_attr, gate->pre_attr_mask,
                                  gate->post_attr_mask, gate->callback,
                                  gate->private_data);
-    free(gate);
+    chimera_vfs_gate_scratch_free(gate->thread, gate);
 } /* chimera_vfs_setattr_gate_complete */
 
-SYMBOL_EXPORT void
-chimera_vfs_setattr(
+static void
+chimera_vfs_setattr_common(
     struct chimera_vfs_thread      *thread,
     const struct chimera_vfs_cred  *cred,
     struct chimera_vfs_open_handle *handle,
     struct chimera_vfs_attrs       *set_attr,
     uint64_t                        pre_attr_mask,
     uint64_t                        post_attr_mask,
+    int                             fd_rights,
     chimera_vfs_setattr_callback_t  callback,
     void                           *private_data)
 {
@@ -459,8 +479,25 @@ chimera_vfs_setattr(
          * callback recomputes once the current owner/group is known. */
         required = chimera_vfs_setattr_required(set_attr, NULL);
 
+        /* POSIX binds I/O rights at open: a descriptor-originated mutation
+         * whose entire requirement is WRITE_DATA (ftruncate,
+         * futimens-to-now through a writable descriptor) is authorized by
+         * the handle's open-time grant and stays valid across later mode
+         * changes.  Only fd_rights callers (chimera_vfs_fsetattr) qualify:
+         * path-based setattr (truncate, utimensat) must check the file's
+         * current permissions even though the internal path-open may share
+         * a cached handle with a user descriptor.  Anything needing more
+         * than WRITE_DATA (chmod/chown/explicit timestamps) keeps the
+         * per-operation owner rules -- ownership does not bind at open. */
+        if (fd_rights && required != 0 &&
+            (required & ~(uint32_t) CHIMERA_ACE_WRITE_DATA) == 0 &&
+            handle->granted_valid &&
+            (handle->granted_access & CHIMERA_ACE_WRITE_DATA)) {
+            required = 0;
+        }
+
         if (required) {
-            gate = malloc(sizeof(*gate));
+            gate = chimera_vfs_gate_scratch_alloc(thread);
 
             gate->thread         = thread;
             gate->cred           = cred;
@@ -481,4 +518,40 @@ chimera_vfs_setattr(
     chimera_vfs_setattr_dispatch(thread, cred, handle, set_attr,
                                  pre_attr_mask, post_attr_mask,
                                  callback, private_data);
+} /* chimera_vfs_setattr_common */
+
+SYMBOL_EXPORT void
+chimera_vfs_setattr(
+    struct chimera_vfs_thread      *thread,
+    const struct chimera_vfs_cred  *cred,
+    struct chimera_vfs_open_handle *handle,
+    struct chimera_vfs_attrs       *set_attr,
+    uint64_t                        pre_attr_mask,
+    uint64_t                        post_attr_mask,
+    chimera_vfs_setattr_callback_t  callback,
+    void                           *private_data)
+{
+    chimera_vfs_setattr_common(thread, cred, handle, set_attr,
+                               pre_attr_mask, post_attr_mask, 0,
+                               callback, private_data);
 } /* chimera_vfs_setattr */
+
+/* Descriptor-originated setattr (ftruncate/futimens family): mutations whose
+ * whole requirement is WRITE_DATA are authorized by the descriptor's
+ * open-time grant (POSIX rights retention) instead of the file's current
+ * mode.  Everything else behaves exactly like chimera_vfs_setattr. */
+SYMBOL_EXPORT void
+chimera_vfs_fsetattr(
+    struct chimera_vfs_thread      *thread,
+    const struct chimera_vfs_cred  *cred,
+    struct chimera_vfs_open_handle *handle,
+    struct chimera_vfs_attrs       *set_attr,
+    uint64_t                        pre_attr_mask,
+    uint64_t                        post_attr_mask,
+    chimera_vfs_setattr_callback_t  callback,
+    void                           *private_data)
+{
+    chimera_vfs_setattr_common(thread, cred, handle, set_attr,
+                               pre_attr_mask, post_attr_mask, 1,
+                               callback, private_data);
+} /* chimera_vfs_fsetattr */

@@ -226,6 +226,10 @@ struct chimera_client_request {
             struct chimera_vfs_open_handle *dest_parent_handle;
             chimera_link_callback_t         callback;
             void                           *private_data;
+            /* CHIMERA_VFS_LOOKUP_FOLLOW to resolve a final-component
+             * symlink in source_path and link its target
+             * (linkat AT_SYMLINK_FOLLOW); 0 links the symlink itself. */
+            unsigned int                    source_lookup_flags;
             int                             source_path_len;
             int                             source_parent_len;
             int                             source_name_offset;
@@ -385,6 +389,7 @@ struct chimera_client_request {
             uint64_t                        dst_offset;
             uint64_t                        length;
             uint64_t                        r_length;
+            uint32_t                        flags;
             chimera_copy_range_callback_t   callback;
             void                           *private_data;
         } copy_range;

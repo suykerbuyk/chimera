@@ -160,6 +160,7 @@ chimera_vfs_link_at_dispatch(
  * directory requires ADD_FILE on that directory.
  */
 struct chimera_vfs_link_at_gate {
+    struct chimera_vfs_gate_ctx     gate_ctx;
     struct chimera_vfs_thread      *thread;
     const struct chimera_vfs_cred  *cred;
     const void                     *fh;
@@ -179,6 +180,9 @@ struct chimera_vfs_link_at_gate {
     void                           *private_data;
 };
 
+_Static_assert(sizeof(struct chimera_vfs_link_at_gate) <= CHIMERA_VFS_GATE_SCRATCH_SIZE,
+               "link_at gate context outgrew the request gate scratch area");
+
 static void
 chimera_vfs_link_at_gate_complete(
     enum chimera_vfs_error status,
@@ -188,7 +192,7 @@ chimera_vfs_link_at_gate_complete(
 
     if (status != CHIMERA_VFS_OK) {
         gate->callback(status, NULL, NULL, NULL, gate->private_data);
-        free(gate);
+        chimera_vfs_gate_scratch_free(gate->thread, gate);
         return;
     }
 
@@ -200,7 +204,7 @@ chimera_vfs_link_at_gate_complete(
                                  gate->parent_lease_skip : NULL,
                                  gate->op_handle,
                                  gate->callback, gate->private_data);
-    free(gate);
+    chimera_vfs_gate_scratch_free(gate->thread, gate);
 } /* chimera_vfs_link_at_gate_complete */
 
 SYMBOL_EXPORT void
@@ -249,7 +253,7 @@ chimera_vfs_link_at(
      * destination directory and never checks its write permission for the caller
      * (pjd link/07).  SMB keeps its own model (see gate_needed_dac). */
     if (module && chimera_vfs_gate_needed_dac(module->capabilities, cred)) {
-        gate                 = malloc(sizeof(*gate));
+        gate                 = chimera_vfs_gate_scratch_alloc(thread);
         gate->thread         = thread;
         gate->cred           = cred;
         gate->fh             = fh;
@@ -272,7 +276,8 @@ chimera_vfs_link_at(
         gate->callback     = callback;
         gate->private_data = private_data;
 
-        chimera_vfs_gate_fh_dac(thread, cred, dir_fh, dir_fhlen,
+        chimera_vfs_gate_fh_dac(&gate->gate_ctx, thread, cred,
+                                dir_fh, dir_fhlen,
                                 CHIMERA_ACE_WRITE_DATA | CHIMERA_ACE_EXECUTE,
                                 chimera_vfs_link_at_gate_complete, gate);
         return;

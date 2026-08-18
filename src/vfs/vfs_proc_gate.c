@@ -29,26 +29,26 @@
 /* ----------------------------------------------------------------------------
  * chimera_vfs_gate_fh: require a fixed mask on a single object.
  * ------------------------------------------------------------------------- */
-struct chimera_vfs_gate_fh_ctx {
-    struct chimera_vfs_thread      *thread;
-    const struct chimera_vfs_cred  *cred;
-    uint32_t                        required;
-    chimera_vfs_gate_callback_t     callback;
-    void                           *private_data;
-    struct chimera_vfs_open_handle *handle;
-};
-
 static void
 chimera_vfs_gate_fh_getattr(
     enum chimera_vfs_error    error_code,
     struct chimera_vfs_attrs *attr,
     void                     *private_data)
 {
-    struct chimera_vfs_gate_fh_ctx *ctx = private_data;
-    enum chimera_vfs_error          status;
+    struct chimera_vfs_gate_ctx *ctx = private_data;
+    enum chimera_vfs_error       status;
 
     if (error_code != CHIMERA_VFS_OK) {
         status = error_code;
+    } else if ((attr->va_set_mask & CHIMERA_VFS_ATTR_MODE) &&
+               !S_ISDIR(attr->va_mode)) {
+        /* Every gate_fh caller gates a directory (the parent of a create/
+         * remove, a rename/link destination, a lookup dir); reaching a
+         * non-directory means the caller resolved through a non-directory
+         * descriptor or handle.  Report POSIX's ENOTDIR ahead of the
+         * access evaluation, so the type error is not masked as EACCES
+         * for callers the backend's own type check never reaches. */
+        status = CHIMERA_VFS_ENOTDIR;
     } else {
         status = chimera_vfs_gate(attr, ctx->cred, ctx->required);
     }
@@ -56,7 +56,6 @@ chimera_vfs_gate_fh_getattr(
     chimera_vfs_release(ctx->thread, ctx->handle);
 
     ctx->callback(status, ctx->private_data);
-    free(ctx);
 } /* chimera_vfs_gate_fh_getattr */
 
 static void
@@ -65,11 +64,10 @@ chimera_vfs_gate_fh_open(
     struct chimera_vfs_open_handle *handle,
     void                           *private_data)
 {
-    struct chimera_vfs_gate_fh_ctx *ctx = private_data;
+    struct chimera_vfs_gate_ctx *ctx = private_data;
 
     if (error_code != CHIMERA_VFS_OK) {
         ctx->callback(error_code, ctx->private_data);
-        free(ctx);
         return;
     }
 
@@ -82,6 +80,7 @@ chimera_vfs_gate_fh_open(
 
 static void
 chimera_vfs_gate_fh_impl(
+    struct chimera_vfs_gate_ctx   *ctx,
     struct chimera_vfs_thread     *thread,
     const struct chimera_vfs_cred *cred,
     const void                    *fh,
@@ -91,14 +90,11 @@ chimera_vfs_gate_fh_impl(
     chimera_vfs_gate_callback_t    callback,
     void                          *private_data)
 {
-    struct chimera_vfs_gate_fh_ctx *ctx;
-
     if (!needed) {
         callback(CHIMERA_VFS_OK, private_data);
         return;
     }
 
-    ctx               = malloc(sizeof(*ctx));
     ctx->thread       = thread;
     ctx->cred         = cred;
     ctx->required     = required;
@@ -113,6 +109,7 @@ chimera_vfs_gate_fh_impl(
 
 SYMBOL_EXPORT void
 chimera_vfs_gate_fh(
+    struct chimera_vfs_gate_ctx   *ctx,
     struct chimera_vfs_thread     *thread,
     const struct chimera_vfs_cred *cred,
     const void                    *fh,
@@ -130,7 +127,7 @@ chimera_vfs_gate_fh(
         return;
     }
 
-    chimera_vfs_gate_fh_impl(thread, cred, fh, fhlen, required,
+    chimera_vfs_gate_fh_impl(ctx, thread, cred, fh, fhlen, required,
                              chimera_vfs_gate_needed(module->capabilities, cred),
                              callback, private_data);
 } /* chimera_vfs_gate_fh */
@@ -142,6 +139,7 @@ chimera_vfs_gate_fh(
  */
 SYMBOL_EXPORT void
 chimera_vfs_gate_fh_dac(
+    struct chimera_vfs_gate_ctx   *ctx,
     struct chimera_vfs_thread     *thread,
     const struct chimera_vfs_cred *cred,
     const void                    *fh,
@@ -159,7 +157,7 @@ chimera_vfs_gate_fh_dac(
         return;
     }
 
-    chimera_vfs_gate_fh_impl(thread, cred, fh, fhlen, required,
+    chimera_vfs_gate_fh_impl(ctx, thread, cred, fh, fhlen, required,
                              chimera_vfs_gate_needed_dac(module->capabilities, cred),
                              callback, private_data);
 } /* chimera_vfs_gate_fh_dac */
@@ -171,34 +169,20 @@ chimera_vfs_gate_fh_dac(
  * done with no child fetch (the common case).  Otherwise fetch the child too so
  * the per-object DELETE grant and the sticky-bit owner check can be evaluated.
  * ------------------------------------------------------------------------- */
-struct chimera_vfs_gate_delete_ctx {
-    struct chimera_vfs_thread      *thread;
-    const struct chimera_vfs_cred  *cred;
-    const void                     *child_fh;
-    int                             child_fhlen;
-    chimera_vfs_gate_callback_t     callback;
-    void                           *private_data;
-    struct chimera_vfs_open_handle *handle;     /* currently-open object */
-    int                             dc;         /* parent grants DELETE_CHILD */
-    int                             sticky;
-    uint64_t                        parent_uid;
-};
-
 static void
 chimera_vfs_gate_delete_child_getattr(
     enum chimera_vfs_error    error_code,
     struct chimera_vfs_attrs *attr,
     void                     *private_data)
 {
-    struct chimera_vfs_gate_delete_ctx *ctx = private_data;
-    enum chimera_vfs_error              status;
-    int                                 allow;
-    uint64_t                            child_uid;
+    struct chimera_vfs_gate_ctx *ctx = private_data;
+    enum chimera_vfs_error       status;
+    int                          allow;
+    uint64_t                     child_uid;
 
     if (error_code != CHIMERA_VFS_OK) {
         chimera_vfs_release(ctx->thread, ctx->handle);
         ctx->callback(error_code, ctx->private_data);
-        free(ctx);
         return;
     }
 
@@ -226,7 +210,6 @@ chimera_vfs_gate_delete_child_getattr(
 
     status = allow ? CHIMERA_VFS_OK : CHIMERA_VFS_EACCES;
     ctx->callback(status, ctx->private_data);
-    free(ctx);
 } /* chimera_vfs_gate_delete_child_getattr */
 
 static void
@@ -235,11 +218,10 @@ chimera_vfs_gate_delete_child_open(
     struct chimera_vfs_open_handle *handle,
     void                           *private_data)
 {
-    struct chimera_vfs_gate_delete_ctx *ctx = private_data;
+    struct chimera_vfs_gate_ctx *ctx = private_data;
 
     if (error_code != CHIMERA_VFS_OK) {
         ctx->callback(error_code, ctx->private_data);
-        free(ctx);
         return;
     }
 
@@ -256,13 +238,12 @@ chimera_vfs_gate_delete_parent_getattr(
     struct chimera_vfs_attrs *attr,
     void                     *private_data)
 {
-    struct chimera_vfs_gate_delete_ctx *ctx = private_data;
-    uint32_t                            mode;
+    struct chimera_vfs_gate_ctx *ctx = private_data;
+    uint32_t                     mode;
 
     if (error_code != CHIMERA_VFS_OK) {
         chimera_vfs_release(ctx->thread, ctx->handle);
         ctx->callback(error_code, ctx->private_data);
-        free(ctx);
         return;
     }
 
@@ -280,7 +261,6 @@ chimera_vfs_gate_delete_parent_getattr(
      * without fetching the child at all. */
     if (ctx->dc && !ctx->sticky) {
         ctx->callback(CHIMERA_VFS_OK, ctx->private_data);
-        free(ctx);
         return;
     }
 
@@ -295,11 +275,10 @@ chimera_vfs_gate_delete_parent_open(
     struct chimera_vfs_open_handle *handle,
     void                           *private_data)
 {
-    struct chimera_vfs_gate_delete_ctx *ctx = private_data;
+    struct chimera_vfs_gate_ctx *ctx = private_data;
 
     if (error_code != CHIMERA_VFS_OK) {
         ctx->callback(error_code, ctx->private_data);
-        free(ctx);
         return;
     }
 
@@ -312,6 +291,7 @@ chimera_vfs_gate_delete_parent_open(
 
 SYMBOL_EXPORT void
 chimera_vfs_gate_delete(
+    struct chimera_vfs_gate_ctx   *ctx,
     struct chimera_vfs_thread     *thread,
     const struct chimera_vfs_cred *cred,
     const void                    *parent_fh,
@@ -321,8 +301,7 @@ chimera_vfs_gate_delete(
     chimera_vfs_gate_callback_t    callback,
     void                          *private_data)
 {
-    struct chimera_vfs_module          *module;
-    struct chimera_vfs_gate_delete_ctx *ctx;
+    struct chimera_vfs_module *module;
 
     module = chimera_vfs_get_module(thread, parent_fh, parent_fhlen);
 
@@ -336,7 +315,6 @@ chimera_vfs_gate_delete(
         return;
     }
 
-    ctx               = malloc(sizeof(*ctx));
     ctx->thread       = thread;
     ctx->cred         = cred;
     ctx->child_fh     = child_fh;

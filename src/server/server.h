@@ -174,6 +174,24 @@ chimera_server_config_get_smb2_max_async_credits(
     const struct chimera_server_config *config);
 
 void
+chimera_server_config_set_smb_fs_physical_bytes_per_sector(
+    struct chimera_server_config *config,
+    uint32_t                      value);
+
+uint32_t
+chimera_server_config_get_smb_fs_physical_bytes_per_sector(
+    const struct chimera_server_config *config);
+
+void
+chimera_server_config_set_smb_fs_sector_size_flags(
+    struct chimera_server_config *config,
+    uint32_t                      value);
+
+uint32_t
+chimera_server_config_get_smb_fs_sector_size_flags(
+    const struct chimera_server_config *config);
+
+void
 chimera_server_config_set_cache_ttl(
     struct chimera_server_config *config,
     int                           ttl);
@@ -373,6 +391,45 @@ chimera_server_config_set_s3_port(
 
 int
 chimera_server_config_get_s3_port(
+    const struct chimera_server_config *config);
+
+void
+chimera_server_config_set_smb_port(
+    struct chimera_server_config *config,
+    int                           port);
+
+int
+chimera_server_config_get_smb_port(
+    const struct chimera_server_config *config);
+
+/* Protocols are opt-in: each serves only when its config explicitly enables
+ * it (default off).  The corresponding port settings above keep the customary
+ * defaults and matter only once the protocol is enabled. */
+void
+chimera_server_config_set_nfs_enabled(
+    struct chimera_server_config *config,
+    int                           enabled);
+
+int
+chimera_server_config_get_nfs_enabled(
+    const struct chimera_server_config *config);
+
+void
+chimera_server_config_set_smb_enabled(
+    struct chimera_server_config *config,
+    int                           enabled);
+
+int
+chimera_server_config_get_smb_enabled(
+    const struct chimera_server_config *config);
+
+void
+chimera_server_config_set_s3_enabled(
+    struct chimera_server_config *config,
+    int                           enabled);
+
+int
+chimera_server_config_get_s3_enabled(
     const struct chimera_server_config *config);
 
 void

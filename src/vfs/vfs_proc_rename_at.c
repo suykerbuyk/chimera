@@ -375,6 +375,7 @@ chimera_vfs_rename_at_dispatch(
  * distinguishing APPEND_DATA on the destination.
  */
 struct chimera_vfs_rename_at_gate {
+    struct chimera_vfs_gate_ctx      gate_ctx;
     struct chimera_vfs_thread       *thread;
     const struct chimera_vfs_cred   *cred;
     const void                      *fh;
@@ -390,6 +391,8 @@ struct chimera_vfs_rename_at_gate {
     unsigned int                     flags;
     uint8_t                          src_child_fh[CHIMERA_VFS_FH_SIZE];
     int                              src_child_fh_len;
+    uint8_t                          dst_target_fh[CHIMERA_VFS_FH_SIZE];
+    int                              dst_target_fh_len;
     uint64_t                         pre_attr_mask;
     uint64_t                         post_attr_mask;
     uint8_t                          parent_lease_skip[16];
@@ -399,13 +402,16 @@ struct chimera_vfs_rename_at_gate {
     void                            *private_data;
 };
 
+_Static_assert(sizeof(struct chimera_vfs_rename_at_gate) <= CHIMERA_VFS_GATE_SCRATCH_SIZE,
+               "rename_at gate context outgrew the request gate scratch area");
+
 static void
 chimera_vfs_rename_at_gate_fail(
     struct chimera_vfs_rename_at_gate *gate,
     enum chimera_vfs_error             status)
 {
     gate->callback(status, NULL, NULL, NULL, NULL, gate->private_data);
-    free(gate);
+    chimera_vfs_gate_scratch_free(gate->thread, gate);
 } /* chimera_vfs_rename_at_gate_fail */
 
 static void
@@ -422,7 +428,7 @@ chimera_vfs_rename_at_gate_dispatch(struct chimera_vfs_rename_at_gate *gate)
                                    gate->parent_lease_skip : NULL,
                                    gate->op_handle,
                                    gate->callback, gate->private_data);
-    free(gate);
+    chimera_vfs_gate_scratch_free(gate->thread, gate);
 } /* chimera_vfs_rename_at_gate_dispatch */
 
 /* Step 3 complete: replaced-target delete authorized -> dispatch. */
@@ -440,6 +446,45 @@ chimera_vfs_rename_at_gate_target(
     chimera_vfs_rename_at_gate_dispatch(gate);
 } /* chimera_vfs_rename_at_gate_target */
 
+/* Destination name resolved -> if it names an existing object, authorize its
+ * replacement (delete_allowed on the destination directory, which applies the
+ * sticky-bit owner rule); a missing name replaces nothing. */
+static void
+chimera_vfs_rename_at_gate_dst_lookup(
+    enum chimera_vfs_error    status,
+    struct chimera_vfs_attrs *attr,
+    void                     *private_data)
+{
+    struct chimera_vfs_rename_at_gate *gate = private_data;
+
+    /* No existing destination object -> nothing to replace, proceed. */
+    if (status == CHIMERA_VFS_ENOENT) {
+        chimera_vfs_rename_at_gate_dispatch(gate);
+        return;
+    }
+
+    if (status != CHIMERA_VFS_OK) {
+        chimera_vfs_rename_at_gate_fail(gate, status);
+        return;
+    }
+
+    if ((attr->va_set_mask & CHIMERA_VFS_ATTR_FH) &&
+        attr->va_fh_len > 0 && attr->va_fh_len <= CHIMERA_VFS_FH_SIZE) {
+        memcpy(gate->dst_target_fh, attr->va_fh, attr->va_fh_len);
+        gate->dst_target_fh_len = attr->va_fh_len;
+
+        chimera_vfs_gate_delete(&gate->gate_ctx, gate->thread, gate->cred,
+                                gate->new_fh, gate->new_fhlen,
+                                gate->dst_target_fh, gate->dst_target_fh_len,
+                                chimera_vfs_rename_at_gate_target, gate);
+        return;
+    }
+
+    /* Existing object but no FH resolved: the sticky owner check needs the
+     * object's attrs, so fall back to permitting the replace (best effort). */
+    chimera_vfs_rename_at_gate_dispatch(gate);
+} /* chimera_vfs_rename_at_gate_dst_lookup */
+
 /* Step 2 complete: destination ADD authorized -> check replaced target. */
 static void
 chimera_vfs_rename_at_gate_dst(
@@ -454,14 +499,21 @@ chimera_vfs_rename_at_gate_dst(
     }
 
     if (gate->target_fh && gate->target_fh_len > 0) {
-        chimera_vfs_gate_delete(gate->thread, gate->cred,
+        chimera_vfs_gate_delete(&gate->gate_ctx, gate->thread, gate->cred,
                                 gate->new_fh, gate->new_fhlen,
                                 gate->target_fh, gate->target_fh_len,
                                 chimera_vfs_rename_at_gate_target, gate);
         return;
     }
 
-    chimera_vfs_rename_at_gate_dispatch(gate);
+    /* The caller supplied no replaced-target FH (e.g. the NFS server rename,
+     * which does not resolve the destination name up front).  Resolve it here
+     * so a sticky destination directory's owner rule is enforced against the
+     * object actually being replaced. */
+    chimera_vfs_lookup(gate->thread, gate->cred, gate->new_fh, gate->new_fhlen,
+                       gate->new_name, gate->new_namelen,
+                       CHIMERA_VFS_ATTR_FH, 0,
+                       chimera_vfs_rename_at_gate_dst_lookup, gate);
 } /* chimera_vfs_rename_at_gate_dst */
 
 /* Step 1 complete: source DELETE_CHILD authorized -> check destination ADD. */
@@ -477,7 +529,8 @@ chimera_vfs_rename_at_gate_src(
         return;
     }
 
-    chimera_vfs_gate_fh(gate->thread, gate->cred, gate->new_fh, gate->new_fhlen,
+    chimera_vfs_gate_fh(&gate->gate_ctx, gate->thread, gate->cred,
+                        gate->new_fh, gate->new_fhlen,
                         CHIMERA_ACE_WRITE_DATA,
                         chimera_vfs_rename_at_gate_dst, gate);
 } /* chimera_vfs_rename_at_gate_src */
@@ -502,7 +555,7 @@ chimera_vfs_rename_at_gate_lookup(
         memcpy(gate->src_child_fh, attr->va_fh, attr->va_fh_len);
         gate->src_child_fh_len = attr->va_fh_len;
 
-        chimera_vfs_gate_delete(gate->thread, gate->cred,
+        chimera_vfs_gate_delete(&gate->gate_ctx, gate->thread, gate->cred,
                                 gate->fh, gate->fhlen,
                                 gate->src_child_fh, gate->src_child_fh_len,
                                 chimera_vfs_rename_at_gate_src, gate);
@@ -511,7 +564,8 @@ chimera_vfs_rename_at_gate_lookup(
 
     /* No FH resolved: fall back to DELETE_CHILD on the source directory alone
      * (sticky owner check needs the object's attrs). */
-    chimera_vfs_gate_fh(gate->thread, gate->cred, gate->fh, gate->fhlen,
+    chimera_vfs_gate_fh(&gate->gate_ctx, gate->thread, gate->cred,
+                        gate->fh, gate->fhlen,
                         CHIMERA_ACE_DELETE_CHILD,
                         chimera_vfs_rename_at_gate_src, gate);
 } /* chimera_vfs_rename_at_gate_lookup */
@@ -569,7 +623,7 @@ chimera_vfs_rename_at(
     module = chimera_vfs_get_module(thread, fh, fhlen);
 
     if (module && chimera_vfs_gate_needed(module->capabilities, cred)) {
-        gate                 = malloc(sizeof(*gate));
+        gate                 = chimera_vfs_gate_scratch_alloc(thread);
         gate->thread         = thread;
         gate->cred           = cred;
         gate->fh             = fh;
@@ -591,10 +645,11 @@ chimera_vfs_rename_at(
         } else {
             gate->parent_lease_skip_valid = 0;
         }
-        gate->op_handle        = op_handle;
-        gate->callback         = callback;
-        gate->private_data     = private_data;
-        gate->src_child_fh_len = 0;
+        gate->op_handle         = op_handle;
+        gate->callback          = callback;
+        gate->private_data      = private_data;
+        gate->src_child_fh_len  = 0;
+        gate->dst_target_fh_len = 0;
 
         /* Resolve the source object's FH first so the sticky-bit owner check on
          * the source directory can be evaluated (no-follow: rename operates on

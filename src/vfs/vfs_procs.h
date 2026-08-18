@@ -181,6 +181,10 @@ chimera_vfs_link(
     int                            fhlen,
     const char                    *old_path,
     int                            old_pathlen,
+    /* CHIMERA_VFS_LOOKUP_FOLLOW resolves a final-component symlink in
+     * old_path and links its target (linkat AT_SYMLINK_FOLLOW); 0 links
+     * the symlink itself. */
+    unsigned int                   source_lookup_flags,
     const char                    *new_path,
     int                            new_pathlen,
     unsigned int                   replace,
@@ -285,6 +289,20 @@ typedef void (*chimera_vfs_setattr_callback_t)(
 
 void
 chimera_vfs_setattr(
+    struct chimera_vfs_thread      *thread,
+    const struct chimera_vfs_cred  *cred,
+    struct chimera_vfs_open_handle *handle,
+    struct chimera_vfs_attrs       *set_attr,
+    uint64_t                        pre_attr_mask,
+    uint64_t                        post_attr_mask,
+    chimera_vfs_setattr_callback_t  callback,
+    void                           *private_data);
+
+/* Descriptor-originated variant: WRITE_DATA-only mutations (ftruncate,
+ * futimens-to-now) are authorized by the handle's open-time access grant
+ * rather than the file's current mode (POSIX rights retention). */
+void
+chimera_vfs_fsetattr(
     struct chimera_vfs_thread      *thread,
     const struct chimera_vfs_cred  *cred,
     struct chimera_vfs_open_handle *handle,
@@ -414,10 +432,18 @@ typedef void (*chimera_vfs_close_callback_t)(
     enum chimera_vfs_error error_code,
     void                  *private_data);
 
+/* Close the open instance named by vfs_private -- the cookie the backend
+ * returned from open.  That cookie, not fh, is what identifies the instance;
+ * fh names the object it was opened on and is carried so a backend can tell
+ * which of its filesystems (or which mount) the close belongs to, and so the
+ * op appears in traces with the handle it applies to.  Both are supplied by
+ * the open-handle cache, which owns them for the handle's lifetime. */
 void
 chimera_vfs_close(
     struct chimera_vfs_thread   *thread,
     struct chimera_vfs_module   *vfs_module,
+    const void                  *fh,
+    int                          fhlen,
     uint64_t                     vfs_private,
     uint64_t                     fh_hash,
     chimera_vfs_close_callback_t callback,
@@ -895,6 +921,7 @@ chimera_vfs_copy_range(
     struct chimera_vfs_open_handle   *dst_handle,
     uint64_t                          dst_offset,
     uint64_t                          length,
+    uint32_t                          flags,
     uint64_t                          pre_attr_mask,
     uint64_t                          post_attr_mask,
     chimera_vfs_copy_range_callback_t callback,

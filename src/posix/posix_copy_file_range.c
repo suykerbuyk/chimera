@@ -70,8 +70,35 @@ chimera_posix_copy_file_range(
         return -1;
     }
 
-    src_off = off_in ? *off_in : (off_t) in_entry->offset;
-    dst_off = off_out ? *off_out : (off_t) out_entry->offset;
+    /* copy_file_range(2): fd_in must be open for reading and fd_out for
+     * writing, and fd_out must not have O_APPEND set -- all EBADF. */
+    if (!chimera_posix_fd_may_read(in_entry) ||
+        !chimera_posix_fd_may_write(out_entry) ||
+        (out_entry->ofd->oflags & O_APPEND)) {
+        chimera_posix_fd_release(out_entry, 0);
+        chimera_posix_fd_release(in_entry, 0);
+        errno = EBADF;
+        return -1;
+    }
+
+    src_off = off_in ? *off_in : (off_t) in_entry->ofd->offset;
+    dst_off = off_out ? *off_out : (off_t) out_entry->ofd->offset;
+
+    /* copy_file_range(2): overlapping source and destination ranges within one
+     * file are EINVAL.  This is a POSIX rule -- SMB copychunk, NFS4 COPY and S3
+     * copy permit overlap -- so the check lives here in the POSIX layer, keyed
+     * on file-handle identity so every backend agrees.  len == 0 already
+     * returned above. */
+    if (in_entry->handle->fh_len == out_entry->handle->fh_len &&
+        memcmp(in_entry->handle->fh, out_entry->handle->fh,
+               in_entry->handle->fh_len) == 0 &&
+        src_off < dst_off + (off_t) len &&
+        dst_off < src_off + (off_t) len) {
+        chimera_posix_fd_release(out_entry, 0);
+        chimera_posix_fd_release(in_entry, 0);
+        errno = EINVAL;
+        return -1;
+    }
 
     chimera_posix_completion_init(&st.comp, &req);
     st.bytes_copied = 0;
@@ -83,6 +110,7 @@ chimera_posix_copy_file_range(
     req.copy_range.dst_offset   = (uint64_t) dst_off;
     req.copy_range.length       = len;
     req.copy_range.r_length     = 0;
+    req.copy_range.flags        = CHIMERA_VFS_COPY_PRESERVE_HOLES;
     req.copy_range.callback     = chimera_posix_copy_file_range_callback;
     req.copy_range.private_data = &st;
 
@@ -94,12 +122,12 @@ chimera_posix_copy_file_range(
         if (off_in) {
             *off_in = src_off + (off_t) st.bytes_copied;
         } else {
-            in_entry->offset = (uint64_t) (src_off + (off_t) st.bytes_copied);
+            in_entry->ofd->offset = (uint64_t) (src_off + (off_t) st.bytes_copied);
         }
         if (off_out) {
             *off_out = dst_off + (off_t) st.bytes_copied;
         } else {
-            out_entry->offset = (uint64_t) (dst_off + (off_t) st.bytes_copied);
+            out_entry->ofd->offset = (uint64_t) (dst_off + (off_t) st.bytes_copied);
         }
     }
 

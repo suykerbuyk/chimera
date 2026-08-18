@@ -72,12 +72,21 @@ chimera_nfs4_mount_reclaim_complete_retry(
 
 /* Get the RDMA protocol from mount options */
 static enum evpl_protocol_id
-chimera_nfs4_mount_get_rdma_protocol(const struct chimera_vfs_mount_options *options)
+chimera_nfs4_mount_get_rdma_protocol(
+    const struct chimera_vfs_mount_options *options,
+    enum chimera_tcp_flavor                 flavor)
 {
     int i;
 
     for (i = 0; i < options->num_options; i++) {
         if (strcmp(options->options[i].key, "rdma") == 0) {
+            /* Under the in-process transport there is no socket to run
+             * either emulation over; DATAGRAM_INPROC is the chunk-bearing
+             * protocol there, whichever rdma= spelling asked for one. */
+            if (flavor == CHIMERA_TCP_FLAVOR_INPROC) {
+                return EVPL_DATAGRAM_INPROC;
+            }
+
             if (options->options[i].value &&
                 strcmp(options->options[i].value, "tcp") == 0) {
                 return EVPL_DATAGRAM_TCP_RDMA;
@@ -151,6 +160,41 @@ chimera_nfs4_mount_get_pnfs(const struct chimera_vfs_mount_options *options)
 } /* chimera_nfs4_mount_get_pnfs */
 
 /*
+ * Fail an in-progress NFSv4 mount: undo the bookkeeping the attempt has
+ * accumulated -- the mount record published on shared->mounts and the server
+ * reference taken with it -- then complete the request with the given status.
+ *
+ * Without this a failed mount stayed on shared->mounts in MOUNTING state
+ * forever (chimera_nfs_destroy frees only the list head).  That was nearly
+ * invisible while a chimera server could not refuse PUTROOTFH; a "/" export
+ * with a security policy now makes a refused mount an ordinary, repeatable
+ * event, so the attempt must clean up after itself.
+ */
+static void
+chimera_nfs4_mount_fail(
+    struct chimera_vfs_request *request,
+    enum chimera_vfs_error      status)
+{
+    struct chimera_nfs4_mount_ctx *ctx = request->plugin_data;
+
+    if (ctx->mount) {
+        struct chimera_nfs_client_server *server = ctx->mount->server;
+        struct chimera_nfs_shared        *shared = server->shared;
+
+        pthread_mutex_lock(&shared->lock);
+        DL_DELETE(shared->mounts, ctx->mount);
+        server->refcnt--;
+        pthread_mutex_unlock(&shared->lock);
+
+        free(ctx->mount);
+        ctx->mount = NULL;
+    }
+
+    request->status = status;
+    request->complete(request);
+} /* chimera_nfs4_mount_fail */
+
+/*
  * Callback for SEQUENCE + PUTROOTFH + GETFH + GETATTR compound
  * This is the final step of mount - we have the root file handle
  */
@@ -180,8 +224,7 @@ chimera_nfs4_mount_get_root_fh_callback(
 
     if (status != 0) {
         chimera_nfsclient_error("NFS4 mount get_root_fh RPC failed: %d", status);
-        request->status = CHIMERA_VFS_EIO;
-        request->complete(request);
+        chimera_nfs4_mount_fail(request, CHIMERA_VFS_EIO);
         return;
     }
 
@@ -205,8 +248,7 @@ chimera_nfs4_mount_get_root_fh_callback(
     if (res->num_resarray >= 1 &&
         res->resarray[0].opsequence.sr_status != NFS4_OK) {
         chimera_nfsclient_error("NFS4 SEQUENCE failed: %d", res->resarray[0].opsequence.sr_status);
-        request->status = CHIMERA_VFS_EIO;
-        request->complete(request);
+        chimera_nfs4_mount_fail(request, CHIMERA_VFS_EIO);
         return;
     }
 
@@ -214,12 +256,11 @@ chimera_nfs4_mount_get_root_fh_callback(
         res->resarray[1].opputrootfh.status != NFS4_OK) {
         /* Mapped rather than fixed at EIO for spec generality: RFC 7530 §8
          * lets a server refuse PUTROOTFH for the client's security flavor with
-         * NFS4ERR_WRONGSEC.  chimera's own PUTROOTFH always succeeds and has no
-         * flavor check, so against chimera that status arrives on the LOOKUP
-         * below, not here. */
+         * NFS4ERR_WRONGSEC.  A chimera server does exactly that when a "/"
+         * export's security policy disallows the client's flavor. */
         chimera_nfsclient_error("NFS4 PUTROOTFH failed: %d", res->resarray[1].opputrootfh.status);
-        request->status = chimera_nfs4_status_to_errno(res->resarray[1].opputrootfh.status);
-        request->complete(request);
+        chimera_nfs4_mount_fail(request,
+                                chimera_nfs4_status_to_errno(res->resarray[1].opputrootfh.status));
         return;
     }
 
@@ -235,8 +276,8 @@ chimera_nfs4_mount_get_root_fh_callback(
              * security flavor; the mapper turns that into EPERM rather than
              * the EINVAL its default gave. */
             chimera_nfsclient_error("NFS4 LOOKUP failed: %d", res->resarray[2].oplookup.status);
-            request->status = chimera_nfs4_status_to_errno(res->resarray[2].oplookup.status);
-            request->complete(request);
+            chimera_nfs4_mount_fail(request,
+                                    chimera_nfs4_status_to_errno(res->resarray[2].oplookup.status));
             return;
         }
         op++;
@@ -245,8 +286,8 @@ chimera_nfs4_mount_get_root_fh_callback(
     if (res->num_resarray > op &&
         res->resarray[op].opgetfh.status != NFS4_OK) {
         chimera_nfsclient_error("NFS4 GETFH failed: %d", res->resarray[op].opgetfh.status);
-        request->status = chimera_nfs4_status_to_errno(res->resarray[op].opgetfh.status);
-        request->complete(request);
+        chimera_nfs4_mount_fail(request,
+                                chimera_nfs4_status_to_errno(res->resarray[op].opgetfh.status));
         return;
     }
 
@@ -254,8 +295,7 @@ chimera_nfs4_mount_get_root_fh_callback(
      * reply whose failing op carried no result of its own. */
     if (res->status != NFS4_OK) {
         chimera_nfsclient_error("NFS4 mount get_root_fh compound failed: %d", res->status);
-        request->status = chimera_nfs4_status_to_errno(res->status);
-        request->complete(request);
+        chimera_nfs4_mount_fail(request, chimera_nfs4_status_to_errno(res->status));
         return;
     }
 
@@ -263,8 +303,7 @@ chimera_nfs4_mount_get_root_fh_callback(
 
     if (res->num_resarray < expected_ops) {
         chimera_nfsclient_error("NFS4 mount get_root_fh: incomplete response");
-        request->status = CHIMERA_VFS_EIO;
-        request->complete(request);
+        chimera_nfs4_mount_fail(request, CHIMERA_VFS_EIO);
         return;
     }
 
@@ -279,8 +318,7 @@ chimera_nfs4_mount_get_root_fh_callback(
     if (remote_fh->len > CHIMERA_NFS_PROXY_REMOTE_FH_MAX) {
         chimera_nfsclient_error("NFS4 mount root file handle too large: %u bytes (max %d)",
                                 remote_fh->len, CHIMERA_NFS_PROXY_REMOTE_FH_MAX);
-        request->status = CHIMERA_VFS_EIO;
-        request->complete(request);
+        chimera_nfs4_mount_fail(request, CHIMERA_VFS_EIO);
         return;
     }
 
@@ -410,8 +448,7 @@ chimera_nfs4_mount_reclaim_complete_callback(
 
     if (status != 0) {
         chimera_nfsclient_error("NFS4 RECLAIM_COMPLETE RPC failed: %d", status);
-        request->status = CHIMERA_VFS_EIO;
-        request->complete(request);
+        chimera_nfs4_mount_fail(request, CHIMERA_VFS_EIO);
         return;
     }
 
@@ -421,8 +458,7 @@ chimera_nfs4_mount_reclaim_complete_callback(
     if (res->status != NFS4_OK &&
         res->status != NFS4ERR_COMPLETE_ALREADY) {
         chimera_nfsclient_error("NFS4 RECLAIM_COMPLETE compound failed: %d", res->status);
-        request->status = CHIMERA_VFS_EIO;
-        request->complete(request);
+        chimera_nfs4_mount_fail(request, CHIMERA_VFS_EIO);
         return;
     }
 
@@ -658,8 +694,9 @@ chimera_nfs4_mount(
         server->shared  = shared;
 
         /* Parse RDMA options */
-        server->rdma_protocol = chimera_nfs4_mount_get_rdma_protocol(&request->mount.options);
-        server->use_rdma      = server->rdma_protocol != 0;
+        server->rdma_protocol = chimera_nfs4_mount_get_rdma_protocol(&request->mount.options,
+                                                                     shared->tcp_flavor);
+        server->use_rdma = server->rdma_protocol != 0;
 
         /* pNFS opt-in (default off); confirmed against eir_flags at EXCHANGE_ID. */
         server->pnfs_requested = chimera_nfs4_mount_get_pnfs(&request->mount.options);
@@ -706,7 +743,8 @@ chimera_nfs4_mount(
 
     if (need_discover) {
         /* First mount to this server: create the shared endpoint. */
-        server->nfs_endpoint = evpl_endpoint_create(server->hostname, server->nfs_port);
+        server->nfs_endpoint = chimera_tcp_flavor_endpoint_create(
+            shared->tcp_flavor, server->hostname, server->nfs_port);
     }
 
     /*

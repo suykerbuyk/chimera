@@ -59,7 +59,10 @@ chimera_posix_lseek_hole_data(
     struct chimera_posix_seek_ctx  ctx;
 
     if (offset < 0) {
-        errno = EINVAL;
+        /* No data or hole can exist at a negative offset; this is the same
+         * out-of-range condition as an offset at/past EOF, which POSIX and
+         * Linux report as ENXIO (not EINVAL) for SEEK_DATA/SEEK_HOLE. */
+        errno = ENXIO;
         return -1;
     }
 
@@ -87,7 +90,7 @@ chimera_posix_lseek_hole_data(
 
     if (!err) {
         pthread_mutex_lock(&entry->lock);
-        entry->offset = ctx.r_offset;
+        entry->ofd->offset = ctx.r_offset;
         pthread_mutex_unlock(&entry->lock);
     }
 
@@ -95,7 +98,10 @@ chimera_posix_lseek_hole_data(
     chimera_posix_completion_destroy(&ctx.comp);
 
     if (err) {
-        errno = err;
+        /* POSIX/Linux: SEEK_DATA/SEEK_HOLE on a file system that does not
+         * implement them fail with EINVAL, not ENOTSUP (e.g. the NFSv3
+         * backend, which has no SEEK operation). */
+        errno = (err == ENOTSUP) ? EINVAL : err;
         return -1;
     }
 

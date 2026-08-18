@@ -38,6 +38,22 @@ signal_handler(int sig)
     SigInt = sig;
 } /* signal_handler */
 
+/* Terminate on a startup-validation failure.  By the time the config is
+ * being validated, service threads (metrics, listener, log flusher) are
+ * already running, and a plain exit() would run libevpl's atexit cleanup,
+ * which frees the shared allocator and registries out from under those
+ * threads.  The resulting crash storm usually still ends the process, but
+ * the concurrent faulting threads can wedge the sanitizer's crash reporting
+ * and leave a hung daemon that ignores SIGTERM.  Nothing needs unwinding on
+ * a bad config: flush the log buffer so the error reaches the user, then
+ * exit without running atexit handlers. */
+static void __attribute__((noreturn))
+startup_validation_fail(void)
+{
+    chimera_log_flush();
+    _exit(1);
+} /* startup_validation_fail */
+
 static int
 generate_self_signed_cert(
     const char *cert_path,
@@ -409,7 +425,7 @@ main(
         if (v < 1 || v > CHIMERA_NFS_EXPORT_ID_MAX) {
             chimera_server_error("Invalid nfs_max_exports (expected integer "
                                  "1..%u)", CHIMERA_NFS_EXPORT_ID_MAX);
-            exit(1);
+            startup_validation_fail();
         }
         chimera_server_config_set_nfs_max_exports(server_config, (uint32_t) v);
     }
@@ -568,6 +584,17 @@ main(
         chimera_server_config_set_smb2_max_async_credits(server_config, json_integer_value(json_value));
     }
 
+    json_value = json_object_get(server_params, "smb_fs_physical_bytes_per_sector");
+    if (json_is_integer(json_value)) {
+        chimera_server_config_set_smb_fs_physical_bytes_per_sector(server_config, (uint32_t) json_integer_value(
+                                                                       json_value));
+    }
+
+    json_value = json_object_get(server_params, "smb_fs_sector_size_flags");
+    if (json_is_integer(json_value)) {
+        chimera_server_config_set_smb_fs_sector_size_flags(server_config, (uint32_t) json_integer_value(json_value));
+    }
+
     json_value = json_object_get(server_params, "nfs4_session_slots");
     if (json_is_integer(json_value)) {
         int_value = json_integer_value(json_value);
@@ -673,6 +700,31 @@ main(
     if (json_is_integer(json_value)) {
         int_value = json_integer_value(json_value);
         chimera_server_config_set_s3_port(server_config, int_value);
+    }
+
+    json_value = json_object_get(server_params, "smb_port");
+    if (json_is_integer(json_value)) {
+        int_value = json_integer_value(json_value);
+        chimera_server_config_set_smb_port(server_config, int_value);
+    }
+
+    /* Protocols are opt-in: nothing serves until the config enables it, so an
+     * instance brought up for one purpose never surprise-binds the other
+     * protocols' well-known ports.  The *_port settings above keep their
+     * customary defaults and matter only once the protocol is enabled. */
+    json_value = json_object_get(server_params, "nfs_enabled");
+    if (json_is_boolean(json_value)) {
+        chimera_server_config_set_nfs_enabled(server_config, json_is_true(json_value));
+    }
+
+    json_value = json_object_get(server_params, "smb_enabled");
+    if (json_is_boolean(json_value)) {
+        chimera_server_config_set_smb_enabled(server_config, json_is_true(json_value));
+    }
+
+    json_value = json_object_get(server_params, "s3_enabled");
+    if (json_is_boolean(json_value)) {
+        chimera_server_config_set_s3_enabled(server_config, json_is_true(json_value));
     }
 
     /* NFSv4.1 server identity (EXCHANGE_ID server scope).  Set a distinct value
@@ -1003,7 +1055,7 @@ main(
             /* "create": create the backend directory path (and any missing
              * parents) before mounting, for backends initialized empty.  May be
              * `true` (mode 0755) or an object `{ "mode": "0755" }` -- the mode
-             * is an octal string; created dirs are owned 0/0. */
+             * is an octal string; created dirs are owned by the server identity. */
             json_t  *create_val  = json_object_get(mount, "create");
             int      do_create   = 0;
             uint32_t create_mode = 0755;
@@ -1033,7 +1085,7 @@ main(
                      * or wrong target. */
                     chimera_server_error("Failed to create mount path %s://%s for /%s",
                                          module, path, name);
-                    exit(1);
+                    startup_validation_fail();
                 }
             }
 
@@ -1052,6 +1104,15 @@ main(
     chimera_server_pnfs_resolve(server);
 
     shares = json_object_get(config, "shares");
+
+    /* A share/export/bucket section whose protocol is not enabled is a
+     * contradiction: nothing would ever serve it.  Fail hard like the
+     * malformed-export errors below rather than silently not serving. */
+    if (shares && json_object_size(shares) > 0 &&
+        !chimera_server_config_get_smb_enabled(server_config)) {
+        chimera_server_error("Config declares SMB shares but smb_enabled is false");
+        startup_validation_fail();
+    }
 
     if (shares) {
         json_object_foreach(shares, name, share)
@@ -1105,6 +1166,12 @@ main(
 
     exports = json_object_get(config, "exports");
 
+    if (exports && json_object_size(exports) > 0 &&
+        !chimera_server_config_get_nfs_enabled(server_config)) {
+        chimera_server_error("Config declares NFS exports but nfs_enabled is false");
+        startup_validation_fail();
+    }
+
     /* Two passes over the exports object: entries pinning an explicit
      * export_id are created first so auto-assignment for the remaining
      * entries cannot take an id a later entry pins; with a single pass,
@@ -1141,7 +1208,7 @@ main(
             if (!path) {
                 chimera_server_error("Export '%s': missing or non-string "
                                      "\"path\"", name);
-                exit(1);
+                startup_validation_fail();
             }
 
             /* The access mode key was renamed from "options" to "access".
@@ -1151,7 +1218,7 @@ main(
                 chimera_server_error("Export '%s': \"options\" has been "
                                      "renamed to \"access\"; update the config",
                                      name);
-                exit(1);
+                startup_validation_fail();
             }
 
             /* Access mode: "ro" | "rw" (default rw).  A value that doesn't
@@ -1166,7 +1233,7 @@ main(
                     chimera_server_error("Invalid export '%s' access value '%s' "
                                          "(expected ro/rw)", name,
                                          access_s ? access_s : "(not a string)");
-                    exit(1);
+                    startup_validation_fail();
                 }
             }
 
@@ -1187,7 +1254,7 @@ main(
                     chimera_server_error("Invalid export '%s' squash value '%s' "
                                          "(expected none/root/all)", name,
                                          squash_s ? squash_s : "(not a string)");
-                    exit(1);
+                    startup_validation_fail();
                 }
             } else {
                 /* The aliases must actually be booleans: a value like
@@ -1198,17 +1265,17 @@ main(
                 if (allsq_j && !json_is_boolean(allsq_j)) {
                     chimera_server_error("Export '%s': \"all_squash\" must be "
                                          "a boolean", name);
-                    exit(1);
+                    startup_validation_fail();
                 }
                 if (rsq_j && !json_is_boolean(rsq_j)) {
                     chimera_server_error("Export '%s': \"root_squash\" must be "
                                          "a boolean", name);
-                    exit(1);
+                    startup_validation_fail();
                 }
                 if (norsq_j && !json_is_boolean(norsq_j)) {
                     chimera_server_error("Export '%s': \"no_root_squash\" must "
                                          "be a boolean", name);
-                    exit(1);
+                    startup_validation_fail();
                 }
                 if (allsq_j && json_is_true(allsq_j)) {
                     squash = CHIMERA_NFS_SQUASH_ALL;
@@ -1229,7 +1296,7 @@ main(
                     chimera_server_error("Export '%s': invalid anonuid "
                                          "(expected integer 0..%u)",
                                          name, UINT32_MAX);
-                    exit(1);
+                    startup_validation_fail();
                 }
                 anonuid = (uint32_t) v;
             }
@@ -1240,7 +1307,7 @@ main(
                     chimera_server_error("Export '%s': invalid anongid "
                                          "(expected integer 0..%u)",
                                          name, UINT32_MAX);
-                    exit(1);
+                    startup_validation_fail();
                 }
                 anongid = (uint32_t) v;
             }
@@ -1258,7 +1325,7 @@ main(
                     chimera_server_error("Export '%s': invalid export_id "
                                          "(expected integer 1..%u)",
                                          name, CHIMERA_NFS_EXPORT_ID_MAX);
-                    exit(1);
+                    startup_validation_fail();
                 }
                 export_id = (uint32_t) v;
             }
@@ -1273,10 +1340,11 @@ main(
              * Kerberos-only export wide open to AUTH_SYS. */
             json_t  *sec_j    = json_object_get(export, "sec");
             uint32_t sec_mask = 0;
+
             if (sec_j && !json_is_array(sec_j)) {
                 chimera_server_error("Export '%s': \"sec\" must be an array "
                                      "of flavor strings", name);
-                exit(1);
+                startup_validation_fail();
             }
             if (sec_j) {
                 size_t  si;
@@ -1288,7 +1356,7 @@ main(
                     if (!f) {
                         chimera_server_error("Export '%s': \"sec\" entry %zu "
                                              "is not a string", name, si);
-                        exit(1);
+                        startup_validation_fail();
                     }
                     if (strcasecmp(f, "sys") == 0 || strcasecmp(f, "auth_sys") == 0) {
                         sec_mask |= CHIMERA_NFS_SEC_SYS;
@@ -1301,7 +1369,7 @@ main(
                     } else {
                         chimera_server_error("Invalid export '%s' sec flavor '%s' "
                                              "(expected sys/krb5/krb5i/krb5p)", name, f);
-                        exit(1);
+                        startup_validation_fail();
                     }
                 }
             }
@@ -1342,12 +1410,18 @@ main(
                  * which breaks cluster failover in a way clients only notice
                  * later.  Fail hard like the mount-path errors above. */
                 chimera_server_error("Failed to create export '%s'", name);
-                exit(1);
+                startup_validation_fail();
             }
         }
     }
 
     buckets = json_object_get(config, "buckets");
+
+    if (buckets && json_object_size(buckets) > 0 &&
+        !chimera_server_config_get_s3_enabled(server_config)) {
+        chimera_server_error("Config declares S3 buckets but s3_enabled is false");
+        startup_validation_fail();
+    }
 
     if (buckets) {
         json_object_foreach(buckets, name, bucket)
