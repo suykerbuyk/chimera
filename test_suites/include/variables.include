@@ -9,6 +9,18 @@
 #   AD_REALM     - kerberos realm of the domain        (default: SNNAS-LAB.MDH.QUANTUM.COM)
 #   AD_WORKGROUP - short/NetBIOS domain name           (default: SNNAS-LAB)
 #
+# LDAP_AUTH = 1: (Default: slapd hosted on the chimera node itself, with the
+#                 Samba schema loaded and the tree managed by smbldap-tools)
+#   LDAP_DOMAIN     - DNS domain slapd is configured for  (default: chimera.test)
+#   LDAP_SUFFIX     - base DN of the directory            (default: dc=chimera,dc=test)
+#   LDAP_ADMIN_DN   - rootDN used to bind                 (default: cn=admin,dc=chimera,dc=test)
+#   LDAP_ADMIN_PASS - password of the rootDN              (default: ldapadmin)
+#   LDAP_URI        - URI samba/smbldap bind to           (default: ldap://127.0.0.1)
+#   LDAP_WORKGROUP  - short/NetBIOS domain name           (default: CHIMLDAP)
+#   LDAP_GROUP      - posix/samba group created for the test (default: nasusers)
+#   LDAP_USER       - account used to authenticate         (default: testuser1)
+#   LDAP_PASS       - password of that account             (default: systest)
+#
 #  * MDC_DISTRO:  rockyl(default)
 #    - Specific distribution to use
 #    - Optional.
@@ -61,6 +73,27 @@
 %define AD_PASS nasadmin
 %define AD_REALM MDH.QUANTUM.COM
 %define AD_WORKGROUP MDH
+%endif
+
+%ifndef LDAP_AUTH
+%define LDAP_AUTH 1
+%endif
+
+# The directory is created by the suite itself, so these are the values it
+# installs rather than a description of pre-existing lab infrastructure.  There
+# is deliberately no LDAP_SID: samba generates the domain SID when it first
+# opens the passdb, and the suite reads it back with "net getlocalsid" so that
+# secrets.tdb and smbldap.conf cannot disagree.
+%if LDAP_AUTH == 1
+%define LDAP_DOMAIN chimera.test
+%define LDAP_SUFFIX dc=chimera,dc=test
+%define LDAP_ADMIN_DN cn=admin,dc=chimera,dc=test
+%define LDAP_ADMIN_PASS ldapadmin
+%define LDAP_URI ldap://127.0.0.1
+%define LDAP_WORKGROUP CHIMLDAP
+%define LDAP_GROUP nasusers
+%define LDAP_USER testuser1
+%define LDAP_PASS systest
 %endif
 
 %ifndef MDC_DISTRO

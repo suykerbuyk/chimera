@@ -1,0 +1,403 @@
+%sntest chimera-ldapsam-auth
+description install chimera on Ubuntu against an OpenLDAP+Samba-schema (ldapsam) passdb served by winbind
+
+# Example:
+# sntest -b master -V PKG_TAG=develop -e chimera-ldapsam-auth.snt
+#
+#
+# CHIM-180.  The ADS counterpart is chimera-ads-auth.snt (CHIM-161); this suite
+# covers the other classic identity backend, a plain OpenLDAP directory
+# extended with the Samba schema and managed with smbldap-tools.
+#
+# Notes:
+#  * chimera needs no ldapsam-specific code: src/server/smb/smb_wbclient.c only
+#    speaks libwbclient, so whatever winbindd validates chimera accepts.
+#    winbindd authenticates its own internal domain out of the passdb
+#    (winbindd_dual_auth_passdb) and resolves those SIDs through idmap_passdb,
+#    which is why the uid chimera stamps on a file is the LDAP uidNumber.
+#  * The samba package is installed for pdbedit and for samba.ldif, but it also
+#    enables smbd, which would hold port 445 against chimera.  smbd/nmbd are
+#    therefore disabled right after the install.
+#  * The POSIX side needs three things together, and all three are load bearing:
+#      - "ldapsam:trusted = yes" so pdb_ldap takes uidNumber/gidNumber from the
+#        entry rather than a further NSS round trip.  Without it pdbedit reports
+#        uid 4294967295 and "Failed to find a Unix account".
+#      - "winbind max domain connections = 5".  The auth stack still calls
+#        getpwnam() for the unix identity (check_sam_security ->
+#        make_server_info_sam -> Get_Pwnam_alloc), and with passwd: pointed at
+#        winbind that call re-enters winbindd while it is still inside the auth
+#        request.  With a single domain connection the nested GETPWNAM cannot be
+#        served, stalls for the nss_winbind client timeout (~5s, visible in the
+#        winbindd log as a GETPWNAM whose start and end are 5.0s apart), and the
+#        logon fails with
+#          "User <u> in passdb, but getpwnam() fails!"
+#          check_sam_security: make_server_info_sam() failed, NT_STATUS_NO_SUCH_USER
+#        while wbinfo -u/-i and getent still work.  Extra domain children let the
+#        nested lookup be answered, which is what makes it deterministic.
+#      - an nsswitch that is exactly "files winbind".  The stock line carries a
+#        stray "nis" (and the naive append duplicates "winbind"), and nss_nis on
+#        a host with no NIS domain adds multi-second delays to every lookup,
+#        which widens the window above.  The caches are flushed afterwards so no
+#        negative entry from before the user existed survives.
+#    (The snnas ldapsam appliances run the same combination, and also set
+#    "ldapsam:editposix = yes", which is only needed when samba itself creates
+#    the POSIX entries; smbldap-tools does that here, so editposix is left off.)
+#  * Deliberately NO "idmap config <workgroup>" stanza, unlike the ADS suite's
+#    rid backend: local SAM domain SIDs must route through idmap_passdb so the
+#    uid comes from LDAP.  An explicit backend for the workgroup would either be
+#    ignored or hand out uids from an idmap range instead.
+#  * The rootDN password is set explicitly with ldapmodify over SASL EXTERNAL
+#    rather than through debconf: slapd's config script clears slapd/password1
+#    once it has used it, so a later "dpkg-reconfigure slapd" recreates the
+#    database without the preseeded password and every authenticated bind then
+#    fails with "Invalid credentials".
+#  * The domain SID is read back from samba with "net getlocalsid" and fed into
+#    smbldap.conf, rather than pinned into both.  "net" initialises the passdb,
+#    and pdb_init_ldapsam creates the sambaDomainName entry using
+#    get_global_sam_sid(), which generates a random SID when secrets.tdb has
+#    none; pinning afterwards would leave LDAP and secrets.tdb disagreeing and
+#    the well-known groups sitting under a different domain SID.
+#  * The shipped /usr/share/doc/smbldap-tools/examples/*.conf are copied and
+#    patched rather than written from scratch, so the files always match the
+#    installed version.  ldapTLS must become 0 for plain ldap:// on localhost,
+#    and smbldap-config is not usable here because it is interactive.
+#  * The SMB password is set with samba's own smbpasswd rather than
+#    smbldap-passwd: that also proves samba can write to LDAP with the bind DN
+#    it holds in secrets.tdb.
+#  * Kerberos is out of scope: an OpenLDAP+Samba deployment has no KDC, and the
+#    kerberos leg resolves principals through winbind with no getpwnam
+#    fallback, so every user would collapse to uid 65534.
+#  * sntest only substitutes variables that appear as delimiter-separated
+#    tokens, so generated config files use __PLACEHOLDER__ tokens patched with
+#    sed afterwards; commands within a step run in parallel, so dependent
+#    commands are chained or split into separate steps.
+#  * sntest resolves $name itself against the hosts, ips and luns of the run and
+#    fails the step when the name is not one of them, so every shell variable
+#    and positional (awk \$2, \$DB, the \$ end-of-line anchor) is written
+#    escaped as \$ and unescaped again by the preprocessor.  Only $sntest,
+#    $spool and $share_fs are left bare, because those are sntest's own.
+#  * Backticks must be escaped as \` for the same reason \$ must be escaped: the
+#    command text is expanded once before the step's own shell runs it, so a bare
+#    `cmd` is substituted THEN, not in sequence.  Two steps were bitten by this:
+#    VAR=`cmd` followed by `other --opt=\$VAR` passed an empty argument (the
+#    second backtick ran before VAR was assigned), and a stat inside a backtick
+#    ran 34ms BEFORE the smbclient put that creates the file, so it reported
+#    "No such file or directory" while the plain stat on the next line printed
+#    the right owner.  Both looked impossible because \$VAR expanded correctly in
+#    a later echo.  A bare backtick is only safe when nothing earlier in the same
+#    command has to run first -- which is why //`hostname`/smb1 is fine in
+#    chimera-ads-auth.snt.  Steps that carry a value between commands avoid the
+#    question entirely: write it to a file under /tmp and consume it with
+#    xargs -a or cmp, needing neither a backtick nor a shell variable.
+
+%include ../include/variables.include
+%ifndef PKG_TAG
+%error need to provide a QB PKG_TAG
+%endif
+
+host srv1	distro:OS_DISTRO version:OS_VERSION arch:x86_64 cores:2 memory:8192
+
+hostgroup allhosts   srv1
+
+# share FS
+lun share_fs allhosts 100
+
+failstep 10m Capture debug info on failure
+command allhosts $sntest/bin/capture_debug_info $spool
+command srv1 journalctl -u chimera -o short-iso | sed 's/ snt.*message="/ /' | tee $spool/chimera_log.txt
+command srv1 journalctl -u winbind -o short-iso | tee $spool/winbind_log.txt
+command srv1 journalctl -u slapd -o short-iso | tee $spool/slapd_log.txt
+command srv1 cp /etc/samba/smb.conf /etc/nsswitch.conf /etc/smbldap-tools/smbldap.conf $spool/ || true
+command srv1 ldapsearch -x -H LDAP_URI -D LDAP_ADMIN_DN -w LDAP_ADMIN_PASS -b LDAP_SUFFIX > $spool/ldap_tree.ldif || true
+command srv1 pdbedit -L -v > $spool/pdbedit.txt || true
+command srv1 net getlocalsid > $spool/localsid.txt || true
+
+
+step 1m extract the NAS sntest_utils
+command allhosts curl https://nexus.mdh.quantum.com/repository/snnas-binaries/sn_tests/sntest_utils.tar.gz | tar zxf - -C /
+
+step 3m disable unattended upgrades
+command srv1 systemctl disable --now unattended-upgrades.service && \
+			systemctl disable --now apt-daily.timer apt-daily-upgrade.timer && \
+			apt-get purge -y unattended-upgrades
+
+#  --------------------   stand up the LDAP directory  ---------------
+step 1m preseed slapd with a deterministic base DN and rootDN password
+command srv1 /bin/echo -e "slapd slapd/no_configuration boolean false\n\
+slapd slapd/domain string __DOMAIN__\n\
+slapd shared/organization string __DOMAIN__\n\
+slapd slapd/password1 password __ADMINPASS__\n\
+slapd slapd/password2 password __ADMINPASS__\n\
+slapd slapd/purge_database boolean true\n\
+slapd slapd/move_old_database boolean true\n\
+slapd slapd/allow_ldap_v2 boolean false" > /tmp/slapd.preseed && \
+	sed -i -e s/__DOMAIN__/LDAP_DOMAIN/g -e s/__ADMINPASS__/LDAP_ADMIN_PASS/g /tmp/slapd.preseed && \
+	debconf-set-selections /tmp/slapd.preseed && \
+	cat /tmp/slapd.preseed
+
+step 5m install slapd, samba and the client packages
+command srv1 apt update && DEBIAN_FRONTEND=noninteractive apt install -y \
+	slapd ldap-utils smbldap-tools \
+	samba samba-common-bin winbind libnss-winbind \
+	smbclient jq
+
+step 2m disable smbd so it does not hold port 445 against chimera
+command srv1 systemctl disable --now smbd nmbd samba-ad-dc || true ; \
+	systemctl mask smbd nmbd || true ; \
+	ss -ltn | awk 'NR>1 {print \$4}' | grep -qE ':445\$' && exit 1 || echo "port 445 is free for chimera"
+
+step 3m reconfigure slapd for the test base DN
+command srv1 DEBIAN_FRONTEND=noninteractive dpkg-reconfigure -f noninteractive slapd && \
+	systemctl restart slapd && sleep 3 && \
+	ldapsearch -x -H LDAP_URI -b LDAP_SUFFIX -s base -LLL
+
+step 2m set a known rootDN password on the directory
+command srv1 PW=\`slappasswd -s LDAP_ADMIN_PASS -n\` && \
+	DB=\`ldapsearch -Q -Y EXTERNAL -H ldapi:/// -b cn=config -s one -LLL dn olcSuffix | grep -B1 LDAP_SUFFIX | awk '/^dn:/ {print \$2}'\` && \
+	printf "dn: %s\nchangetype: modify\nreplace: olcRootDN\nolcRootDN: %s\n-\nreplace: olcRootPW\nolcRootPW: %s\n" \
+		"\$DB" LDAP_ADMIN_DN "\$PW" > /tmp/rootpw.ldif && \
+	ldapmodify -Q -Y EXTERNAL -H ldapi:/// -f /tmp/rootpw.ldif && \
+	ldapwhoami -x -H LDAP_URI -D LDAP_ADMIN_DN -w LDAP_ADMIN_PASS
+
+step 3m load the samba schema into slapd
+command srv1 ldapadd -Q -Y EXTERNAL -H ldapi:/// -f /usr/share/doc/samba/examples/LDAP/samba.ldif && \
+	ldapsearch -Q -Y EXTERNAL -H ldapi:/// -b cn=schema,cn=config -LLL dn | grep -i samba
+
+step 2m index the samba attributes in slapd
+command srv1 /bin/echo -e "dn: __DBDN__\n\
+changetype: modify\n\
+add: olcDbIndex\n\
+olcDbIndex: sambaSID eq\n\
+-\n\
+add: olcDbIndex\n\
+olcDbIndex: sambaPrimaryGroupSID eq\n\
+-\n\
+add: olcDbIndex\n\
+olcDbIndex: sambaGroupType eq\n\
+-\n\
+add: olcDbIndex\n\
+olcDbIndex: sambaSIDList eq\n\
+-\n\
+add: olcDbIndex\n\
+olcDbIndex: sambaDomainName eq" > /tmp/samba_indices.ldif && \
+	DB=\`ldapsearch -Q -Y EXTERNAL -H ldapi:/// -b cn=config -s one -LLL dn olcSuffix | grep -B1 LDAP_SUFFIX | awk '/^dn:/ {print \$2}'\` && \
+	echo "indexing database \$DB" && \
+	sed -i -e "s|__DBDN__|\$DB|" /tmp/samba_indices.ldif && \
+	ldapmodify -Q -Y EXTERNAL -H ldapi:/// -f /tmp/samba_indices.ldif
+
+
+#  --------------------   point samba at the LDAP passdb  ---------------
+step 1m configure samba with the ldapsam passdb
+command srv1 /bin/echo -e "[global]\n\
+workgroup = __WORKGROUP__\n\
+server role = classic primary domain controller\n\
+passdb backend = ldapsam:__LDAPURI__\n\
+ldap suffix = __SUFFIX__\n\
+ldap user suffix = ou=Users\n\
+ldap group suffix = ou=Groups\n\
+ldap machine suffix = ou=Computers\n\
+ldap idmap suffix = ou=Idmap\n\
+ldap admin dn = __ADMINDN__\n\
+ldap ssl = off\n\
+ldap passwd sync = yes\n\
+ldapsam:trusted = yes\n\
+winbind use default domain = yes\n\
+winbind enum users = yes\n\
+winbind enum groups = yes\n\
+winbind max domain connections = 5\n\
+template shell = /bin/bash\n\
+idmap config * : backend = tdb\n\
+idmap config * : range = 3000-7999" > /etc/samba/smb.conf && \
+	sed -i -e s/__WORKGROUP__/LDAP_WORKGROUP/g -e s/__SUFFIX__/LDAP_SUFFIX/g \
+	       -e s/__ADMINDN__/LDAP_ADMIN_DN/g -e s%__LDAPURI__%LDAP_URI%g /etc/samba/smb.conf
+
+step 1m validate the samba configuration
+command srv1 testparm -s
+
+step 2m store the LDAP bind password samba binds with
+command srv1 smbpasswd -w LDAP_ADMIN_PASS
+
+step 3m initialize the passdb and capture the domain SID samba generated
+command srv1 net getlocalsid | tee /tmp/localsid.txt && \
+	awk '/^SID for domain/ {print \$NF}' /tmp/localsid.txt > /tmp/domain.sid && \
+	cat /tmp/domain.sid && \
+	grep -qE '^S-1-5-21-' /tmp/domain.sid && \
+	ldapsearch -x -H LDAP_URI -D LDAP_ADMIN_DN -w LDAP_ADMIN_PASS -b LDAP_SUFFIX \
+		sambaDomainName=LDAP_WORKGROUP -LLL
+
+
+#  --------------------   populate the directory  ---------------
+step 2m install and patch the smbldap-tools configuration
+command srv1 install -D -m 644 /usr/share/doc/smbldap-tools/examples/smbldap.conf /etc/smbldap-tools/smbldap.conf && \
+	install -D -m 600 /usr/share/doc/smbldap-tools/examples/smbldap_bind.conf /etc/smbldap-tools/smbldap_bind.conf && \
+	sed -i -E -e 's%^SID=.*%SID="__SID__"%' \
+	          -e 's%^sambaDomain=.*%sambaDomain="__WORKGROUP__"%' \
+	          -e 's%^(master|slave)LDAP=.*%\1LDAP="__LDAPURI__"%' \
+	          -e 's%^ldapTLS=.*%ldapTLS="0"%' \
+	          -e 's%^suffix=.*%suffix="__SUFFIX__"%' /etc/smbldap-tools/smbldap.conf && \
+	sed -i -E -e 's%^(master|slave)DN=.*%\1DN="__ADMINDN__"%' \
+	          -e 's%^(master|slave)Pw=.*%\1Pw="__ADMINPASS__"%' /etc/smbldap-tools/smbldap_bind.conf && \
+	xargs -a /tmp/domain.sid -I{} sed -i -e s%__SID__%{}%g /etc/smbldap-tools/smbldap.conf && \
+	sed -i -e s/__WORKGROUP__/LDAP_WORKGROUP/g \
+	       -e s/__SUFFIX__/LDAP_SUFFIX/g -e s%__LDAPURI__%LDAP_URI%g /etc/smbldap-tools/smbldap.conf && \
+	sed -i -e s/__ADMINDN__/LDAP_ADMIN_DN/g -e s/__ADMINPASS__/LDAP_ADMIN_PASS/g /etc/smbldap-tools/smbldap_bind.conf && \
+	grep -E '^(SID|sambaDomain|masterLDAP|slaveLDAP|ldapTLS|suffix)=' /etc/smbldap-tools/smbldap.conf
+
+step 5m populate the directory with the samba domain structure
+command srv1 printf "%s\n%s\n" LDAP_ADMIN_PASS LDAP_ADMIN_PASS | smbldap-populate -g 10000 -u 10000 -r 10000
+
+step 2m show the domain structure that was created
+command srv1 smbldap-grouplist
+command srv1 ldapsearch -x -H LDAP_URI -D LDAP_ADMIN_DN -w LDAP_ADMIN_PASS -b LDAP_SUFFIX -LLL dn
+
+step 3m create the test group and user in LDAP
+command srv1 smbldap-groupadd -a LDAP_GROUP && \
+	smbldap-useradd -a -m -g LDAP_GROUP -s /bin/bash LDAP_USER && \
+	printf "%s\n%s\n" LDAP_PASS LDAP_PASS | smbpasswd -s LDAP_USER && \
+	smbpasswd -e LDAP_USER && \
+	smbldap-usershow LDAP_USER
+
+step 3m verify samba reads the account back out of the LDAP passdb
+command srv1 pdbedit -L -v LDAP_USER
+command srv1 ldapsearch -x -H LDAP_URI -D LDAP_ADMIN_DN -w LDAP_ADMIN_PASS -b LDAP_SUFFIX \
+	uid=LDAP_USER uid uidNumber gidNumber sambaSID sambaNTPassword sambaAcctFlags -LLL | tee /tmp/ldapuser.txt && \
+	grep -q sambaNTPassword: /tmp/ldapuser.txt && \
+	grep sambaAcctFlags: /tmp/ldapuser.txt
+
+
+#  --------------------   hand the passdb to winbind  ---------------
+step 1m enable winbind NSS lookups
+command srv1 sed -i -E 's/^(passwd|group|shadow):.*/\1:files winbind/' /etc/nsswitch.conf && \
+	grep -E '^(passwd|group|shadow):' /etc/nsswitch.conf
+
+step 2m enable winbind
+command srv1 systemctl enable winbind
+
+step 3m start winbind and wait for it to resolve the LDAP account
+command srv1 while true ; do \
+	sleep 3  &&  systemctl restart winbind && sleep 3 ; \
+	if wbinfo -i LDAP_USER > /dev/null 2>&1 ; then \
+		break ; \
+	fi ; \
+	done && \
+	net cache flush && \
+	systemctl status winbind
+
+step 3m flush the glibc NSS cache
+# nscd is deliberately not in the install list above: nothing the suite needs
+# pulls it in, and whether the node image ships it is not guaranteed.  Guard the
+# call so the step reports what it did rather than dying with "command not
+# found" (127) where it is absent.  "net cache flush" in the previous step
+# covers samba's own cache either way.
+command srv1 if command -v nscd > /dev/null ; then \
+		for t in passwd group ; do nscd -i \$t || true ; done ; \
+		echo "flushed nscd passwd/group caches" ; \
+	else \
+		echo "nscd is not installed, no glibc NSS cache to flush" ; \
+	fi
+
+step 5m verify winbind enumerates and authenticates the LDAP account
+command srv1 wbinfo --own-domain | tee /tmp/owndomain.txt && \
+	grep -qx LDAP_WORKGROUP /tmp/owndomain.txt
+command srv1 wbinfo -D LDAP_WORKGROUP
+command srv1 wbinfo -u | head -20
+command srv1 wbinfo -g | head -20
+command srv1 wbinfo -a LDAP_USER%LDAP_PASS
+command srv1 ntlm_auth --username=LDAP_USER --domain=LDAP_WORKGROUP --password=LDAP_PASS
+command srv1 getent passwd LDAP_USER && id LDAP_USER
+
+step 2m verify winbind maps the account SID to the LDAP uidNumber
+command srv1 wbinfo -n LDAP_USER | awk '{print \$1}' > /tmp/user.sid && \
+	cat /tmp/user.sid && \
+	xargs -a /tmp/user.sid -I{} wbinfo --sid-to-uid={} > /tmp/wb.uid && \
+	ldapsearch -x -H LDAP_URI -D LDAP_ADMIN_DN -w LDAP_ADMIN_PASS -b LDAP_SUFFIX \
+		uid=LDAP_USER uidNumber -LLL | awk '/^uidNumber:/ {print \$2}' > /tmp/ldap.uid && \
+	echo "winbind uid:" && cat /tmp/wb.uid && \
+	echo "ldap uidNumber:" && cat /tmp/ldap.uid && \
+	cmp /tmp/wb.uid /tmp/ldap.uid
+
+
+#  --------------------   install Chimera  ---------------
+step 2m Download chimera pkg for QB_OS
+command srv1 /sntest_utils/get_qb_asset.py -p chimera -t PKG_TAG -d /chimera-repo -u release/QB_OS/amd64/repo-chimera.tar.gz
+
+step 2m install the chimera Packages for QB_OS
+command srv1 apt-get install -y /chimera-repo/*.deb
+
+step 5m setup share filesystem
+command srv1 echo $share_fs && \
+	parted /dev/sda mklabel gpt && \
+	parted /dev/sda mkpart "" ext4 0% 100% && \
+	sleep 5 && mkfs.ext4  /dev/sda1 && \
+	mkdir /shares && \
+	mount /dev/sda1 /shares && \
+	chmod 777 /shares
+
+step 1m Create base chimera.json file with winbind NTLM SMB auth
+command srv1 cp /etc/chimera/chimera.json /etc/chimera/chimera.json.orig && \
+	     jq -n '{ \
+                 server: { \
+                    threads: 16, \
+                    smb_enabled: true, \
+                    max_open_files: 1048576, \
+                    rest_http_port: 8080, \
+                    rest_auth_enabled: false, \
+                    smb_auth: { \
+                       winbind_enabled: true, \
+                       winbind_domain: "__WBDOM__", \
+                       kerberos_enabled: false \
+                    } \
+                } }'  > /etc/chimera/chimera.json && \
+	sed -i -e s/__WBDOM__/LDAP_WORKGROUP/ /etc/chimera/chimera.json
+
+step 5m enable and start chimera
+command srv1 cat /etc/default/chimera
+command srv1 ls -ld /var/lib/samba/winbindd_privileged || true
+command srv1 jq . /etc/chimera/chimera.json
+command srv1 systemctl enable chimera && \
+	     systemctl start chimera && \
+	     sleep 5 && \
+	     systemctl status chimera
+
+
+step 5m add mount
+command srv1  python3 -m  chimera_admin mount create --module linux --path /shares sharefs
+
+step 5m Create SMB share
+command srv1  python3 -m  chimera_admin share create smb1 /sharefs
+
+step 5m validate the config
+command srv1 python3 -m  chimera_admin config
+
+
+#  --------------------   authenticate the LDAP user through chimera  -------
+step 5m test SMB auth with the LDAP user via winbind NTLM
+command srv1 smbclient --use-kerberos=off -U LDAP_WORKGROUP/LDAP_USER%LDAP_PASS //127.0.0.1/smb1 -c "allinfo /"
+command srv1 smbclient --use-kerberos=off -U LDAP_USER%LDAP_PASS //127.0.0.1/smb1 -c "allinfo /"
+
+step 5m verify a file written through chimera lands on disk with the LDAP uidNumber
+command srv1 smbclient --use-kerberos=off -U LDAP_WORKGROUP/LDAP_USER%LDAP_PASS //127.0.0.1/smb1 \
+		-c "put /etc/hostname ldapsam.txt" && \
+	stat -c '%u %g %n' /shares/ldapsam.txt && \
+	stat -c %u /shares/ldapsam.txt > /tmp/file.uid && \
+	ldapsearch -x -H LDAP_URI -D LDAP_ADMIN_DN -w LDAP_ADMIN_PASS -b LDAP_SUFFIX \
+		uid=LDAP_USER uidNumber -LLL | awk '/^uidNumber:/ {print \$2}' > /tmp/ldap.uid && \
+	echo "file uid:" && cat /tmp/file.uid && \
+	echo "ldap uidNumber:" && cat /tmp/ldap.uid && \
+	cmp /tmp/file.uid /tmp/ldap.uid
+
+step 5m verify a wrong password is rejected
+command srv1 smbclient --use-kerberos=off -U LDAP_WORKGROUP/LDAP_USER%badpassword //127.0.0.1/smb1 -c "allinfo /" > /tmp/negauth.txt 2>&1 ; \
+	cat /tmp/negauth.txt ; \
+	if grep -qE 'NT_STATUS_(LOGON_FAILURE|WRONG_PASSWORD|ACCESS_DENIED)' /tmp/negauth.txt ; then \
+		echo "OK: bad password rejected by the auth stack" ; \
+	else \
+		echo "ERROR: expected an authentication rejection" ; \
+		exit 1 ; \
+	fi
+
+
+step 5m gather logs
+command srv1 journalctl -u chimera -o short-iso | sed 's/ snt.*message="/ /' | tee $spool/chimera_log.txt
+command srv1 journalctl -u winbind -o short-iso | tee $spool/winbind_log.txt
+command srv1 journalctl -u slapd -o short-iso | tee $spool/slapd_log.txt
