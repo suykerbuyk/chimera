@@ -18,6 +18,8 @@ ARG PYNFS_REF=b861f7b8211b4dc798b88a7e81b300fb4615189c
 # Pinned Microsoft Windows Protocol Test Suites (WPTS) FileServer release.
 ARG WPTS_VERSION=4.26.3.0
 ARG ELBENCHO_REF=96b1bf29c35e437715c0527194e69e4c96ed9922
+# oras CLI, used by the KVM suites to pull the VM images from the registry.
+ARG ORAS_VERSION=1.2.0
 
 ENV APT_MIRROR=http://repository.mdh.quantum.com/repository/pkgs/ubuntu
 ENV DEBIAN_FRONTEND=noninteractive
@@ -100,6 +102,23 @@ RUN apt-get -y update && \
     apt-get -y --no-install-recommends install docker-ce docker-ce-cli containerd.io docker-buildx-plugin && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
+
+# oras: the OCI artifact client the KVM suites use to pull the VM images
+# (vmlinuz, initrd, rootfs.qcow2) from the internal registry -- see
+# kvm/fetch_vm_image.sh.  Baked into the image rather than fetched at job start:
+# the qb ctest_kvm task runs in a cluster pod with no egress to github.com, so a
+# runtime download made every KVM leg depend on an external host purely to obtain
+# a tool that then talks to our own registry.  CMake picks it up off PATH via
+# find_program(ORAS_EXECUTABLE oras); with -DKVM_TESTING=ON a missing oras is a
+# configure-time FATAL_ERROR, so its absence can never be mistaken for a test
+# failure.  dpkg's arch names (amd64/arm64) match the oras asset names exactly.
+# --fail matters: without it curl pipes an HTTP error page into tar, which then
+# reports a bogus "not in gzip format" and hides the real status.
+RUN curl -fsSL \
+        "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_$(dpkg --print-architecture).tar.gz" \
+        | tar -xz -C /usr/local/bin oras && \
+    chmod +x /usr/local/bin/oras && \
+    oras version
 
 RUN apt-get -y update && \
     apt-get -y --no-install-recommends install python3-ply python3-gssapi python3-pip && \

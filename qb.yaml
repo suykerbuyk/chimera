@@ -551,8 +551,6 @@ tasks:
       - /build
     privileged: true
     variables:
-      ORAS_VERSION: 1.2.0
-      ORAS_URL: "https://github.com/oras-project/oras/releases/download"
       KVM_FILTER: ""
       MODE: "Debug"
       PLATFORM: "ubuntu2604"
@@ -566,10 +564,15 @@ tasks:
       # acceleration without /dev/kvm, so there is no point building chimera and
       # fetching the (~GB) image first.
       - '[ -w /dev/kvm ] || { echo "ERROR: /dev/kvm not present -- this runner has no KVM passthrough"; exit 1; }'
-      - >
-        curl -sSL "${ORAS_URL}/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_$arch.tar.gz"
-        | tar -xz -C "/usr/local/bin" oras
-      - chmod +x "/usr/local/bin/oras"
+      # oras (used by kvm/fetch_vm_image.sh to pull the VM images from the
+      # internal registry) comes from the chimera-dev image -- see
+      # builders/dev/Dockerfile.  It used to be curl'd from github.com here, but
+      # this pod has no egress to github, so the download returned a block page
+      # that tar reported as "not in gzip format" and every KVM leg died in 30s
+      # before building anything.  Do not reintroduce a runtime fetch: nothing in
+      # this task should need an external host, since the images themselves live
+      # on repository.mdh.quantum.com.  A missing oras is caught by cmake below
+      # (KVM_TESTING=ON makes it a configure-time FATAL_ERROR naming the tool).
       - >
         cmake -G Ninja -DCMAKE_BUILD_TYPE=${MODE}
         -DREQUIRE_NETNS_TESTS=ON
