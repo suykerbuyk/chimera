@@ -758,11 +758,15 @@ chimera_vfs_eval_breakable(
  * common owning open (cb_private, set identically on an SMB open's share
  * reservation and caching lease) -- so a SHARE acquire can park on its break
  * instead of denying outright.  Returns NULL when the holder has no
- * still-breakable handle-caching lease, i.e. a genuine hard conflict. */
+ * still-breakable handle-caching lease, i.e. a genuine hard conflict.
+ *
+ * `probe` is the acquiring lease, needed only so the RqLs arm can skip the
+ * acquirer's OWN caching lease (see the same-key skip below). */
 static inline struct chimera_vfs_lease *
 chimera_vfs_share_batch_escape(
     const struct chimera_vfs_file_state *file,
-    const struct chimera_vfs_lease      *share_holder)
+    const struct chimera_vfs_lease      *share_holder,
+    const struct chimera_vfs_lease      *probe)
 {
     struct chimera_vfs_lease *cur;
 
@@ -799,9 +803,47 @@ chimera_vfs_share_batch_escape(
         bool dir_lease_match =
             cur->grant && cur->grant->is_dir &&
             cur->owner.client_key == share_holder->owner.client_key;
+        /* An RqLs FILE lease is keyed by LeaseKey, so neither cb_private (the
+         * grant) nor owner_lo/hi (the key) matches the share holder's open;
+         * the holder's own lease key, stamped on its share reservation when the
+         * open took it, is the link.  A conflicting open must be able to park on
+         * such a lease's HANDLE break exactly as it parks on a batch oplock's:
+         * the holder may close its handle-cached open and free the conflict
+         * (MS-FSA break-before-share; smb2.replay.dhv2-pending1n-vs-violation-
+         * lease-*, where the holder either closes -> the open is granted, or acks
+         * and keeps the handle -> SHARING_VIOLATION).  Note this does NOT make an
+         * RqLs lease sole-handle across clients: only a genuine share-mode
+         * conflict reaches here, and a compatible open still coexists with the
+         * holder's H via the caching matrix.
+         *
+         * The escape must never land on the ACQUIRER's own caching lease.  A
+         * second open under one LeaseKey presents that key on both opens, so
+         * without the skip the arm matches the probe's own lease: same
+         * client_key, and the holder's own_lease_* IS the probe's key.  The
+         * client would then be told to relinquish a handle cache it is still
+         * using, and its conflicting open would park behind its own break ack
+         * before the share conflict was answered at all -- where MS-SMB2 has a
+         * create never break the lease it presents.  This mirrors the
+         * SHARE-acquire skip in chimera_vfs_state_would_conflict's caching loop
+         * and chimera_vfs_lease_smb2_same_key; the escape needs `probe` passed in
+         * to apply it.  Deliberately scoped to this arm: a legacy oplock's
+         * caching lease is keyed by open rather than by LeaseKey, and the
+         * dir-lease arm matches by client alone (pre-existing, untouched here). */
+        bool probe_owns_lease =
+            probe->has_break_skip_key &&
+            cur->owner.owner_lo == probe->break_skip_lo &&
+            cur->owner.owner_hi == probe->break_skip_hi;
+
+        bool rqls_lease_match =
+            cur->grant && !cur->grant->is_oplock && !cur->grant->is_dir &&
+            share_holder->has_own_lease_key &&
+            cur->owner.is_lease && !probe_owns_lease &&
+            cur->owner.client_key == share_holder->owner.client_key &&
+            cur->owner.owner_lo == share_holder->own_lease_lo &&
+            cur->owner.owner_hi == share_holder->own_lease_hi;
 
         if (cur->owner.cb_private != share_holder->owner.cb_private &&
-            !legacy_oplock_match && !dir_lease_match) {
+            !legacy_oplock_match && !dir_lease_match && !rqls_lease_match) {
             continue;
         }
 
@@ -985,7 +1027,7 @@ chimera_vfs_state_would_conflict(
                 if (chimera_vfs_eval_breakable(cur, &has_breakable_conflict,
                                                &idle_break, &expired_break)) {
                     struct chimera_vfs_lease *batch =
-                        chimera_vfs_share_batch_escape(file, cur);
+                        chimera_vfs_share_batch_escape(file, cur, probe);
 
                     if (!batch) {
                         if (conflict_out) {
@@ -1524,9 +1566,21 @@ chimera_vfs_state_try_insert(
                  * holder may close and free the share conflict (else it stands ->
                  * SHARING_VIOLATION).  A SHARE acquirer carries no H bit, so the
                  * generic retain floor would leave H intact; force it off for a
-                 * directory-lease conflict (dirlease.v2_request / rename_dst_parent). */
+                 * directory-lease conflict (dirlease.v2_request / rename_dst_parent).
+                 *
+                 * The same applies to a FILE lease whose handle cache is what a
+                 * hard share conflict must dislodge (the RqLs arm of
+                 * chimera_vfs_share_batch_escape): break H and ONLY H, leaving the
+                 * holder's read/write caching alone -- the conflicting open never
+                 * gains access unless the holder closes, so its cached data stays
+                 * valid (smb2.replay.dhv2-pending1n-vs-violation-lease-* assert
+                 * exactly one break, RWH -> RW). */
                 if (conflict->kind == CHIMERA_VFS_LEASE_CACHING &&
-                    conflict->grant && conflict->grant->is_dir) {
+                    conflict->grant &&
+                    (conflict->grant->is_dir ||
+                     (lease->kind == CHIMERA_VFS_LEASE_SHARE &&
+                      !conflict->grant->is_oplock &&
+                      (conflict->mode.granted & CHIMERA_VFS_LEASE_MODE_H)))) {
                     floor = conflict->mode.granted & ~CHIMERA_VFS_LEASE_MODE_H;
                 }
 
@@ -2725,6 +2779,7 @@ chimera_vfs_lease_ack(
 SYMBOL_EXPORT void
 chimera_vfs_lease_revoke(struct chimera_vfs_lease *lease)
 {
+
     struct chimera_vfs_file_state *file = lease->file;
     chimera_vfs_lease_revoked_cb_t revoked_cb;
     void                          *cb_private;

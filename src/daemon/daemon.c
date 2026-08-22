@@ -493,6 +493,11 @@ main(
     chimera_server_config_set_name_cache_enabled(server_config,
                                                  chimera_common_name_cache_enabled(config));
 
+    /* How long umount waits for a mount's handles to drain before reporting
+     * EBUSY (common.umount_timeout_ms); shared with the client. */
+    chimera_server_config_set_umount_timeout(server_config,
+                                             chimera_common_umount_timeout_ms(config));
+
     json_value = json_object_get(server_params, "smb_persistent_handles");
     if (json_is_boolean(json_value)) {
         chimera_server_config_set_smb_persistent_handles(server_config, json_is_true(json_value));
@@ -577,6 +582,11 @@ main(
     json_value = json_object_get(server_params, "smb_acl_inherited_canonicalize");
     if (json_is_boolean(json_value)) {
         chimera_server_config_set_smb_acl_inherited_canonicalize(server_config, json_is_true(json_value));
+    }
+
+    json_value = json_object_get(server_params, "smb_replay_pending_windows");
+    if (json_is_boolean(json_value)) {
+        chimera_server_config_set_smb_replay_pending_windows(server_config, json_is_true(json_value));
     }
 
     json_value = json_object_get(server_params, "smb2_max_async_credits");

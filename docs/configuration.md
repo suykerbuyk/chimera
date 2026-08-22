@@ -85,6 +85,7 @@ the canonical place to set them.
 | `preallocate_threads` | int | libevpl default | Threads used to preallocate slabs in parallel. |
 | `rdmacm_tos` | int | `0` | RoCEv2 traffic class stamped on every RDMA QP. ToS = DSCP x 4 (e.g. `104` for DSCP 26) so the fabric's lossless/PFC class carries Chimera traffic. |
 | `metrics_file` | string | - | On shutdown, write a final Prometheus scrape to this file (so short runs keep their metrics). |
+| `umount_timeout_ms` | int | `1000` | How long an unmount waits for the mount's open handles to be closed and released before giving up and returning `EBUSY`. Raise it for backends whose closes are slow; it exists so that unmounting a genuinely busy mount fails rather than hanging. |
 
 ---
 
@@ -121,6 +122,7 @@ the canonical place to set them.
 | `smb_named_streams` | bool | `false` | Enable SMB named streams (alternate data streams). |
 | `smb_encryption` | string/int | `"off"` | SMB3 transport encryption: `"off"`/`"disabled"` (0), `"enabled"`/`"on"` (1), or `"required"` (2). |
 | `smb_acl_inherited_canonicalize` | bool | `true` | Canonicalize inherited ACLs on SMB. |
+| `smb_replay_pending_windows` | bool | `false` | Answer a replayed durable-v2 CREATE that collides with a still-deferred CREATE the way Windows servers do (`STATUS_ACCESS_DENIED`, and no replay detection while the original waits on a share conflict). The default answers `STATUS_FILE_NOT_AVAILABLE`, which clients retry until the original create completes. MS-SMB2 does not specify this race; the two profiles are mutually exclusive. |
 | `metrics_port` | int | `9000` | Prometheus metrics port (`/metrics`). Make it distinct when running multiple daemons per host. |
 | `rest_http_port` | int | - | HTTP port for the REST admin API. Set to enable it (examples use `8080`). |
 | `rest_https_port` | int | `0` | HTTPS port for the REST API (`0` = disabled). |
@@ -144,6 +146,11 @@ Domain-authentication backends for SMB.
 | `kerberos_enabled` | bool | `false` | Enable Kerberos authentication. |
 | `kerberos_keytab` | string | - | Path to the Kerberos keytab. |
 | `kerberos_realm` | string | - | Kerberos realm. |
+
+Winbind and Kerberos both require setup outside chimera (a domain join, a
+keytab, and NSS pointed at winbind). See
+[SMB Domain Authentication](smb-domain-auth) for worked procedures against
+Active Directory and against an OpenLDAP directory with the Samba schema.
 
 #### `server.smb_multichannel`
 

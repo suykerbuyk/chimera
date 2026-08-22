@@ -243,6 +243,7 @@ chimera_smb_server_init(
     shared->config.smb2_max_async_credits       = chimera_server_config_get_smb2_max_async_credits(config);
     shared->config.fs_physical_bytes_per_sector = chimera_server_config_get_smb_fs_physical_bytes_per_sector(config);
     shared->config.fs_sector_size_flags         = chimera_server_config_get_smb_fs_sector_size_flags(config);
+    shared->config.replay_pending_windows       = chimera_server_config_get_smb_replay_pending_windows(config);
 
     if (shared->config.persistent_handles) {
         chimera_smb_info("SMB3 durable/persistent handles enabled (in-memory state)");
@@ -440,11 +441,19 @@ chimera_smb_compound_reply(struct chimera_smb_compound *compound)
      * whatever connection currently owns the recycled bind, corrupting its
      * stream from the first message (seen as a fresh smbtorture connection
      * failing NEGOTIATE with NT_STATUS_INVALID_NETWORK_RESPONSE).  The client
-     * this reply was for is gone; drop it and just release the compound. */
+     * this reply was for is gone; drop it and just release the compound.
+     *
+     * evpl_bind_is_closing() reports our OWN half-close (EVPL_BIND_FINISH)
+     * alongside the peer-initiated EVPL_BIND_PENDING_CLOSED / _CLOSED.  The
+     * unparseable-request path deliberately queues an error reply and only then
+     * calls evpl_finish -- a flush-then-close -- so treating FINISH as "drop it"
+     * would silently free exactly the reply that close was meant to deliver,
+     * leaving the client a bare FIN.  conn->finishing marks that case; the
+     * peer-initiated flags still drop. */
     if (unlikely(conn->generation != compound->conn_generation ||
                  conn->disconnecting ||
                  !conn->bind ||
-                 evpl_bind_is_closing(conn->bind))) {
+                 (evpl_bind_is_closing(conn->bind) && !conn->finishing))) {
         chimera_smb_compound_free(thread, compound);
         return;
     }
@@ -1065,6 +1074,16 @@ chimera_smb_complete_request(
      * SMB2_FLAGS_ASYNC_COMMAND and the matching AsyncId. */
     if (unlikely(request->async.armed)) {
         chimera_smb_async_interim_cancel(request);
+    }
+
+    /* A CREATE that was registered as deferred-and-not-yet-hashed
+     * (tree->pending_creates) is finished now however it got here, so drop the
+     * registration: the entry lives in this request and must never outlive it.
+     * Idempotent -- the create paths that resolve normally unregister at the
+     * point the open becomes visible in open_files[] instead. */
+    if (unlikely(request->smb2_hdr.command == SMB2_CREATE &&
+                 request->create.pending_linked)) {
+        chimera_smb_create_pending_unregister(request);
     }
 
     request->status = status;
@@ -1995,6 +2014,12 @@ chimera_smb_server_handle_smb2(
             }
 
             if (thread->shared->config.soft_fail_bad_req == 0) {
+                /* Half-close: flush what is queued (including the error reply
+                 * completed just above, and any compound still parked on async
+                 * VFS work), then close.  Mark it so the reply-drop guard in
+                 * chimera_smb_compound_reply does not mistake this for a peer
+                 * teardown and free those replies unsent. */
+                conn->finishing = 1;
                 evpl_finish(evpl, conn->bind);
             }
 
