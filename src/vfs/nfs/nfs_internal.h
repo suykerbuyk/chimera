@@ -170,6 +170,12 @@ enum chimera_nfs_client_mount_state {
  * per operation.
  */
 struct chimera_nfs4_client_session {
+    /* References to this session: one for the server that published it, plus
+     * one per per-thread slot table holding ids out of its pool.  The server
+     * drops its reference when the last mount goes away and the session is
+     * destroyed on the wire; the memory outlives that until every table has
+     * noticed and let go, so no thread ever dereferences a freed session. */
+    _Atomic int      refcnt;
     pthread_mutex_t  lock;          /* guards the pool + usable; NOT per-op        */
     uint8_t          sessionid[NFS4_SESSIONID_SIZE];
     uint64_t         clientid;
@@ -193,6 +199,8 @@ struct chimera_nfs_client_mount;
 struct chimera_nfs4_compound_ctx;   /* in-flight wrapper context (nfs4_slot.c)   */
 struct chimera_nfs4_parked;                   /* queued request awaiting a slot (nfs4_slot.c) */
 struct chimera_nfs4_layout;                   /* per-file pNFS layout (nfs4_pnfs.h)        */
+struct chimera_nfs4_open_state;               /* per-handle open state (nfs4_open_state.h) */
+struct chimera_nfs4_open_file;                /* per-file open refcount (same header)      */
 
 /*
  * Per-(thread,server) fore-channel slot table.  Touched by exactly one evpl
@@ -202,19 +210,26 @@ struct chimera_nfs4_layout;                   /* per-file pNFS layout (nfs4_pnfs
  * global slot ids (a small stack); per-id seqids live in session->slot_seqid.
  */
 struct chimera_nfs4_slot_table {
-    int                               initialized;
-    uint32_t                         *local_free;    /* [max_slots] owned-free ids */
-    int                               local_free_top; /* top of local_free stack   */
-    uint32_t                          leased; /* ids owned (floor+borrowed) */
-    uint32_t                          floor;  /* reserved ids, never returned *
-                                               * except at teardown          */
-    uint32_t                          cached_target; /* last-seen sr_target+1; cheap *
-                                                      * change detect, no per-op atomic */
-    struct chimera_nfs4_parked       *wait_head;     /* FIFO of parked requests    */
-    struct chimera_nfs4_parked       *wait_tail;
-    struct chimera_nfs4_parked       *parked_freelist;
-    struct chimera_nfs4_compound_ctx *inflight;      /* dll, for disconnect reset  */
-    struct chimera_nfs4_compound_ctx *ctx_freelist;
+    int                                 initialized;
+    /* The session these ids belong to.  Compared against the server's current
+     * session on every acquire: when the two differ the session was torn down
+     * and replaced (a remount), and this table's ids and seqids belong to the
+     * old one.  Comparing rather than dereferencing is what makes that check
+     * safe, and each thread repairs its own table, so no one ever writes
+     * another thread's lock-free state. */
+    struct chimera_nfs4_client_session *session;
+    uint32_t                           *local_free;  /* [max_slots] owned-free ids */
+    int                                 local_free_top; /* top of local_free stack   */
+    uint32_t                            leased; /* ids owned (floor+borrowed) */
+    uint32_t                            floor; /* reserved ids, never returned *
+                                                * except at teardown          */
+    uint32_t                            cached_target; /* last-seen sr_target+1; cheap *
+                                                        * change detect, no per-op atomic */
+    struct chimera_nfs4_parked         *wait_head;   /* FIFO of parked requests    */
+    struct chimera_nfs4_parked         *wait_tail;
+    struct chimera_nfs4_parked         *parked_freelist;
+    struct chimera_nfs4_compound_ctx   *inflight;    /* dll, for disconnect reset  */
+    struct chimera_nfs4_compound_ctx   *ctx_freelist;
 };
 
 struct chimera_nfs_client_server_thread {
@@ -291,6 +306,14 @@ struct chimera_nfs_client_server {
     uint8_t                             nfs4_verifier[NFS4_VERIFIER_SIZE];
     char                                nfs4_owner_id[128];
     int                                 nfs4_owner_id_len;
+
+    /* How many VFS handles have each file open, keyed on the wire file handle.
+     * All the opens this client sends carry the one open-owner above, so the
+     * server hands back a single stateid per file however many times it is
+     * opened, and the CLOSE that ends it may only go once the last handle is
+     * done; see nfs4_open_state.h. */
+    pthread_mutex_t                     open_state_lock;
+    struct chimera_nfs4_open_file      *open_files;
 
     /* Persistent back-channel / control connection, owned by the control thread
      * (shared->cb_thread).  CREATE_SESSION binds the back channel to it, so the
@@ -1002,6 +1025,10 @@ void chimera_nfs4_session_pool_destroy(
 
 /* Free a server_thread's slot table (called from thread teardown).  Returns the
  * thread's leased slot ids (floor + borrowed) to the session pool first. */
+/* Drop a reference to a session, destroying it once the last goes. */
+void chimera_nfs4_session_put(
+    struct chimera_nfs4_client_session *session);
+
 void chimera_nfs4_slot_table_destroy(
     struct chimera_nfs_client_server_thread *server_thread);
 
@@ -1172,6 +1199,43 @@ void chimera_nfs4_close(
     struct chimera_nfs_shared *,
     struct chimera_vfs_request *,
     void *);
+
+/* Terminal step of a close: drop this handle's reference to the file's open,
+ * send the CLOSE if it was the last, then free the handle's open state and
+ * complete the request.  Split out of chimera_nfs4_close so the pNFS close path
+ * can run its LAYOUTCOMMIT/LAYOUTRETURN first and then hand the request here,
+ * rather than completing with the layout still held.  Takes ownership of
+ * open_state and of request->plugin_data. */
+void chimera_nfs4_close_send(
+    struct chimera_nfs_thread *,
+    struct chimera_nfs_shared *,
+    struct chimera_vfs_request *,
+    struct chimera_nfs4_open_state *);
+
+/* ---- Per-file open refcount (nfs4_open_state.c) ------------------------- */
+
+/* Take a reference on the file's open, recording it if this is the first handle
+ * to open the file.  `stateid` is the one OPEN returned, or NULL for a caller
+ * that has none.  See nfs4_open_state.h for why this is counted apart from the
+ * per-handle open state. */
+void chimera_nfs4_open_file_get(
+    struct chimera_nfs_client_server *server,
+    const uint8_t                    *fh,
+    int                               fh_len,
+    const struct stateid4            *stateid);
+
+/* Drop a reference.  Non-zero if it was the last, in which case the entry has
+ * been retired and its stateid copied out for the caller to CLOSE with. */
+int chimera_nfs4_open_file_put(
+    struct chimera_nfs_client_server *server,
+    const uint8_t                    *fh,
+    int                               fh_len,
+    struct stateid4                  *r_stateid);
+
+/* Free any entries left on a server at module teardown. */
+void chimera_nfs4_open_file_drain(
+    struct chimera_nfs_client_server *server);
+
 void chimera_nfs4_umount(
     struct chimera_nfs_thread *,
     struct chimera_nfs_shared *,

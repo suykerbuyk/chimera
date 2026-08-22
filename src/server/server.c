@@ -30,6 +30,7 @@
 #include "common/macros.h"
 #include "common/chimera_tracing.h"
 #include "server/server.h"
+#include "common/common_config.h"
 #include "smb/smb2.h"
 #include "rest/rest.h"
 
@@ -73,6 +74,7 @@ struct chimera_server_config {
     int                                   async_delegation_threads;
     int                                   cache_ttl;
     int                                   attr_cache_enabled;
+    int                                   umount_timeout_ms;
     int                                   name_cache_enabled;
     int                                   rcu_reclaim_threads;
     int                                   nfs4_session_slots;
@@ -101,6 +103,7 @@ struct chimera_server_config {
     int                                   smb_oplocks;
     int                                   smb_notify_disabled;
     int                                   smb_acl_inherited_canonicalize;
+    int                                   smb_replay_pending_windows;
     int                                   smb2_max_async_credits;
     uint32_t                              smb_fs_physical_bytes_per_sector;
     uint32_t                              smb_fs_sector_size_flags;
@@ -235,14 +238,42 @@ chimera_server_config_init(void)
      * exercises). */
     config->smb_acl_inherited_canonicalize = 1;
 
+    /* How a replayed durable-v2 CREATE is answered when its create_guid matches
+     * an open whose own CREATE has not completed yet (it is deferred on a
+     * conflicting holder's oplock/lease break).  MS-SMB2 3.3.5.9 / 3.3.5.9.10
+     * do not cover this race -- the spec's replay lookup assumes a fully
+     * initialised Open -- so the two real implementations diverge:
+     *
+     *   0 (default): STATUS_FILE_NOT_AVAILABLE, as Samba answers.  A client
+     *      RETRIES on this status (three times, then every 5s until the
+     *      resiliency timeout), so the replay succeeds once the original create
+     *      completes -- which is the point of replaying it after a channel
+     *      failure.  smb2.replay.dhv2-pending*-sane assert this.
+     *   1: STATUS_ACCESS_DENIED, as Windows servers answer (it falls out of
+     *      the "Open.DurableOwner is NULL" rule in 3.3.5.9, DurableOwner not
+     *      being set until the open completes).  A client reports this to the
+     *      application rather than retrying.  Also suppresses replay detection
+     *      entirely while the original create is deferred on a SHARE conflict,
+     *      which is the other half of the Windows profile.
+     *      smb2.replay.dhv2-pending*-windows assert this.
+     *
+     * The two profiles are mutually exclusive on identical wire traffic (the
+     * -sane and -windows smbtorture variants send byte-identical sequences and
+     * differ only in the status they require), so one daemon satisfies one of
+     * them: the smbtorture driver runs each half against a daemon in the matching
+     * profile.  See https://bugzilla.samba.org/show_bug.cgi?id=14449. */
+    config->smb_replay_pending_windows = 0;
+
     /* Per-connection ceiling on outstanding async (STATUS_PENDING) operations.
      * 512 matches the value smb2.credits.*_ipc_max_async_credits asserts. */
     config->smb2_max_async_credits = 512;
 
     /* FileFsSectorSizeInformation defaults: report 4KiB physical sectors and
-     * aligned + partition-aligned flags for modern storage. */
+     * aligned + partition-aligned flags for modern storage.  Per MS-FSCC
+     * 2.5.8 those two flags are bits 0 and 1; every higher bit is reserved. */
     config->smb_fs_physical_bytes_per_sector = 4096;
-    config->smb_fs_sector_size_flags         = 0x300;
+    config->smb_fs_sector_size_flags         = SMB2_SSINFO_FLAGS_ALIGNED_DEVICE |
+        SMB2_SSINFO_FLAGS_PARTITION_ALIGNED_ON_DEVICE;
 
     // SMB auth config defaults - local NTLM only
     config->smb_auth.winbind_enabled    = 0;
@@ -299,6 +330,7 @@ chimera_server_config_init(void)
 
     /* The VFS attribute cache is on by default (common.attr_cache). */
     config->attr_cache_enabled = 1;
+    config->umount_timeout_ms  = CHIMERA_COMMON_UMOUNT_TIMEOUT_MS_DEFAULT;
 
     /* The VFS name (lookup) cache is on by default (common.name_cache). */
     config->name_cache_enabled = 1;
@@ -585,6 +617,20 @@ chimera_server_config_get_smb_acl_inherited_canonicalize(const struct chimera_se
 } /* chimera_server_config_get_smb_acl_inherited_canonicalize */
 
 SYMBOL_EXPORT void
+chimera_server_config_set_smb_replay_pending_windows(
+    struct chimera_server_config *config,
+    int                           enable)
+{
+    config->smb_replay_pending_windows = enable;
+} /* chimera_server_config_set_smb_replay_pending_windows */
+
+SYMBOL_EXPORT int
+chimera_server_config_get_smb_replay_pending_windows(const struct chimera_server_config *config)
+{
+    return config->smb_replay_pending_windows;
+} /* chimera_server_config_get_smb_replay_pending_windows */
+
+SYMBOL_EXPORT void
 chimera_server_config_set_smb2_max_async_credits(
     struct chimera_server_config *config,
     int                           value)
@@ -672,6 +718,14 @@ chimera_server_config_get_cache_ttl(const struct chimera_server_config *config)
 {
     return config->cache_ttl;
 } /* chimera_server_config_get_cache_ttl */
+
+SYMBOL_EXPORT void
+chimera_server_config_set_umount_timeout(
+    struct chimera_server_config *config,
+    int                           timeout_ms)
+{
+    config->umount_timeout_ms = timeout_ms;
+} /* chimera_server_config_set_umount_timeout */
 
 SYMBOL_EXPORT void
 chimera_server_config_set_attr_cache_enabled(
@@ -2517,6 +2571,8 @@ chimera_server_init(
      * remove/rename paths know to resolve a by-name victim's FH and recall a
      * cross-protocol holder before the namespace change (see
      * chimera_vfs_remove_at).  When none are enabled the lookup is skipped. */
+    chimera_vfs_set_umount_timeout(server->vfs, config->umount_timeout_ms);
+
     chimera_vfs_set_caching_enabled(server->vfs,
                                     config->nfs4_delegations ||
                                     config->smb_leases ||

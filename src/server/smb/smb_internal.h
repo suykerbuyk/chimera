@@ -239,6 +239,12 @@ struct chimera_smb_config {
      * SET_SECURITY; see chimera_server_config_set_smb_acl_inherited_canonicalize
      * for semantics.  Default 1 (canonical). */
     int                            acl_inherited_canonicalize;
+    /* Answer a replayed durable-v2 CREATE that matches a still-deferred CREATE
+     * the Windows way (ACCESS_DENIED, and no replay detection while the original
+     * is deferred on a share conflict) rather than the default Samba way
+     * (FILE_NOT_AVAILABLE, which clients retry).  The two are mutually exclusive;
+     * see chimera_server_config_set_smb_replay_pending_windows.  Default 0. */
+    int                            replay_pending_windows;
     /* Per-connection ceiling on simultaneously outstanding async (STATUS_PENDING)
      * operations.  A blocking named-pipe READ that cannot be served now is made
      * async until the connection holds (smb2_max_async_credits - 1) of them;
@@ -629,10 +635,21 @@ struct chimera_smb_request {
             uint8_t                            gen_share_retry;
             /* GRANTED/DENIED result stashed by chimera_smb_create_share_park_cb
              * when the share-park ticket resolves on another thread, so the
-             * owning thread's resume doorbell can finish the open with it.  The
-             * queue link reuses async.park_next (a gen_parked CREATE is not on
-             * conn->parked_requests). */
+             * owning thread's resume doorbell can finish the open with it.
+             * gen_resume_next is that queue's own link: it must NOT share
+             * async.park_next, because a share-parked CREATE also emits an
+             * async interim and is therefore linked on conn->parked_requests by
+             * that field at the same time. */
             enum chimera_vfs_lease_result      gen_resume_result;
+            struct chimera_smb_request        *gen_resume_next;
+            /* Registration of this deferred DH2Q create on tree->pending_creates
+            * (see the comment there): pending_link chains the list, and
+            * pending_linked says whether this request is currently on it.  The
+            * client GUID is snapshotted so the replay lookup can match
+            * Open.ClientGuid without touching the (possibly gone) connection. */
+            struct chimera_smb_request        *pending_link;
+            uint8_t                            pending_linked;
+            uint8_t                            pending_client_guid[16];
             uint8_t                            r_is_directory;
             uint32_t                           r_granted_access;
             uint32_t                           r_maximal_access;
@@ -1240,6 +1257,15 @@ struct chimera_smb_conn {
      * is gone, it will yield -- retry briefly" from "a genuinely-live durable
      * holder -- real SHARING_VIOLATION".  Cleared on reuse in conn_alloc. */
     uint8_t                            disconnecting;
+    /* Set when the SERVER half-closes this connection itself (evpl_finish on
+     * the unparseable-request path).  That is a flush-then-close: replies
+     * already in flight must still reach the client.  evpl_bind_is_closing()
+     * cannot distinguish our own half-close from a peer FIN -- it reports
+     * EVPL_BIND_FINISH, EVPL_BIND_PENDING_CLOSED and EVPL_BIND_CLOSED alike --
+     * so the reply-drop guard consults this to keep the peer-initiated cases
+     * dropping while letting our own graceful close flush.  Cleared on reuse in
+     * conn_alloc. */
+    uint8_t                            finishing;
     /* Count of compounds in flight on THIS connection (guarded by the owning
     * thread's lease_break_lock).  A dir-lease break whose holder connection is
     * mid-compound is a self-break: the same connection's reply must precede the
@@ -2406,6 +2432,7 @@ chimera_smb_conn_alloc(struct chimera_server_smb_thread *thread)
         LL_DELETE(thread->free_conns, conn);
         conn->lease_break_tearing_down = 0;
         conn->disconnecting            = 0;
+        conn->finishing                = 0;
         conn->in_compound              = 0;
     } else {
         conn = calloc(1, sizeof(*conn));
@@ -2610,6 +2637,7 @@ chimera_smb_tree_alloc(struct chimera_server_smb_shared *shared)
         for (int i = 0; i < CHIMERA_SMB_OPEN_FILE_BUCKETS; i++) {
             pthread_mutex_init(&tree->open_files_lock[i], NULL);
         }
+        pthread_mutex_init(&tree->pending_creates_lock, NULL);
     }
 
     tree->fh_expiration.tv_sec  = 0;
@@ -2632,6 +2660,7 @@ chimera_smb_tree_free(
     struct chimera_smb_notify_state *nstate;
     struct chimera_smb_request      *lock_aborts = NULL;
     struct chimera_smb_request      *labort;
+    struct chimera_smb_request      *pcreate;
     bool                             closed_breaking = false;
     int                              i;
 
@@ -2792,6 +2821,25 @@ chimera_smb_tree_free(
         evpl_ring_doorbell(&thread->lease_resume_doorbell);
         chimera_smb_create_resume_parked_broadcast(thread);
     }
+
+    /* Detach any DH2Q creates still registered as deferred-and-not-yet-hashed on
+     * this tree (tree->pending_creates).  A deferred CREATE holds no tree
+     * reference -- refcnt is touched only by TREE_DISCONNECT -- so the tree can
+     * reach here while a create is parked on a handle-lease break or retrying a
+     * disconnecting durable holder, and the free list below does NOT zero the
+     * tree.  A surviving head would be inherited by the next tree to take this
+     * slot, where chimera_smb_create_pending_match would walk a request from a
+     * different tree connect and could answer an unrelated replay
+     * FILE_NOT_AVAILABLE (a client's two tree connects share one client_guid).
+     * Clear each entry's link as well, so the unregister those requests still run
+     * when they resolve is a no-op instead of a walk against a recycled list. */
+    pthread_mutex_lock(&tree->pending_creates_lock);
+    while ((pcreate = tree->pending_creates)) {
+        tree->pending_creates          = pcreate->create.pending_link;
+        pcreate->create.pending_link   = NULL;
+        pcreate->create.pending_linked = 0;
+    }
+    pthread_mutex_unlock(&tree->pending_creates_lock);
 
     pthread_mutex_lock(&shared->trees_lock);
 
