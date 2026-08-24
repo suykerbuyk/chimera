@@ -684,6 +684,24 @@ chimera_server_mount(
     const char            *module_path,
     const char            *options);
 
+/* Create a named filesystem inside a CAP_MKFS module (memfs, diskfs, cairn).
+ * Returns 0 on success or a chimera_vfs_error (EEXIST if the name is taken,
+ * ENOTSUP if the module has no filesystem support). */
+int
+chimera_server_mkfs(
+    struct chimera_server *server,
+    const char            *module_name,
+    const char            *fsname,
+    const char            *options);
+
+/* Remove a named filesystem.  Returns 0 on success or a chimera_vfs_error
+ * (EBUSY while the filesystem still has active mounts). */
+int
+chimera_server_rmfs(
+    struct chimera_server *server,
+    const char            *module_name,
+    const char            *fsname);
+
 /* Ensure module_path exists inside module_name (creating intermediate dirs with
  * the given mode, owner 0/0) before it is mounted -- backs the "create" mount
  * option.  Returns 0 on success, -1 if any component could not be created. */
@@ -702,7 +720,8 @@ chimera_server_mkpath(
 int
 chimera_server_seed_symlinks(
     struct chimera_server *server,
-    const char            *module_name);
+    const char            *module_name,
+    const char            *module_path);
 
 /* Seed the fixtures the WPTS MS-FSA suite expects to pre-exist on a memfs-backed
  * share: a directory (ExistingFolder) and a regular file (ExistingFile.txt).  A
@@ -710,7 +729,8 @@ chimera_server_seed_symlinks(
 int
 chimera_server_seed_fsa(
     struct chimera_server *server,
-    const char            *module_name);
+    const char            *module_name,
+    const char            *module_path);
 
 int
 chimera_server_unmount(

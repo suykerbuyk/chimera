@@ -63,6 +63,7 @@
 
 #include "vfs/vfs_internal.h"
 
+
 #include "vfs/vfs_acl.h"
 
 #include "vfs/vfs_access.h"
@@ -97,15 +98,16 @@
 
 
 /* Statically-reserved inums (block_idx in AG 0 / disk 0; see space_map.c).
- * inum 2 = root; inum 3 = orphan list (deleted inodes pending incremental
- * reclaim).  The orphan inode is a directory whose b+tree keys are orphan
- * inums; the drainer empties it. */
-#define DISKFS_ROOT_INUM          2
+ * inum 2 is reserved (the pre-named-filesystem static root; unused now that
+ * filesystem roots are ordinary allocated inodes recorded in the superblock
+ * fs_table); inums 3.. are the orphan-list shards (deleted inodes pending
+ * incremental reclaim, directories whose b+tree keys are orphan inums; the
+ * drainer empties them). */
 
 /* Sharded orphan-list inodes: deleted-but-not-yet-reclaimed inodes are
  * recorded as DISKFS_REC_ORPHAN keys spread across these (by deleted inum),
  * so concurrent unlinks don't serialize on a single inode's write lock
- * (inode locks are held until the txn is durable).  Created at format,
+ * (inode locks are held until the txn is durable).  Created at first use,
  * permanent.  Count is baked into the on-disk bootstrap layout. */
 #define DISKFS_ORPHAN_INUM_BASE   3
 
@@ -179,6 +181,8 @@ diskfs_diag_now_ns(void)
         chimera_abort_if(cond, "diskfs", __FILE__, __LINE__, __VA_ARGS__)
 
 
+struct diskfs_fs;
+
 struct diskfs_extent {
     uint32_t              device_id;
     uint32_t              length;
@@ -196,6 +200,11 @@ struct diskfs_request_private {
     int                         status;
     int                         pending;
     int                         niov;
+
+    /* Owning named filesystem, resolved once at dispatch from the FH's
+     * mount_id (NULL for the ops that carry no FH: mount/mkfs/rmfs resolve
+     * by name, umount by mount_private, KV ops are pool-level). */
+    struct diskfs_fs           *fs;
 
     /* xattr EaSize maintenance: captured in set_xattr's lookup callback so the
      * insert-completion can update the inode's cached ea_size/ea_count delta. */
@@ -569,6 +578,10 @@ struct diskfs_inode {
     uint64_t                    inum;
     uint32_t                    gen;
     uint32_t                    refcnt;
+    /* Owning named filesystem, stamped at every materialization (alloc and
+     * both fault paths).  NULL only for the pool-level orphan-shard inodes
+     * and orphaned inodes being drained, which never map attrs. */
+    struct diskfs_fs           *fs;
     uint64_t                    size;
     uint64_t                    space_used;
     uint64_t                    alloc_size;  /* SMB AllocationSize reservation */
@@ -1464,6 +1477,27 @@ struct diskfs_intent_log {
 };
 
 
+/* One named filesystem (CHIMERA_VFS_CAP_MKFS) within the pool.  Created by
+ * MKFS, loaded from the superblock fs_table at init, removed by RMFS.  Inums
+ * are pool-unique, so inode/b+tree records carry no filesystem discriminator;
+ * only the root and fsid are per-fs. */
+struct diskfs_fs {
+    struct diskfs_shared *shared;
+    char                 *name;
+    uint64_t              fsid;
+    uint64_t              root_inum;
+    uint32_t              root_gen;
+    /* Mounts currently referencing this filesystem; RMFS fails with EBUSY
+     * while non-zero.  Guarded by shared->lock. */
+    int                   mount_count;
+    uint8_t               root_fh[CHIMERA_VFS_FH_SIZE];
+    uint32_t              root_fhlen;
+    struct diskfs_fs     *prev;
+    struct diskfs_fs     *next;
+    struct rcu_head       rcu;
+};
+
+
 struct diskfs_shared {
     struct diskfs_device       *devices;
     char                      **device_paths;    /* for unmount-time persistence */
@@ -1473,11 +1507,14 @@ struct diskfs_shared {
     struct diskfs_kv_shard     *kv_shards;
     int                         num_kv_shards;
     int                         num_active_threads;
-    uint8_t                     root_fh[CHIMERA_VFS_FH_SIZE];
-    uint32_t                    root_fhlen;
+    /* Named filesystems, for by-name lookup (mount/mkfs/rmfs, guarded by
+     * lock).  Per-op resolution does not consult this: it comes in on the
+     * request as mount_private.  fs_table mirrors the superblock's table
+     * (guarded by lock). */
+    struct diskfs_fs           *fs_list;
+    struct sm_fs_entry          fs_table[SM_FS_TABLE_MAX];
+    int                         orphans_created;   /* orphan-shard inodes exist on disk */
     int                         orphans_scanned;   /* mount-time orphan recovery done */
-    uint64_t                    root_inum;         /* for the clean-unmount superblock */
-    uint32_t                    root_gen;
     int                         unsafe_async;      /* config opt-in: submit block writes without FUA/sync (no crash safety) */
     int                         noatime;           /* config opt-in: never update atime on read (default: relatime) */
     uint64_t                    mtime_defer_us;    /* coalesce non-FILE_SYNC in-place mtime updates: flush each dirty inode at most once per this many us (0 = disabled, log every write); default 1s */
@@ -1564,6 +1601,14 @@ struct diskfs_thread {
      * b+tree in bounded batches across transactions). */
     struct diskfs_drain         *drain_head, *drain_tail;
     int                          draining;
+
+    /* Background transactions started on this thread AFTER their request
+    * completed (currently only the RMFS root burn-down kickoff).  They hold
+    * inode locks (the fs root + an orphan shard) that no other teardown
+    * accounting covers, so diskfs_thread_destroy pumps the event loop until
+    * this reaches zero; destroying the thread mid-flight would leak those
+    * locks and wedge the reclaim workers' drains on the orphan shard. */
+    int                          bg_txns;
 
     /* Deferred-mtime flusher: this worker owns inode-cache shards where
      * (shard % num_active_threads) == thread_id.  The periodic timer kicks the
@@ -1841,7 +1886,14 @@ struct diskfs_drain {
     struct diskfs_inode  *inode;
     int                   batch;
     struct diskfs_bt_key  found_key;
+    /* Sized for the largest fixed-header record the drain parses: the extent
+     * record, and a dirent record's inum/gen header (its name tail is
+     * truncated by the lookup, which is fine -- only inum/gen are read). */
     uint8_t               recbuf[sizeof(struct diskfs_extent_rec)];
+    /* Dirent child being orphaned (rmfs tree burn-down; see
+     * diskfs_drain_looked_cb). */
+    uint64_t              child_inum;
+    uint32_t              child_gen;
     struct diskfs_drain  *next;
 };
 
@@ -1985,12 +2037,12 @@ struct diskfs_orphan_ent {
 struct diskfs_inode_load_ctx {
     struct diskfs_thread       *thread;
     struct diskfs_txn          *txn;
+    struct diskfs_fs           *fs;      /* stamped on the faulted inode */
     uint64_t                    inum;
     uint32_t                    gen;
     enum diskfs_inode_lock_mode mode;
     diskfs_inode_cb_t           cb;
     void                       *private_data;
-    struct evpl_iovec           iov;
     /* Record-load chain state (valid once the inode is published). */
     struct diskfs_inode        *inode;
     int                         acl_len;
@@ -2005,6 +2057,7 @@ struct diskfs_inode_load_ctx {
 struct diskfs_inode_alloc_ctx {
     struct diskfs_thread *thread;
     struct diskfs_txn    *txn;
+    struct diskfs_fs     *fs;
     diskfs_inode_cb_t     cb;
     void                 *private_data;
 };
@@ -2232,6 +2285,7 @@ void
 diskfs_inode_acquire(
     struct diskfs_thread       *thread,
     struct diskfs_txn          *txn,
+    struct diskfs_fs           *fs,
     uint64_t                    inum,
     uint32_t                    gen,
     enum diskfs_inode_lock_mode mode,
@@ -2251,6 +2305,7 @@ struct diskfs_inode *
 diskfs_inode_load_sync(
     struct diskfs_thread   *thread,
     struct diskfs_mount_io *io,
+    struct diskfs_fs       *fs,
     uint64_t                inum,
     uint32_t                gen,
     int                     allow_orphan);
@@ -2285,6 +2340,22 @@ diskfs_block_claim(
     uint32_t              device_id,
     uint64_t              device_offset,
     int                   is_new);
+
+/* As diskfs_block_claim (returns the block pinned; is_new starts from a zeroed
+ * buffer) but never reads or waits synchronously: on a miss, an in-flight read,
+ * or pin-cap backpressure it parks resume(thread, arg) -- dispatched back on the
+ * claiming thread -- and returns NULL.  The resume re-invokes the claim, which
+ * then returns the resident block inline. */
+struct diskfs_block *
+diskfs_block_claim_async(
+    struct diskfs_thread *thread,
+    uint32_t              device_id,
+    uint64_t              device_offset,
+    int                   is_new,
+    void (               *resume )(
+        struct diskfs_thread *,
+        void *),
+    void                 *arg);
 
 void
 diskfs_block_buf_release(
@@ -2484,7 +2555,8 @@ diskfs_orphan_op_start(
     uint64_t              inum,
     uint32_t              gen,
     int                   remove,
-    void (               *done )(void *priv),
+    void (               *done )(
+        void *priv),
     void                 *priv);
 
 void
@@ -2511,16 +2583,19 @@ diskfs_gen_extend(
 int
 diskfs_gen_alloc(
     struct diskfs_thread *thread,
-    uint32_t *r_gen,
-    void ( *resume )(struct diskfs_thread *, void *),
-    void *arg);
+    uint32_t             *r_gen,
+    void (               *resume )(
+        struct diskfs_thread *,
+        void *),
+    void                 *arg);
 
 void
 diskfs_inode_orphaned(
     struct diskfs_thread *thread,
     struct diskfs_txn    *txn,
     struct diskfs_inode  *inode,
-    void (               *done )(void *priv),
+    void (               *done )(
+        void *priv),
     void                 *priv);
 
 void
@@ -2645,6 +2720,7 @@ void
 diskfs_inode_load(
     struct diskfs_thread       *thread,
     struct diskfs_txn          *txn,
+    struct diskfs_fs           *fs,
     uint64_t                    inum,
     uint32_t                    gen,
     enum diskfs_inode_lock_mode mode,
@@ -2777,8 +2853,27 @@ diskfs_init(
     struct prometheus_metrics *metrics);
 
 void
-diskfs_bootstrap(
+diskfs_bootstrap_orphans(
     struct diskfs_thread *thread);
+
+/* Find a filesystem by name.  Caller holds shared->lock (or is single-
+ * threaded init/destroy). */
+struct diskfs_fs *
+diskfs_fs_find(
+    struct diskfs_shared *shared,
+    const char           *name,
+    int                   namelen);
+
+/* Build the in-memory filesystem object for an fs_table entry and register
+ * its root mount_id.  Caller holds shared->lock (or is single-threaded init). */
+struct diskfs_fs *
+diskfs_fs_attach(
+    struct diskfs_shared *shared,
+    const char           *name,
+    int                   namelen,
+    uint64_t              fsid,
+    uint64_t              root_inum,
+    uint32_t              root_gen);
 
 void
 diskfs_destroy(
@@ -2871,6 +2966,20 @@ diskfs_mount(
 
 void
 diskfs_umount(
+    struct diskfs_thread       *thread,
+    struct diskfs_shared       *shared,
+    struct chimera_vfs_request *request,
+    void                       *private_data);
+
+void
+diskfs_mkfs(
+    struct diskfs_thread       *thread,
+    struct diskfs_shared       *shared,
+    struct chimera_vfs_request *request,
+    void                       *private_data);
+
+void
+diskfs_rmfs(
     struct diskfs_thread       *thread,
     struct diskfs_shared       *shared,
     struct chimera_vfs_request *request,
@@ -3186,10 +3295,10 @@ diskfs_pending_io_add(
 
 static inline uint32_t
 diskfs_inum_to_fh(
-    struct diskfs_shared *shared,
-    uint8_t              *fh,
-    uint64_t              inum,
-    uint32_t              gen);
+    struct diskfs_fs *fs,
+    uint8_t          *fh,
+    uint64_t          inum,
+    uint32_t          gen);
 
 static inline void
 diskfs_fh_to_inum(
@@ -3260,6 +3369,7 @@ static inline void
 diskfs_inode_get_inum_async(
     struct diskfs_thread *thread,
     struct diskfs_txn    *txn,
+    struct diskfs_fs     *fs,
     uint64_t              inum,
     uint32_t              gen,
     diskfs_inode_cb_t     cb,
@@ -3269,6 +3379,7 @@ static inline void
 diskfs_inode_get_fh_async(
     struct diskfs_thread *thread,
     struct diskfs_txn    *txn,
+    struct diskfs_fs     *fs,
     const uint8_t        *fh,
     int                   fhlen,
     diskfs_inode_cb_t     cb,
@@ -3380,6 +3491,7 @@ static inline void
 diskfs_inode_alloc_async(
     struct diskfs_thread *thread,
     struct diskfs_txn    *txn,
+    struct diskfs_fs     *fs,
     diskfs_inode_cb_t     cb,
     void                 *private_data);
 
@@ -3400,14 +3512,16 @@ diskfs_kv_entry_alloc(
 static inline int
 diskfs_inode_alloc_space(
     struct diskfs_thread *thread,
-    struct diskfs_txn *txn,
-    struct diskfs_inode *inode,
-    int64_t desired_size,
-    uint64_t floor,
-    uint64_t *r_device_id,
-    uint64_t *r_device_offset,
-    void ( *resume )(struct diskfs_thread *, void *),
-    void *resume_arg);
+    struct diskfs_txn    *txn,
+    struct diskfs_inode  *inode,
+    int64_t               desired_size,
+    uint64_t              floor,
+    uint64_t             *r_device_id,
+    uint64_t             *r_device_offset,
+    void (               *resume )(
+        struct diskfs_thread *,
+        void *),
+    void                 *resume_arg);
 
 static inline void
 diskfs_thread_free_space(
@@ -3693,12 +3807,13 @@ diskfs_pending_io_add(
 
 static inline uint32_t
 diskfs_inum_to_fh(
-    struct diskfs_shared *shared,
-    uint8_t              *fh,
-    uint64_t              inum,
-    uint32_t              gen)
+    struct diskfs_fs *fs,
+    uint8_t          *fh,
+    uint64_t          inum,
+    uint32_t          gen)
 {
-    return chimera_vfs_encode_fh_inum_parent(shared->root_fh, inum, gen, fh);
+    chimera_diskfs_abort_if(!fs, "diskfs_inum_to_fh: inode has no filesystem");
+    return chimera_vfs_encode_fh_inum_parent(fs->root_fh, inum, gen, fh);
 } /* diskfs_inum_to_fh */
 
 
@@ -3964,12 +4079,13 @@ static inline void
 diskfs_inode_get_inum_async(
     struct diskfs_thread *thread,
     struct diskfs_txn    *txn,
+    struct diskfs_fs     *fs,
     uint64_t              inum,
     uint32_t              gen,
     diskfs_inode_cb_t     cb,
     void                 *private_data)
 {
-    diskfs_inode_acquire(thread, txn, inum, gen,
+    diskfs_inode_acquire(thread, txn, fs, inum, gen,
                          DISKFS_INODE_MODE_FOR_TXN(txn), cb, private_data);
 } /* diskfs_inode_get_inum_async */
 
@@ -3978,6 +4094,7 @@ static inline void
 diskfs_inode_get_fh_async(
     struct diskfs_thread *thread,
     struct diskfs_txn    *txn,
+    struct diskfs_fs     *fs,
     const uint8_t        *fh,
     int                   fhlen,
     diskfs_inode_cb_t     cb,
@@ -3987,7 +4104,7 @@ diskfs_inode_get_fh_async(
     uint32_t gen;
 
     diskfs_fh_to_inum(&inum, &gen, fh, fhlen);
-    diskfs_inode_get_inum_async(thread, txn, inum, gen, cb, private_data);
+    diskfs_inode_get_inum_async(thread, txn, fs, inum, gen, cb, private_data);
 } /* diskfs_inode_get_fh_async */
 
 
@@ -4449,6 +4566,7 @@ static inline void
 diskfs_inode_alloc_async(
     struct diskfs_thread *thread,
     struct diskfs_txn    *txn,
+    struct diskfs_fs     *fs,
     diskfs_inode_cb_t     cb,
     void                 *private_data)
 {
@@ -4465,6 +4583,7 @@ diskfs_inode_alloc_async(
     actx               = malloc(sizeof(*actx));
     actx->thread       = thread;
     actx->txn          = txn;
+    actx->fs           = fs;
     actx->cb           = cb;
     actx->private_data = private_data;
 
@@ -4489,6 +4608,7 @@ diskfs_inode_alloc_async(
     inum       = sm_inum_from_device_offset(shared->space_map, device_id, device_offset);
     inode      = diskfs_inode_struct_new(inum);
     inode->gen = gen;
+    inode->fs  = fs;
 
     /* New dirty inode: write-locked by this (write) txn from birth. */
     inode->writer = 1;
@@ -4575,14 +4695,16 @@ diskfs_kv_entry_alloc(
 static inline int
 diskfs_inode_alloc_space(
     struct diskfs_thread *thread,
-    struct diskfs_txn *txn,
-    struct diskfs_inode *inode,
-    int64_t desired_size,
-    uint64_t floor,
-    uint64_t *r_device_id,
-    uint64_t *r_device_offset,
-    void ( *resume )(struct diskfs_thread *, void *),
-    void *resume_arg)
+    struct diskfs_txn    *txn,
+    struct diskfs_inode  *inode,
+    int64_t               desired_size,
+    uint64_t              floor,
+    uint64_t             *r_device_id,
+    uint64_t             *r_device_offset,
+    void (               *resume )(
+        struct diskfs_thread *,
+        void *),
+    void                 *resume_arg)
 {
     uint32_t          dev_id;
     int               rc;
@@ -4866,7 +4988,7 @@ diskfs_map_attrs(
 
     if (attr->va_req_mask & CHIMERA_VFS_ATTR_FH) {
         attr->va_set_mask |= CHIMERA_VFS_ATTR_FH;
-        attr->va_fh_len    = diskfs_inum_to_fh(shared, attr->va_fh, inode->inum, inode->gen);
+        attr->va_fh_len    = diskfs_inum_to_fh(inode->fs, attr->va_fh, inode->inum, inode->gen);
     }
 
     if (attr->va_req_mask & CHIMERA_VFS_ATTR_MASK_STAT) {
@@ -4920,7 +5042,7 @@ diskfs_map_attrs(
 
     if (attr->va_req_mask & CHIMERA_VFS_ATTR_FSID) {
         attr->va_set_mask |= CHIMERA_VFS_ATTR_FSID;
-        attr->va_fsid      = shared->fsid;
+        attr->va_fsid      = inode->fs->fsid;
     }
 
     /*
@@ -4962,7 +5084,7 @@ diskfs_map_attrs(
         attr->va_fs_files_total = CHIMERA_VFS_SYNTHETIC_FS_INODES;
         attr->va_fs_files_avail = CHIMERA_VFS_SYNTHETIC_FS_INODES;
         attr->va_fs_files_free  = CHIMERA_VFS_SYNTHETIC_FS_INODES;
-        attr->va_fsid           = shared->fsid;
+        attr->va_fsid           = inode->fs->fsid;
     }
 
 } /* diskfs_map_attrs */

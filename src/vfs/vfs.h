@@ -12,7 +12,7 @@
 #include "vfs_error.h"
 #include "vfs_cred.h"
 #include "vfs_pnfs.h"
-#include "vfs_lease_types.h"
+#include "vfs_claim_types.h"
 #include "evpl/evpl.h"
 #include "prometheus-c.h"
 #include "vfs_clock.h"
@@ -117,7 +117,11 @@ struct chimera_vfs_mount_options {
 #define CHIMERA_VFS_OP_OPEN_STREAM      37
 #define CHIMERA_VFS_OP_LIST_STREAMS     38
 #define CHIMERA_VFS_OP_REMOVE_STREAM    39
-#define CHIMERA_VFS_OP_NUM              40
+#define CHIMERA_VFS_OP_MKFS             40
+#define CHIMERA_VFS_OP_RMFS             41
+#define CHIMERA_VFS_OP_LEASE_ACQUIRE    42
+#define CHIMERA_VFS_OP_LEASE_RELEASE    43
+#define CHIMERA_VFS_OP_NUM              44
 
 #define CHIMERA_VFS_OPEN_CREATE         (1U << 0)
 #define CHIMERA_VFS_OPEN_PATH           (1U << 1)
@@ -483,6 +487,15 @@ struct chimera_vfs_request {
     uint8_t                            token_count;
 
     struct chimera_vfs_module         *module;
+
+    /* The mount_private the backend returned from MOUNT for the mount that
+     * owns this request's file handle -- for a backend hosting several named
+     * filesystems, the one this operation targets.  Resolved from the mount
+     * table at alloc, which is authoritative now that a handle cannot outlive
+     * its mount: umount holds the mount live until every handle referencing
+     * it is gone, so this is set for every operation the backend sees,
+     * including the closes umount itself issues. */
+    void                              *mount_private;
     void                              *proto_callback;
     void                              *proto_private_data;
 
@@ -505,7 +518,7 @@ struct chimera_vfs_request {
      * once the lease is held (normally chimera_vfs_dispatch); io_lease_file
      * is the per-file state whose implicit lease this request has pinned
      * (NULL on the fast path where nothing was pinned). */
-    struct chimera_vfs_lease_owner     io_owner;
+    struct chimera_claim_actor         io_owner;
     uint8_t                            io_owner_valid;
     /* Set by chimera_vfs_io_recall(): this request is a namespace/metadata
      * mutation that must recall every caching lease on a target file (regardless
@@ -526,6 +539,10 @@ struct chimera_vfs_request {
      * floor handed to begin_break for this flavor. */
     uint8_t                            io_recall_single;
     uint8_t                            io_recall_retain;
+    /* Owned write parked until every awaited-class sync grant (FUSE
+     * coherence=sync) it invalidated has acked; the pump resume re-fires
+     * the write trigger before re-checking (rearm-on-demand races). */
+    uint8_t                            io_sync_write;
     void                               ( *io_next )(
         struct chimera_vfs_request *request);
     struct chimera_vfs_file_state     *io_lease_file;
@@ -756,6 +773,19 @@ struct chimera_vfs_request {
              * someone else to be dropped (chimera_vfs_umount_wait). */
             void                     *wait;
         } umount;
+
+        struct {
+            const char                      *name;
+            uint32_t                         namelen;
+            struct chimera_vfs_mount_options options;
+            char                             options_buffer[CHIMERA_VFS_MOUNT_OPT_BUFFER_MAX];
+            const char                      *raw_options;
+        } mkfs;
+
+        struct {
+            const char *name;
+            uint32_t    namelen;
+        } rmfs;
 
         struct {
             struct chimera_vfs_open_handle *handle;
@@ -1141,6 +1171,56 @@ struct chimera_vfs_request {
         } get_xattr;
 
         struct {
+            /* Backend lease acquire (CHIMERA_VFS_OP_LEASE_ACQUIRE).  Kindless
+             * wire: masks + a cluster-meaningful owner, never a protocol
+             * construct.  klass selects the claim shape. */
+            uint8_t                    klass;      /* CHIMERA_VFS_LEASE_AGGREGATE
+                                                    * / CHIMERA_VFS_LEASE_RANGE  */
+            uint8_t                    rev_used;   /* AGGREGATE: revocable use
+                                                    * union (CHIMERA_CLAIM_R|W)  */
+            uint8_t                    bind_deny;  /* AGGREGATE: binding deny
+                                                    * union (R|W|D)              */
+            uint8_t                    exclusive;  /* RANGE only                 */
+            uint64_t                   offset;     /* RANGE only                 */
+            uint64_t                   length;     /* RANGE only; UINT64_MAX =
+                                                    * to-EOF, 0 = zero-byte      */
+            struct chimera_claim_owner owner;      /* AGGREGATE: the node owner;
+                                                    *  RANGE: the lock's cluster-
+                                                    *  stable owner identity      */
+            uint64_t                   prev_token; /* AGGREGATE escalate: the
+                                                    * currently held token (0 =
+                                                    * fresh); the backend
+                                                    * replaces it atomically     */
+            /* Recall path, captured at grant: the backend invokes recall_cb
+            * (any thread) to demand the token back down to `retain`; the
+            * node's eventual LEASE_RELEASE with that token is the ack.  The
+            * core marshals internally; backends store the pair verbatim. */
+            void                       ( *recall_cb )(
+                void          *recall_arg,
+                const uint8_t *fh,
+                uint8_t        fh_len,
+                uint64_t       fh_hash,
+                uint64_t       token,
+                uint8_t        retain);
+            void                      *recall_arg;
+            uint64_t                   r_token;    /* backend-opaque, 0 = none  */
+            uint8_t                    r_granted;  /* AGGREGATE: granted subset
+                                                    *  of rev_used (deny bits are
+                                                    *  all-or-nothing with the
+                                                    *  grant); RANGE: nonzero =
+                                                    *  granted (all-or-nothing)  */
+        } lease_acquire;
+
+        struct {
+            /* Backend lease release (CHIMERA_VFS_OP_LEASE_RELEASE): drop or
+             * downgrade the record behind `token`.  retained == 0 releases
+             * outright; for an AGGREGATE under recall, the release with the
+             * retained mask IS the recall acknowledgment. */
+            uint64_t token;
+            uint8_t  retained;
+        } lease_release;
+
+        struct {
             struct chimera_vfs_open_handle *handle;
             uint32_t                        option;       /* setxattr_option4 */
             const char                     *name;
@@ -1425,6 +1505,40 @@ struct chimera_vfs_handle_state {
  * change_attr_type NFS4_CHANGE_TYPE_IS_MONOTONIC_INCR.  Modules that leave this
  * unset have change derived from ctime (change_attr_type TIME_METADATA). */
 #define CHIMERA_VFS_CAP_CHANGE                (1U << 24)
+
+/* If set, the module manages named filesystems via CHIMERA_VFS_OP_MKFS /
+ * CHIMERA_VFS_OP_RMFS.  Filesystems are created by name, mounted with a
+ * module path of "<name>[/subpath]" (the leading path component selects the
+ * filesystem), and removed only while no mount references them (RMFS returns
+ * CHIMERA_VFS_EBUSY otherwise).  Modules without this bit interpret the whole
+ * module path themselves (e.g. as a host path for passthrough backends). */
+#define CHIMERA_VFS_CAP_MKFS                  (1UL << 25)
+
+/* Backend lease arbitration (the claim-core projection boundary).
+ *
+ * A backend declaring CHIMERA_VFS_CAP_LEASE is the lease ARBITER for its
+ * files: the claim core routes cross-node visibility through it instead of
+ * deciding purely node-locally.  The wire is kindless -- masks, never
+ * protocol constructs -- and carries exactly two claim shapes:
+ *
+ *   AGGREGATE: one revocable per-node token per file covering the union of
+ *     the node's local holders -- rev_used (R|W: data the node reads/writes
+ *     or caches) plus bind_deny (R|W|D: the union of binding share-deny
+ *     bits).  Held lazily (escalate-or-reuse): the hot I/O path never
+ *     round-trips; only the first escalating acquire does.  The backend
+ *     may grant a subset, and may later RECALL via the recall callback
+ *     captured at acquire time; the node drains its local holders and
+ *     releases (the release IS the recall ack).
+ *
+ *   RANGE: one binding, non-recallable record per byte-range lock, keyed by
+ *     the cluster-stable owner identity (never a node id -- POSIX same-owner
+ *     coalescing must survive a client landing on two nodes).  Confirmed
+ *     before the local grant completes; all-or-nothing.
+ *
+ * A backend that sets this bit must implement BOTH lease ops and invoke the
+ * recall callback from whatever context it likes (the core marshals).  There
+ * is no partial mode. */
+#define CHIMERA_VFS_CAP_LEASE                 (1U << 26)
 
 struct chimera_vfs_module {
     /* Required

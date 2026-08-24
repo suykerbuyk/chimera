@@ -2,6 +2,8 @@
 #
 # SPDX-License-Identifier: LGPL-2.1-only
 
+add_subdirectory(quint)
+
 # FSX - File System Exerciser ported to Chimera POSIX API
 add_executable(posix_fsx fsx.c)
 target_link_libraries(posix_fsx chimera_posix chimera_client chimera_server)
@@ -130,6 +132,15 @@ endif()
 generate_posix_backend_tests(cairn CAIRN_ENABLED)
 generate_posix_backend_tests(linux CHIMERA_LINUX)
 generate_posix_backend_tests(io_uring CHIMERA_VFS_IO_URING)
+
+# CAP_LEASE projection tests (memfs is the only native arbiter; the env
+# knobs exist only there, so these stay out of the all-backend matrix)
+add_posix_testprog(test_lease_deny)
+add_posix_testprog(test_lease_recall)
+if(CHIMERA_LIMITS_TESTING)
+    add_posix_test(lease_deny_memfs test_lease_deny memfs)
+    add_posix_test(lease_recall_memfs test_lease_recall memfs)
+endif()
 
 # diskfs-only cache-eviction / cold-remount stress (not part of the
 # all-backend matrix: it shrinks the diskfs caches and remounts the devices)
