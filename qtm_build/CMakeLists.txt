@@ -13,11 +13,12 @@ install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/chimera.service DESTINATION ${DESTDIR}
 install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/chimera.default DESTINATION ${DESTDIR}/etc/default RENAME chimera )
 
 # Quantum-specific: install VFS headers consumed by downstream packaging.
-# Glob the public headers but skip internal-only ones (internal helpers, the
-# RCU caches, the proc dispatch table, and the open-cache release inlines,
-# which include the excluded vfs_open_cache.h).
+# Glob the public headers but skip internal-only ones (internal helpers
+# including the claim core's, the RCU caches, the proc dispatch table, and
+# the open-cache release inlines, which include the excluded
+# vfs_open_cache.h).
 file(GLOB VFS_HEADERS CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/vfs/*.h)
-list(FILTER VFS_HEADERS EXCLUDE REGEX "/(vfs_internal|vfs_release|vfs_[^/]*_cache)\\.h$")
+list(FILTER VFS_HEADERS EXCLUDE REGEX "/(vfs_[^/]*internal|vfs_release|vfs_[^/]*_cache)\\.h$")
 install(FILES ${VFS_HEADERS} DESTINATION include/vfs)
 install(FILES
 	${CMAKE_SOURCE_DIR}/ext/libevpl/ext/prometheus-c/prometheus-c.h
