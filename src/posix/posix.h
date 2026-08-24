@@ -73,6 +73,22 @@ int
 chimera_posix_umount(
     const char *mount_path);
 
+/* Create a named filesystem inside a CAP_MKFS module (memfs, diskfs, cairn);
+ * mount it afterwards with a module path of "<fsname>[/path]".  Returns 0 on
+ * success, -1 with errno set otherwise (EEXIST if the name is taken). */
+int
+chimera_posix_mkfs(
+    const char *module_name,
+    const char *fsname,
+    const char *options);
+
+/* Remove a named filesystem.  Returns 0 on success, -1 with errno set
+ * otherwise (EBUSY while the filesystem still has active mounts). */
+int
+chimera_posix_rmfs(
+    const char *module_name,
+    const char *fsname);
+
 int
 chimera_posix_open(
     const char *path,
@@ -312,10 +328,13 @@ chimera_posix_telldir(
 
 int
 chimera_posix_scandir(
-    const char *dirp,
+    const char      *dirp,
     struct dirent ***namelist,
-    int ( *filter )(const struct dirent *),
-    int ( *compar )(const struct dirent **, const struct dirent **));
+    int (           *filter )(
+        const struct dirent *),
+    int (           *compar )(
+        const struct dirent **,
+        const struct dirent **));
 
 // FILE* operations
 // CHIMERA_FILE is defined in posix_internal.h as a pointer to fd_entry

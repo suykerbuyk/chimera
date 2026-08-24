@@ -1051,6 +1051,40 @@ main(
         }
     }
 
+    /* "filesystems": named filesystems to ensure exist inside CAP_MKFS
+     * modules before any mounts reference them.  Declarative: a filesystem
+     * that already exists (EEXIST, e.g. a persistent backend rebooting
+     * against the same store) is not an error. */
+    json_t *filesystems = json_object_get(config, "filesystems");
+
+    if (filesystems) {
+        const char *fsname;
+        json_t     *fs_entry;
+        json_object_foreach(filesystems, fsname, fs_entry)
+        {
+            const char *fs_module  = json_string_value(json_object_get(fs_entry, "module"));
+            const char *fs_options = json_string_value(json_object_get(fs_entry, "options"));
+            int         fs_rc;
+
+            if (!fs_module) {
+                chimera_server_error("Filesystem %s missing module, skipping", fsname);
+                continue;
+            }
+
+            chimera_server_info("Creating filesystem %s in module %s...", fsname, fs_module);
+
+            fs_rc = chimera_server_mkfs(server, fs_module, fsname, fs_options);
+
+            if (fs_rc == CHIMERA_VFS_EEXIST) {
+                chimera_server_info("Filesystem %s already exists in module %s", fsname, fs_module);
+            } else if (fs_rc != 0) {
+                chimera_server_error("Failed to create filesystem %s in module %s",
+                                     fsname, fs_module);
+                exit(1);
+            }
+        }
+    }
+
     mounts = json_object_get(config, "mounts");
 
     if (mounts) {
@@ -1152,8 +1186,17 @@ main(
      * since no SMB client can create a reparse-point symlink on an empty share. */
     const char *seed_module = getenv("CHIMERA_SMB_SEED_SYMLINKS");
 
+    /* Where on the module the fixtures go.  "/" was the implicit filesystem
+     * every backend used to have; a CAP_MKFS backend has none, so the harness
+     * names the filesystem its shares mount (e.g. "fs0"). */
+    const char *seed_path = getenv("CHIMERA_SMB_SEED_PATH");
+
+    if (!seed_path || !seed_path[0]) {
+        seed_path = "/";
+    }
+
     if (seed_module && seed_module[0]) {
-        if (chimera_server_seed_symlinks(server, seed_module) != 0) {
+        if (chimera_server_seed_symlinks(server, seed_module, seed_path) != 0) {
             chimera_server_error("Failed to seed symlink fixtures on module %s",
                                  seed_module);
         } else {
@@ -1166,7 +1209,7 @@ main(
     const char *seed_fsa_module = getenv("CHIMERA_SMB_SEED_FSA");
 
     if (seed_fsa_module && seed_fsa_module[0]) {
-        if (chimera_server_seed_fsa(server, seed_fsa_module) != 0) {
+        if (chimera_server_seed_fsa(server, seed_fsa_module, seed_path) != 0) {
             chimera_server_error("Failed to seed FSA fixtures on module %s",
                                  seed_fsa_module);
         } else {

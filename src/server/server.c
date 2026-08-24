@@ -1582,6 +1582,63 @@ chimera_server_mount(
 
 } /* chimera_server_create_share */
 
+SYMBOL_EXPORT int
+chimera_server_mkfs(
+    struct chimera_server *server,
+    const char            *module_name,
+    const char            *fsname,
+    const char            *options)
+{
+    struct evpl               *evpl;
+    struct chimera_vfs_thread *thread;
+    struct mount_ctx           ctx = { .done = 0, .status = 0 };
+
+    evpl = evpl_create(NULL);
+
+    thread = chimera_vfs_thread_init(evpl, server->vfs);
+
+    chimera_vfs_mkfs(thread, NULL, module_name, fsname, options,
+                     chimera_server_mount_callback, &ctx);
+
+    while (!ctx.done) {
+        evpl_continue(evpl);
+    }
+
+    chimera_vfs_thread_destroy(thread);
+
+    evpl_destroy(evpl);
+
+    return ctx.status;
+} /* chimera_server_mkfs */
+
+SYMBOL_EXPORT int
+chimera_server_rmfs(
+    struct chimera_server *server,
+    const char            *module_name,
+    const char            *fsname)
+{
+    struct evpl               *evpl;
+    struct chimera_vfs_thread *thread;
+    struct mount_ctx           ctx = { .done = 0, .status = 0 };
+
+    evpl = evpl_create(NULL);
+
+    thread = chimera_vfs_thread_init(evpl, server->vfs);
+
+    chimera_vfs_rmfs(thread, NULL, module_name, fsname,
+                     chimera_server_mount_callback, &ctx);
+
+    while (!ctx.done) {
+        evpl_continue(evpl);
+    }
+
+    chimera_vfs_thread_destroy(thread);
+
+    evpl_destroy(evpl);
+
+    return ctx.status;
+} /* chimera_server_rmfs */
+
 /*
  * Ensure a directory path exists inside a backend before it is mounted, for the
  * "create" mount option.  A backend's MOUNT op only walks the path read-only
@@ -1826,8 +1883,13 @@ chimera_server_mkpath(
     const char            *module_path,
     uint32_t               mode)
 {
-    struct evpl              *evpl;
-    struct chimera_mkpath_ctx ctx;
+    struct evpl               *evpl;
+    struct chimera_mkpath_ctx  ctx;
+    struct chimera_vfs_module *module = NULL;
+    const char                *walk   = module_path;
+    const char                *slash;
+    char                       mount_root[256] = "/";
+    int                        i;
 
     memset(&ctx, 0, sizeof(ctx));
 
@@ -1836,16 +1898,43 @@ chimera_server_mkpath(
         return -1;
     }
 
+    /* For a CAP_MKFS module the leading component of module_path names the
+     * filesystem: the transient mount targets that filesystem's root and the
+     * walk covers only the remainder.  Other modules mount "/" and walk the
+     * whole path. */
+    for (i = 0; i < CHIMERA_VFS_MAX_MODULES; i++) {
+        if (server->vfs->modules[i] &&
+            strcmp(server->vfs->modules[i]->name, module_name) == 0) {
+            module = server->vfs->modules[i];
+            break;
+        }
+    }
+
+    if (module && (module->capabilities & CHIMERA_VFS_CAP_MKFS)) {
+        while (*walk == '/') {
+            walk++;
+        }
+        slash = strchr(walk, '/');
+        if (slash) {
+            snprintf(mount_root, sizeof(mount_root), "%.*s",
+                     (int) (slash - walk), walk);
+            walk = slash + 1;
+        } else {
+            snprintf(mount_root, sizeof(mount_root), "%s", walk);
+            walk += strlen(walk);
+        }
+    }
+
     evpl        = evpl_create(NULL);
     ctx.vfs     = server->vfs;
     ctx.thread  = chimera_vfs_thread_init(evpl, server->vfs);
     ctx.mode    = mode ? mode : 0755;
     ctx.status  = CHIMERA_VFS_OK;
-    ctx.pathlen = snprintf(ctx.path, sizeof(ctx.path), "%s", module_path);
+    ctx.pathlen = snprintf(ctx.path, sizeof(ctx.path), "%s", walk);
 
     /* Transiently mount the backend root so we have a handle to walk under. */
     chimera_vfs_mount(ctx.thread, chimera_vfs_get_server_cred(),
-                      CHIMERA_MKPATH_TMP_NAME, module_name, "/", NULL,
+                      CHIMERA_MKPATH_TMP_NAME, module_name, mount_root, NULL,
                       chimera_mkpath_mounted_cb, &ctx);
 
     while (!ctx.done) {
@@ -2065,7 +2154,8 @@ chimera_seed_mounted_cb(
 SYMBOL_EXPORT int
 chimera_server_seed_symlinks(
     struct chimera_server *server,
-    const char            *module_name)
+    const char            *module_name,
+    const char            *module_path)
 {
     struct evpl            *evpl;
     struct chimera_seed_ctx ctx;
@@ -2082,7 +2172,7 @@ chimera_server_seed_symlinks(
     ctx.status = CHIMERA_VFS_OK;
 
     chimera_vfs_mount(ctx.thread, chimera_vfs_get_server_cred(),
-                      CHIMERA_SEED_TMP_NAME, module_name, "/", NULL,
+                      CHIMERA_SEED_TMP_NAME, module_name, module_path, NULL,
                       chimera_seed_mounted_cb, &ctx);
 
     while (!ctx.done) {
@@ -2215,7 +2305,8 @@ chimera_seed_fsa_mounted_cb(
 SYMBOL_EXPORT int
 chimera_server_seed_fsa(
     struct chimera_server *server,
-    const char            *module_name)
+    const char            *module_name,
+    const char            *module_path)
 {
     struct evpl            *evpl;
     struct chimera_seed_ctx ctx;
@@ -2232,7 +2323,7 @@ chimera_server_seed_fsa(
     ctx.status = CHIMERA_VFS_OK;
 
     chimera_vfs_mount(ctx.thread, chimera_vfs_get_server_cred(),
-                      CHIMERA_SEED_TMP_NAME, module_name, "/", NULL,
+                      CHIMERA_SEED_TMP_NAME, module_name, module_path, NULL,
                       chimera_seed_fsa_mounted_cb, &ctx);
 
     while (!ctx.done) {
