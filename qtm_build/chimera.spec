@@ -1,6 +1,11 @@
+# Git commit id the package was built from; passed in by make_rpm_pkg.sh
+# via --define "commit <sha>".  Query with rpm -q --qf '%%{VCS}\n'.
+%{!?commit: %define commit unknown}
+
 Name: quantum-chimera-server
 Version: %{version}
 Release: %{release}
+Vcs: %{commit}
 
 Summary: Quantum Chimera NAS server
 License: Quantum Corporation
@@ -18,8 +23,7 @@ Requires: python3
 Requires: python3-requests
 
 %description
-Quantum build of the Chimera NAS server for
-the StorNext Filesystem (SNFS)
+Quantum build of the Chimera NAS server.
 
 %package -n quantum-chimera-snfs-module
 Summary: Quantum Chimera StorNext (SNFS) VFS module
@@ -54,6 +58,11 @@ mkdir -p %{buildroot}
 tar -xzf %{SOURCE0} -C %{buildroot}
 mkdir -p %{buildroot}/etc/ld.so.conf.d/
 echo "/opt/quantum/chimera/lib" > %{buildroot}/etc/ld.so.conf.d/chimera.conf
+# Version stamp for quick reference on installed systems; the same
+# information is carried in the VCS header tag.  Deliberately not
+# %%config: it must be replaced on every upgrade.
+echo "version: %{version}-%{release}" >  %{buildroot}/opt/quantum/chimera/etc/version
+echo "commit: %{commit}"              >> %{buildroot}/opt/quantum/chimera/etc/version
 # Runtime state directory (CHIMERA_STATE_DIR): holds secrets persisted by the
 # server (NFS file-handle signing key, SMB server GUID), so keep it 0700.
 mkdir -p %{buildroot}/opt/quantum/chimera/share/state
@@ -73,6 +82,7 @@ exit 0
 %defattr(-,root,root)
 /usr/lib/systemd/system/chimera.service
 /etc/ld.so.conf.d/chimera.conf
+/opt/quantum/chimera/etc/version
 %dir /etc/chimera
 %config(noreplace) /etc/default/chimera
 %config(noreplace) /etc/chimera/suppressions.txt

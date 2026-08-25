@@ -3,6 +3,11 @@
 VERSION=$1
 REVISION=$2
 ARCH=$3
+# Git commit id the packages were built from, stamped into the control
+# files as Quantum-Git-Commit (query with dpkg -s).  qb exports it into
+# the build container as QB_BUILD_GIT_SHA (with a -dirty suffix when the
+# source tree has local changes).
+COMMIT=${QB_BUILD_GIT_SHA:-unknown}
 
 PKG_DIR="$(basename $PWD)"
 
@@ -76,10 +81,20 @@ DEPENDS="${SHLIB_DEPS:+${SHLIB_DEPS}, }${EXTRA_DEPS}"
 sed -e "s/__VERSION__/${VERSION}/" \
     -e "s/__REVISION__/${REVISION}/" \
     -e "s/__ARCH__/${ARCH}/" \
+    -e "s/__COMMIT__/${COMMIT}/" \
     -e "s|__DEPENDS__|${DEPENDS}|" \
     /context/qtm_build/debian/control.tmpl > ./DEBIAN/control
 mkdir -p etc/ld.so.conf.d/
 echo "/opt/quantum/chimera/lib" > etc/ld.so.conf.d/chimera.conf
+
+# Version stamp for quick reference on installed systems; the same
+# information is carried in the package metadata (Quantum-Git-Commit).
+# Deliberately not a conffile: it must be replaced on every upgrade.
+mkdir -p opt/quantum/chimera/etc
+cat > opt/quantum/chimera/etc/version <<EOF
+version: ${VERSION}-${REVISION}
+commit: ${COMMIT}
+EOF
 
 # Runtime state directory (CHIMERA_STATE_DIR): holds secrets persisted by the
 # server (NFS file-handle signing key, SMB server GUID), so keep it 0700.
@@ -131,6 +146,7 @@ EOF
     sed -e "s/__VERSION__/${VERSION}/" \
         -e "s/__REVISION__/${REVISION}/" \
         -e "s/__ARCH__/${ARCH}/" \
+        -e "s/__COMMIT__/${COMMIT}/" \
         -e "s|__DEPENDS__|${TESTS_DEPENDS}|" \
         /context/qtm_build/debian/control-tests.tmpl > "${TESTS_ROOT}/DEBIAN/control"
 
