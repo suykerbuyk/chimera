@@ -7,6 +7,11 @@
 VERSION=$1
 REVISION=$2
 ARCH=$3
+# Git commit id the packages were built from, stamped into the RPM VCS
+# header tag (query with rpm -q --qf '%{VCS}\n').  qb exports it into
+# the build container as QB_BUILD_GIT_SHA (with a -dirty suffix when the
+# source tree has local changes).
+COMMIT=${QB_BUILD_GIT_SHA:-unknown}
 
 mkdir -p /build /dist /repo
 cd /build
@@ -17,6 +22,7 @@ cp /dist/chimera.tar.gz /build/rpmbuild/SOURCES
 rpmbuild -ba \
     --define "version ${VERSION}" \
     --define "release ${REVISION}" \
+    --define "commit ${COMMIT}" \
     /context/qtm_build/chimera.spec
 
 # Make the chimera Admin python module
@@ -35,6 +41,7 @@ tar -czf /build/rpmbuild/SOURCES/chimera-admin.tar.gz -C /build/admin-root .
 rpmbuild -ba \
     --define "version ${VERSION}" \
     --define "release ${REVISION}" \
+    --define "commit ${COMMIT}" \
     /context/qtm_build/python3-chimera-admin.spec
 
 # Create a repo with prereq RPM.

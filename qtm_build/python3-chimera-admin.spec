@@ -1,6 +1,11 @@
+# Git commit id the package was built from; passed in by make_rpm_pkg.sh
+# via --define "commit <sha>".  Query with rpm -q --qf '%%{VCS}\n'.
+%{!?commit: %define commit unknown}
+
 Name: python3-chimera-admin
 Version: %{version}
 Release: %{release}
+Vcs: %{commit}
 
 Summary: Chimera admin Python SDK
 License: Quantum Corporation
