@@ -36,18 +36,26 @@
 #include "nfs3_xdr.h"
 #include "nfs4_xdr.h"
 #include "nfs_mount_xdr.h"
+#include "portmap_xdr.h"
+#include "nlm4_xdr.h"
+#include "sm_inter_xdr.h"
 
 #include "evpl/evpl.h"
 #include "evpl/evpl_rpc2.h"
 
-#define MBT_MAX_ENTRIES 512     /* readdir entries copied out per reply */
-#define MBT_NAME_MAX    256
-#define MBT_MAX_DATA    (4 << 20) /* read payload copy-out bound */
+#define MBT_MAX_ENTRIES  512    /* readdir entries copied out per reply */
+#define MBT_NAME_MAX     256
+#define MBT_MAX_DATA     (4 << 20) /* read payload copy-out bound */
 
 /* Must match NFS_MOUNT_PORT in nfs_external_portmap.h: under inproc the
  * port number is only a service name ("chimera-inproc-20048"), but it
- * still has to be the name the server registered. */
-#define MBT_MOUNT_PORT  20048
+ * still has to be the name the server registered.  The auxiliary services
+ * follow the same rule: 111 is hardwired in nfs.c, the other two are the
+ * nfs_lockmgr_port / nfs_nsm_port defaults (server.c). */
+#define MBT_MOUNT_PORT   20048
+#define MBT_PORTMAP_PORT 111
+#define MBT_NLM_PORT     32803
+#define MBT_NSM_PORT     32765
 
 struct mbt_fh {
     int      has;
@@ -120,6 +128,15 @@ struct mbt_env_opts {
     const char *module;           /* VFS backend: NULL/"memfs", "diskfs",
                                    * "cairn".  diskfs/cairn self-provision
                                    * scratch under the env's session_dir. */
+    /* Auxiliary NFS services (portmap/rpcbind, NLM, NSM).  Off by default:
+     * the NFS3/NFS4 suites never touch them, and connecting three more
+     * inproc services per replay process is pure overhead there. */
+    int         aux;
+    /* server.portmap_hostname: when set, portmap universal addresses are
+     * built from this host instead of the connection's local address.  The
+     * aux suite uses it to make the uaddr predictable (the inproc local
+     * address is not an IP). */
+    const char *portmap_hostname;
 };
 
 struct mbt_env {
@@ -137,7 +154,24 @@ struct mbt_env {
     struct NFS_V4_CB           nfs_v4_cb;
     struct evpl_rpc2_cred      cred;
 
+    /* Auxiliary services, connected only when mbt_env_opts.aux is set.  The
+     * programs are registered on the client rpc2 thread either way, which
+     * costs nothing and lets the server call back into this process (NLM's
+     * *_RES messages ride the same connection the *_MSG arrived on). */
+    struct evpl_rpc2_conn     *portmap_conn;
+    struct evpl_rpc2_conn     *nlm_conn;
+    struct evpl_rpc2_conn     *nsm_conn;
+    struct PORTMAP_V2          pm_v2;
+    struct PORTMAP_V3          pm_v3;
+    struct PORTMAP_V4          pm_v4;
+    struct NLM_V4              nlm_v4;
+    struct SM_INTER_V1         nsm_v1;
+    /* struct mbt_aux_result *, owned by nfs_aux_mbt_common.h. */
+    void                      *aux;
+
     char                       session_dir[256];
+    char                       pt_root[256]; /* passthrough backing root
+                                              * (linux/io_uring); empty otherwise */
     uint8_t                   *data_buf;   /* READ copy-out scratch */
 
     struct mbt_result          res;
@@ -186,15 +220,24 @@ mbt_fh_eq(
 
 /* ---- server + client lifecycle ------------------------------------------ */
 
+/* memfs/diskfs/cairn create named filesystems (mkfs); linux and io_uring are
+ * passthrough backends that mount a host directory and have no mkfs. */
+static inline int
+mbt_module_is_passthrough(const char *module)
+{
+    return strcmp(module, "linux") == 0 || strcmp(module, "io_uring") == 0;
+} /* mbt_module_is_passthrough */
+
 static inline void
 mbt_env_open_opts(
     struct mbt_env            *env,
     const struct mbt_env_opts *opts)
 {
     struct chimera_server_config *config;
-    struct evpl_rpc2_program     *programs[4];
+    struct evpl_rpc2_program     *programs[9];
     struct evpl_endpoint         *nfs_ep;
     struct evpl_endpoint         *mount_ep;
+    int                           aux = opts && opts->aux;
 
     memset(env, 0, sizeof(*env));
 
@@ -223,6 +266,10 @@ mbt_env_open_opts(
     if (opts) {
         if (opts->nfs4_delegations) {
             chimera_server_config_set_nfs4_delegations(config, 1);
+        }
+        if (opts->portmap_hostname) {
+            chimera_server_config_set_portmap_hostname(config,
+                                                       opts->portmap_hostname);
         }
         if (opts->disable_caches) {
             chimera_server_config_set_attr_cache_enabled(config, 0);
@@ -270,6 +317,38 @@ mbt_env_open_opts(
                                          opts->memfs_config);
     }
 
+    /* Passthrough backends store their trees on a real host filesystem, which
+     * must support name_to_handle_at (the linux/io_uring modules derive their
+     * file handles with it) -- tmpfs and overlayfs do not, so the usual /tmp
+     * session_dir will not do.  Root the backing store at $CHIMERA_MBT_SCRATCH
+     * (default: the current directory, which under ctest is the build tree);
+     * an unsupported filesystem surfaces as an ENOTSUP mount that fs_setup
+     * turns into a clean skip. */
+    if (mbt_module_is_passthrough(env->module)) {
+        const char *scratch = getenv("CHIMERA_MBT_SCRATCH");
+        char       *abs_scratch;
+
+        if (!scratch || !scratch[0]) {
+            scratch = ".";
+        }
+        /* The module opens this path from a server thread, so it must be
+         * absolute; resolve $CHIMERA_MBT_SCRATCH (default cwd) to a real path. */
+        abs_scratch = realpath(scratch, NULL);
+        if (!abs_scratch) {
+            fprintf(stderr, "realpath(%s) failed: %s\n", scratch,
+                    strerror(errno));
+            exit(1);
+        }
+        snprintf(env->pt_root, sizeof(env->pt_root),
+                 "%s/nfs3_mbt_pt_XXXXXX", abs_scratch);
+        free(abs_scratch);
+        if (!mkdtemp(env->pt_root)) {
+            fprintf(stderr, "mkdtemp(%s) failed: %s\n", env->pt_root,
+                    strerror(errno));
+            exit(1);
+        }
+    }
+
     env->server = chimera_server_init(config, env->metrics);
 
     chimera_server_start(env->server);
@@ -282,13 +361,23 @@ mbt_env_open_opts(
     NFS_MOUNT_V3_init(&env->mount_v3);
     NFS_V4_init(&env->nfs_v4);
     NFS_V4_CB_init(&env->nfs_v4_cb);
+    PORTMAP_V2_init(&env->pm_v2);
+    PORTMAP_V3_init(&env->pm_v3);
+    PORTMAP_V4_init(&env->pm_v4);
+    NLM_V4_init(&env->nlm_v4);
+    SM_INTER_V1_init(&env->nsm_v1);
 
     programs[0] = &env->nfs_v3.rpc2;
     programs[1] = &env->mount_v3.rpc2;
     programs[2] = &env->nfs_v4.rpc2;
     programs[3] = &env->nfs_v4_cb.rpc2;
+    programs[4] = &env->pm_v2.rpc2;
+    programs[5] = &env->pm_v3.rpc2;
+    programs[6] = &env->pm_v4.rpc2;
+    programs[7] = &env->nlm_v4.rpc2;
+    programs[8] = &env->nsm_v1.rpc2;
 
-    env->rpc2_thread = evpl_rpc2_thread_init(env->evpl, programs, 4,
+    env->rpc2_thread = evpl_rpc2_thread_init(env->evpl, programs, 9,
                                              NULL, NULL);
 
     /* Endpoint names must match what the server derived from its ports
@@ -310,6 +399,40 @@ mbt_env_open_opts(
         exit(1);
     }
 
+    if (aux) {
+        /* The NLM connection also SERVES NLM_V4: the asynchronous half of the
+         * protocol (NLMPROC4_*_MSG) is answered by the server calling
+         * NLMPROC4_*_RES back on this very connection, so the client end has
+         * to export the program to receive them.  env rides along as the
+         * dispatch private_data. */
+        static struct evpl_rpc2_program *nlm_srv[1];
+        struct evpl_endpoint            *pm_ep, *nlm_ep, *nsm_ep;
+
+        pm_ep = chimera_tcp_flavor_endpoint_create(CHIMERA_TCP_FLAVOR_INPROC,
+                                                   "127.0.0.1",
+                                                   MBT_PORTMAP_PORT);
+        nlm_ep = chimera_tcp_flavor_endpoint_create(CHIMERA_TCP_FLAVOR_INPROC,
+                                                    "127.0.0.1", MBT_NLM_PORT);
+        nsm_ep = chimera_tcp_flavor_endpoint_create(CHIMERA_TCP_FLAVOR_INPROC,
+                                                    "127.0.0.1", MBT_NSM_PORT);
+
+        env->portmap_conn = evpl_rpc2_client_connect(env->rpc2_thread,
+                                                     EVPL_STREAM_INPROC,
+                                                     pm_ep, NULL, 0, NULL);
+        nlm_srv[0]    = &env->nlm_v4.rpc2;
+        env->nlm_conn = evpl_rpc2_client_connect(env->rpc2_thread,
+                                                 EVPL_STREAM_INPROC,
+                                                 nlm_ep, nlm_srv, 1, env);
+        env->nsm_conn = evpl_rpc2_client_connect(env->rpc2_thread,
+                                                 EVPL_STREAM_INPROC,
+                                                 nsm_ep, NULL, 0, NULL);
+
+        if (!env->portmap_conn || !env->nlm_conn || !env->nsm_conn) {
+            fprintf(stderr, "failed to connect to in-process aux services\n");
+            exit(1);
+        }
+    }
+
     /* AUTH_SYS root credential (uid 0, gid 0) so access
      * decisions and attr ownership are identical on both harnesses. */
     env->cred.flavor                  = EVPL_RPC2_AUTH_SYS;
@@ -323,22 +446,62 @@ mbt_env_open_opts(
     env->data_buf = malloc(MBT_MAX_DATA);
 } /* mbt_env_open_opts */
 
-/* Per-trace filesystem: create a fresh named filesystem (unique fsname =>
- * distinct fsid => distinct FH mount-id, so stale attr/name/open-cache entries
- * from an earlier trace can never be hit), mount it at "share", and export it.
- * Runs on the already-started server -- the trade that lets one process
- * amortize server/client init across every trace of a batch. */
+/* Per-trace filesystem: stand up a fresh, isolated root, mount it at "share",
+ * and export it.  Runs on the already-started server -- the trade that lets one
+ * process amortize server/client init across every trace of a batch.
+ *
+ * mkfs backends get a fresh named filesystem (unique fsname => distinct fsid =>
+ * distinct FH mount-id, so stale attr/name/open-cache entries from an earlier
+ * trace can never be hit).  Passthrough backends instead get a fresh host
+ * subdirectory: a brand-new inode is the passthrough analogue of a fresh fsid,
+ * and because the dir is left in place on teardown (only unmounted) its inode
+ * is never reused mid-run, so cached FHs likewise cannot collide across
+ * traces.  The whole session_dir is reaped at process exit. */
 static inline void
 mbt_env_fs_setup(
     struct mbt_env *env,
     const char     *fsname)
 {
-    if (chimera_server_mkfs(env->server, env->module, fsname, NULL) != 0) {
-        fprintf(stderr, "failed to create %s filesystem %s\n", env->module,
-                fsname);
-        exit(1);
+    if (mbt_module_is_passthrough(env->module)) {
+        char dir[300];
+        int  mrc;
+
+        snprintf(dir, sizeof(dir), "%s/%s", env->pt_root, fsname);
+        /* The model's export root is 0777, owned root:root; create it that way
+         * (umask is neutralized in the replayer main) so the passthrough tree
+         * starts from the same state as the mkfs backends. */
+        if (mkdir(dir, 0777) != 0 && errno != EEXIST) {
+            fprintf(stderr, "failed to create %s backing dir %s: %s\n",
+                    env->module, dir, strerror(errno));
+            exit(1);
+        }
+        mrc = chimera_server_mount(env->server, "share", env->module, dir,
+                                   NULL);
+        if (mrc == CHIMERA_VFS_ENOTSUP) {
+            /* The backing filesystem cannot produce file handles
+             * (name_to_handle_at): tmpfs/overlayfs, e.g. a /tmp or overlay
+             * build tree.  Skip rather than fail -- point CHIMERA_MBT_SCRATCH
+             * at an ext4/xfs/btrfs path to actually exercise the backend.
+             * _exit() to bypass evpl's atexit leak-check, which would abort on
+             * the buffers the failed mount left pinned. */
+            fprintf(stderr, "SKIP: %s backend needs a name_to_handle_at-capable "
+                    "scratch fs; %s is not one (set CHIMERA_MBT_SCRATCH)\n",
+                    env->module, dir);
+            _exit(77);
+        }
+        if (mrc != 0) {
+            fprintf(stderr, "mount %s at %s failed: status=%d\n",
+                    env->module, dir, mrc);
+            _exit(1);
+        }
+    } else {
+        if (chimera_server_mkfs(env->server, env->module, fsname, NULL) != 0) {
+            fprintf(stderr, "failed to create %s filesystem %s\n", env->module,
+                    fsname);
+            exit(1);
+        }
+        chimera_server_mount(env->server, "share", env->module, fsname, NULL);
     }
-    chimera_server_mount(env->server, "share", env->module, fsname, NULL);
     if (chimera_server_create_export(env->server, "/share", "/share", 0,
                                      NULL) != 0) {
         fprintf(stderr, "failed to create /share export\n");
@@ -357,6 +520,15 @@ mbt_env_fs_teardown(
 
     chimera_server_remove_export(env->server, "/share");
     chimera_server_unmount(env->server, "share");
+
+    /* Passthrough backends have no filesystem to remove; the unmounted host
+     * dir is intentionally left in place (its inode must not be reused
+     * mid-run, see mbt_env_fs_setup) and is reaped with the session_dir.
+     * Unlike a leaked named fs, an unmounted host dir is inert -- the VFS does
+     * not walk it -- so there is no quadratic cost. */
+    if (mbt_module_is_passthrough(env->module)) {
+        return;
+    }
 
     /* nfs3 is stateless, so rmfs is free once the mount is gone.  nfs4 leaves
      * the just-closed opens (v4_close_dangling_opens) draining on the server's
@@ -395,6 +567,15 @@ mbt_env_stop(struct mbt_env *env)
 {
     char cmd[300];
 
+    if (env->portmap_conn) {
+        evpl_rpc2_client_disconnect(env->rpc2_thread, env->portmap_conn);
+    }
+    if (env->nlm_conn) {
+        evpl_rpc2_client_disconnect(env->rpc2_thread, env->nlm_conn);
+    }
+    if (env->nsm_conn) {
+        evpl_rpc2_client_disconnect(env->rpc2_thread, env->nsm_conn);
+    }
     evpl_rpc2_client_disconnect(env->rpc2_thread, env->nfs_conn);
     evpl_rpc2_client_disconnect(env->rpc2_thread, env->mount_conn);
     evpl_rpc2_thread_destroy(env->rpc2_thread);
@@ -435,6 +616,23 @@ mbt_call_wait(struct mbt_env *env)
         exit(3);
     }
 } /* mbt_call_wait */
+
+/* Same pump, but an RPC-level refusal is a modeled outcome rather than a
+ * harness bug: the auxiliary suite deliberately calls procedures chimera
+ * does not implement and expects PROC_UNAVAIL (accept_stat 3) back.  A
+ * negative status still means the transport itself failed (see
+ * EVPL_RPC2_REPLY_* in evpl_rpc2_program.h) and is fatal here too. */
+static inline void
+mbt_call_wait_soft(struct mbt_env *env)
+{
+    while (!env->res.done) {
+        evpl_continue(env->evpl);
+    }
+    if (env->res.rpc_err < 0) {
+        fprintf(stderr, "rpc2 transport error %d\n", env->res.rpc_err);
+        exit(3);
+    }
+} /* mbt_call_wait_soft */
 
 /* ---- MOUNT --------------------------------------------------------------- */
 

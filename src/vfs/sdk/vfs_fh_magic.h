@@ -8,9 +8,21 @@
  * that can never be changed.  They can be reserved
  * here.
  *
- * The 1-byte magic must be the first byte of all
- * file handles returned by the plugin to ensure
- * uniqueness across plugins.
+ * The magic identifies the module, not the bytes of a file handle.  It is
+ * stamped into struct chimera_vfs_module.fh_magic and core uses it to:
+ *
+ *   - index the process-wide module tables (chimera_vfs.modules and the
+ *     per-thread module_private), which is why it must be unique and
+ *     stable across releases;
+ *   - namespace keys when an fh-routed KV operation falls back to the
+ *     shared default KV module (see chimera_vfs_kv_route_fh), so keys from
+ *     different backends cannot collide there;
+ *   - stand in as a one-byte synthetic handle for the bootstrap operations
+ *     that run before any mount exists (mount, getrootfh).
+ *
+ * It is NOT a prefix of the handles a module returns.  Handles are routed
+ * on their leading 16-byte mount_id; the contract a module has to satisfy
+ * is documented at the top of vfs_fh.h.
  *
  * This header is MIT licensed, unlike the rest of chimera, so that
  * out-of-tree VFS modules under any license may modify it if desired
@@ -35,8 +47,8 @@ enum CHIMERA_FS_FH_MAGIC {
     /* The last 16 values (240-255) are reserved for proprietary
      * out-of-tree VFS modules and will never be assigned to
      * in-tree modules. */
-    CHIMERA_VFS_FH_MAGIC_MYRIAD   = 240, // CHIMERA_VFS_FH_MAGIC_VENDOR0
-    CHIMERA_VFS_FH_MAGIC_SNFS     = 241, // CHIMERA_VFS_FH_MAGIC_VENDOR1
+    CHIMERA_VFS_FH_MAGIC_VENDOR0  = 240,
+    CHIMERA_VFS_FH_MAGIC_VENDOR1  = 241,
     CHIMERA_VFS_FH_MAGIC_VENDOR2  = 242,
     CHIMERA_VFS_FH_MAGIC_VENDOR3  = 243,
     CHIMERA_VFS_FH_MAGIC_VENDOR4  = 244,
@@ -50,5 +62,14 @@ enum CHIMERA_FS_FH_MAGIC {
     CHIMERA_VFS_FH_MAGIC_VENDOR12 = 252,
     CHIMERA_VFS_FH_MAGIC_VENDOR13 = 253,
     CHIMERA_VFS_FH_MAGIC_VENDOR14 = 254,
-    CHIMERA_VFS_FH_MAGIC_VENDOR15 = 255
+    CHIMERA_VFS_FH_MAGIC_VENDOR15 = 255,
+
+    /* Quantum's assignments for the two vendor slots its out-of-tree
+     * modules claim.  Aliases rather than renames: upstream names the
+     * slots positionally and its own examples/vfs_module selects
+     * VENDOR0 by that name, so renaming the enumerators made this
+     * header conflict on every upstream sync and broke the example
+     * build.  Adding names costs nothing and keeps the merge clean. */
+    CHIMERA_VFS_FH_MAGIC_MYRIAD   = CHIMERA_VFS_FH_MAGIC_VENDOR0,
+    CHIMERA_VFS_FH_MAGIC_SNFS     = CHIMERA_VFS_FH_MAGIC_VENDOR1
 };

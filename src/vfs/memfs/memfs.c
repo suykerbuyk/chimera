@@ -13,15 +13,17 @@
 #include <sys/stat.h>
 #include <jansson.h>
 #include <utlist.h>
+#include <urcu/urcu-qsbr.h>
 
-#include "common/varint.h"
+#include "vfs/sdk/vfs_varint.h"
 #include "common/rbtree.h"
 
-#include "vfs/vfs.h"
-#include "vfs/vfs_internal.h"
-#include "vfs/vfs_acl.h"
-#include "vfs/vfs_access.h"
-#include "vfs/vfs_xattr_name.h"
+#include "vfs/sdk/chimera_vfs_sdk.h"
+#include "vfs/sdk/vfs_fh.h"
+#include "vfs/sdk/vfs_acl.h"
+#include "vfs/sdk/vfs_access.h"
+#include "vfs/sdk/vfs_xattr_name.h"
+#include "vfs/vfs_clock.h"
 #include "memfs.h"
 #include "common/logging.h"
 #include "common/misc.h"
@@ -2815,6 +2817,22 @@ memfs_mkdir_at(
         return;
     }
 
+    /* A directory that has been removed is an orphan: it survives only as
+     * long as a descriptor pins it, and POSIX lets nothing be created in or
+     * resolved through it any more (Linux returns ENOENT for every *at() call
+     * made against such a dirfd).  memfs zeroes a directory's link count when
+     * it is removed, so that is the test.  It follows the type check, matching
+     * the order the standard's *at() resolution uses: what the descriptor
+     * names first, whether it still exists second. */
+    if (parent_inode->nlink == 0) {
+        pthread_mutex_unlock(&parent_inode->lock);
+        request->status = CHIMERA_VFS_ENOENT;
+        request->complete(request);
+        memfs_inode_free(thread, inode);
+        memfs_dirent_free(thread, dirent);
+        return;
+    }
+
     /* Set parent pointer for .. lookup support */
     inode->dir.parent_inum = parent_inode->inum;
     inode->dir.parent_gen  = parent_inode->gen;
@@ -2905,6 +2923,17 @@ memfs_mknod_at(
     inode->change++;
     inode->btime = now;
 
+    /* Inodes come off a free list and memfs_inode_alloc does not reset the
+    * type-specific union, so a recycled inode still holds the previous
+    * occupant's block array pointer.  POSIX lets mknod(2) create a regular
+    * file (S_IFREG, or an unspecified type), and for that inode
+    * memfs_inode_free takes the S_ISREG branch and frees inode->file.blocks
+    * -- freeing the stale pointer and corrupting the heap.  The create and
+    * open-with-create paths clear these explicitly for the same reason. */
+    inode->file.blocks     = NULL;
+    inode->file.num_blocks = 0;
+    inode->file.max_blocks = 0;
+
     /* The mode (including file type bits S_IFCHR/S_IFBLK/S_IFSOCK/S_IFIFO)
      * and rdev are set via set_attr by the caller */
     if (request->mknod_at.set_attr->va_set_mask & CHIMERA_VFS_ATTR_MODE) {
@@ -2942,6 +2971,22 @@ memfs_mknod_at(
     if (!S_ISDIR(parent_inode->mode)) {
         pthread_mutex_unlock(&parent_inode->lock);
         request->status = CHIMERA_VFS_ENOTDIR;
+        request->complete(request);
+        memfs_inode_free(thread, inode);
+        memfs_dirent_free(thread, dirent);
+        return;
+    }
+
+    /* A directory that has been removed is an orphan: it survives only as
+     * long as a descriptor pins it, and POSIX lets nothing be created in or
+     * resolved through it any more (Linux returns ENOENT for every *at() call
+     * made against such a dirfd).  memfs zeroes a directory's link count when
+     * it is removed, so that is the test.  It follows the type check, matching
+     * the order the standard's *at() resolution uses: what the descriptor
+     * names first, whether it still exists second. */
+    if (parent_inode->nlink == 0) {
+        pthread_mutex_unlock(&parent_inode->lock);
+        request->status = CHIMERA_VFS_ENOENT;
         request->complete(request);
         memfs_inode_free(thread, inode);
         memfs_dirent_free(thread, dirent);
@@ -3026,6 +3071,20 @@ memfs_remove_at(
         return;
     }
 
+    /* A directory that has been removed is an orphan: it survives only as
+     * long as a descriptor pins it, and POSIX lets nothing be created in or
+     * resolved through it any more (Linux returns ENOENT for every *at() call
+     * made against such a dirfd).  memfs zeroes a directory's link count when
+     * it is removed, so that is the test.  It follows the type check, matching
+     * the order the standard's *at() resolution uses: what the descriptor
+     * names first, whether it still exists second. */
+    if (parent_inode->nlink == 0) {
+        pthread_mutex_unlock(&parent_inode->lock);
+        request->status = CHIMERA_VFS_ENOENT;
+        request->complete(request);
+        return;
+    }
+
     rb_tree_query_exact(&parent_inode->dir.dirents, hash, hash, dirent);
 
     if (!dirent) {
@@ -3103,11 +3162,13 @@ memfs_remove_at(
         inode->nlink = 0;
     } else {
         inode->nlink--;
-        /* Removing one of several hard links changes the surviving inode's
-         * link count, which is a status change: bump its ctime. */
+        /* The link count changed, so the change attribute advances whether or
+         * not a link survives.  ctime is the narrower POSIX rule: marked only
+         * "if the file's link count is not 0" (XSH unlink()), which is also
+         * what the rename-over path applies to the target it clobbers. */
+        inode->change++;
         if (inode->nlink > 0) {
             inode->ctime = now;
-            inode->change++;
         }
     }
 
@@ -3361,6 +3422,20 @@ memfs_open_at(
         return;
     }
 
+    /* A directory that has been removed is an orphan: it survives only as
+     * long as a descriptor pins it, and POSIX lets nothing be created in or
+     * resolved through it any more (Linux returns ENOENT for every *at() call
+     * made against such a dirfd).  memfs zeroes a directory's link count when
+     * it is removed, so that is the test.  It follows the type check, matching
+     * the order the standard's *at() resolution uses: what the descriptor
+     * names first, whether it still exists second. */
+    if (parent_inode->nlink == 0) {
+        pthread_mutex_unlock(&parent_inode->lock);
+        request->status = CHIMERA_VFS_ENOENT;
+        request->complete(request);
+        return;
+    }
+
     memfs_map_pre_attr(fs, &request->open_at.r_dir_pre_attr, parent_inode, request->fh);
 
     rb_tree_query_exact(&parent_inode->dir.dirents, hash, hash, dirent);
@@ -3477,6 +3552,21 @@ memfs_open_at(
             pthread_mutex_unlock(&inode->lock);
             pthread_mutex_unlock(&parent_inode->lock);
             request->status = CHIMERA_VFS_EEXIST;
+            request->complete(request);
+            return;
+        }
+
+        /* CHIMERA_VFS_OPEN_CREATE_REGULAR (NFS3 UNCHECKED create): the create
+         * must yield a regular file, so an existing non-regular object at the
+         * name is not opened -- a directory gives EISDIR, any other type
+         * (symlink/socket/fifo) gives EEXIST.  Answered from the inode we
+         * already hold, no data open. */
+        if ((flags & CHIMERA_VFS_OPEN_CREATE_REGULAR) && !S_ISREG(inode->mode)) {
+            enum chimera_vfs_error e = S_ISDIR(inode->mode) ?
+                CHIMERA_VFS_EISDIR : CHIMERA_VFS_EEXIST;
+            pthread_mutex_unlock(&inode->lock);
+            pthread_mutex_unlock(&parent_inode->lock);
+            request->status = e;
             request->complete(request);
             return;
         }
@@ -5139,6 +5229,321 @@ memfs_seek(
     }
 } /* memfs_seek */
 
+/*
+ * READ_PLUS: classify the leading byte-run at request->read_plus.offset as a
+ * single DATA or HOLE segment from the sparse block map (NULL block = hole).
+ * Returns only the classification + run length; the NFS server fetches DATA
+ * bytes via a normal read.  One segment per call is sufficient (the client
+ * re-issues from the last byte returned).
+ */
+static void
+memfs_read_plus(
+    struct memfs_thread        *thread,
+    struct memfs_fs            *fs,
+    struct chimera_vfs_request *request,
+    void                       *private_data)
+{
+    struct memfs_inode        *inode;
+    struct memfs_named_stream *stream;
+    struct memfs_fork         *fork;
+    uint64_t                   fork_size;
+    uint64_t                   offset = request->read_plus.offset;
+    uint64_t                   length = request->read_plus.length;
+    uint64_t                   first_block, bi, natural_end, seg_end;
+    int                        is_data;
+
+    (void) thread;
+
+    inode = memfs_resolve_io(fs, request->read_plus.handle,
+                             request->fh, request->fh_len, &stream);
+
+    if (unlikely(!inode)) {
+        request->status = CHIMERA_VFS_ENOENT;
+        request->complete(request);
+        return;
+    }
+
+    fork      = stream ? &stream->fork : &inode->file;
+    fork_size = stream ? stream->size : inode->size;
+
+    /* At or past EOF: no segment, just report eof (the NFS server returns
+     * NFS4_OK with an empty content array). */
+    if (offset >= fork_size || length == 0) {
+        pthread_mutex_unlock(&inode->lock);
+        request->status              = CHIMERA_VFS_OK;
+        request->read_plus.r_is_data = 0;
+        request->read_plus.r_length  = 0;
+        request->read_plus.r_eof     = (offset >= fork_size);
+        request->complete(request);
+        return;
+    }
+
+    const uint32_t block_shift = thread->shared->block_shift;
+
+    first_block = offset >> block_shift;
+    is_data     = (fork->blocks && first_block < fork->num_blocks &&
+                   fork->blocks[first_block]) ? 1 : 0;
+
+    /* Walk forward to the run boundary (where block presence flips). */
+    bi = first_block;
+    if (is_data) {
+        while (bi < fork->num_blocks && fork->blocks[bi]) {
+            bi++;
+        }
+        natural_end = bi << block_shift;
+    } else {
+        while (bi < fork->num_blocks &&
+               !(fork->blocks && fork->blocks[bi])) {
+            bi++;
+        }
+        natural_end = (bi >= fork->num_blocks) ? fork_size : (bi << block_shift);
+    }
+
+    if (natural_end > fork_size) {
+        natural_end = fork_size;
+    }
+
+    seg_end = natural_end;
+    if (seg_end > offset + length) {
+        seg_end = offset + length;
+    }
+
+    pthread_mutex_unlock(&inode->lock);
+
+    request->status              = CHIMERA_VFS_OK;
+    request->read_plus.r_is_data = is_data;
+    request->read_plus.r_length  = seg_end - offset;
+    request->read_plus.r_eof     = (seg_end >= fork_size);
+
+    request->complete(request);
+} /* memfs_read_plus */
+
+/* Tile `tmpl` (period `period` bytes) into dst[0..len), starting at template
+ * phase (rel_off % period). */
+static inline void
+memfs_tile_pattern(
+    uint8_t       *dst,
+    uint64_t       len,
+    uint64_t       rel_off,
+    const uint8_t *tmpl,
+    uint32_t       period)
+{
+    uint32_t phase = rel_off % period;
+    uint64_t done  = 0;
+
+    while (done < len) {
+        uint32_t chunk = period - phase;
+        if (chunk > len - done) {
+            chunk = len - done;
+        }
+        memcpy(dst + done, tmpl + phase, chunk);
+        done += chunk;
+        phase = 0;
+    }
+} /* memfs_tile_pattern */
+
+/*
+ * WRITE_SAME: materialize block_count Application Data Blocks of block_size
+ * bytes from offset, each block zero-filled with `pattern` placed at
+ * reloff_pattern.  Implemented by tiling a single ADB-block template across the
+ * affected memfs blocks (memfs block size is independent of the ADB block size).
+ */
+static void
+memfs_write_same(
+    struct memfs_thread        *thread,
+    struct memfs_fs            *fs,
+    struct chimera_vfs_request *request,
+    void                       *private_data)
+{
+    struct evpl               *evpl = thread->evpl;
+    struct memfs_inode        *inode;
+    struct memfs_named_stream *stream;
+    struct memfs_fork         *fork;
+    uint64_t                  *p_size, *p_space_used;
+    struct memfs_block        *block, *old_block;
+    uint64_t                   offset    = request->write_same.offset;
+    uint32_t                   adb_bsize = request->write_same.block_size;
+    uint64_t                   total;
+    uint64_t                   first_block, last_block, bi;
+    uint32_t                   block_offset, block_len;
+    uint64_t                   left, cur_off;
+    uint8_t                   *tmpl;
+    struct timespec            now;
+
+    total = adb_bsize * request->write_same.block_count;
+
+    if (total == 0) {
+        /* Nothing to write (block_count or block_size is 0). */
+        inode = memfs_resolve_io(fs, request->write_same.handle,
+                                 request->fh, request->fh_len, &stream);
+        if (unlikely(!inode)) {
+            request->status = CHIMERA_VFS_ENOENT;
+            request->complete(request);
+            return;
+        }
+        memfs_map_attrs_fork(fs, &request->write_same.r_pre_attr, inode, stream, request->fh);
+        memfs_map_attrs_fork(fs, &request->write_same.r_post_attr, inode, stream, request->fh);
+        pthread_mutex_unlock(&inode->lock);
+        request->status             = CHIMERA_VFS_OK;
+        request->write_same.r_count = 0;
+        request->write_same.r_sync  = CHIMERA_VFS_WRITE_FILESYNC;
+        request->complete(request);
+        return;
+    }
+
+    chimera_vfs_realtime(&now);
+
+    const uint32_t block_size  = thread->shared->block_size;
+    const uint32_t block_shift = thread->shared->block_shift;
+    const uint32_t block_mask  = thread->shared->block_mask;
+
+    /* Build one ADB-block template: zero-filled with the pattern at
+     * reloff_pattern.  The NFS server has already validated that
+     * reloff_pattern + pattern_len <= adb_bsize. */
+    tmpl = malloc(adb_bsize);
+    chimera_memfs_abort_if(tmpl == NULL, "write_same template OOM");
+    memset(tmpl, 0, adb_bsize);
+    if (request->write_same.pattern_len) {
+        memcpy(tmpl + request->write_same.reloff_pattern,
+               request->write_same.pattern,
+               request->write_same.pattern_len);
+    }
+
+    inode = memfs_resolve_io(fs, request->write_same.handle,
+                             request->fh, request->fh_len, &stream);
+
+    if (unlikely(!inode)) {
+        free(tmpl);
+        request->status = CHIMERA_VFS_ENOENT;
+        request->complete(request);
+        return;
+    }
+
+    if (!S_ISREG(inode->mode)) {
+        request->status = S_ISDIR(inode->mode) ?
+            CHIMERA_VFS_EISDIR : CHIMERA_VFS_EINVAL;
+        pthread_mutex_unlock(&inode->lock);
+        free(tmpl);
+        request->complete(request);
+        return;
+    }
+
+    fork         = stream ? &stream->fork : &inode->file;
+    p_size       = stream ? &stream->size : &inode->size;
+    p_space_used = stream ? &stream->space_used : &inode->space_used;
+
+    memfs_map_attrs_fork(fs, &request->write_same.r_pre_attr, inode, stream, request->fh);
+
+    first_block  = offset >> block_shift;
+    block_offset = offset & block_mask;
+    last_block   = (offset + total - 1) >> block_shift;
+    left         = total;
+    cur_off      = offset;
+
+    if (fork->max_blocks <= last_block || !fork->blocks) {
+        struct memfs_block **new_blocks;
+        unsigned int         new_max_blocks = 1024;
+
+        while (new_max_blocks <= last_block) {
+            new_max_blocks <<= 1;
+        }
+
+        new_blocks = calloc(new_max_blocks, sizeof(struct memfs_block *));
+
+        if (!new_blocks) {
+            pthread_mutex_unlock(&inode->lock);
+            free(tmpl);
+            request->status = CHIMERA_VFS_ENOSPC;
+            request->complete(request);
+            return;
+        }
+
+        if (fork->blocks) {
+            memcpy(new_blocks, fork->blocks,
+                   fork->num_blocks * sizeof(struct memfs_block *));
+            free(fork->blocks);
+        }
+
+        fork->blocks     = new_blocks;
+        fork->max_blocks = new_max_blocks;
+    }
+
+    if (last_block + 1 > fork->num_blocks) {
+        fork->num_blocks = last_block + 1;
+    }
+
+    for (bi = first_block; bi <= last_block; bi++) {
+        block_len = block_size - block_offset;
+        if (left < block_len) {
+            block_len = left;
+        }
+
+        old_block = fork->blocks ? fork->blocks[bi] : NULL;
+
+        block = memfs_block_alloc_charged(thread, fs, old_block ? 0 : 1);
+
+        if (!block) {
+            pthread_mutex_unlock(&inode->lock);
+            free(tmpl);
+            request->status = CHIMERA_VFS_ENOSPC;
+            request->complete(request);
+            return;
+        }
+
+        block->niov = evpl_iovec_alloc(evpl, block_size, 4096,
+                                       CHIMERA_MEMFS_BLOCK_MAX_IOV,
+                                       EVPL_IOVEC_FLAG_SHARED, block->iov);
+
+        /* Zero any prefix/suffix of this memfs block that the ADB region does
+         * not cover (partial leading/trailing block). */
+        if (block_offset) {
+            memset(block->iov[0].data, 0, block_offset);
+        }
+        if (block_offset + block_len < block_size) {
+            memset(block->iov[0].data + block_offset + block_len, 0,
+                   block_size - block_offset - block_len);
+        }
+
+        /* Tile the ADB pattern into the covered span. */
+        memfs_tile_pattern(block->iov[0].data + block_offset, block_len,
+                           cur_off - offset, tmpl, adb_bsize);
+
+        if (old_block) {
+            fork->blocks[bi] = NULL;
+            memfs_block_free_charged(thread, fs, old_block, 0);
+        }
+        fork->blocks[bi] = block;
+
+        cur_off     += block_len;
+        left        -= block_len;
+        block_offset = 0;
+    }
+
+    if (*p_size < offset + total) {
+        *p_size       = offset + total;
+        *p_space_used = (*p_size + 4095) & ~4095;
+    }
+
+    inode->mtime = now;
+    inode->ctime = now;
+    /* WRITE_SAME changes file data, so it must advance the change attribute
+     * like WRITE does -- a client that validates its cache against change
+     * would otherwise never notice the write. */
+    inode->change++;
+
+    memfs_map_attrs_fork(fs, &request->write_same.r_post_attr, inode, stream, request->fh);
+
+    pthread_mutex_unlock(&inode->lock);
+
+    free(tmpl);
+
+    request->status             = CHIMERA_VFS_OK;
+    request->write_same.r_count = total;
+    request->write_same.r_sync  = CHIMERA_VFS_WRITE_FILESYNC;
+
+    request->complete(request);
+} /* memfs_write_same */
+
 static void
 memfs_symlink_at(
     struct memfs_thread        *thread,
@@ -5200,6 +5605,22 @@ memfs_symlink_at(
     if (!S_ISDIR(parent_inode->mode)) {
         pthread_mutex_unlock(&parent_inode->lock);
         request->status = CHIMERA_VFS_ENOTDIR;
+        request->complete(request);
+        memfs_inode_free(thread, inode);
+        memfs_dirent_free(thread, dirent);
+        return;
+    }
+
+    /* A directory that has been removed is an orphan: it survives only as
+     * long as a descriptor pins it, and POSIX lets nothing be created in or
+     * resolved through it any more (Linux returns ENOENT for every *at() call
+     * made against such a dirfd).  memfs zeroes a directory's link count when
+     * it is removed, so that is the test.  It follows the type check, matching
+     * the order the standard's *at() resolution uses: what the descriptor
+     * names first, whether it still exists second. */
+    if (parent_inode->nlink == 0) {
+        pthread_mutex_unlock(&parent_inode->lock);
+        request->status = CHIMERA_VFS_ENOENT;
         request->complete(request);
         memfs_inode_free(thread, inode);
         memfs_dirent_free(thread, dirent);
@@ -5581,13 +6002,22 @@ memfs_rename_at(
                     existing_freed = 1;
                 }
             }
-            /* POSIX: dropping a link is a status change on the clobbered
-             * inode.  If it survives (a remaining hard link, or unlinked but
-             * still open) its ctime/change must advance so a handle that still
-             * resolves to it observes the update. */
+            /* POSIX (XSH unlink(), which rename()'s removal of the target
+             * follows): dropping a link marks the file's ctime "if the file's
+             * link count is not 0".  A surviving hard link therefore records
+             * the status change; the last link going away does not, and an fd
+             * held across the rename sees the ctime it had before.  This is
+             * the same condition memfs_remove_at applies -- the two paths
+             * remove a link for the same reason and must age the inode the
+             * same way. */
             if (!existing_freed) {
-                existing_inode->ctime = now;
+                /* The change attribute tracks any mutation of the object,
+                 * link count included (RFC 7530 change), so it advances even
+                 * for the last link; ctime does not. */
                 existing_inode->change++;
+                if (existing_inode->nlink > 0) {
+                    existing_inode->ctime = now;
+                }
             }
             pthread_mutex_unlock(&existing_inode->lock);
             memfs_dirent_free(thread, existing_dirent);
@@ -5677,6 +6107,20 @@ memfs_link_at(
     if (!S_ISDIR(parent_inode->mode)) {
         pthread_mutex_unlock(&parent_inode->lock);
         request->status = CHIMERA_VFS_ENOTDIR;
+        request->complete(request);
+        return;
+    }
+
+    /* A directory that has been removed is an orphan: it survives only as
+     * long as a descriptor pins it, and POSIX lets nothing be created in or
+     * resolved through it any more (Linux returns ENOENT for every *at() call
+     * made against such a dirfd).  memfs zeroes a directory's link count when
+     * it is removed, so that is the test.  It follows the type check, matching
+     * the order the standard's *at() resolution uses: what the descriptor
+     * names first, whether it still exists second. */
+    if (parent_inode->nlink == 0) {
+        pthread_mutex_unlock(&parent_inode->lock);
+        request->status = CHIMERA_VFS_ENOENT;
         request->complete(request);
         return;
     }
@@ -6611,6 +7055,12 @@ memfs_dispatch(
         case CHIMERA_VFS_OP_SEEK:
             memfs_seek(thread, fs, request, private_data);
             break;
+        case CHIMERA_VFS_OP_READ_PLUS:
+            memfs_read_plus(thread, fs, request, private_data);
+            break;
+        case CHIMERA_VFS_OP_WRITE_SAME:
+            memfs_write_same(thread, fs, request, private_data);
+            break;
         case CHIMERA_VFS_OP_SYMLINK_AT:
             memfs_symlink_at(thread, fs, request, private_data);
             break;
@@ -6660,6 +7110,7 @@ memfs_dispatch(
 } /* memfs_dispatch */
 
 SYMBOL_EXPORT struct chimera_vfs_module vfs_memfs = {
+    .sdk_version  = CHIMERA_VFS_SDK_VERSION,
     .name         = "memfs",
     .fh_magic     = CHIMERA_VFS_FH_MAGIC_MEMFS,
     .capabilities = CHIMERA_VFS_CAP_CREATE_UNLINKED | CHIMERA_VFS_CAP_FS |
@@ -6669,7 +7120,8 @@ SYMBOL_EXPORT struct chimera_vfs_module vfs_memfs = {
         CHIMERA_VFS_CAP_READ_PROVIDES_BUFFERS |
         CHIMERA_VFS_CAP_NAMED_STREAMS | CHIMERA_VFS_CAP_RPL | CHIMERA_VFS_CAP_FS_LOCK |
         CHIMERA_VFS_CAP_CHANGE | CHIMERA_VFS_CAP_MKFS |
-        CHIMERA_VFS_CAP_LEASE,
+        CHIMERA_VFS_CAP_LEASE |
+        CHIMERA_VFS_CAP_READ_PLUS | CHIMERA_VFS_CAP_WRITE_SAME,
     .init           = memfs_init,
     .destroy        = memfs_destroy,
     .thread_init    = memfs_thread_init,

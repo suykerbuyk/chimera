@@ -13,7 +13,7 @@
 #include "common/misc.h"
 #include "vfs/vfs.h"
 #include "vfs/vfs_procs.h"
-#include "vfs/vfs_access.h"
+#include "vfs/sdk/vfs_access.h"
 #include "vfs/vfs_notify.h"
 #include "vfs/vfs_release.h"
 #include "smb_attr.h"
@@ -3910,7 +3910,11 @@ static void
 chimera_smb_create_issue_open(struct chimera_smb_request *request)
 {
     struct chimera_vfs_thread *vfs_thread = request->compound->thread->vfs_thread;
-    unsigned int               flags      = 0;
+    /* NO_NOTIFY: the SMB create path emits its own CHANGE_NOTIFY event
+     * (disposition policy, DIR/STREAM_NAME classes, directory-lease key
+     * sparing), so the VFS core's generic created-file emission must stay
+     * quiet or watchers would see the create twice. */
+    unsigned int               flags = CHIMERA_VFS_OPEN_NO_NOTIFY;
 
     if (request->create.create_options & SMB2_FILE_DIRECTORY_FILE) {
         flags |= CHIMERA_VFS_OPEN_DIRECTORY;

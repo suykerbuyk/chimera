@@ -11,7 +11,7 @@
 #include "client.h"
 #include "common/macros.h"
 #include "vfs/vfs.h"
-#include "vfs/vfs_cred.h"
+#include "vfs/sdk/vfs_cred.h"
 #include "vfs/vfs_procs.h"
 #include "vfs/vfs_release.h"
 #include "common/logging.h"
@@ -59,6 +59,7 @@ enum chimera_client_request_opcode {
     CHIMERA_CLIENT_OP_CLONE_RANGE,
     CHIMERA_CLIENT_OP_ALLOCATE,
     CHIMERA_CLIENT_OP_SEEK,
+    CHIMERA_CLIENT_OP_WRITE_SAME,
 };
 
 struct chimera_client_request;
@@ -436,6 +437,18 @@ struct chimera_client_request {
             uint16_t                        r_acl_aces;
             char                            path[CHIMERA_VFS_PATH_MAX];
         } getacl;
+
+        struct {
+            struct chimera_vfs_open_handle *handle;
+            uint64_t                        offset;
+            uint32_t                        block_size;
+            uint64_t                        block_count;
+            const void                     *pattern;
+            uint32_t                        pattern_len;
+            uint32_t                        reloff_pattern;
+            chimera_write_same_callback_t   callback;
+            void                           *private_data;
+        } write_same;
     };
 } __attribute__((aligned(64)));
 

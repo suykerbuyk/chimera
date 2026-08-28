@@ -96,6 +96,7 @@ option(IO_URING_ENABLED "Enable io_uring support" ${CHIMERA_LINUX})
 option(CAIRN_ENABLED "Enable cairn support" ON)
 option(CHIMERA_VFS_IO_URING "Enable chimera VFS io_uring backend" ${CHIMERA_LINUX})
 option(REQUIRE_NETNS_TESTS "Fail configure if network namespace tests cannot be enabled" OFF)
+option(REQUIRE_FUSE_TESTS "Fail FUSE tests instead of skipping when FUSE mounts are unavailable" OFF)
 option(EVPL_IOVEC_PROFILE "Enable libevpl retained-iovec stack profiling" OFF)
 
 # Build the product only: no test executables are compiled and no ctests are
@@ -646,4 +647,11 @@ endif()
 
 add_subdirectory(src)
 add_subdirectory(tools)
+add_subdirectory(examples/vfs_module)
+
+# Must stay last: qtm_build re-installs oteltracing.h over the copy
+# src/vfs/CMakeLists.txt places in include/chimera, pinning OTEL_TRACING to
+# the value the packaged binaries were built with.  CMake honours the last
+# install() rule for a given destination file, so moving this line above
+# add_subdirectory(src) would silently ship the unpinned header.
 add_subdirectory(qtm_build)

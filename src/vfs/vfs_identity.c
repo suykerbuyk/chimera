@@ -43,7 +43,7 @@ struct chimera_vfs_identity_request {
     char                                 name[CHIMERA_VFS_SID_MAX_LEN > 256 ?
                                               CHIMERA_VFS_SID_MAX_LEN : 256];
     int                                  found;
-    struct chimera_vfs_user              result;
+    struct chimera_vfs_identity_result   result;
     chimera_vfs_identity_callback        callback;
     void                                *private_data;
 };
@@ -76,20 +76,33 @@ chimera_vfs_identity_copy_user(
     dst->username_len = src->username_len;
 } /* chimera_vfs_identity_copy_user */
 
+/* Copy a cached group into a standalone result. */
+static inline void
+chimera_vfs_identity_copy_group(
+    struct chimera_vfs_group       *dst,
+    const struct chimera_vfs_group *src)
+{
+    dst->gid = src->gid;
+    memcpy(dst->groupname, src->groupname, sizeof(dst->groupname));
+    memcpy(dst->sid, src->sid, sizeof(dst->sid));
+    dst->groupname_len = src->groupname_len;
+} /* chimera_vfs_identity_copy_group */
+
 /*
  * Synchronous cache probe.  Returns 1 and fills `out` on a hit, 0 on a miss.
  * Caller need not hold the RCU read lock -- it is taken here.
  */
 static int
 chimera_vfs_identity_cache_probe(
-    struct chimera_vfs_user_cache *cache,
-    enum chimera_vfs_identity_key  key,
-    uint32_t                       id,
-    const char                    *name,
-    struct chimera_vfs_user       *out)
+    struct chimera_vfs_user_cache      *cache,
+    enum chimera_vfs_identity_key       key,
+    uint32_t                            id,
+    const char                         *name,
+    struct chimera_vfs_identity_result *out)
 {
-    const struct chimera_vfs_user *user  = NULL;
-    int                            found = 0;
+    const struct chimera_vfs_user  *user  = NULL;
+    const struct chimera_vfs_group *group = NULL;
+    int                             found = 0;
 
     urcu_qsbr_read_lock();
 
@@ -101,15 +114,27 @@ chimera_vfs_identity_cache_probe(
             user = chimera_vfs_user_cache_lookup_by_name(cache, name);
             break;
         case CHIMERA_VFS_IDENTITY_BY_SID:
+            /* A SID is ambiguous: try users first (preserving the previous
+             * behaviour), then groups. */
             user = chimera_vfs_user_cache_lookup_by_sid(cache, name);
+            if (!user) {
+                group = chimera_vfs_group_cache_lookup_by_sid(cache, name);
+            }
             break;
         case CHIMERA_VFS_IDENTITY_BY_GID:
+            group = chimera_vfs_group_cache_lookup_by_gid(cache, id);
+            break;
         default:
             break;
     } /* switch */
 
     if (user) {
-        chimera_vfs_identity_copy_user(out, user);
+        out->is_group = 0;
+        chimera_vfs_identity_copy_user(&out->user, user);
+        found = 1;
+    } else if (group) {
+        out->is_group = 1;
+        chimera_vfs_identity_copy_group(&out->group, group);
         found = 1;
     }
 
@@ -118,14 +143,48 @@ chimera_vfs_identity_cache_probe(
     return found;
 } /* chimera_vfs_identity_cache_probe */
 
-/* Run the registered miss handlers in order until one resolves the key. */
+static inline int
+chimera_vfs_identity_result_has_sid(const struct chimera_vfs_identity_result *result)
+{
+    return result->is_group ? result->group.sid[0] != '\0'
+           : result->user.sid[0] != '\0';
+} /* chimera_vfs_identity_result_has_sid */
+
+/*
+ * Run the registered miss handlers in order until one resolves the key.
+ *
+ * For the numeric keys (BY_UID / BY_GID) a plain first-wins walk is not enough.
+ * NSS is registered first and, on a host whose nsswitch routes passwd/group
+ * through winbind, it answers those keys itself -- with a name but never a SID,
+ * because NSS has no notion of one.  That would short-circuit the winbind
+ * handler, which is the only one that can supply the real SID, and the identity
+ * would be cached SID-less; the cache hit then suppresses any further resolve,
+ * so the SID never arrives and the marshaller falls back to the algorithmic
+ * S-1-5-88 form for good.
+ *
+ * So for those two keys a SID-less success is only provisional: keep walking in
+ * case a later handler can name the same identity properly, and settle for the
+ * provisional answer only if none can.  This is safe precisely because the key
+ * is numeric -- every handler is being asked about the same uid/gid, so they
+ * can only disagree about the SID, never about which identity it is.  BY_NAME
+ * and BY_SID stay first-wins: there the key is a string that two handlers could
+ * legitimately resolve to different identities (a local "alice" and a domain
+ * "alice"), and preferring the SID-bearing answer would silently change which
+ * account wins.
+ */
 static int
 chimera_vfs_identity_run_handlers(
     struct chimera_vfs_identity         *identity,
     struct chimera_vfs_identity_request *req)
 {
     struct chimera_vfs_identity_handler_entry *entry;
+    struct chimera_vfs_identity_result         provisional;
+    int                                        have_provisional = 0;
+    int                                        prefer_sid;
     int                                        rc = -1;
+
+    prefer_sid = (req->key == CHIMERA_VFS_IDENTITY_BY_UID ||
+                  req->key == CHIMERA_VFS_IDENTITY_BY_GID);
 
     pthread_mutex_lock(&identity->handler_lock);
     entry = identity->handlers;
@@ -137,10 +196,23 @@ chimera_vfs_identity_run_handlers(
         memset(&req->result, 0, sizeof(req->result));
         if (entry->handler(req->key, req->id, req->name, &req->result,
                            entry->private_data) == 0) {
-            rc = 0;
-            break;
+            if (!prefer_sid ||
+                chimera_vfs_identity_result_has_sid(&req->result)) {
+                rc = 0;
+                break;
+            }
+            /* Resolved, but with no SID.  Hold it and keep looking. */
+            if (!have_provisional) {
+                provisional      = req->result;
+                have_provisional = 1;
+            }
         }
         entry = entry->next;
+    }
+
+    if (rc != 0 && have_provisional) {
+        req->result = provisional;
+        rc          = 0;
     }
 
     return rc;
@@ -178,14 +250,23 @@ chimera_vfs_identity_worker(void *arg)
         if (chimera_vfs_identity_run_handlers(identity, req) == 0) {
             req->found = 1;
             /* Populate the cache so future lookups for this identity are
-             * synchronous (TTL-expiring, non-pinned). */
-            chimera_vfs_user_cache_add(
-                identity->vfs->vfs_user_cache,
-                req->result.username[0] ? req->result.username : "",
-                NULL, NULL,
-                req->result.sid[0] ? req->result.sid : NULL,
-                req->result.uid, req->result.gid,
-                req->result.ngids, req->result.gids, 0);
+             * synchronous (TTL-expiring, non-pinned).  A group goes to the
+             * group chains, never the user ones. */
+            if (req->result.is_group) {
+                chimera_vfs_group_cache_add(
+                    identity->vfs->vfs_user_cache,
+                    req->result.group.groupname,
+                    req->result.group.sid[0] ? req->result.group.sid : NULL,
+                    req->result.group.gid, 0);
+            } else {
+                chimera_vfs_user_cache_add(
+                    identity->vfs->vfs_user_cache,
+                    req->result.user.username[0] ? req->result.user.username : "",
+                    NULL, NULL,
+                    req->result.user.sid[0] ? req->result.user.sid : NULL,
+                    req->result.user.uid, req->result.user.gid,
+                    req->result.user.ngids, req->result.user.gids, 0);
+            }
         } else {
             req->found = 0;
         }
@@ -209,13 +290,14 @@ chimera_vfs_identity_worker(void *arg)
 
 static int
 chimera_vfs_identity_nss_handler(
-    enum chimera_vfs_identity_key key,
-    uint32_t                      id,
-    const char                   *name,
-    struct chimera_vfs_user      *out,
-    void                         *private_data)
+    enum chimera_vfs_identity_key       key,
+    uint32_t                            id,
+    const char                         *name,
+    struct chimera_vfs_identity_result *out,
+    void                               *private_data)
 {
     struct passwd       pw, *res = NULL;
+    struct group        gr, *gres = NULL;
     char                buf[16384];
     int                 rc;
     chimera_grouplist_t grps[CHIMERA_VFS_CRED_MAX_GIDS];
@@ -231,8 +313,21 @@ chimera_vfs_identity_nss_handler(
         case CHIMERA_VFS_IDENTITY_BY_NAME:
             rc = getpwnam_r(name, &pw, buf, sizeof(buf), &res);
             break;
+        case CHIMERA_VFS_IDENTITY_BY_GID:
+            rc = getgrgid_r(id, &gr, buf, sizeof(buf), &gres);
+            if (rc != 0 || gres == NULL) {
+                return -1;
+            }
+            out->is_group  = 1;
+            out->group.gid = gr.gr_gid;
+            strncpy(out->group.groupname, gr.gr_name,
+                    sizeof(out->group.groupname) - 1);
+            out->group.groupname_len = (int) strlen(out->group.groupname);
+            /* NSS supplies no SID; left empty so the algorithmic idmap is
+             * used for this group. */
+            return 0;
         default:
-            /* NSS has no notion of a Windows SID, and a gid is not a user. */
+            /* NSS has no notion of a Windows SID. */
             return -1;
     } /* switch */
 
@@ -240,10 +335,10 @@ chimera_vfs_identity_nss_handler(
         return -1;
     }
 
-    out->uid = pw.pw_uid;
-    out->gid = pw.pw_gid;
-    strncpy(out->username, pw.pw_name, sizeof(out->username) - 1);
-    out->username_len = (int) strlen(out->username);
+    out->user.uid = pw.pw_uid;
+    out->user.gid = pw.pw_gid;
+    strncpy(out->user.username, pw.pw_name, sizeof(out->user.username) - 1);
+    out->user.username_len = (int) strlen(out->user.username);
 
     /* Supplementary groups (getgrouplist includes the primary gid; storing it
      * twice is harmless for membership checks). */
@@ -253,9 +348,9 @@ chimera_vfs_identity_nss_handler(
     if (ng > CHIMERA_VFS_CRED_MAX_GIDS) {
         ng = CHIMERA_VFS_CRED_MAX_GIDS;
     }
-    out->ngids = ng;
+    out->user.ngids = ng;
     for (i = 0; i < ng; i++) {
-        out->gids[i] = grps[i];
+        out->user.gids[i] = grps[i];
     }
 
     /* NSS supplies no SID; left empty so the algorithmic idmap is used. */
@@ -384,8 +479,10 @@ chimera_vfs_identity_resolve(
     void                         *private_data)
 {
     struct chimera_vfs_identity         *identity = thread->vfs->identity;
-    struct chimera_vfs_user              hit;
+    struct chimera_vfs_identity_result   hit;
     struct chimera_vfs_identity_request *req;
+
+    memset(&hit, 0, sizeof(hit));
 
     /* Fast path: a cache hit resolves inline on this thread. */
     if (chimera_vfs_identity_cache_probe(thread->vfs->vfs_user_cache,
@@ -419,7 +516,9 @@ chimera_vfs_identity_cached(
     uint32_t                      id,
     const char                   *name)
 {
-    struct chimera_vfs_user scratch;
+    struct chimera_vfs_identity_result scratch;
+
+    memset(&scratch, 0, sizeof(scratch));
 
     return chimera_vfs_identity_cache_probe(vfs->vfs_user_cache, key, id, name,
                                             &scratch);

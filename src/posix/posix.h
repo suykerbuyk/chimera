@@ -14,7 +14,7 @@
 #include <unistd.h>
 
 #include "common/platform.h"
-#include "vfs/vfs_cred.h"
+#include "vfs/sdk/vfs_cred.h"
 
 struct chimera_posix_client;
 struct chimera_client_config;
@@ -668,6 +668,20 @@ chimera_posix_clone_file_range(
     int    src_fd,
     off_t  src_offset,
     size_t len);
+
+// NFSv4.2 WRITE_SAME: write block_count blocks of block_size bytes from offset,
+// each zero-filled with `pattern` placed at reloff_pattern. Backend must
+// advertise CHIMERA_VFS_CAP_WRITE_SAME; otherwise returns -1 errno=EOPNOTSUPP.
+// Returns the number of bytes written (block_size * block_count) or -1.
+ssize_t
+chimera_posix_write_same(
+    int         fd,
+    off_t       offset,
+    uint32_t    block_size,
+    uint64_t    block_count,
+    const void *pattern,
+    uint32_t    pattern_len,
+    uint32_t    reloff_pattern);
 
 // Sync functions
 int

@@ -22,9 +22,8 @@
 #include <uthash.h>
 #include <jansson.h>
 #include <linux/version.h>
-#include "vfs/vfs_error.h"
-#include "vfs/vfs_internal.h"
-#include "vfs/vfs_acl.h"
+#include "vfs/sdk/vfs_error.h"
+#include "vfs/sdk/vfs_acl.h"
 
 // fchmodat support for AT_SYMLINK_NOFOLLOW was added in Linux 6.6
 #if defined(LINUX_VERSION_CODE) && defined(KERNEL_VERSION)
@@ -689,7 +688,14 @@ chimera_linux_open_at(
          * executed.  The ACL cannot be stored here anyway, so drop it. */
         request->open_at.set_attr->va_set_mask &= ~CHIMERA_VFS_ATTR_ACL;
     } else {
-        mode = 0600;
+        /* No mode supplied -- an NFS3 EXCLUSIVE create defers the mode to the
+         * client's follow-up SETATTR.  Use 0644, matching the memfs/cairn
+         * backends (and the model): with per-op DAC now enforced, a divergent
+         * initial mode (0600) would spuriously deny another user the read/write
+         * access the reference backends grant on the same object before its
+         * mode is set.  (Security note: this is a brief, pre-SETATTR window,
+         * consistent with memfs's long-standing behavior.) */
+        mode = 0644;
     }
 
     flags = chimera_linux_set_open_flags(request->open_at.flags);
@@ -707,12 +713,49 @@ chimera_linux_open_at(
      * so for a non-exclusive create probe with O_EXCL first: success means we
      * created the file, EEXIST means it already existed and we re-open without
      * O_EXCL (the original flags still carry O_TRUNC for OVERWRITE_IF/SUPERSEDE). */
-    int created = 0;
+    int created  = 0;
+    int reopened = 0;
 
     if ((flags & O_CREAT) && !(flags & O_EXCL)) {
         fd = openat(parent_fd, fullname, flags | O_EXCL, mode);
         if (fd >= 0) {
             created = 1;
+        } else if (errno == EEXIST &&
+                   (request->open_at.flags & CHIMERA_VFS_OPEN_CREATE_REGULAR)) {
+            /* NFS3 UNCHECKED create must yield a regular file.  Resolve the
+             * leaf type without a data open first: a non-regular object is
+             * never opened (directory -> EISDIR, symlink/socket/fifo ->
+             * EEXIST). */
+            struct stat est;
+
+            if (fstatat(parent_fd, fullname, &est, AT_SYMLINK_NOFOLLOW) == 0 &&
+                !S_ISREG(est.st_mode)) {
+                chimera_restore_privilege(request->cred);
+                request->status = S_ISDIR(est.st_mode) ? CHIMERA_VFS_EISDIR
+                                  : CHIMERA_VFS_EEXIST;
+                request->complete(request);
+                return;
+            }
+
+            /* The descriptor this returns is the handle the VFS caches, and
+             * the client's later READ/WRITE run against it -- an O_PATH one
+             * cannot serve those at all, which reads back as a write failing
+             * on a file that was just created.  fstatat has established the
+             * leaf is a regular file, so open it for the access asked for,
+             * minus the create and truncate bits an UNCHECKED create must not
+             * apply to an object it merely found.  A stateless CREATE does not
+             * require write on that object, so a caller without it still gets
+             * a metadata-only handle rather than a failed create; the engine's
+             * own DAC check is what refuses the write that follows. */
+            fd = openat(parent_fd, fullname,
+                        (flags & ~(O_CREAT | O_EXCL | O_TRUNC)) | O_NOFOLLOW,
+                        0);
+
+            if (fd < 0 && (errno == EACCES || errno == EPERM ||
+                           errno == EROFS)) {
+                fd = openat(parent_fd, fullname, O_PATH | O_NOFOLLOW, 0);
+            }
+            reopened = 1;
         } else if (errno == EEXIST) {
             fd = openat(parent_fd, fullname, flags, mode);
         }
@@ -741,7 +784,10 @@ chimera_linux_open_at(
         return;
     }
 
-    rc = chimera_linux_set_attrs(fd, "", request->open_at.set_attr);
+    /* An UNCHECKED create that re-opened an existing regular file leaves its
+     * attributes untouched -- it found the object, it did not make it. */
+    rc = reopened ? 0 :
+        chimera_linux_set_attrs(fd, "", request->open_at.set_attr);
 
     /* openat() applies the requested mode through the process umask, so a
      * freshly created file may be missing bits the client asked for (the
@@ -750,7 +796,7 @@ chimera_linux_open_at(
      * create, fchmod() it to the exact value -- this also restores the
      * set-user-ID/set-group-ID bits, which openat()'s mode argument does not
      * reliably carry. */
-    if (rc >= 0 && have_mode && (flags & O_CREAT)) {
+    if (rc >= 0 && have_mode && (flags & O_CREAT) && !reopened) {
         if (fchmod(fd, mode & 07777) < 0) {
             rc = -errno;
         }
@@ -1996,6 +2042,7 @@ chimera_linux_dispatch(
 } /* linux_dispatch */
 
 SYMBOL_EXPORT struct chimera_vfs_module vfs_linux = {
+    .sdk_version  = CHIMERA_VFS_SDK_VERSION,
     .name         = "linux",
     .fh_magic     = CHIMERA_VFS_FH_MAGIC_LINUX,
     .capabilities = CHIMERA_VFS_CAP_BLOCKING | CHIMERA_VFS_CAP_OPEN_PATH_REQUIRED | CHIMERA_VFS_CAP_OPEN_FILE_REQUIRED |
