@@ -67,6 +67,28 @@ description install chimera on Ubuntu against an OpenLDAP+Samba-schema (ldapsam)
 #  * Kerberos is out of scope: an OpenLDAP+Samba deployment has no KDC, and the
 #    kerberos leg resolves principals through winbind with no getpwnam
 #    fallback, so every user would collapse to uid 65534.
+#  * Two shares are served, and the pair is load bearing for the ACL checks:
+#      - smb1 is the linux VFS over /shares, created at run time through the
+#        REST admin API as before.  It is a MODE-ONLY backend: getattr
+#        synthesises the DACL from the POSIX mode (chimera_acl_from_mode) and a
+#        set-ACL is down-projected to a chmod, so it can carry the owner/group
+#        SIDs of a descriptor but can never store a named-group ACE.
+#      - smb2 is memfs, which advertises CHIMERA_VFS_CAP_ACL_NATIVE and stores
+#        the rich ACL verbatim.  That is what makes a domain-group ACE
+#        observable at all.
+#    memfs is declared in chimera.json rather than created with
+#    "chimera_admin mount create", because a memfs mount path names a
+#    filesystem that MKFS must have created first (memfs_mount rejects an empty
+#    leading component with ENOENT), and the REST API has no equivalent of the
+#    config's "filesystems" tag -- GET /config does not even round-trip it.  So
+#    the filesystems/mounts/shares trio for memfs has to be part of the base
+#    chimera.json written below.
+#  * The group-SID assertions cover CHIM-186: before that fix chimera resolved
+#    only uids through the identity layer, so a descriptor came back with the
+#    real domain SID for the owner but the algorithmic S-1-5-88-2-<gid> for the
+#    group, and inbound domain-group ACEs were silently dropped.  winbind is
+#    asked for the gid->SID mapping first, so a failure there is distinguishable
+#    from a failure in chimera.
 #  * sntest only substitutes variables that appear as delimiter-separated
 #    tokens, so generated config files use __PLACEHOLDER__ tokens patched with
 #    sed afterwards; commands within a step run in parallel, so dependent
@@ -111,6 +133,9 @@ command srv1 cp /etc/samba/smb.conf /etc/nsswitch.conf /etc/smbldap-tools/smblda
 command srv1 ldapsearch -x -H LDAP_URI -D LDAP_ADMIN_DN -w LDAP_ADMIN_PASS -b LDAP_SUFFIX > $spool/ldap_tree.ldif || true
 command srv1 pdbedit -L -v > $spool/pdbedit.txt || true
 command srv1 net getlocalsid > $spool/localsid.txt || true
+command srv1 cp /etc/chimera/chimera.json $spool/ || true
+command srv1 cat /tmp/memfs_acl.txt /tmp/memfs_diracl.txt /tmp/linux_acl.txt > $spool/smbcacls.txt 2>&1 || true
+command srv1 cp /tmp/memfs_showacls.txt $spool/ || true
 
 
 step 1m extract the NAS sntest_utils
@@ -202,12 +227,12 @@ ldap ssl = off\n\
 ldap passwd sync = yes\n\
 ldapsam:trusted = yes\n\
 winbind use default domain = yes\n\
-winbind enum users = yes\n\
-winbind enum groups = yes\n\
+winbind enum users = no\n\
+winbind enum groups = no\n\
 winbind max domain connections = 5\n\
 template shell = /bin/bash\n\
 idmap config * : backend = tdb\n\
-idmap config * : range = 3000-7999" > /etc/samba/smb.conf && \
+idmap config * : range = 2147483648-4294967294" > /etc/samba/smb.conf && \
 	sed -i -e s/__WORKGROUP__/LDAP_WORKGROUP/g -e s/__SUFFIX__/LDAP_SUFFIX/g \
 	       -e s/__ADMINDN__/LDAP_ADMIN_DN/g -e s%__LDAPURI__%LDAP_URI%g /etc/samba/smb.conf
 
@@ -347,6 +372,15 @@ command srv1 cp /etc/chimera/chimera.json /etc/chimera/chimera.json.orig && \
                        winbind_domain: "__WBDOM__", \
                        kerberos_enabled: false \
                     } \
+                }, \
+                filesystems: { \
+                    fs0: { module: "memfs" } \
+                }, \
+                mounts: { \
+                    memfs0: { module: "memfs", path: "fs0" } \
+                }, \
+                shares: { \
+                    smb2: { path: "/memfs0" } \
                 } }'  > /etc/chimera/chimera.json && \
 	sed -i -e s/__WBDOM__/LDAP_WORKGROUP/ /etc/chimera/chimera.json
 
@@ -385,6 +419,112 @@ command srv1 smbclient --use-kerberos=off -U LDAP_WORKGROUP/LDAP_USER%LDAP_PASS 
 	echo "file uid:" && cat /tmp/file.uid && \
 	echo "ldap uidNumber:" && cat /tmp/ldap.uid && \
 	cmp /tmp/file.uid /tmp/ldap.uid
+
+#  --------------------   group SIDs in the security descriptor (CHIM-186)  ---
+step 5m confirm both shares are being served
+# Connecting to each share rather than enumerating with -L: the tree connect is
+# what the rest of this section depends on, and it does not also pull in the
+# srvsvc share-enumeration path.
+command srv1 smbclient --use-kerberos=off -U LDAP_WORKGROUP/LDAP_USER%LDAP_PASS //127.0.0.1/smb1 -c "allinfo /"
+command srv1 smbclient --use-kerberos=off -U LDAP_WORKGROUP/LDAP_USER%LDAP_PASS //127.0.0.1/smb2 -c "allinfo /"
+
+step 3m record the LDAP group's gid and confirm winbind can map it to a SID
+# Asked of winbind directly first: the CHIM-186 symptom was that winbindd
+# resolved the gid perfectly well and chimera simply never asked it, so a
+# failure here is an environment/idmap problem rather than a chimera bug, and
+# the two need to be told apart.
+command srv1 ldapsearch -x -H LDAP_URI -D LDAP_ADMIN_DN -w LDAP_ADMIN_PASS -b LDAP_SUFFIX \
+		cn=LDAP_GROUP gidNumber -LLL | awk '/^gidNumber:/ {print \$2}' > /tmp/group.gid && \
+	echo "ldap gidNumber:" && cat /tmp/group.gid && \
+	xargs -a /tmp/group.gid -I{} wbinfo --gid-to-sid={} > /tmp/wb_group.sid && \
+	echo "winbind gid-to-sid:" && cat /tmp/wb_group.sid && \
+	grep -qF -f /tmp/domain.sid /tmp/wb_group.sid && \
+	echo "OK: winbind maps the group gid to a SID under the domain SID"
+
+step 5m create a directory and a file on the memfs share
+command srv1 smbclient --use-kerberos=off -U LDAP_WORKGROUP/LDAP_USER%LDAP_PASS //127.0.0.1/smb2 \
+		-c "mkdir acldir; put /etc/hostname acl.txt; ls" | tee /tmp/memfs_ls.txt && \
+	grep -qF acldir /tmp/memfs_ls.txt && \
+	grep -qF acl.txt /tmp/memfs_ls.txt
+
+step 5m show the security descriptors smbclient reports for them
+command srv1 smbclient --use-kerberos=off -U LDAP_WORKGROUP/LDAP_USER%LDAP_PASS //127.0.0.1/smb2 \
+		-c "showacls; ls" | tee /tmp/memfs_showacls.txt
+
+step 5m verify the memfs file's owner and group SIDs carry the domain SID prefix
+# smbcacls rather than smbclient's showacls for the assertion itself: it emits
+# one "OWNER:<sid>" and one "GROUP:<sid>" line, which greps cleanly, where the
+# showacls listing above is for a human reading the spool.
+#
+# --numeric is load bearing, not cosmetic.  Without it smbcacls resolves each
+# SID back to a name through winbind and prints "OWNER:CHIMLDAP\testuser1", so
+# every SID assertion below would fail on a correctly working server -- and,
+# worse, would PASS on a broken one for the group, because S-1-5-88-2-<gid>
+# resolves to no name and is the one value printed in raw SID form.
+command srv1 smbcacls --numeric --use-kerberos=off -U LDAP_WORKGROUP/LDAP_USER%LDAP_PASS \
+		//127.0.0.1/smb2 acl.txt | tee /tmp/memfs_acl.txt && \
+	awk -F: '/^OWNER:/ {print \$2}' /tmp/memfs_acl.txt > /tmp/owner.sid && \
+	awk -F: '/^GROUP:/ {print \$2}' /tmp/memfs_acl.txt > /tmp/memfs_group.sid && \
+	echo "owner SID:" && cat /tmp/owner.sid && \
+	echo "group SID:" && cat /tmp/memfs_group.sid && \
+	if grep -q '^S-1-5-88-' /tmp/memfs_group.sid ; then \
+		echo "ERROR: group SID is the algorithmic S-1-5-88-2-<gid> form; the identity layer did not resolve the gid (CHIM-186)" ; \
+		exit 1 ; \
+	fi && \
+	grep -qF -f /tmp/domain.sid /tmp/owner.sid && \
+	grep -qF -f /tmp/domain.sid /tmp/memfs_group.sid && \
+	echo "OK: owner and group SIDs both carry the LDAP domain SID prefix"
+
+step 5m verify the group SID chimera emits matches what winbind maps the gid to
+# grep -x rather than cmp: this is the assertion that actually pins CHIM-186
+# down (the prefix check above would still pass on a SID from the right domain
+# but the wrong RID), and whole-line matching keeps it from tripping over a
+# trailing-byte difference between wbinfo's output and awk's.
+command srv1 echo "winbind:" && cat /tmp/wb_group.sid && \
+	echo "chimera:" && cat /tmp/memfs_group.sid && \
+	grep -qxF -f /tmp/wb_group.sid /tmp/memfs_group.sid && \
+	echo "OK: chimera emits exactly the SID winbind maps the gid to"
+
+step 5m verify the directory's descriptor resolves the same way
+command srv1 smbcacls --numeric --use-kerberos=off -U LDAP_WORKGROUP/LDAP_USER%LDAP_PASS \
+		//127.0.0.1/smb2 acldir | tee /tmp/memfs_diracl.txt && \
+	awk -F: '/^GROUP:/ {print \$2}' /tmp/memfs_diracl.txt > /tmp/memfs_dirgroup.sid && \
+	cat /tmp/memfs_dirgroup.sid && \
+	grep -qF -f /tmp/domain.sid /tmp/memfs_dirgroup.sid && \
+	echo "OK: the directory's group SID carries the domain SID prefix too"
+
+step 5m verify the group SID resolves on the linux share as well
+# The group SID field comes from the object's gid, not from the stored ACL, so
+# the mode-only linux backend exercises this half of the fix too.  Only the
+# named-group ACE below needs memfs.
+command srv1 smbclient --use-kerberos=off -U LDAP_WORKGROUP/LDAP_USER%LDAP_PASS //127.0.0.1/smb1 \
+		-c "put /etc/hostname linuxacl.txt" && \
+	smbcacls --numeric --use-kerberos=off -U LDAP_WORKGROUP/LDAP_USER%LDAP_PASS \
+		//127.0.0.1/smb1 linuxacl.txt | tee /tmp/linux_acl.txt && \
+	awk -F: '/^GROUP:/ {print \$2}' /tmp/linux_acl.txt > /tmp/linux_group.sid && \
+	cat /tmp/linux_group.sid && \
+	if grep -q '^S-1-5-88-' /tmp/linux_group.sid ; then \
+		echo "ERROR: group SID is the algorithmic S-1-5-88-2-<gid> form on the linux share (CHIM-186)" ; \
+		exit 1 ; \
+	fi && \
+	grep -qF -f /tmp/domain.sid /tmp/linux_group.sid && \
+	echo "OK: the linux share resolves the group SID too"
+
+step 5m verify an inbound domain-group ACE survives a round trip on memfs
+# The other direction of CHIM-186: a SET-security carrying a real domain group
+# SID used to resolve only against the user index and the ACE was silently
+# dropped.  memfs is required here -- the linux backend down-projects any
+# set-ACL to a chmod, so the ACE would not survive on it for reasons unrelated
+# to identity resolution.
+command srv1 xargs -a /tmp/wb_group.sid -I{} smbcacls --numeric --use-kerberos=off \
+		-U LDAP_WORKGROUP/LDAP_USER%LDAP_PASS \
+		//127.0.0.1/smb2 acl.txt -a "ACL:{}:0/0x0/0x00120089" && \
+	smbcacls --numeric --use-kerberos=off -U LDAP_WORKGROUP/LDAP_USER%LDAP_PASS \
+		//127.0.0.1/smb2 acl.txt | tee /tmp/memfs_acl2.txt && \
+	grep '^ACL:' /tmp/memfs_acl2.txt > /tmp/memfs_aces.txt && \
+	cat /tmp/memfs_aces.txt && \
+	grep -qF -f /tmp/wb_group.sid /tmp/memfs_aces.txt && \
+	echo "OK: the domain-group ACE was stored and read back with its real SID"
 
 step 5m verify a wrong password is rejected
 command srv1 smbclient --use-kerberos=off -U LDAP_WORKGROUP/LDAP_USER%badpassword //127.0.0.1/smb1 -c "allinfo /" > /tmp/negauth.txt 2>&1 ; \
