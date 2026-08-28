@@ -21,7 +21,7 @@
 #include "evpl/evpl.h"
 
 #include "server/server.h"
-#include "vfs/vfs_cred.h"
+#include "vfs/sdk/vfs_cred.h"
 #include "vfs/vfs_pnfs.h"
 #include "server/server_internal.h"
 #include "common/logging.h"
@@ -735,6 +735,11 @@ main(
     json_value = json_object_get(server_params, "s3_enabled");
     if (json_is_boolean(json_value)) {
         chimera_server_config_set_s3_enabled(server_config, json_is_true(json_value));
+    }
+
+    json_value = json_object_get(server_params, "fuse_enabled");
+    if (json_is_boolean(json_value)) {
+        chimera_server_config_set_fuse_enabled(server_config, json_is_true(json_value));
     }
 
     /* NFSv4.1 server identity (EXCHANGE_ID server scope).  Set a distinct value
@@ -1482,6 +1487,50 @@ main(
             path = json_string_value(json_object_get(bucket, "path"));
             chimera_server_info("Adding S3 bucket %s -> %s", name, path);
             chimera_server_create_bucket(server, name, path);
+        }
+    }
+
+    /* FUSE mountpoints: local kernel mounts of chimera namespace paths,
+     * keyed by mountpoint directory.  Linux-only; on other builds
+     * chimera_server_create_fuse_mount always rejects, which the
+     * contradiction check below reports at startup. */
+    {
+        json_t     *fuse_mounts = json_object_get(config, "fuse_mounts");
+        json_t     *fuse_mount;
+        const char *fuse_mountpoint;
+
+        if (fuse_mounts && json_object_size(fuse_mounts) > 0 &&
+            !chimera_server_config_get_fuse_enabled(server_config)) {
+            chimera_server_error("Config declares FUSE mounts but fuse_enabled is false");
+            startup_validation_fail();
+        }
+
+        if (fuse_mounts) {
+            json_object_foreach(fuse_mounts, fuse_mountpoint, fuse_mount)
+            {
+                const char *fuse_options;
+
+                path = json_string_value(json_object_get(fuse_mount, "path"));
+
+                if (!path) {
+                    chimera_server_error("FUSE mount '%s': missing \"path\"",
+                                         fuse_mountpoint);
+                    startup_validation_fail();
+                    continue;
+                }
+
+                fuse_options = json_string_value(json_object_get(fuse_mount, "options"));
+
+                chimera_server_info("Adding FUSE mount %s -> %s", fuse_mountpoint, path);
+
+                if (chimera_server_create_fuse_mount(server, fuse_mountpoint,
+                                                     path, fuse_options) != 0) {
+                    chimera_server_error(
+                        "FUSE mount '%s' rejected (non-Linux build, fuse disabled, or bad options)",
+                        fuse_mountpoint);
+                    startup_validation_fail();
+                }
+            }
         }
     }
 

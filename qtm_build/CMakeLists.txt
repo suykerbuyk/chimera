@@ -12,18 +12,19 @@ install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/../suppressions.txt DESTINATION ${DEST
 install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/chimera.service DESTINATION ${DESTDIR}/usr/lib/systemd/system )
 install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/chimera.default DESTINATION ${DESTDIR}/etc/default RENAME chimera )
 
-# Quantum-specific: install VFS headers consumed by downstream packaging.
-# Glob the public headers but skip internal-only ones (internal helpers
-# including the claim core's, the RCU caches, the proc dispatch table, and
-# the open-cache release inlines, which include the excluded
-# vfs_open_cache.h).
-file(GLOB VFS_HEADERS CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/vfs/*.h)
-list(FILTER VFS_HEADERS EXCLUDE REGEX "/(vfs_[^/]*internal|vfs_release|vfs_[^/]*_cache)\\.h$")
-install(FILES ${VFS_HEADERS} DESTINATION include/vfs)
-install(FILES
-	${CMAKE_SOURCE_DIR}/ext/libevpl/ext/prometheus-c/prometheus-c.h
-	${CMAKE_SOURCE_DIR}/ext/libevpl/ext/prometheus-c/ext/stopwatch/stopwatch.h
-	DESTINATION include/vfs)
+# The headers an out-of-tree VFS module builds against are installed by
+# src/vfs/CMakeLists.txt, not here: upstream defines the module SDK as the
+# backend boundary and ships it as include/chimera/vfs/sdk/ plus the three
+# external headers it includes (prometheus-c.h, stopwatch.h, oteltracing.h)
+# at include/chimera/.  A module compiles with
+# -I<prefix>/include/chimera and #include "vfs/sdk/chimera_vfs_sdk.h",
+# the same form used in-tree.  This directory used to install its own flat
+# include/vfs/ tree globbed from src/vfs/*.h; that glob silently stopped
+# covering nine of those headers the moment they moved into sdk/, so the
+# duplicate is gone rather than repaired.
+#
+# The one thing upstream's install does not do is pin OTEL_TRACING, so the
+# packaged oteltracing.h is still generated and installed below.
 
 # The packaged oteltracing.h must pin OTEL_TRACING to the value the packaged
 # binaries were compiled with: the header defaults to 1 (4 KiB otel_span
@@ -44,8 +45,12 @@ file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/include/oteltracing.h
 #define OTEL_TRACING ${QTM_OTEL_TRACING}
 #endif
 ${QTM_OTEL_HEADER}")
+# Overwrites the unpinned copy src/vfs/CMakeLists.txt installs at the same
+# path: CMake honours the last install() rule for a destination file, and
+# the top-level CMakeLists.txt adds this directory after src/ for exactly
+# that reason.  Keep those two facts together if either moves.
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/include/oteltracing.h
-	DESTINATION include/vfs)
+	DESTINATION include/chimera)
 
 # Quantum-specific: install the standalone test suites under <prefix>/tests
 # so a deployed server can be used to validate VFS modules (e.g. snfs) and

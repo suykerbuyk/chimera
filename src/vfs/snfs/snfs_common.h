@@ -4,8 +4,9 @@
 
 #pragma once
 
-#include "common/varint.h"
-#include "vfs/vfs_fh.h"
+#include "common/logging.h"
+#include "vfs/sdk/vfs_varint.h"
+#include "vfs/sdk/vfs_fh.h"
 #include "snfs_cvapi.h"
 
 #define snfs_debug(...) chimera_debug("snfs", \

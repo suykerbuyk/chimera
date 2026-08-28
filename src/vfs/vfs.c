@@ -280,6 +280,9 @@ chimera_vfs_close_thread_wake_timer(
                                     close_thread->vfs->vfs_state->implicit_idle_ms);
     }
 
+    /* Complete any sync-gated namespace op whose watcher ack is overdue. */
+    chimera_vfs_notify_gate_sweep(close_thread->vfs->vfs_notify);
+
 } /* chimera_vfs_close_thread_wake */
 
 static uint64_t
@@ -1044,11 +1047,18 @@ chimera_vfs_process_completion(
         request->unblock_callback(request, request->pending_handle);
     }
 
-    /* Resume parked I/O/metadata requests on this (their owning) thread. */
+    /* Resume parked I/O/metadata requests on this (their owning) thread.
+     * A request parked by the sync notify gate resumes into its (restored)
+     * completion; everything else re-runs the lease-mediation retry. */
     while (io_resume_requests) {
         request = io_resume_requests;
         DL_DELETE(io_resume_requests, request);
-        chimera_vfs_state_io_resume(request);
+        if (request->notify_gate_resume) {
+            request->notify_gate_resume = 0;
+            request->complete(request);
+        } else {
+            chimera_vfs_state_io_resume(request);
+        }
     }
 
     /* Deliver any identity-resolver jobs that completed for this thread. */
@@ -1310,6 +1320,14 @@ chimera_vfs_register(
     struct chimera_vfs_module *module,
     const char                *cfgdata)
 {
+    /* A module built against a different SDK contract would misinterpret the
+     * request/module structures; refuse it at load time rather than corrupt
+     * memory.  Out-of-tree modules arrive via dlopen (module_path), so this
+     * is their only compatibility gate. */
+    chimera_vfs_abort_if(module->sdk_version != CHIMERA_VFS_SDK_VERSION,
+                         "module %s was built against VFS SDK version %u; this chimera provides version %u",
+                         module->name, module->sdk_version, CHIMERA_VFS_SDK_VERSION);
+
     vfs->modules[module->fh_magic] = module;
 
     vfs->module_private[module->fh_magic] = module->init(cfgdata, vfs->metrics.metrics);
@@ -1429,6 +1447,57 @@ chimera_vfs_identity_sid_to_uid(
 
     return rc;
 } /* chimera_vfs_identity_sid_to_uid */
+
+SYMBOL_EXPORT int
+chimera_vfs_identity_gid_to_sid(
+    struct chimera_vfs *vfs,
+    uint32_t            gid,
+    char               *buf,
+    int                 buflen)
+{
+    const struct chimera_vfs_group *group;
+    int                             rc = -1;
+
+    urcu_qsbr_read_lock();
+
+    group = chimera_vfs_group_cache_lookup_by_gid(vfs->vfs_user_cache, gid);
+
+    if (group && group->sid[0]) {
+        int len = (int) strlen(group->sid);
+
+        if (len + 1 <= buflen) {
+            memcpy(buf, group->sid, len + 1);
+            rc = len;
+        }
+    }
+
+    urcu_qsbr_read_unlock();
+
+    return rc;
+} /* chimera_vfs_identity_gid_to_sid */
+
+SYMBOL_EXPORT int
+chimera_vfs_identity_sid_to_gid(
+    struct chimera_vfs *vfs,
+    const char         *sid,
+    uint32_t           *gid)
+{
+    const struct chimera_vfs_group *group;
+    int                             rc = -1;
+
+    urcu_qsbr_read_lock();
+
+    group = chimera_vfs_group_cache_lookup_by_sid(vfs->vfs_user_cache, sid);
+
+    if (group) {
+        *gid = group->gid;
+        rc   = 0;
+    }
+
+    urcu_qsbr_read_unlock();
+
+    return rc;
+} /* chimera_vfs_identity_sid_to_gid */
 
 
 SYMBOL_EXPORT void

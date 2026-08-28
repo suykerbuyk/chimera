@@ -21,8 +21,7 @@
 #include <uthash.h>
 #include <jansson.h>
 #include <linux/version.h>
-#include "vfs/vfs_error.h"
-#include "vfs/vfs_internal.h"
+#include "vfs/sdk/vfs_error.h"
 
 // fchmodat support for AT_SYMLINK_NOFOLLOW was added in Linux 6.6
 #if defined(LINUX_VERSION_CODE) && defined(KERNEL_VERSION)
@@ -33,7 +32,7 @@
 
 #include "evpl/evpl.h"
 
-#include "vfs/vfs.h"
+#include "vfs/sdk/chimera_vfs_sdk.h"
 #include "snfs_common.h"
 #include "common/logging.h"
 #include "common/format.h"

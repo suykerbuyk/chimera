@@ -35,6 +35,7 @@ reads the file:
 | `exports` | object | server | NFS exports. |
 | `shares` | object | server | SMB shares. |
 | `buckets` | object | server | S3 buckets. |
+| `fuse_mounts` | object | server | Local kernel FUSE mounts (Linux only). |
 | `users` | array | server + client | Built-in user accounts (uid/gid, passwords). |
 | `s3_access_keys` | array | server | S3 access/secret key pairs. |
 | `config` | object | client | Client-library settings (the client's analogue of `server`). |
@@ -116,6 +117,7 @@ the canonical place to set them.
 | `nfs_server_scope` | int | `42` | NFSv4.1 `EXCHANGE_ID` server scope. Give independent servers (e.g. an MDS and a co-located DS) distinct values so clients don't coalesce them. |
 | `nfs_max_exports` | int | `4096` | Maximum number of NFS exports that may exist at once (1..65535). Distinct from the export id space, which is always 1..65535; creating an export past this cap fails. |
 | `data_server` | bool | `false` | pNFS data-server mode: bind only the NFSv4 service (no portmap/mount/NLM) so a DS can share a host with its MDS. |
+| `fuse_enabled` | bool | `false` | Serve the `fuse_mounts` section as local kernel FUSE mounts. Linux only; the daemon must run as root to issue the mounts. |
 | `kv_module` | string | - | Key-value module used to persist server state. |
 | `state_dir` | string | `<prefix>/share/state` | Directory for persisted NFS/SMB state. |
 | `smb_persistent_handles` | bool | `false` | Enable SMB durable/persistent handles (needed for Continuous Availability). |
@@ -238,6 +240,85 @@ accepts one extra key.
 | `shares` (SMB) | `path` | string | required | VFS path to share. |
 | `shares` (SMB) | `continuous_availability` | bool | `false` | Advertise SMB Continuous Availability (requires `smb_persistent_handles`). |
 | `buckets` (S3) | `path` | string | required | VFS path backing the bucket. |
+
+### `fuse_mounts`
+
+Local kernel mounts of Chimera namespace paths, served by the daemon speaking
+the FUSE protocol directly against `/dev/fuse`. Linux only, requires
+`"fuse_enabled": true` in `server`, and the daemon must run as root (the mount
+syscall is issued directly, without a `fusermount` helper). Keyed by the host
+mountpoint directory, which must exist.
+
+```json
+"server":      { "fuse_enabled": true },
+"mounts":      { "data": { "module": "memfs", "path": "/" } },
+"fuse_mounts": { "/mnt/chimera": { "path": "/data", "options": "allow_other" } }
+```
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `path` | string | required | VFS path to mount (`/<mount-name>[/subdir]`, or `/` for the whole namespace). |
+| `options` | string | - | Comma-separated: `allow_other` (other users may access the mount), `no_default_permissions` (skip kernel mode-bit enforcement), `attr_timeout_ms=<n>` / `entry_timeout_ms=<n>` (kernel attribute/entry cache lifetimes, default `1000`), `negative_timeout_ms=<n>` (kernel negative-dentry lifetime; defaults to `entry_timeout_ms` under `coherence=sync` and `0` under `coherence=ttl`), `coherence=sync\|ttl` (default `sync`), `direct_io` and `parallel_direct_writes` (default off; see below). |
+
+Notes:
+
+- The FUSE request header carries only uid/gid, so backends cannot see
+  supplementary groups; the default `default_permissions` mode has the kernel
+  do mode-bit checks with the caller's full group list.
+- POSIX byte-range locks (`fcntl` `F_GETLK`/`F_SETLK`/`F_SETLKW`) are served
+  remotely through the shared lease layer, so they conflict correctly with
+  NLM, NFSv4, and SMB2 locks on the same files.  A blocked `F_SETLKW` is
+  cancellable by signal.  `flock(2)` stays kernel-local to the mount.
+- Cross-protocol cache invalidation is pushed to the kernel: a write,
+  truncate, chmod/chown/utimens, remove, or rename arriving through
+  NFS/SMB/S3 (or another FUSE mount of the same share) invalidates the
+  kernel's cached attributes, pages, and directory entries for the affected
+  objects — including files the kernel knows only from a `stat`, and the
+  changed directory's own attributes.  With coverage in force, cached pages
+  also survive close/open cycles (`FOPEN_KEEP_CACHE`).
+- `coherence=sync` (the default) makes that invalidation **synchronous and
+  ordered**: a conflicting write elsewhere does not complete until this
+  kernel's caches are invalidated, a foreign namespace mutation (create,
+  remove, rename, link) does not return to its caller until this kernel's
+  dentries for the affected names are dropped, and replies carry cache
+  lifetimes only while backed by a live invalidation grant or directory
+  watch.  Once one operation returns anywhere, the very next syscall on any
+  FUSE mount of the share sees its effect — which is also what makes
+  negative-dentry caching safe to enable by default.  Two narrow softenings
+  keep concurrent cross-mount activity off the multi-second recovery
+  deadlines, both arising only when two kernels race mutations on the *same*
+  directory or file (where no cross-mount ordering exists to preserve): the
+  raced mount converges asynchronously (microseconds) instead of blocking.
+  Recovery deadlines bound the wait if a mount stops acknowledging
+  invalidations (~5s for namespace gates, the lease break deadline for
+  data).
+- `direct_io` makes the daemon reply `FOPEN_DIRECT_IO` on every open, so the
+  kernel never stages this mount's file data in its page cache: reads and
+  writes reach the VFS as exact `(offset, length)` requests built straight
+  from the calling process's pinned pages.  This is the server's choice, not
+  the application's — it applies to a plain `open()` and imposes none of
+  `O_DIRECT`'s alignment requirements on the caller.  It removes one memory
+  copy per operation in each direction, and for a page-aligned writer it is
+  what lets a write reach a backend's zero-copy device path.  It also removes
+  readahead, read caching, and write batching, so small or repeated I/O gets
+  dramatically slower — this is a switch for bulk streaming workloads, which
+  is why it is off by default.  `parallel_direct_writes` additionally allows
+  concurrent writers to one file instead of serializing them on the kernel's
+  inode lock; it relaxes write atomicity between overlapping concurrent
+  writes, so it is separately opt-in, but without it a multi-threaded write
+  benchmark measures the inode lock rather than the data path.  Shared `mmap`
+  of a file on a `direct_io` mount needs `FUSE_DIRECT_IO_ALLOW_MMAP`
+  (kernel 6.6 / ABI 7.39 and later), which the daemon negotiates when
+  offered and logs as `(no mmap)` when it is not.
+- `coherence=ttl` restores the purely asynchronous model: invalidations are
+  still pushed, but mutations never wait for peer acknowledgments and the
+  `attr/entry` timeouts alone bound staleness.  One extra residual there
+  falls back to the entry timeout: directory-entry names dropped by an
+  overflowed event ring (the directory's attributes are still refreshed).
+- If a previous daemon instance crashed and left a disconnected mount on the
+  mountpoint, the next start detaches it and mounts fresh.
+- An externally issued `umount` disconnects the mount; the daemon logs it and
+  does not remount until restart.
 
 ### `users`
 

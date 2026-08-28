@@ -15,6 +15,51 @@ description install chimera on Ubuntu server joined to an ADS domain with winbin
 #    only upgrade an existing legacy machine password record, so dummy records
 #    are seeded with tdbtool first; the join then overwrites them with the
 #    real machine password so winbindd can establish its netlogon channel.
+#  * Two shares are served, and the pair is load bearing for the ACL checks:
+#      - smb1 is the linux VFS over /shares, created at run time through the
+#        REST admin API as before.  It is a MODE-ONLY backend: getattr
+#        synthesises the DACL from the POSIX mode (chimera_acl_from_mode) and a
+#        set-ACL is down-projected to a chmod, so it can carry the owner/group
+#        SIDs of a descriptor but can never store a named-group ACE.
+#      - smb2 is memfs, which advertises CHIMERA_VFS_CAP_ACL_NATIVE and stores
+#        the rich ACL verbatim.  That is what makes a domain-group ACE
+#        observable at all.
+#    memfs is declared in chimera.json rather than created with
+#    "chimera_admin mount create", because a memfs mount path names a
+#    filesystem that MKFS must have created first (memfs_mount rejects an empty
+#    leading component with ENOENT), and the REST API has no equivalent of the
+#    config's "filesystems" tag -- GET /config does not even round-trip it.  So
+#    the filesystems/mounts/shares trio for memfs has to be part of the base
+#    chimera.json written below.
+#  * The group-SID assertions cover CHIM-186: before that fix chimera resolved
+#    only uids through the identity layer, so a descriptor came back with the
+#    real domain SID for the owner but the algorithmic S-1-5-88-2-<gid> for the
+#    group, and inbound domain-group ACEs were silently dropped.  winbind is
+#    asked for the gid->SID mapping first, so a failure there is distinguishable
+#    from a failure in chimera.  This is the ADS counterpart of the same section
+#    in chimera-ldapsam-auth.snt, and the two are worth keeping in step: they
+#    reach the identity layer through different winbindd backends (rid idmap
+#    against a real DC here, idmap_passdb over LDAP there).
+#  * The group under test is the AD user's own primary group rather than a
+#    purpose-made one.  That is the gid chimera stamps on anything the session
+#    creates, so it is the gid the descriptor's group field actually carries,
+#    and the rid backend maps it algorithmically (100000 + RID) so no directory
+#    change is needed to make it exist.  Its gid is also well clear of the
+#    3000-7999 "*" range, so no BUILTIN group can collide with it -- unlike the
+#    ldapsam suite, which has to widen its ranges to get the same separation.
+#  * The descriptor is re-read over the kerberos leg as well.  Identity
+#    resolution is auth-method independent in principle, but the two legs reach
+#    it by different routes -- the NTLM leg takes uid/gid straight from the
+#    winbind logon, the kerberos leg resolves the principal afterwards -- so the
+#    cheapest way to know they agree is to ask both.
+#  * sntest resolves $name itself against the hosts, ips and luns of the run and
+#    fails the step when the name is not one of them, so every shell variable
+#    and positional (awk \$2, \$3) is written escaped as \$ and unescaped again
+#    by the preprocessor.  Only $sntest and $spool are left bare, because those
+#    are sntest's own.  Backticks are expanded at the same point rather than in
+#    sequence with the rest of the command, which is why //`hostname`/smb1 is
+#    safe (nothing earlier in that command has to run first) but a backtick that
+#    has to observe an earlier command's effect is not.
 
 %include ../include/variables.include
 %ifndef PKG_TAG
@@ -33,10 +78,18 @@ command allhosts $sntest/bin/capture_debug_info $spool
 command srv1 journalctl -u chimera -o short-iso | sed 's/ snt.*message="/ /' | tee $spool/chimera_log.txt
 command srv1 journalctl -u winbind -o short-iso | tee $spool/winbind_log.txt
 command srv1 cp /etc/samba/smb.conf /etc/krb5.conf $spool/ || true
+command srv1 cp /etc/chimera/chimera.json $spool/ || true
+command srv1 cat /tmp/memfs_acl.txt /tmp/memfs_diracl.txt /tmp/linux_acl.txt > $spool/smbcacls.txt 2>&1 || true
+command srv1 cp /tmp/memfs_showacls.txt $spool/ || true
 
 
 step 1m extract the NAS sntest_utils
 command allhosts curl https://nexus.mdh.quantum.com/repository/snnas-binaries/sn_tests/sntest_utils.tar.gz | tar zxf - -C /
+
+step 3m disable unattended upgrades
+command srv1 systemctl disable --now unattended-upgrades.service && \
+			systemctl disable --now apt-daily.timer apt-daily-upgrade.timer && \
+			apt-get purge -y unattended-upgrades
 
 
 step 5m install winbind and client packages
@@ -95,8 +148,8 @@ command srv1 echo AD_PASS | /usr/sbin/adcli join --domain AD_DOMAIN --login-user
 command srv1 tdbdump /var/lib/samba/private/secrets.tdb | grep key
 
 step 1m enable winbind NSS lookups
-command srv1 sed -i -E 's/^(passwd|group):(.*)/\1:\2 winbind/' /etc/nsswitch.conf && \
-	grep -E '^(passwd|group):' /etc/nsswitch.conf
+command srv1 sed -i -E 's/^(passwd|group|shadow):.*/\1:files winbind/' /etc/nsswitch.conf && \
+	grep -E '^(passwd|group|shadow):' /etc/nsswitch.conf
 
 step 2m enable winbind
 command srv1 systemctl enable winbind
@@ -107,7 +160,22 @@ command srv1 while true ; do \
 	if wbinfo -i AD_USER > /dev/null 2>&1 ; then \
 		break ; \
 	fi ; \
-	done && systemctl status winbind
+	done && \
+	net cache flush && \
+	systemctl status winbind
+
+step 3m flush the glibc NSS cache
+# nscd is deliberately not in the install list above: nothing the suite needs
+# pulls it in, and whether the node image ships it is not guaranteed.  Guard the
+# call so the step reports what it did rather than dying with "command not
+# found" (127) where it is absent.  "net cache flush" in the previous step
+# covers samba's own cache either way.
+command srv1 if command -v nscd > /dev/null ; then \
+		for t in passwd group ; do nscd -i \$t || true ; done ; \
+		echo "flushed nscd passwd/group caches" ; \
+	else \
+		echo "nscd is not installed, no glibc NSS cache to flush" ; \
+	fi
 
 step 5m verify winbind domain connectivity and RID idmapping
 command srv1 wbinfo --ping-dc
@@ -150,6 +218,15 @@ command srv1 cp /etc/chimera/chimera.json /etc/chimera/chimera.json.orig && \
                        kerberos_keytab: "/etc/krb5.keytab", \
                        kerberos_realm: "__KRBREALM__" \
                     } \
+                }, \
+                filesystems: { \
+                    fs0: { module: "memfs" } \
+                }, \
+                mounts: { \
+                    memfs0: { module: "memfs", path: "fs0" } \
+                }, \
+                shares: { \
+                    smb2: { path: "/memfs0" } \
                 } }'  > /etc/chimera/chimera.json && \
 	sed -i -e s/__WBDOM__/AD_WORKGROUP/ -e s/__KRBREALM__/AD_REALM/ /etc/chimera/chimera.json
 
@@ -185,6 +262,139 @@ command srv1 smbclient --use-kerberos=required --use-krb5-ccache=/tmp/test_cache
 
 step 5m test SMB auth with AD domain user via kerberos (smbclient password)
 command srv1 smbclient --use-kerberos=required -U AD_USER%AD_PASS //`hostname -f`/smb1 -c "allinfo /"
+
+
+#  --------------------   group SIDs in the security descriptor (CHIM-186)  ---
+step 3m capture the AD domain SID
+# Taken from winbindd rather than from the join output: winbindd is the same
+# source chimera's identity layer consults, so anything that disagrees with it
+# later is chimera's doing and not the lab's.  net getdomainsid is printed
+# alongside as an independent second opinion out of secrets.tdb.
+command srv1 wbinfo --domain-info=AD_WORKGROUP | tee /tmp/dominfo.txt && \
+	awk '/^SID/ {print \$3}' /tmp/dominfo.txt > /tmp/domain.sid && \
+	echo "domain SID:" && cat /tmp/domain.sid && \
+	grep -qE '^S-1-5-21-' /tmp/domain.sid && \
+	wbinfo -n AD_USER | awk '{print \$1}' > /tmp/user.sid && \
+	echo "user SID:" && cat /tmp/user.sid && \
+	grep -qF -f /tmp/domain.sid /tmp/user.sid && \
+	echo "OK: the user SID sits under the captured domain SID"
+command srv1 net getdomainsid || true
+
+step 5m confirm both shares are being served
+# Connecting to each share rather than enumerating with -L: the tree connect is
+# what the rest of this section depends on, and it does not also pull in the
+# srvsvc share-enumeration path.
+command srv1 smbclient --use-kerberos=off -U AD_WORKGROUP/AD_USER%AD_PASS //127.0.0.1/smb1 -c "allinfo /"
+command srv1 smbclient --use-kerberos=off -U AD_WORKGROUP/AD_USER%AD_PASS //127.0.0.1/smb2 -c "allinfo /"
+
+step 3m record the AD user's primary gid and confirm winbind can map it to a SID
+# Asked of winbind directly first: the CHIM-186 symptom was that winbindd
+# resolved the gid perfectly well and chimera simply never asked it, so a
+# failure here is an idmap/environment problem rather than a chimera bug, and
+# the two need to be told apart.
+command srv1 id AD_USER && \
+	id -g AD_USER > /tmp/group.gid && \
+	echo "primary gid:" && cat /tmp/group.gid && \
+	xargs -a /tmp/group.gid -I{} wbinfo --gid-to-sid={} > /tmp/wb_group.sid && \
+	echo "winbind gid-to-sid:" && cat /tmp/wb_group.sid && \
+	grep -qF -f /tmp/domain.sid /tmp/wb_group.sid && \
+	echo "OK: winbind maps the primary gid to a SID under the domain SID"
+
+step 5m create a directory and a file on the memfs share
+command srv1 smbclient --use-kerberos=off -U AD_WORKGROUP/AD_USER%AD_PASS //127.0.0.1/smb2 \
+		-c "mkdir acldir; put /etc/hostname acl.txt; ls" | tee /tmp/memfs_ls.txt && \
+	grep -qF acldir /tmp/memfs_ls.txt && \
+	grep -qF acl.txt /tmp/memfs_ls.txt
+
+step 5m show the security descriptors smbclient reports for them
+command srv1 smbclient --use-kerberos=off -U AD_WORKGROUP/AD_USER%AD_PASS //127.0.0.1/smb2 \
+		-c "showacls; ls" | tee /tmp/memfs_showacls.txt
+
+step 5m verify the memfs file's owner and group SIDs carry the domain SID prefix
+# smbcacls rather than smbclient's showacls for the assertion itself: it emits
+# one "OWNER:<sid>" and one "GROUP:<sid>" line, which greps cleanly, where the
+# showacls listing above is for a human reading the spool.
+#
+# --numeric is load bearing, not cosmetic.  Without it smbcacls resolves each
+# SID back to a name through winbind and prints "OWNER:SNNAS-LAB\<user>", so
+# every SID assertion below would fail on a correctly working server -- and,
+# worse, would PASS on a broken one for the group, because S-1-5-88-2-<gid>
+# resolves to no name and is the one value printed in raw SID form.
+command srv1 smbcacls --numeric --use-kerberos=off -U AD_WORKGROUP/AD_USER%AD_PASS \
+		//127.0.0.1/smb2 acl.txt | tee /tmp/memfs_acl.txt && \
+	awk -F: '/^OWNER:/ {print \$2}' /tmp/memfs_acl.txt > /tmp/memfs_owner.sid && \
+	awk -F: '/^GROUP:/ {print \$2}' /tmp/memfs_acl.txt > /tmp/memfs_group.sid && \
+	echo "owner SID:" && cat /tmp/memfs_owner.sid && \
+	echo "group SID:" && cat /tmp/memfs_group.sid && \
+	if grep -q '^S-1-5-88-' /tmp/memfs_group.sid ; then \
+		echo "ERROR: group SID is the algorithmic S-1-5-88-2-<gid> form; the identity layer did not resolve the gid (CHIM-186)" ; \
+		exit 1 ; \
+	fi && \
+	grep -qF -f /tmp/domain.sid /tmp/memfs_owner.sid && \
+	grep -qF -f /tmp/domain.sid /tmp/memfs_group.sid && \
+	echo "OK: owner and group SIDs both carry the AD domain SID prefix"
+
+step 5m verify the group SID chimera emits matches what winbind maps the gid to
+# grep -x rather than cmp: this is the assertion that actually pins CHIM-186
+# down (the prefix check above would still pass on a SID from the right domain
+# but the wrong RID), and whole-line matching keeps it from tripping over a
+# trailing-byte difference between wbinfo's output and awk's.
+command srv1 echo "winbind:" && cat /tmp/wb_group.sid && \
+	echo "chimera:" && cat /tmp/memfs_group.sid && \
+	grep -qxF -f /tmp/wb_group.sid /tmp/memfs_group.sid && \
+	echo "OK: chimera emits exactly the SID winbind maps the gid to"
+
+step 5m verify the directory's descriptor resolves the same way
+command srv1 smbcacls --numeric --use-kerberos=off -U AD_WORKGROUP/AD_USER%AD_PASS \
+		//127.0.0.1/smb2 acldir | tee /tmp/memfs_diracl.txt && \
+	awk -F: '/^GROUP:/ {print \$2}' /tmp/memfs_diracl.txt > /tmp/memfs_dirgroup.sid && \
+	cat /tmp/memfs_dirgroup.sid && \
+	grep -qF -f /tmp/domain.sid /tmp/memfs_dirgroup.sid && \
+	echo "OK: the directory's group SID carries the domain SID prefix too"
+
+step 5m verify the same descriptor comes back over the kerberos leg
+# Kerberos rather than NTLM reaches the identity layer by a different route, and
+# the connection has to go via the host's own name for the cifs/ SPN to be
+# found, so 127.0.0.1 is not usable here.
+command srv1 smbcacls --numeric --use-kerberos=required -U AD_USER%AD_PASS \
+		//`hostname -f`/smb2 acl.txt | tee /tmp/krb_acl.txt && \
+	awk -F: '/^GROUP:/ {print \$2}' /tmp/krb_acl.txt > /tmp/krb_group.sid && \
+	cat /tmp/krb_group.sid && \
+	grep -qxF -f /tmp/wb_group.sid /tmp/krb_group.sid && \
+	echo "OK: the kerberos leg reports the same group SID as the NTLM leg"
+
+step 5m verify the group SID resolves on the linux share as well
+# The group SID field comes from the object's gid, not from the stored ACL, so
+# the mode-only linux backend exercises this half of the fix too.  Only the
+# named-group ACE below needs memfs.
+command srv1 smbclient --use-kerberos=off -U AD_WORKGROUP/AD_USER%AD_PASS //127.0.0.1/smb1 \
+		-c "put /etc/hostname linuxacl.txt" && \
+	smbcacls --numeric --use-kerberos=off -U AD_WORKGROUP/AD_USER%AD_PASS \
+		//127.0.0.1/smb1 linuxacl.txt | tee /tmp/linux_acl.txt && \
+	awk -F: '/^GROUP:/ {print \$2}' /tmp/linux_acl.txt > /tmp/linux_group.sid && \
+	cat /tmp/linux_group.sid && \
+	if grep -q '^S-1-5-88-' /tmp/linux_group.sid ; then \
+		echo "ERROR: group SID is the algorithmic S-1-5-88-2-<gid> form on the linux share (CHIM-186)" ; \
+		exit 1 ; \
+	fi && \
+	grep -qF -f /tmp/domain.sid /tmp/linux_group.sid && \
+	echo "OK: the linux share resolves the group SID too"
+
+step 5m verify an inbound domain-group ACE survives a round trip on memfs
+# The other direction of CHIM-186: a SET-security carrying a real domain group
+# SID used to resolve only against the user index and the ACE was silently
+# dropped.  memfs is required here -- the linux backend down-projects any
+# set-ACL to a chmod, so the ACE would not survive on it for reasons unrelated
+# to identity resolution.
+command srv1 xargs -a /tmp/wb_group.sid -I{} smbcacls --numeric --use-kerberos=off \
+		-U AD_WORKGROUP/AD_USER%AD_PASS \
+		//127.0.0.1/smb2 acl.txt -a "ACL:{}:0/0x0/0x00120089" && \
+	smbcacls --numeric --use-kerberos=off -U AD_WORKGROUP/AD_USER%AD_PASS \
+		//127.0.0.1/smb2 acl.txt | tee /tmp/memfs_acl2.txt && \
+	grep '^ACL:' /tmp/memfs_acl2.txt > /tmp/memfs_aces.txt && \
+	cat /tmp/memfs_aces.txt && \
+	grep -qF -f /tmp/wb_group.sid /tmp/memfs_aces.txt && \
+	echo "OK: the domain-group ACE was stored and read back with its real SID"
 
 
 step 5m gather logs

@@ -151,6 +151,19 @@ RUN if [ "$ENABLE_WPTS" = "1" ] ; then \
 # Quantum specific addons
 #
 
+# quint is deliberately NOT installed here, though upstream's
+# .devcontainer/Dockerfile installs it.  This image backs every qb ctest,
+# syntax and static_analysis leg, and qb.yaml suppresses the model-based
+# trace replays by hiding the oras binary before cmake runs, so
+# cmake/SpecsBundle.cmake cannot fetch the prebuilt corpus.  Installing
+# quint would let its "local" provider build that corpus from ext/specs
+# instead, re-registering the very replays the oras trick disables -- and
+# the batch replayer still wedges (trace stepFds_128_0x1_2 preceding
+# another trace leaves the reset's umount waiting on a VFS close that
+# never completes), so every ctest leg would burn its timeout.  Add quint
+# here only once that hang is fixed upstream and the oras lines come out
+# of qb.yaml.
+
 # install install snfs on amd64 arch
 RUN if [ "`dpkg --print-architecture`" = "amd64" ] ; then \
         curl -s http://qsan.mdh.quantum.com/sw/rels/sn/7.2.5_E/GA/delivery/saveobjs/Ubuntu25_x86_64/objs-snfs-130-master.tar.gz | \
