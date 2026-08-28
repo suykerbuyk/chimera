@@ -13,7 +13,7 @@
 #include <extapi.h>
 #include <extapi_internal.h>
 
-#include "vfs/vfs_attrs.h"
+#include "vfs/sdk/vfs_attrs.h"
 
 /**
  * @file snfs_cvapi.h
