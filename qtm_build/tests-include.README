@@ -1,0 +1,88 @@
+Chimera caller-side VFS headers -- internal, no stability guarantee
+===================================================================
+
+These are the headers an in-process *caller* of the chimera_vfs layer builds
+against: chimera_vfs_init/destroy, chimera_vfs_thread_init, mount, umount,
+get_root_fh, and the dispatch and xattr procs.  It is the same layer the
+in-tree NFS, SMB and FUSE servers sit on, which is what makes a test written
+against it meaningful.
+
+They ship in quantum-chimera-tests so a downstream test fixture that loads the
+packaged libchimera_vfs.so can build against the real declarations instead of
+keeping its own copies.  A vendored copy is worse than no copy: after an
+upstream signature change it still compiles -- the local prototype is the only
+one the compiler sees -- and the mismatch surfaces as a run-time failure.
+
+They are NOT an API.  The supported boundary for an out-of-tree VFS *backend*
+is the module SDK in the server package, at
+
+    <prefix>/include/chimera/vfs/sdk/
+
+Everything here is chimera internals: it changes without notice and matches
+only the libchimera_vfs.so from the quantum-chimera-server package of the exact
+same version.  quantum-chimera-tests already depends on that exact version.
+
+
+What is installed
+-----------------
+
+    <prefix>/tests/include/vfs/vfs.h              chimera_vfs, _thread, mounts,
+                                                  the attribute vocabulary
+    <prefix>/tests/include/vfs/vfs_procs.h        the dispatch and xattr procs
+    <prefix>/tests/include/vfs/vfs_dump.h         included by vfs.h
+    <prefix>/tests/include/vfs/vfs_pnfs.h         included by vfs.h
+    <prefix>/tests/include/vfs/vfs_clock.h        included by vfs.h
+    <prefix>/tests/include/common/logging.h       included by vfs_dump.h
+    <prefix>/tests/include/common/tcp_flavor.h    included by vfs.h
+
+<prefix> is /opt/quantum/chimera in the Quantum packages.
+
+
+Building against them
+---------------------
+
+    #include "vfs/vfs_procs.h"
+
+    cc -I<prefix>/tests/include \
+       -I<prefix>/include/chimera \
+       -I<prefix>/include/chimera/vfs \
+       -I<prefix>/include \
+       -c consumer.c
+
+    cc consumer.o -L<prefix>/lib -lchimera_vfs -o consumer
+
+All four include roots are needed:
+
+  tests/include        these headers, reached as "vfs/..." and "common/...".
+                       Its vfs/ directory and the SDK root's vfs/ directory
+                       hold disjoint sets -- the caller headers here, sdk/
+                       there -- so neither shadows the other and the order of
+                       the two is not load-bearing.
+
+  include/chimera      the module SDK ("vfs/sdk/...") and the three external
+                       headers it includes (prometheus-c.h, stopwatch.h, and
+                       the OTEL_TRACING-pinned oteltracing.h).  Shipped by
+                       quantum-chimera-server.
+
+  include/chimera/vfs  vfs.h and vfs_pnfs.h reach the SDK by the relative form
+                       the in-tree build uses ("sdk/vfs_attrs.h").  Those
+                       headers no longer sit next to sdk/ once installed, so
+                       the relative include only resolves if the SDK's parent
+                       directory is itself on the include path.
+
+  include              libevpl's public headers ("evpl/evpl.h").
+
+uthash.h and xxhash.h are system headers (uthash-dev / libxxhash-dev on Debian
+and Ubuntu, uthash-devel / xxhash-devel on Rocky) and are not shipped here.
+
+The OTEL_TRACING value is pinned by the packaged oteltracing.h, so a consumer
+that uses the include roots above automatically agrees with the packaged
+library on the size of otel_span embedded in chimera_vfs_request.  Do not
+define OTEL_TRACING yourself: the wrong value skews the request layout and
+crashes on the first mount, and the dlopen/link boundary has no ABI check that
+would catch it.
+
+qtm_build/verify_test_includes.sh in the chimera source tree compiles a
+standalone translation unit exactly this way against a staged install, and the
+package build runs it, so a closure that has grown a new header fails the build
+here rather than at the consumer.
