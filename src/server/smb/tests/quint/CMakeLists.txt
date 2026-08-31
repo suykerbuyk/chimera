@@ -2,6 +2,10 @@
 #
 # SPDX-License-Identifier: LGPL-2.1-only
 
+# These are the model-based tests, so they make up the quick tier that plain
+# `ctest` runs.  See the test-tier block in the top-level CMakeLists.txt.
+set(CHIMERA_TEST_TIER quick)
+
 # SMB2/3 model-based tests: the Quint specification (smb2.qnt and its pure
 # smb2_state.qnt / smb2_ops.qnt modules, on top of the protocol-neutral
 # filesystem core the NFSv4 model shares) and its trace generation live in the
@@ -28,6 +32,7 @@ target_link_libraries(smb2_smoke_probe chimera_server chimera_metrics)
 add_test(NAME chimera/server/smb/mbt/smoke_probe_memfs
     COMMAND $<TARGET_FILE:smb2_smoke_probe>)
 set_tests_properties(chimera/server/smb/mbt/smoke_probe_memfs PROPERTIES
+    ENVIRONMENT "CHIMERA_MBT_ARTIFACTS=smb2_smoke_probe_memfs"
     LABELS "quint;smb_mbt;memfs"
     TIMEOUT 60)
 
@@ -42,6 +47,7 @@ target_link_libraries(smb2_oplock_probe chimera_server chimera_metrics)
 add_test(NAME chimera/server/smb/mbt/oplock_probe_memfs
     COMMAND $<TARGET_FILE:smb2_oplock_probe>)
 set_tests_properties(chimera/server/smb/mbt/oplock_probe_memfs PROPERTIES
+    ENVIRONMENT "CHIMERA_MBT_ARTIFACTS=smb2_oplock_probe_memfs"
     LABELS "quint;smb_mbt;memfs"
     TIMEOUT 90)
 
@@ -56,6 +62,7 @@ target_link_libraries(smb2_durable_probe chimera_server chimera_metrics)
 add_test(NAME chimera/server/smb/mbt/durable_probe_memfs
     COMMAND $<TARGET_FILE:smb2_durable_probe>)
 set_tests_properties(chimera/server/smb/mbt/durable_probe_memfs PROPERTIES
+    ENVIRONMENT "CHIMERA_MBT_ARTIFACTS=smb2_durable_probe_memfs"
     LABELS "quint;smb_mbt;memfs"
     TIMEOUT 120)
 
@@ -71,6 +78,7 @@ target_link_libraries(smb2_replay_probe chimera_server chimera_metrics)
 add_test(NAME chimera/server/smb/mbt/replay_probe_memfs
     COMMAND $<TARGET_FILE:smb2_replay_probe>)
 set_tests_properties(chimera/server/smb/mbt/replay_probe_memfs PROPERTIES
+    ENVIRONMENT "CHIMERA_MBT_ARTIFACTS=smb2_replay_probe_memfs"
     LABELS "quint;smb_mbt;memfs"
     TIMEOUT 120)
 
@@ -95,10 +103,18 @@ endif()
 
 add_test(NAME chimera/server/smb/mbt/batch_memfs
     COMMAND $<TARGET_FILE:smb2_mbt_replay> --trace-dir ${SPECS_BUNDLE_DIR}/smb2)
-# 40 traces at depth 500 against an ASAN build, each standing up and tearing
-# down its own filesystem: measured at 55-105 s on a loaded container, so 120 s
-# was close enough to the ceiling to flake.  This is a batch of 40 tests in one
-# ctest, not a single case.
+# The whole generated corpus in one ctest, not a single case.  ext/specs
+# generates every instance and flavor unconditionally -- nothing is withheld on
+# account of what chimera does with it -- so this runs ~70 traces at depth
+# 300-500, each standing up and tearing down its own filesystem, against an
+# ASAN build on a loaded container.
+#
+# The batches chimera cannot drive yet are declined BY NAME in
+# smb2_mbt_deviations.h (smb2_mbt_trace_limits), each with the chimera bug that
+# would retire the entry, and reported as SKIP lines.  SKIP_RETURN_CODE turns a
+# run where nothing was drivable into a ctest SKIP rather than a false pass.
 set_tests_properties(chimera/server/smb/mbt/batch_memfs PROPERTIES
+    ENVIRONMENT "CHIMERA_MBT_ARTIFACTS=smb2_batch_memfs"
     LABELS "quint;smb_mbt;memfs"
-    TIMEOUT 600)
+    TIMEOUT 1800
+    SKIP_RETURN_CODE 77)

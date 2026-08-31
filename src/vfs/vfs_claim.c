@@ -42,6 +42,7 @@ chimera_vfs_state_init(void)
     state->implicit_idle_ms          = CHIMERA_VFS_CLAIM_DEFAULT_IMPLICIT_IDLE_MS;
 
     pthread_mutex_init(&state->service_lock, NULL);
+    pthread_mutex_init(&state->bl_dispatch_lock, NULL);
 
     return state;
 } /* chimera_vfs_state_init */
@@ -1345,46 +1346,122 @@ chimera_vfs_claim_try_acquire(
         if (conflict && conflict_out) {
             chimera_vfs_claim_conflict_fill(conflict, conflict_out);
         }
-        pthread_mutex_unlock(&file->lock);
 
         if (result == CHIMERA_CLAIM_DENIED) {
+            chimera_vfs_claim_revoked_cb_t revoked_cb = NULL;
+            void *cb_private                          = NULL;
+            bool reclaimed                            = false;
+
+            /* Reclaim a courtesy holder while the lock is still held.
+             * `conflict` is borrowed, not owned: ACCESS and RANGE claims
+             * carry no refcount (their grant is NULL), so this lock is the
+             * only thing keeping the holder alive.  Unlocking first and
+             * revoking afterwards races the holder's owner tearing it down --
+             * the NFSv4 lease sweeper frees a lock-owner's range leases
+             * outright in lock_state_cleanup -- and the revoke then reads
+             * freed memory. */
             if (conflict &&
                 chimera_vfs_claim_holder_reclaimable(conflict, claim)) {
-                chimera_vfs_claim_revoke(conflict);
+                chimera_vfs_claim_revoke_locked(file, conflict,
+                                                &revoked_cb, &cb_private);
+                reclaimed = true;
+            }
+            pthread_mutex_unlock(&file->lock);
+
+            if (revoked_cb) {
+                /* Past the unlock the claim may already be freed, so it is
+                 * not passed on; every revoked callback works from its
+                 * cb_private (see chimera_vfs_claim_revoke_locked). */
+                revoked_cb(NULL, cb_private);
+            }
+
+            if (reclaimed) {
+                /* The pumps chimera_vfs_claim_revoke() would have run. */
+                if (file->state) {
+                    chimera_vfs_claim_pump_pending(file->state, file);
+                    chimera_vfs_claim_pump_io(file->state, file);
+                    chimera_vfs_claim_backend_reeval(file->state, file);
+                }
                 continue;
             }
             return CHIMERA_CLAIM_DENIED;
         }
+        pthread_mutex_unlock(&file->lock);
 
         /* BREAKING: kick a break on EVERY breakable conflicting holder
          * (R50), revoking dead/expired ones, then re-probe until no IDLE
          * conflict remains. */
         while (conflict) {
             struct chimera_vfs_claim_grant *iter_pin = NULL;
+            chimera_vfs_claim_revoked_cb_t revoked_cb = NULL;
+            void *cb_private                          = NULL;
+            bool revoked_now                          = false;
+            bool do_break                             = false;
+            bool do_wait                              = false;
+            uint32_t deadline_ms                      = 0;
+            uint8_t floor                             = 0;
 
+            /* Classify (and, for a revoke, mutate) with the lock held.
+             * `conflict` is borrowed: a courtesy holder may be a grant-less
+             * claim -- a byte-range lease -- for which pin_grant returns
+             * NULL, and its owner, the NFSv4 lease sweeper, frees it
+             * outright in lock_state_cleanup.  Deciding after unlocking
+             * races that teardown and reads freed memory.
+             *
+             * The arm order is load-bearing and matches the original: a
+             * never-broken holder sits at break_deadline 0, so the
+             * deadline test must stay *after* the IDLE/ACKED arm or every
+             * idle holder is revoked instead of broken.
+             *
+             * begin_break still runs unlocked below.  That is safe for a
+             * grant-bearing holder, which iter_pin keeps alive; an NFSv4
+             * delegation carries a break_cb with no grant, and closing that
+             * window needs a refcount for grant-less claims rather than a
+             * lock discipline.  Left alone deliberately: no failure has been
+             * observed through it, and a break callback cannot be deferred
+             * the way a revoke's can. */
             pthread_mutex_lock(&file->lock);
             iter_pin = chimera_vfs_claim_pin_grant(conflict);
-            pthread_mutex_unlock(&file->lock);
 
             if (chimera_vfs_claim_holder_reclaimable(conflict, claim)) {
-                chimera_vfs_claim_revoke(conflict);
+                chimera_vfs_claim_revoke_locked(file, conflict,
+                                                &revoked_cb, &cb_private);
                 revoked_any = true;
+                revoked_now = true;
             } else if (conflict->break_state == CHIMERA_CLAIM_BREAK_IDLE ||
                        conflict->break_state == CHIMERA_CLAIM_BREAK_ACKED) {
-                uint32_t deadline_ms =
+                deadline_ms =
                     (conflict->owner.proto == CHIMERA_CLAIM_PROTO_NFSV4)
                     ? CHIMERA_VFS_NFS_DELEG_RECALL_MS : 0;
-                uint8_t floor =
-                    chimera_vfs_claim_contended_floor(claim, conflict);
+                floor    = chimera_vfs_claim_contended_floor(claim, conflict);
+                do_break = true;
+            } else if (chimera_vfs_claim_deadline_passed(conflict)) {
+                chimera_vfs_claim_revoke_locked(file, conflict,
+                                                &revoked_cb, &cb_private);
+                revoked_any = true;
+                revoked_now = true;
+            } else {
+                do_wait = true;
+            }
+            pthread_mutex_unlock(&file->lock);
 
+            if (revoked_now) {
+                if (revoked_cb) {
+                    /* The claim may already be freed; see
+                     * chimera_vfs_claim_revoke_locked. */
+                    revoked_cb(NULL, cb_private);
+                }
+                if (file->state) {
+                    chimera_vfs_claim_pump_pending(file->state, file);
+                    chimera_vfs_claim_pump_io(file->state, file);
+                    chimera_vfs_claim_backend_reeval(file->state, file);
+                }
+            } else if (do_break) {
                 chimera_vfs_claim_begin_break_ex(
                     state, conflict, floor, deadline_ms,
                     claim->klass == CHIMERA_CLAIM_CLASS_RANGE /* one_shot */);
                 began_live_break = true;
-            } else if (chimera_vfs_claim_deadline_passed(conflict)) {
-                chimera_vfs_claim_revoke(conflict);
-                revoked_any = true;
-            } else {
+            } else if (do_wait) {
                 /* Mid-break, deadline pending: the caller waits. */
                 if (iter_pin) {
                     chimera_vfs_claim_grant_release(state, iter_pin, false);
@@ -1578,18 +1655,19 @@ chimera_vfs_claim_acquire(
     /* A locally-granted byte-range lock on a CAP_LEASE file is confirmed
      * with the backend BEFORE the callback fires: optimistic local insert,
      * rollback + DENIED on refusal (binding claims are all-or-nothing at
-     * the arbiter, never recallable).  Dispatched on the CALLER's thread:
-     * a CAP_LEASE arbiter completes lease ops inline (it must not be
-     * CAP_BLOCKING-delegated), so the callback still fires synchronously
-     * for FAIL_IMMEDIATELY-style callers.  Unlock-then-relock ordering is
-     * preserved by program order because the release paths with a thread
-     * dispatch their backend release synchronously too
-     * (chimera_vfs_claim_release_ranged); only threadless teardown
-     * releases ride the queued lane. */
+     * the arbiter, never recallable).  Dispatched on the CALLER's thread,
+     * so the callback fires synchronously for FAIL_IMMEDIATELY-style
+     * callers whenever the backend answers inline -- which is the common
+     * case but NOT guaranteed (async delegation, and eventually a
+     * clustered arbiter, both answer later), so this is not something a
+     * caller may depend on.  Unlock-then-relock ordering is preserved by
+     * program order because the release paths with a thread dispatch their
+     * backend release synchronously too (chimera_vfs_claim_release_ranged);
+     * only threadless teardown releases ride the queued lane. */
     if (result == CHIMERA_CLAIM_GRANTED &&
         claim->klass == CHIMERA_CLAIM_CLASS_RANGE &&
         chimera_vfs_claim_backend_range_projects(state, file, thread)) {
-        chimera_vfs_claim_backend_project_range(thread, state, ticket);
+        chimera_vfs_claim_backend_project_range(thread, state, ticket, false);
         return;
     }
 
@@ -1701,15 +1779,14 @@ chimera_vfs_claim_cancel(
         return true;
     }
 
-    /* Not on the pending queue.  A pump-granted projectable lock is NOT
-     * complete yet: its ticket sits in the service work FIFO awaiting the
-     * backend confirm (chimera_vfs_claim_backend_defer_ticket), callback
-     * unfired.  Yank it so the service thread never touches a ticket whose
-     * owner is tearing it down -- and roll back the pump's optimistic local
-     * insert, releasing the range for other waiters.  When the yank misses
-     * because the confirm is executing right now, ticket_cancel waits it
-     * out, so false keeps its contract: the callback HAS fired (smbtorture
-     * smb2.lock cancel-by-teardown vs deferred-grant UAF). */
+    /* Not on the pending queue.  A projectable lock granted locally is NOT
+     * complete yet: its ticket is either queued for the backend confirm
+     * (chimera_vfs_claim_backend_defer_ticket) or has one in flight, with
+     * the callback unfired either way.  Claim it so nothing ever completes
+     * a ticket whose owner is tearing it down, and roll back the optimistic
+     * local insert, releasing the range for other waiters.  ticket_cancel
+     * never blocks: when it cannot claim the ticket the callback has
+     * already been invoked, and false hands ownership to that callback. */
     if (state && chimera_vfs_claim_backend_ticket_cancel(state, ticket)) {
         chimera_vfs_claim_release(state, file, ticket->claim);
         return true;

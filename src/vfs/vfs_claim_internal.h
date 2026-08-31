@@ -227,11 +227,13 @@ chimera_vfs_claim_backend_capable(
 /* Confirm a locally-granted RANGE claim with the backend before its ticket
  * callback fires; `thread` must be the CALLING vfs thread (its request pool
  * is per-thread and unlocked). */
+
 void
 chimera_vfs_claim_backend_project_range(
     struct chimera_vfs_thread          *thread,
     struct chimera_vfs_state           *state,
-    struct chimera_vfs_pending_acquire *ticket);
+    struct chimera_vfs_pending_acquire *ticket,
+    bool                                serial_lane);
 
 bool
 chimera_vfs_claim_backend_range_projects(

@@ -36,6 +36,7 @@
 
 #include "nfs3_mbt_common.h"
 #include "common/mbt_trace_dir.h"
+#include "common/mbt_watchdog.h"
 
 #define V4_BLOCK_SIZE       8192
 #define V4_LOCK_BYTES       8
@@ -62,12 +63,31 @@
 #define V4_IA_MAX_HINTS     8
 #define V4_RETRY_DELAY_MAX  40
 
+/* layouttype4 values the harness can ask for.  The generated XDR names only
+ * the NFSv4.1-files type (RFC 8881 12.2.5), which chimera does not serve; the
+ * two it does are RFC 8435 flex-files and RFC 5663 block, spelled out here the
+ * same way src/server/nfs/nfs4_pnfs.c spells them. */
+#define V4_LAYOUT_FILES     0x1
+#define V4_LAYOUT_BLOCK     0x3
+#define V4_LAYOUT_FLEX      0x4
+#define V4_LAYOUT_SCSI      0x5
+
+/* Offset of ffds_deviceid inside an ff_layout4 loc_body (RFC 8435 5.1):
+ * ffl_stripe_unit (8) + ffl_mirrors<> count (4) + ffm_data_servers<> count (4). */
+#define V4_FF_DEVICEID_OFF  16
+
 #define E_DELAY             10008
 #define E_DENIED            10010
 #define E_NOTSUPP           10004
 #define E_LOCKS_HELD        10037
 #define E_LAYOUTUNAVAILABLE 10059
+#define E_NOMATCHING_LAYOUT 10060
 #define V4_ERR_SYMLINK      10029
+
+/* The layout type this run drives.  Fixed for the process: which one a server
+ * serves is a property of the MDS backend (flex-files for the orchestrated
+ * backends, block/SCSI for a layout-sourcing one), not of a trace. */
+static uint32_t g_layout_type = V4_LAYOUT_FLEX;
 
 /* ---- mismatch accumulator ------------------------------------------------ */
 
@@ -207,6 +227,40 @@ jf_val(json_t *v)
     return json_object_get(v, "value");
 } /* jf_val */
 
+
+/* Every attribute chimera advertises as supported, minus the two write-only
+ * *_SET attributes and RDATTR_ERROR (meaningful only inside READDIR).  Shared
+ * by RGetattrWide, RReaddir and the wide VERIFY/NVERIFY variants: asking for
+ * the server's whole attribute vocabulary is what drives
+ * chimera_nfs4_marshall_attrs, which each of those three ops compiles its own
+ * static copy of. */
+static void
+v4_wide_attr_mask(uint32_t *m)
+{
+    m[0] = (1U << FATTR4_SUPPORTED_ATTRS) |
+        (1U << FATTR4_TYPE) | (1U << FATTR4_FH_EXPIRE_TYPE) |
+        (1U << FATTR4_CHANGE) | (1U << FATTR4_SIZE) |
+        (1U << FATTR4_LINK_SUPPORT) | (1U << FATTR4_SYMLINK_SUPPORT) |
+        (1U << FATTR4_NAMED_ATTR) | (1U << FATTR4_FSID) |
+        (1U << FATTR4_UNIQUE_HANDLES) | (1U << FATTR4_LEASE_TIME) |
+        (1U << FATTR4_ACL) | (1U << FATTR4_ACLSUPPORT) |
+        (1U << FATTR4_ARCHIVE) | (1U << FATTR4_CANSETTIME) |
+        (1U << FATTR4_CASE_INSENSITIVE) | (1U << FATTR4_CASE_PRESERVING) |
+        (1U << FATTR4_CHOWN_RESTRICTED) | (1U << FATTR4_FILEHANDLE) |
+        (1U << FATTR4_FILEID) | (1U << FATTR4_FILES_AVAIL) |
+        (1U << FATTR4_FILES_FREE) | (1U << FATTR4_FILES_TOTAL) |
+        (1U << FATTR4_MAXNAME) | (1U << FATTR4_MAXREAD) |
+        (1U << FATTR4_MAXWRITE);
+    m[1] = (1U << (FATTR4_MODE - 32)) |
+        (1U << (FATTR4_NUMLINKS - 32)) | (1U << (FATTR4_OWNER - 32)) |
+        (1U << (FATTR4_OWNER_GROUP - 32)) | (1U << (FATTR4_RAWDEV - 32)) |
+        (1U << (FATTR4_SPACE_AVAIL - 32)) | (1U << (FATTR4_SPACE_FREE - 32)) |
+        (1U << (FATTR4_SPACE_TOTAL - 32)) | (1U << (FATTR4_SPACE_USED - 32)) |
+        (1U << (FATTR4_TIME_ACCESS - 32)) |
+        (1U << (FATTR4_TIME_METADATA - 32)) |
+        (1U << (FATTR4_TIME_MODIFY - 32));
+} /* v4_wide_attr_mask */
+
 /* ---- known-deviation registry (see DEVIATIONS-NFS4.md) ------------------- */
 
 enum v4_dev {
@@ -214,6 +268,8 @@ enum v4_dev {
     DEV_ACCESS_NO_EXECUTE,        /* D4-2 */
     DEV_SYMLINK_MODE_0755,        /* D4-4 */
     DEV_LOOKUPP_SYMLINK,          /* D4-7 */
+    DEV_COARSE_TYPE_ERR,          /* D4-15 */
+    DEV_READLINK_DIR_INVAL,       /* D4-16 */
     DEV_COUNT,
 };
 
@@ -222,7 +278,11 @@ static const char *v4_dev_ids[DEV_COUNT] = {
     "D4-2-access-no-execute",
     "D4-4-symlink-mode-0755",
     "D4-7-lookupp-symlink",
+    "D4-15-coarse-type-error",
+    "D4-16-readlink-dir-inval",
 };
+
+#define E_WRONG_TYPE 10083
 
 /* ---- per-op reply summary ------------------------------------------------ */
 
@@ -262,6 +322,7 @@ struct v4_res {
     uint8_t         confirm[8];
     uint32_t        sequenceid, flags; /* EXCHANGE_ID */
     uint8_t         sessionid[16];    /* CREATE_SESSION */
+    uint32_t        fore_slots;       /* CREATE_SESSION: ca_maxrequests */
 
     int             has_sid;          /* OPEN/LOCK/LOCKU/... result stateid */
     struct stateid4 sid;
@@ -365,6 +426,11 @@ struct oracle {
     uint8_t                sess[V4_MAX_SESS][16];
     uint8_t                sess_known[V4_MAX_SESS];
     int                    sess_client[V4_MAX_SESS]; /* model sess -> client */
+
+    /* Fore-channel slots the server granted, and a private sequence id on
+     * the retry slot (see the DELAY retry in run_compound). */
+    uint32_t               sess_slots[V4_MAX_SESS];
+    uint32_t               retry_seq[V4_MAX_SESS];
 
     uint8_t                sid_other[V4_MAX_SIDS][12];
     uint8_t                sid_known[V4_MAX_SIDS];
@@ -648,6 +714,36 @@ static struct oracle *g_recall_oracle;
  * clientid/session/slot state rather than colliding with a prior trace's. */
 static uint64_t       g_owner_epoch;
 
+/*
+ * CB_NULL.  The server probes a client's callback path with one before it will
+ * use the path (nfs4_cb_ensure_probe), and it holds a reference on the channel
+ * until the probe completes -- so a harness that never answers leaves the
+ * channel pinned for the life of the process.  pNFS is the first MBT profile to
+ * open a callback path at all (LAYOUTGET opens one so the layout can later be
+ * recalled), which is why this went unnoticed while delegations stayed off.
+ */
+static void
+v4_cb_null(
+    struct evpl               *evpl,
+    struct evpl_rpc2_conn     *conn,
+    struct evpl_rpc2_cred     *cred,
+    struct evpl_rpc2_encoding *encoding,
+    void                      *private_data)
+{
+    struct oracle *o = private_data ? private_data : g_recall_oracle;
+    int            rc;
+
+    (void) conn;
+    (void) cred;
+
+    if (!o) {
+        return;
+    }
+
+    rc = o->env->nfs_v4_cb.send_reply_CB_NULL(evpl, NULL, encoding);
+    (void) rc;
+} /* v4_cb_null */
+
 static void
 v4_cb_compound(
     struct evpl               *evpl,
@@ -662,6 +758,7 @@ v4_cb_compound(
     struct nfs_cb_resop4  *resarray;
     uint32_t               i;
     int                    rc;
+    nfsstat4               cb_status = NFS4_OK;
 
     (void) conn;
     (void) cred;
@@ -714,13 +811,35 @@ v4_cb_compound(
                 }
                 resop->opcbrecall.status = NFS4_OK;
                 break;
+            case OP_CB_LAYOUTRECALL:
+                /* Decline the recall.  NFS4_OK would promise a LAYOUTRETURN,
+                 * and there is nobody here to send one: the trace is fixed and
+                 * this thread is blocked inside the very compound whose
+                 * SETATTR triggered the recall, so the server would wait for a
+                 * return that can never arrive.  NFS4ERR_NOMATCHING_LAYOUT is
+                 * also the honest answer -- a replayer holds no layout state
+                 * of its own -- and it makes the server revoke the layout and
+                 * resume the deferred op (RFC 8881 12.5.5), which is what the
+                 * pNFS model profiles encode.  Both the op status and the
+                 * compound status carry it; the server reads the latter. */
+                if (o && o->nrecalls <
+                    (int) (sizeof(o->recalls) / sizeof(o->recalls[0]))) {
+                    memcpy(o->recalls[o->nrecalls++],
+                           argop->opcblayoutrecall.clora_recall.lor_layout.
+                           lor_stateid.other, 12);
+                }
+                resop->opcblayoutrecall.clorr_status =
+                    E_NOMATCHING_LAYOUT;
+                cb_status = E_NOMATCHING_LAYOUT;
+                break;
             default:
                 resop->opcbrecall.status = NFS4ERR_NOTSUPP;
+                cb_status                = NFS4ERR_NOTSUPP;
                 break;
         } /* switch */
     }
 
-    res.status       = NFS4_OK;
+    res.status       = cb_status;
     res.num_resarray = args->num_argarray;
     res.resarray     = resarray;
 
@@ -829,14 +948,149 @@ struct v4_argscratch {
     char              owner[64];
     uint8_t           verf[8];
     uint32_t          bitmap[2];
-    uint8_t           blob[16];
+    uint8_t           blob[64];
     uint32_t          attr_req[2];
     struct evpl_iovec wiov;
     int               wiov_used;
     char              xval[64];
     uint32_t          ia_hint;               /* IO_ADVISE request hint */
     uint8_t           ws_pattern[V4_BLOCK_SIZE]; /* WRITE_SAME ADB pattern */
+    /* Materialized component names.  Two, because RENAME carries two at once. */
+    char              nbuf[2][300];
 };
+
+
+/*
+ * Materialize a model component name onto the wire.
+ *
+ * Ordinary names travel as themselves.  The hostile sentinels expand to byte
+ * strings a JSON trace cannot carry literally -- an embedded NUL, invalid
+ * UTF-8, 256 bytes -- which is the same abstract-sentinel trick the POSIX
+ * suite uses for its ENAMETOOLONG cases.  Kept in lockstep with nameStatus()
+ * in nfs4_ops.qnt, which predicts what chimera_nfs4_validate_name() answers
+ * for each (nfs4_procs.h):
+ *
+ *   NEMPTY  ""                  -> NFS4ERR_INVAL        (len == 0)
+ *   NLONG   256 * 'x'           -> NFS4ERR_NAMETOOLONG  (len > 255)
+ *   NDOT    "."                 -> NFS4ERR_BADNAME
+ *   NDOTDOT ".."                -> NFS4ERR_BADNAME
+ *   NSLASH  "a/b"               -> NFS4ERR_BADCHAR      (path separator)
+ *   NNUL    "a\0b"              -> NFS4ERR_BADCHAR      (embedded NUL)
+ *   NUTF8   "\x80"              -> NFS4ERR_INVAL        (stray continuation)
+ *   NUTF8B  "\xC0\x80"          -> NFS4ERR_INVAL        (overlong 2-byte)
+ *   NUTF8C  "\xE0\x80\x80"      -> NFS4ERR_INVAL        (overlong 3-byte)
+ */
+static void
+v4_expand_name(
+    const char  *sname,
+    char        *buf,
+    const char **out,
+    uint32_t    *outlen)
+{
+    /* Adjacent string literals, not one literal: a C hex escape is greedy, so
+     * "\xE6\x97\xA5" would parse as a single overlong escape. */
+    /* *INDENT-OFF* */
+    struct { const char *tag; const char *bytes; uint32_t len; } map[] = {
+        /* --- rejected by chimera_nfs4_validate_name ------------------ */
+        { "NEMPTY",  "",                                          0
+        },
+        { "NDOT",    ".",                                         1
+        },
+        { "NDOTDOT", "..",                                        2
+        },
+        { "NSLASH",  "a/b",                                       3
+        },
+        { "NNUL",    "a\0b",                                      3
+        },
+        /* --- rejected by chimera_nfs4_utf8_valid, one per branch ----- */
+        { "NUTF8",   "\x80",                                      1
+        },                                                                                         /* stray continuation */
+        { "NUTF8B",  "\xC0" "\x80",                               2
+        },                                                                                         /* overlong 2-byte    */
+        { "NUTF8C",  "\xE0" "\x80" "\x80",                        3
+        },                                                                                         /* overlong 3-byte    */
+        { "NUSUR",   "\xED" "\xA0" "\x80",                        3
+        },                                                                                         /* surrogate U+D800   */
+        { "NUNCH",   "\xEF" "\xBF" "\xBF",                        3
+        },                                                                                         /* non-char U+FFFF    */
+        { "NU4OV",   "\xF0" "\x8F" "\xBF" "\xBF",                 4
+        },                                                                                         /* overlong 4-byte    */
+        { "NU4HI",   "\xF4" "\x90" "\x80" "\x80",                 4
+        },                                                                                         /* above U+10FFFF     */
+        { "NUF5",    "\xF5" "\x80" "\x80" "\x80",                 4
+        },                                                                                         /* c > 0xF4           */
+        { "NUTRUNC", "\xE6" "\x97",                               2
+        },                                                                                         /* truncated 3-byte   */
+        { "NUBADC",  "\xC3" "A",                                  2
+        },                                                                                         /* bad continuation   */
+        /* --- multi-character names.  Every sentinel above is a single
+         * character, so the validator's loop (for i < len, with the inner
+         * continuation-byte while) only ever ran one iteration and never a
+         * transition between widths.  These do. --- */
+        { "NUMIXB",  "a" "\xC3" "\xA9" "\x80",                    4
+        },                                                                                         /* ok,ok,stray cont  */
+        { "NUMIXT",  "a" "\xE6" "\x97",                           3
+        },                                                                                         /* ok, then truncated*/
+        { "NUMIXS",  "\xC3" "\xA9" "\xED" "\xA0" "\x80",          5
+        },                                                                                         /* ok, surrogate */
+        /* --- ACCEPTED: the multi-byte success paths, which every name
+         * the model generated until now (pure ASCII) skipped entirely --- */
+        { "NUMIX",   "a" "\xC3" "\xA9" "\xE6" "\x97" "\xA5"
+          "\xF0" "\x9D" "\x84" "\x9E",  10 },            /* 1+2+3+4 widths  */
+        { "NUREP",   "\xC3" "\xA9" "\xC3" "\xA9" "\xC3" "\xA9",   6
+        },                                                                                         /* loop x3 */
+        { "NU2",     "\xC3" "\xA9",                               2
+        },                                                                                         /* U+00E9  e-acute    */
+        { "NU3",     "\xE6" "\x97" "\xA5",                        3
+        },                                                                                         /* U+65E5  CJK        */
+        { "NU4",     "\xF0" "\x9D" "\x84" "\x9E",                 4
+        },                                                                                         /* U+1D11E clef       */
+        { "NU3E",    "\xE0" "\xA0" "\x80",                        3
+        },                                                                                         /* U+0800  3-byte min */
+        { "NU3S",    "\xED" "\x9F" "\xBF",                        3
+        },                                                                                         /* U+D7FF just below
+                                                                                                    * the surrogates    */
+        { "NU4M",    "\xF4" "\x8F" "\xBF" "\xBF",                 4
+        },                                                                                         /* U+10FFFF max       */
+    };
+    /* *INDENT-ON* */
+    unsigned i;
+
+    if (strcmp(sname, "NLONG") == 0) {
+        memset(buf, 'x', 256);
+        *out    = buf;
+        *outlen = 256;
+        return;
+    }
+    for (i = 0; i < sizeof(map) / sizeof(map[0]); i++) {
+        if (strcmp(sname, map[i].tag) == 0) {
+            memcpy(buf, map[i].bytes, map[i].len);
+            *out    = buf;
+            *outlen = map[i].len;
+            return;
+        }
+    }
+    *out    = sname;
+    *outlen = (uint32_t) strlen(sname);
+} /* v4_expand_name */
+
+
+/* Compare a server-returned directory entry against a model name.  Model names
+ * may be sentinels (see v4_expand_name), so the expected side has to be
+ * materialized before comparing -- the server returns the real bytes, e.g. the
+ * two bytes of U+00E9 rather than the string "NU2". */
+static int
+v4_name_eq(
+    const char *wire,
+    const char *model_name)
+{
+    char        buf[300];
+    const char *want;
+    uint32_t    wantlen;
+
+    v4_expand_name(model_name, buf, &want, &wantlen);
+    return strlen(wire) == wantlen && memcmp(wire, want, wantlen) == 0;
+} /* v4_name_eq */
 
 static void
 pack_be32(
@@ -886,6 +1140,63 @@ pack_fattr(
     f->attr_vals.data = s->blob;
     f->attr_vals.len  = len;
 } /* pack_fattr */
+
+/*
+ * SETATTR carrying every writable attribute chimera accepts except SIZE and
+ * ACL: mode, owner, owner_group and both settable times.  Values are packed in
+ * ascending attribute-bit order (RFC 7530 §5) -- MODE(33), OWNER(36),
+ * OWNER_GROUP(37), TIME_ACCESS_SET(40), TIME_MODIFY_SET(42).
+ *
+ * The model treats this as exactly a mode-only SETATTR, so the extra
+ * attributes must not move anything it tracks: owner and group are "0", the
+ * identity the harness already runs as, and both times use
+ * SET_TO_SERVER_TIME4 (discriminant 0, no nfstime4 body).  The point is
+ * SETATTR's own copy of chimera_nfs4_unmarshall_attrs, which a mode/size-only
+ * model leaves largely unexecuted.
+ */
+static void
+pack_fattr_wide(
+    struct fattr4        *f,
+    struct v4_argscratch *s,
+    int                   mode)
+{
+    uint32_t len = 0;
+    int      i;
+
+    s->bitmap[0] = 0;
+    s->bitmap[1] = (1U << (FATTR4_MODE - 32)) |
+        (1U << (FATTR4_OWNER - 32)) |
+        (1U << (FATTR4_OWNER_GROUP - 32)) |
+        (1U << (FATTR4_TIME_ACCESS_SET - 32)) |
+        (1U << (FATTR4_TIME_MODIFY_SET - 32));
+
+    pack_be32(s->blob + len, (uint32_t) mode);
+    len += 4;
+
+    /* owner, then owner_group: utf8str_mixed, length-prefixed and padded to a
+     * 4-byte boundary.  chimera converts the text with strtoul(). */
+    for (i = 0; i < 2; i++) {
+        pack_be32(s->blob + len, 1);
+        len             += 4;
+        s->blob[len]     = '0';
+        s->blob[len + 1] = 0;
+        s->blob[len + 2] = 0;
+        s->blob[len + 3] = 0;
+        len             += 4;
+    }
+
+    /* settime4 x2: SET_TO_SERVER_TIME4 carries no timestamp. */
+    pack_be32(s->blob + len, 0);
+    len += 4;
+    pack_be32(s->blob + len, 0);
+    len += 4;
+
+    f->num_attrmask   = 2;
+    f->attrmask       = s->bitmap;
+    f->attr_vals.data = s->blob;
+    f->attr_vals.len  = len;
+} /* pack_fattr_wide */
+
 
 static void
 set_stateid(
@@ -1027,9 +1338,17 @@ encode_op(
         return 0;
     }
     if (strcmp(tag, "RLookup") == 0) {
-        a->argop                 = OP_LOOKUP;
-        a->oplookup.objname.data = (void *) json_string_value(v);
-        a->oplookup.objname.len  = (uint32_t) strlen(json_string_value(v));
+        a->argop = OP_LOOKUP;
+        v4_expand_name(json_string_value(v), s->nbuf[0],
+                       (const char **) &a->oplookup.objname.data,
+                       &a->oplookup.objname.len);
+        return 0;
+    }
+    if (strcmp(tag, "RSecinfo") == 0) {
+        a->argop = OP_SECINFO;
+        v4_expand_name(json_string_value(v), s->nbuf[0],
+                       (const char **) &a->opsecinfo.name.data,
+                       &a->opsecinfo.name.len);
         return 0;
     }
     if (strcmp(tag, "RLookupp") == 0) {
@@ -1042,6 +1361,16 @@ encode_op(
             (1U << FATTR4_SIZE);
         s->attr_req[1] = (1U << (FATTR4_MODE - 32)) |
             (1U << (FATTR4_NUMLINKS - 32));
+        a->opgetattr.attr_request     = s->attr_req;
+        a->opgetattr.num_attr_request = 2;
+        return 0;
+    }
+    if (strcmp(tag, "RGetattrWide") == 0) {
+        /* See v4_wide_attr_mask: the model predicts the status and nothing
+         * else (SGetattrWide has no comparator arm), so this exists purely to
+         * run chimera's attribute marshaller over its whole vocabulary. */
+        a->argop = OP_GETATTR;
+        v4_wide_attr_mask(s->attr_req);
         a->opgetattr.attr_request     = s->attr_req;
         a->opgetattr.num_attr_request = 2;
         return 0;
@@ -1059,11 +1388,15 @@ encode_op(
         a->argop            = OP_READDIR;
         a->opreaddir.cookie = 0;
         memset(a->opreaddir.cookieverf, 0, sizeof(a->opreaddir.cookieverf));
-        a->opreaddir.dircount         = 65536;
-        a->opreaddir.maxcount         = 1048576;
-        s->attr_req[0]                = 1U << FATTR4_FILEID;
+        a->opreaddir.dircount = 65536;
+        a->opreaddir.maxcount = 1048576;
+        /* Ask for the server's whole attribute vocabulary, not just FILEID:
+         * READDIR compiles its own copy of chimera_nfs4_marshall_attrs and
+         * marshals it per directory entry, and the harness compares only
+         * names and eof -- so this is free coverage of that copy. */
+        v4_wide_attr_mask(s->attr_req);
         a->opreaddir.attr_request     = s->attr_req;
-        a->opreaddir.num_attr_request = 1;
+        a->opreaddir.num_attr_request = 2;
         return 0;
     }
     if (strcmp(tag, "RCreate") == 0) {
@@ -1080,29 +1413,40 @@ encode_op(
             a->opcreate.objtype.devdata.specdata1 = 0;
             a->opcreate.objtype.devdata.specdata2 = 0;
         }
-        a->opcreate.objname.data = (void *) jf_str(v, "name");
-        a->opcreate.objname.len  = (uint32_t) strlen(jf_str(v, "name"));
+        v4_expand_name(jf_str(v, "name"), s->nbuf[0],
+                       (const char **) &a->opcreate.objname.data,
+                       &a->opcreate.objname.len);
         pack_fattr(&a->opcreate.createattrs, s, (int) jf_i64(v, "mode"), -1);
         return 0;
     }
     if (strcmp(tag, "RRemove") == 0) {
-        a->argop                = OP_REMOVE;
-        a->opremove.target.data = (void *) json_string_value(v);
-        a->opremove.target.len  = (uint32_t) strlen(json_string_value(v));
+        a->argop = OP_REMOVE;
+        v4_expand_name(json_string_value(v), s->nbuf[0],
+                       (const char **) &a->opremove.target.data,
+                       &a->opremove.target.len);
         return 0;
     }
     if (strcmp(tag, "RRename") == 0) {
-        a->argop                 = OP_RENAME;
-        a->oprename.oldname.data = (void *) jf_str(v, "oldname");
-        a->oprename.oldname.len  = (uint32_t) strlen(jf_str(v, "oldname"));
-        a->oprename.newname.data = (void *) jf_str(v, "newname");
-        a->oprename.newname.len  = (uint32_t) strlen(jf_str(v, "newname"));
+        a->argop = OP_RENAME;
+        v4_expand_name(jf_str(v, "oldname"), s->nbuf[0],
+                       (const char **) &a->oprename.oldname.data,
+                       &a->oprename.oldname.len);
+        v4_expand_name(jf_str(v, "newname"), s->nbuf[1],
+                       (const char **) &a->oprename.newname.data,
+                       &a->oprename.newname.len);
         return 0;
     }
     if (strcmp(tag, "RLink") == 0) {
-        a->argop               = OP_LINK;
-        a->oplink.newname.data = (void *) json_string_value(v);
-        a->oplink.newname.len  = (uint32_t) strlen(json_string_value(v));
+        a->argop = OP_LINK;
+        v4_expand_name(json_string_value(v), s->nbuf[0],
+                       (const char **) &a->oplink.newname.data,
+                       &a->oplink.newname.len);
+        return 0;
+    }
+    if (strcmp(tag, "RSetattrWide") == 0) {
+        a->argop = OP_SETATTR;
+        memset(&a->opsetattr.stateid, 0, sizeof(a->opsetattr.stateid));
+        pack_fattr_wide(&a->opsetattr.obj_attributes, s, (int) itf_i64(v));
         return 0;
     }
     if (strcmp(tag, "RSetattr") == 0) {
@@ -1117,6 +1461,32 @@ encode_op(
         pack_fattr(&a->opsetattr.obj_attributes, s,
                    mode < 0 ? -1 : (int) mode,
                    size_blk < 0 ? -1 : size_blk * V4_BLOCK_SIZE);
+        return 0;
+    }
+    if (strcmp(tag, "RVerifyWide") == 0 ||
+        strcmp(tag, "RNverifyWide") == 0) {
+        int            nv = tag[1] == 'N';
+        struct fattr4 *f  = nv ? &a->opnverify.obj_attributes
+                               : &a->opverify.obj_attributes;
+
+        /* Wide mask, empty value blob.  chimera marshals every requested
+         * attribute before comparing, so this exercises VERIFY's own copy of
+         * chimera_nfs4_marshall_attrs; the length guard
+         * (out_len == attr_vals.len) then makes the comparison differ
+         * deterministically, which is what lets the model predict the answer
+         * without knowing a single attribute value. */
+        a->argop = nv ? OP_NVERIFY : OP_VERIFY;
+        v4_wide_attr_mask(s->bitmap);
+        /* VERIFY's own supported set omits FATTR4_RAWDEV, though GETATTR
+         * marshals it happily -- an asymmetry in chimera, recorded as an open
+         * finding in DEVIATIONS-NFS4.md.  Requesting it here would answer
+         * NFS4ERR_ATTRNOTSUPP before the marshaller ever runs, defeating the
+         * point of the op, so drop the bit until chimera is fixed. */
+        s->bitmap[1]     &= ~(1U << (FATTR4_RAWDEV - 32));
+        f->attrmask       = s->bitmap;
+        f->num_attrmask   = 2;
+        f->attr_vals.data = s->blob;
+        f->attr_vals.len  = 0;
         return 0;
     }
     if (strcmp(tag, "RVerifySize") == 0 ||
@@ -1249,6 +1619,20 @@ encode_op(
         memcpy(a->opdestroy_session.dsa_sessionid, o->sess[sess], 16);
         return 0;
     }
+    if (strcmp(tag, "RBindConnToSession") == 0) {
+        int64_t sess = jf_i64(v, "sess");
+
+        if (sess < 0 || sess >= V4_MAX_SESS || !o->sess_known[sess]) {
+            mism_add(m, "model session %" PRId64 " unknown", sess);
+            return -1;
+        }
+        a->argop = OP_BIND_CONN_TO_SESSION;
+        memcpy(a->opbind_conn_to_session.bctsa_sessid, o->sess[sess], 16);
+        a->opbind_conn_to_session.bctsa_dir =
+            (uint32_t) jf_i64(v, "dir");
+        a->opbind_conn_to_session.bctsa_use_conn_in_rdma_mode = 0;
+        return 0;
+    }
     if (strcmp(tag, "RDestroyClientid") == 0) {
         if (wire_clientid(o, itf_i64(v), &cid, m) < 0) {
             return -1;
@@ -1317,9 +1701,10 @@ encode_op(
         if (strcmp(jf_tag(claim), "OCNull") == 0) {
             const char *name = json_string_value(jf_val(claim));
 
-            a->opopen.claim.claim     = CLAIM_NULL;
-            a->opopen.claim.file.data = (void *) name;
-            a->opopen.claim.file.len  = (uint32_t) strlen(name);
+            a->opopen.claim.claim = CLAIM_NULL;
+            v4_expand_name(name, s->nbuf[0],
+                           (const char **) &a->opopen.claim.file.data,
+                           &a->opopen.claim.file.len);
         } else {
             a->opopen.claim.claim = CLAIM_FH;
         }
@@ -1657,7 +2042,7 @@ encode_op(
     if (strcmp(tag, "RLayoutget") == 0) {
         a->argop                                = OP_LAYOUTGET;
         a->oplayoutget.loga_signal_layout_avail = 0;
-        a->oplayoutget.loga_layout_type         = LAYOUT4_NFSV4_1_FILES;
+        a->oplayoutget.loga_layout_type         = g_layout_type;
         a->oplayoutget.loga_iomode              = jf_bool(v, "rw")
             ? LAYOUTIOMODE4_RW : LAYOUTIOMODE4_READ;
         a->oplayoutget.loga_offset = (uint64_t) jf_i64(v, "lo") *
@@ -1679,7 +2064,7 @@ encode_op(
         }
         a->argop                                          = OP_LAYOUTRETURN;
         a->oplayoutreturn.lora_reclaim                    = 0;
-        a->oplayoutreturn.lora_layout_type                = LAYOUT4_NFSV4_1_FILES;
+        a->oplayoutreturn.lora_layout_type                = g_layout_type;
         a->oplayoutreturn.lora_iomode                     = LAYOUTIOMODE4_ANY;
         a->oplayoutreturn.lora_layoutreturn.lr_returntype =
             LAYOUTRETURN4_FILE;
@@ -1708,9 +2093,8 @@ encode_op(
         a->oplayoutcommit.loca_last_write_offset.no_offset    =
             (uint64_t) jf_i64(v, "hi") * V4_BLOCK_SIZE - 1;
         a->oplayoutcommit.loca_time_modify.nt_timechanged = 0;
-        a->oplayoutcommit.loca_layoutupdate.lou_type      =
-            LAYOUT4_NFSV4_1_FILES;
-        a->oplayoutcommit.loca_layoutupdate.lou_body.len = 0;
+        a->oplayoutcommit.loca_layoutupdate.lou_type      = g_layout_type;
+        a->oplayoutcommit.loca_layoutupdate.lou_body.len  = 0;
         return 0;
     }
     if (strcmp(tag, "RGetdeviceinfo") == 0) {
@@ -1718,7 +2102,7 @@ encode_op(
         memcpy(a->opgetdeviceinfo.gdia_device_id,
                o->has_deviceid ? o->deviceid : (const uint8_t[16]) { 0 },
                16);
-        a->opgetdeviceinfo.gdia_layout_type      = LAYOUT4_NFSV4_1_FILES;
+        a->opgetdeviceinfo.gdia_layout_type      = g_layout_type;
         a->opgetdeviceinfo.gdia_maxcount         = 1048576;
         a->opgetdeviceinfo.num_gdia_notify_types = 0;
         return 0;
@@ -1894,6 +2278,9 @@ decode_resop(
         case OP_LOOKUP:
             st = rop->oplookup.status;
             break;
+        case OP_SECINFO:
+            st = rop->opsecinfo.status;
+            break;
         case OP_LOOKUPP:
             st = rop->oplookupp.status;
             break;
@@ -2055,7 +2442,12 @@ decode_resop(
             if (st == NFS4_OK) {
                 memcpy(r->sessionid,
                        rop->opcreate_session.csr_resok4.csr_sessionid, 16);
+                r->fore_slots = rop->opcreate_session.csr_resok4.
+                    csr_fore_chan_attrs.ca_maxrequests;
             }
+            break;
+        case OP_BIND_CONN_TO_SESSION:
+            st = rop->opbind_conn_to_session.bctsr_status;
             break;
         case OP_DESTROY_SESSION:
             st = rop->opdestroy_session.dsr_status;
@@ -2210,11 +2602,22 @@ decode_resop(
                     r->segs[r->nsegs].length = ok->logr_layout[j].lo_length;
                     r->nsegs++;
                 }
-                if (ok->num_logr_layout > 0 &&
-                    ok->logr_layout[0].lo_content.loc_body.len >= 16) {
-                    memcpy(r->deviceid,
-                           ok->logr_layout[0].lo_content.loc_body.data, 16);
-                    r->has_deviceid = 1;
+                if (ok->num_logr_layout > 0) {
+                    const xdr_opaque *body =
+                        &ok->logr_layout[0].lo_content.loc_body;
+                    /* Where the deviceid sits in the body depends on the
+                     * layout type: an ff_layout4 carries it inside its first
+                     * ff_data_server4 (RFC 8435 5.1); a pnfs_block_layout4
+                     * opens with the extent count and then bex_vol_id
+                     * (RFC 5663 2.3.1).  A client has to parse it out either
+                     * way to have anything to hand GETDEVICEINFO. */
+                    uint32_t          off = (g_layout_type == V4_LAYOUT_FLEX)
+                        ? V4_FF_DEVICEID_OFF : 4;
+
+                    if (body->len >= off + 16) {
+                        memcpy(r->deviceid, body->data + off, 16);
+                        r->has_deviceid = 1;
+                    }
                 }
             }
             break;
@@ -2382,17 +2785,31 @@ check_deleg(
               "deleg.stateid");
 } /* check_deleg */
 
-#define SPARSE_TAG(t) (strcmp(t, "SAllocate") == 0 || \
-                       strcmp(t, "SDeallocate") == 0 || \
-                       strcmp(t, "SSeek") == 0)
-#define XATTR_TAG(t)  (strcmp(t, "SGetxattr") == 0 || \
-                       strcmp(t, "SSetxattr") == 0 || \
-                       strcmp(t, "SListxattrs") == 0 || \
-                       strcmp(t, "SRemovexattr") == 0)
-#define PNFS_TAG(t)   (strcmp(t, "SLayoutget") == 0 || \
-                       strcmp(t, "SLayoutreturn") == 0 || \
-                       strcmp(t, "SLayoutcommit") == 0 || \
-                       strcmp(t, "SGetdeviceinfo") == 0)
+#define SPARSE_TAG(t)   (strcmp(t, "SAllocate") == 0 || \
+                         strcmp(t, "SDeallocate") == 0 || \
+                         strcmp(t, "SSeek") == 0)
+/* Ops that run the shared regular-file type gate (see D4-15). */
+/* ...of which these four now answer the per-type split directly
+ * (chimera_nfs4_data_nonreg_status), so their symlink arm must match
+ * exactly rather than fall through the D4-15 acceptance. */
+#define DATAGATE_TAG(t) (strcmp(t, "SRead") == 0 || \
+                         strcmp(t, "SWrite") == 0 || \
+                         strcmp(t, "SCommit") == 0 || \
+                         strcmp(t, "SLockt") == 0)
+#define TYPEGATE_TAG(t) (strcmp(t, "SRead") == 0 || \
+                         strcmp(t, "SWrite") == 0 || \
+                         strcmp(t, "SCommit") == 0 || \
+                         strcmp(t, "SLockt") == 0 || \
+                         strcmp(t, "SSetattr") == 0 || \
+                         SPARSE_TAG(t))
+#define XATTR_TAG(t)    (strcmp(t, "SGetxattr") == 0 || \
+                         strcmp(t, "SSetxattr") == 0 || \
+                         strcmp(t, "SListxattrs") == 0 || \
+                         strcmp(t, "SRemovexattr") == 0)
+#define PNFS_TAG(t)     (strcmp(t, "SLayoutget") == 0 || \
+                         strcmp(t, "SLayoutreturn") == 0 || \
+                         strcmp(t, "SLayoutcommit") == 0 || \
+                         strcmp(t, "SGetdeviceinfo") == 0)
 
 /* Divergence in status: capability reconciliation or mismatch.  Mirrors
  * Replayer.classify_status_mismatch. */
@@ -2452,9 +2869,50 @@ classify_status_mismatch(
                       tag, est, ast);
         return;
     }
-    if ((strcmp(tag, "SLookupp") == 0 || strcmp(tag, "SReaddir") == 0) &&
-        est == NFS4ERR_NOTDIR && ast == V4_ERR_SYMLINK) {
+    /* D4-7: wherever a path operation meets a symlink where a directory was
+    * required, chimera answers the more specific NFS4ERR_SYMLINK and the
+    * model predicts the generic NFS4ERR_NOTDIR.  RFC 7530 Table 7 lists both
+    * for every op that can hit it -- LOOKUPP and READDIR on a symlink cfh,
+    * and OPEN/CREATE/REMOVE/RENAME/LINK on a symlink *parent* -- so either is
+    * conformant.  Matched on the (NOTDIR, SYMLINK) status pair rather than an
+    * op list: the pair itself is the deviation, and enumerating tags would
+    * silently miss each new op the generator learns to aim at a symlink. */
+    if (est == NFS4ERR_NOTDIR && ast == V4_ERR_SYMLINK) {
         o->dev_hits[DEV_LOOKUPP_SYMLINK]++;
+        o->status_dev = ast;
+        return;
+    }
+    /* D4-15: chimera answers the coarse 4.0-style type error on every
+     * data-path and size-setting op -- NFS4ERR_ISDIR for a directory,
+     * NFS4ERR_INVAL for every other non-regular object, in all minor
+     * versions -- where the model predicts the per-type split (SYMLINK for a
+     * symlink; WRONG_TYPE for a special file, and for a directory on a 4.1+
+     * SETATTR(size)).  Both are conformant: RFC 7530 Table 7 lists SYMLINK
+     * *and* INVAL for READ/WRITE/COMMIT on a symlink cfh (R-CORE-91/96/97),
+     * and RFC 8881 15.1.2.9 makes WRONG_TYPE the more specific successor of
+     * INVAL (R-ATTR-25 marks the exact choice server-specific).  The model
+     * stays RFC-first and reconciles here, exactly as D4-7 does. */
+    /* D4-16: READLINK on a *directory* answers NFS4ERR_INVAL where the model
+    * predicts NFS4ERR_ISDIR.  Here the model is right and chimera is not --
+    * RFC 7530 §16.25.4/.5 Table 7 (rfc-notes R-CORE-86) and RFC 8881
+    * §18.24.3 both make a directory cfh ISDIR, with INVAL reserved for the
+    * other non-symlink types.  It is registered rather than fixed because
+    * pynfs RDLK2d (st_readlink.testDir) asserts INVAL for a directory, so the
+    * RFC-correct answer fails the legacy suite: chimera stays bug-compatible
+    * with pynfs on purpose and the model tolerates it here.  Retire this row
+    * and restore the split in nfs4_proc_readlink.c if pynfs is corrected. */
+    if (strcmp(tag, "SReadlink") == 0 && est == NFS4ERR_ISDIR &&
+        ast == NFS4ERR_INVAL) {
+        o->dev_hits[DEV_READLINK_DIR_INVAL]++;
+        o->status_dev = ast;
+        return;
+    }
+    if (TYPEGATE_TAG(tag) &&
+        (est == V4_ERR_SYMLINK || est == E_WRONG_TYPE) &&
+        !(DATAGATE_TAG(tag) && est == V4_ERR_SYMLINK) &&
+        (ast == NFS4ERR_INVAL ||
+         (ast == NFS4ERR_ISDIR && strcmp(tag, "SSetattr") == 0))) {
+        o->dev_hits[DEV_COARSE_TYPE_ERR]++;
         o->status_dev = ast;
         return;
     }
@@ -2581,7 +3039,7 @@ check_result(
             int found = 0;
 
             for (j = 0; j < r->nnames; j++) {
-                if (strcmp(r->names[j], json_string_value(jn)) == 0) {
+                if (v4_name_eq(r->names[j], json_string_value(jn))) {
                     found = 1;
                     break;
                 }
@@ -2596,7 +3054,7 @@ check_result(
 
             json_array_foreach(names, i, jn)
             {
-                if (strcmp(r->names[j], json_string_value(jn)) == 0) {
+                if (v4_name_eq(r->names[j], json_string_value(jn))) {
                     found = 1;
                     break;
                 }
@@ -2678,6 +3136,10 @@ check_result(
         if (sess >= 0 && sess < V4_MAX_SESS) {
             memcpy(o->sess[sess], r->sessionid, 16);
             o->sess_known[sess] = 1;
+            o->sess_slots[sess] = r->fore_slots;
+            /* A brand-new session's slots are all unused, and an unused
+             * slot's first request must carry sequence id 1. */
+            o->retry_seq[sess] = 0;
             if (req && strcmp(jf_tag(req), "RCreateSession") == 0) {
                 o->sess_client[sess] =
                     (int) jf_i64(jf_val(req), "client");
@@ -3057,16 +3519,21 @@ run_compound(
     struct nfs_argop4    argarray[V4_MAX_OPS];
     struct v4_argscratch scratch[V4_MAX_OPS];
     struct v4_reply      rep;
-    struct v4_call_ctx   cctx = { .o = o, .rep = &rep };
+    struct v4_reply      first = { 0 };
+    struct v4_call_ctx   cctx  = { .o = o, .rep = &rep };
     struct COMPOUND4args args;
     struct v4_ctx        ctx = { .cur = -1, .saved = -1, .abort = 0 };
     char                 tagbuf[32];
+    char                 tagexp[300];
     json_t              *op;
     json_t              *seq_req = NULL;
     json_t              *seq_exp = NULL;
     size_t               i;
     int                  attempt;
     int                  n;
+    uint32_t             retry_slot = 0;
+    int                  retry_sess = 0;
+    int                  has_seq    = 0;
 
     o->status_dev              = 0;
     o->cur_open_clientid_known = 0;
@@ -3100,10 +3567,28 @@ run_compound(
         }
     }
 
-    snprintf(tagbuf, sizeof(tagbuf), "t%" PRId64, jf_i64(lab, "tag"));
     memset(&args, 0, sizeof(args));
-    args.tag.data     = tagbuf;
-    args.tag.len      = (uint32_t) strlen(tagbuf);
+    {
+        /* The model may override the wire tag with a sentinel (see runTagged
+         * in nfs4.qnt): chimera validates the COMPOUND tag as a utf8str_cs
+         * before running any operation, so a malformed one fails the whole
+         * compound with an empty result array.  "" means use the default
+         * identity tag. */
+        const char *tn = jf_str(lab, "tagName");
+
+        if (tn && tn[0]) {
+            const char *tb;
+            uint32_t    tl;
+
+            v4_expand_name(tn, tagexp, &tb, &tl);
+            args.tag.data = (void *) tb;
+            args.tag.len  = tl;
+        } else {
+            snprintf(tagbuf, sizeof(tagbuf), "t%" PRId64, jf_i64(lab, "tag"));
+            args.tag.data = tagbuf;
+            args.tag.len  = (uint32_t) strlen(tagbuf);
+        }
+    }
     args.minorversion = (uint32_t) o->minor;
     args.argarray     = argarray;
     args.num_argarray = (uint32_t) nops;
@@ -3111,10 +3596,46 @@ run_compound(
     struct evpl_rpc2_conn *conn =
         conn_for(o, compound_client(o, ops, results));
 
+    /* A 4.1+ compound leads with SEQUENCE.  Pick the session's highest
+     * granted slot for DELAY retries: the model only ever drives slot 0, so
+     * anything above it is ours to use.  Slot 0 means "no safe retry slot"
+     * (a 4.0 compound, or a session that granted a single slot). */
+    if (nops > 0 && strcmp(jf_tag(json_array_get(ops, 0)), "RSequence") == 0) {
+        int64_t rsess = jf_i64(jf_val(json_array_get(ops, 0)), "sess");
+
+        has_seq = 1;
+        if (rsess >= 0 && rsess < V4_MAX_SESS && o->sess_known[rsess] &&
+            o->sess_slots[rsess] >= 2) {
+            retry_sess = (int) rsess;
+            retry_slot = o->sess_slots[rsess] - 1;
+        }
+    }
+
     /* Send; retry when the server reports transient DELAY the model did
-     * not predict. */
+     * not predict.
+     *
+     * A 4.1+ retry may not reuse the model's (slot, sequence id).  That pair
+     * names a slot in the session reply cache, and RFC 8881 2.10.6.2 reserves
+     * reusing it for retransmitting a request whose reply was lost -- so the
+     * server answers a verbatim resend from the cache, which is exactly what
+     * it is required to do.  Resending the same compound therefore replays
+     * the cached DELAY forever instead of re-running the operation: the retry
+     * loop could never make progress, and every DELAY became a divergence
+     * after the retry budget ran out.
+     *
+     * Retry on a slot the model never uses, with a sequence id of our own, so
+     * the retry actually executes and the model's slot keeps the sequence the
+     * trace assigned it.  The model's slot still holds the first attempt's
+     * reply on the server, so the reply-cache bookkeeping below records that
+     * one rather than the retry's. */
     for (attempt = 0; attempt < V4_RETRY_DELAY_MAX; attempt++) {
         int unexpected_delay = 0;
+
+        if (attempt > 0 && has_seq && retry_slot > 0) {
+            argarray[0].opsequence.sa_slotid     = retry_slot;
+            argarray[0].opsequence.sa_sequenceid = ++o->retry_seq[retry_sess];
+            argarray[0].opsequence.sa_cachethis  = 0;
+        }
 
         memset(&rep, 0, sizeof(rep));
         o->arena_used = 0;
@@ -3140,7 +3661,16 @@ run_compound(
                 unexpected_delay = 1;
             }
         }
+        if (attempt == 0) {
+            first = rep;
+        }
         if (!unexpected_delay) {
+            break;
+        }
+        if (has_seq && retry_slot == 0) {
+            /* A 4.1+ compound with nowhere safe to retry: resending it
+             * verbatim would only replay the cached reply.  A 4.0 compound
+             * has no reply cache, so resending it re-runs the work. */
             break;
         }
         usleep(100000);
@@ -3200,6 +3730,11 @@ run_compound(
             ctx.cur = itf_i64(jf_val(json_array_get(ops, i)));
         } else if (strcmp(eop, "RPutrootfh") == 0) {
             ctx.cur = 0;
+        } else if (strcmp(eop, "RSecinfo") == 0) {
+            /* SECINFO consumes the current filehandle (RFC 7530 16.31.3), so
+             * drop the tracked cfh exactly as the model does -- any following
+             * op is expected to answer NFS4ERR_NOFILEHANDLE. */
+            ctx.cur = -1;
         } else if (strcmp(eop, "RSavefh") == 0) {
             ctx.saved = ctx.cur;
         } else if (strcmp(eop, "RRestorefh") == 0) {
@@ -3233,7 +3768,7 @@ run_compound(
 
     /* Record the reply summary for future SEQUENCE replays of this
      * slot. */
-    if (seq_req && rep.nres > 0 && rep.res[0].status == NFS4_OK) {
+    if (seq_req && first.nres > 0 && first.res[0].status == NFS4_OK) {
         int64_t sess = jf_i64(seq_req, "sess");
         int64_t slot = jf_i64(seq_req, "slot");
 
@@ -3241,12 +3776,14 @@ run_compound(
             slot < V4_MAX_SLOTS) {
             struct v4_cached *c = &o->cache[sess][slot];
 
+            /* The first attempt is what the server cached against the
+             * model's slot: a retry runs on a different one. */
             c->valid  = 1;
-            c->status = rep.status;
-            c->nres   = rep.nres;
-            for (n = 0; n < rep.nres; n++) {
-                c->op[n].status = rep.res[n].status;
-                c->op[n].fnv    = rep.res[n].fnv;
+            c->status = first.status;
+            c->nres   = first.nres;
+            for (n = 0; n < first.nres; n++) {
+                c->op[n].status = first.res[n].status;
+                c->op[n].fnv    = first.res[n].fnv;
             }
         }
     }
@@ -3621,7 +4158,7 @@ run_trace(
         return 0;
     }
 
-    alarm(150);
+    mbt_watchdog_arm(150);
 
     o = calloc(1, sizeof(*o));
 
@@ -3654,10 +4191,13 @@ run_trace(
         memset(&rep, 0, sizeof(rep));
         memset(&args, 0, sizeof(args));
         memset(argarray, 0, sizeof(argarray));
-        argarray[0].argop                 = OP_PUTROOTFH;
-        argarray[1].argop                 = OP_LOOKUP;
-        argarray[1].oplookup.objname.data = "share";
-        argarray[1].oplookup.objname.len  = 5;
+        argarray[0].argop = OP_PUTROOTFH;
+        argarray[1].argop = OP_LOOKUP;
+        /* The export is named after this trace's filesystem (see
+         * mbt_env_fs_setup), so a mount left stuck by an earlier diverging
+         * trace cannot be picked up here by mistake. */
+        argarray[1].oplookup.objname.data = (void *) fsname;
+        argarray[1].oplookup.objname.len  = (uint32_t) strlen(fsname);
         argarray[2].argop                 = OP_GETFH;
         args.minorversion                 = 0;
         args.argarray                     = argarray;
@@ -3704,6 +4244,9 @@ run_trace(
         }
         lab = jf_val(lastop);
 
+        /* The v4 step label is the whole compound object, not a tag, so
+         * the trace and step index are what name the position. */
+        mbt_watchdog_at(trace_path, (int) idx, "compound");
         memset(&m, 0, sizeof(m));
         run_compound(o, (int) idx, lab, &m);
         if (o->skip) {
@@ -3759,7 +4302,7 @@ run_trace(
     free(o->scratch);
     free(o);
     json_decref(root);
-    alarm(0);
+    mbt_watchdog_disarm();
     return failed;
 } /* run_trace */
 
@@ -3768,37 +4311,36 @@ main(
     int    argc,
     char **argv)
 {
+    /* *INDENT-OFF* */
+    /* uncrustify's column alignment does not converge on this initializer --
+     * each pass widens the trailing brace column of the entry it just moved --
+     * so the table is aligned by hand and left alone. */
     static struct option long_options[] = {
-        { "trace",          required_argument,          0,
-          't'                                                                             },
-        { "trace-dir",      required_argument,          0,
-          'D'                                                                             },
-        { "exclude-prefix", required_argument,          0,
-          'X'                                                                             },
-        { "mandatory",      required_argument,          0,
-          'M'                                                                                                  },
-        { "backend",        required_argument,          0,
-          'b'                                                                                                  },
-        { "dry-run",        no_argument,                0,
-          'n'                                                                                                                      },
-        { "verbose",        no_argument,                0,
-          'v'                                                                                                                                          },
-        { 0,                0,                          0,                         0 },
+        { "trace",          required_argument, 0, 't' },
+        { "trace-dir",      required_argument, 0, 'D' },
+        { "exclude-prefix", required_argument, 0, 'X' },
+        { "mandatory",      required_argument, 0, 'M' },
+        { "backend",        required_argument, 0, 'b' },
+        { "pnfs",           required_argument, 0, 'p' },
+        { "dry-run",        no_argument,       0, 'n' },
+        { "verbose",        no_argument,       0, 'v' },
+        { 0,                0,                 0, 0   },
     };
-    char               **traces;
-    const char          *mandatory[8];
-    int                  ntraces    = 0;
-    int                  nmandatory = 0;
-    int                  dry_run    = 0;
-    int                  verbose    = 0;
-    int                  rc;
-    int                  failures = 0;
-    int                  skips    = 0;
-    int                  c;
-    int                  i;
-    struct mbt_env       env;
-    const char          *backend = "memfs";
-    struct mbt_env_opts  opts    = {
+    /* *INDENT-ON* */
+    char              **traces;
+    const char         *mandatory[8];
+    int                 ntraces    = 0;
+    int                 nmandatory = 0;
+    int                 dry_run    = 0;
+    int                 verbose    = 0;
+    int                 rc;
+    int                 failures = 0;
+    int                 skips    = 0;
+    int                 c;
+    int                 i;
+    struct mbt_env      env;
+    const char         *backend = "memfs";
+    struct mbt_env_opts opts    = {
         .disable_caches = 1,
         /* Pin memfs's block size to the model's block granularity so sub-block
          * holes line up with SEEK_HOLE/SEEK_DATA (DEVIATIONS-NFS4.md round 8).
@@ -3811,7 +4353,7 @@ main(
      * shared helper; getopt only recognizes them so it does not error. */
     traces = mbt_collect_traces(argc, argv, &ntraces);
 
-    while ((c = getopt_long(argc, argv, "t:D:X:M:b:nv", long_options,
+    while ((c = getopt_long(argc, argv, "t:D:X:M:b:p:nv", long_options,
                             NULL)) != -1) {
         switch (c) {
             case 't':
@@ -3832,10 +4374,22 @@ main(
             case 'v':
                 verbose = 1;
                 break;
+            case 'p':
+                /* Run the server as a pNFS metadata server with this many
+                 * in-process data servers.  0 (the default) leaves pNFS off,
+                 * which is what the plain corpus expects. */
+                opts.pnfs_num_ds = atoi(optarg);
+                if (opts.pnfs_num_ds < 0 || opts.pnfs_num_ds > MBT_MAX_DS) {
+                    fprintf(stderr, "%s: --pnfs takes 0..%d data servers\n",
+                            argv[0], MBT_MAX_DS);
+                    mbt_free_traces(traces, ntraces);
+                    return 2;
+                }
+                break;
             default:
                 fprintf(stderr,
                         "usage: %s [--trace FILE ...] [--trace-dir DIR] "
-                        "[--backend memfs|diskfs|cairn] "
+                        "[--backend memfs|diskfs|cairn] [--pnfs N] "
                         "[--mandatory CAP] [--dry-run] [--verbose]\n",
                         argv[0]);
                 mbt_free_traces(traces, ntraces);
@@ -3861,6 +4415,7 @@ main(
     if (!dry_run) {
         mbt_env_open_opts(&env, &opts);
         env.nfs_v4_cb.recv_call_CB_COMPOUND = v4_cb_compound;
+        env.nfs_v4_cb.recv_call_CB_NULL     = v4_cb_null;
     }
 
     for (i = 0; i < ntraces; i++) {

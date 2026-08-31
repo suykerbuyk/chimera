@@ -401,7 +401,8 @@ chimera_vfs_open_lookup_complete(
         }
 
         /* Authorize the requested read/write access against the file. */
-        if (chimera_vfs_gate_needed(request->module->capabilities, request->cred)) {
+        if (chimera_vfs_open_gate_needed(request->module->capabilities,
+                                         request->cred)) {
             if (chimera_vfs_gate(attr, request->cred,
                                  chimera_vfs_open_required_access(f)) != CHIMERA_VFS_OK) {
                 chimera_vfs_request_free(thread, request);

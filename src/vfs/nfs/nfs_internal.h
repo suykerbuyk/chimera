@@ -1112,6 +1112,12 @@ void chimera_nfs3_read(
     struct chimera_nfs_shared *,
     struct chimera_vfs_request *,
     void *);
+void chimera_nfs3_allocate(
+    struct chimera_nfs_thread  *thread,
+    struct chimera_nfs_shared  *shared,
+    struct chimera_vfs_request *request,
+    void                       *private_data);
+
 void chimera_nfs3_write(
     struct chimera_nfs_thread *,
     struct chimera_nfs_shared *,

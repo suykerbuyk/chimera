@@ -313,11 +313,23 @@ s3_server_notify(
                     chimera_s3_put_recv(evpl, s3_request);
                 }
             } else if (is_complete_mpu) {
-                /* Accumulate the client's part manifest. */
-                chimera_s3_complete_multipart_upload_recv(evpl, s3_request);
+                /* Accumulate the client's part manifest.  A request routing
+                 * already failed (e.g. NoSuchBucket) never reached the
+                 * handler that initializes the accumulation state -- drain
+                 * the body instead of touching it. */
+                if (s3_request->vfs_state == CHIMERA_S3_VFS_STATE_COMPLETE) {
+                    s3_server_drain_body(evpl, s3_request);
+                } else {
+                    chimera_s3_complete_multipart_upload_recv(evpl, s3_request);
+                }
             } else if (is_delete_objects) {
-                /* Accumulate the <Delete> document. */
-                chimera_s3_delete_objects_recv(evpl, s3_request);
+                /* Accumulate the <Delete> document (same failed-routing
+                 * guard as above). */
+                if (s3_request->vfs_state == CHIMERA_S3_VFS_STATE_COMPLETE) {
+                    s3_server_drain_body(evpl, s3_request);
+                } else {
+                    chimera_s3_delete_objects_recv(evpl, s3_request);
+                }
             } else if (request_type == EVPL_HTTP_REQUEST_TYPE_POST) {
                 /* CreateMultipartUpload: body is empty in practice. */
                 s3_server_drain_body(evpl, s3_request);
@@ -349,13 +361,26 @@ s3_server_notify(
                     chimera_s3_put_recv(evpl, s3_request);
                 }
             } else if (is_complete_mpu) {
-                chimera_s3_complete_multipart_upload_recv(evpl, s3_request);
-                /* Body fully in hand: parse + validate + assemble. */
-                chimera_s3_complete_multipart_upload_body_done(evpl, s3_request);
+                /* A request routing already failed (e.g. NoSuchBucket) must
+                 * keep its error: running the handler here would operate on
+                 * never-initialized body state and overwrite the status
+                 * with a fabricated success. */
+                if (s3_request->vfs_state == CHIMERA_S3_VFS_STATE_COMPLETE) {
+                    s3_server_drain_body(evpl, s3_request);
+                } else {
+                    chimera_s3_complete_multipart_upload_recv(evpl, s3_request);
+                    /* Body fully in hand: parse + validate + assemble. */
+                    chimera_s3_complete_multipart_upload_body_done(evpl,
+                                                                   s3_request);
+                }
             } else if (is_delete_objects) {
-                chimera_s3_delete_objects_recv(evpl, s3_request);
-                /* Body fully in hand: parse keys + remove them. */
-                chimera_s3_delete_objects_body_done(evpl, s3_request);
+                if (s3_request->vfs_state == CHIMERA_S3_VFS_STATE_COMPLETE) {
+                    s3_server_drain_body(evpl, s3_request);
+                } else {
+                    chimera_s3_delete_objects_recv(evpl, s3_request);
+                    /* Body fully in hand: parse keys + remove them. */
+                    chimera_s3_delete_objects_body_done(evpl, s3_request);
+                }
             } else if (request_type == EVPL_HTTP_REQUEST_TYPE_POST) {
                 s3_server_drain_body(evpl, s3_request);
             }
@@ -363,6 +388,21 @@ s3_server_notify(
             if (s3_request->vfs_state == CHIMERA_S3_VFS_STATE_SEND ||
                 s3_request->vfs_state == CHIMERA_S3_VFS_STATE_COMPLETE) {
                 s3_server_respond(evpl, s3_request);
+
+                if (request_type == EVPL_HTTP_REQUEST_TYPE_GET &&
+                    s3_request->vfs_state == CHIMERA_S3_VFS_STATE_SEND &&
+                    s3_request->file_left == 0) {
+                    /* A zero-length GET body produces no WANT_DATA
+                     * notification, so nothing else would ever drive the
+                     * send path: run it here.  With nothing left to read it
+                     * finishes immediately, releasing the object handle --
+                     * otherwise the handle leaks and pins the filesystem.
+                     * (Reached when the VFS lookup/open chain completed
+                     * inline -- synchronous backends like memfs -- before
+                     * this RECEIVE_COMPLETE; the opposite ordering runs the
+                     * send path from chimera_s3_get_metadata_done.) */
+                    chimera_s3_get_send(evpl, s3_request);
+                }
             }
             break;
         case EVPL_HTTP_NOTIFY_WANT_DATA:
@@ -455,6 +495,12 @@ chimera_s3_dispatch_callback(
     if (error_code) {
         s3_request->status    = CHIMERA_S3_STATUS_NO_SUCH_KEY;
         s3_request->vfs_state = CHIMERA_S3_VFS_STATE_COMPLETE;
+        /* This is a VFS completion callback: on an asynchronous backend the
+         * RECEIVE_COMPLETE notification may already have passed, so an error
+         * completed here must answer the request itself or nothing will. */
+        if (s3_request->http_state == CHIMERA_S3_HTTP_STATE_RECVED) {
+            s3_server_respond(evpl, s3_request);
+        }
         return;
     }
 
@@ -485,6 +531,10 @@ chimera_s3_dispatch_callback(
                 s3_request->vfs_state = CHIMERA_S3_VFS_STATE_COMPLETE;
                 break;
         } /* switch */
+        if (s3_request->vfs_state == CHIMERA_S3_VFS_STATE_COMPLETE &&
+            s3_request->http_state == CHIMERA_S3_HTTP_STATE_RECVED) {
+            s3_server_respond(evpl, s3_request);
+        }
         return;
     }
 
@@ -549,6 +599,14 @@ chimera_s3_dispatch_callback(
             s3_request->vfs_state = CHIMERA_S3_VFS_STATE_COMPLETE;
             break;
     } /* switch */
+
+    /* Routing that completed the request in this VFS-callback context (the
+    * unimplemented-method arms above) must answer it: on an asynchronous
+    * backend the RECEIVE_COMPLETE notification may already have passed. */
+    if (s3_request->vfs_state == CHIMERA_S3_VFS_STATE_COMPLETE &&
+        s3_request->http_state == CHIMERA_S3_HTTP_STATE_RECVED) {
+        s3_server_respond(evpl, s3_request);
+    }
 
 } /* chimera_s3_dispatch_callback */
 
@@ -698,7 +756,18 @@ s3_server_dispatch(
             urlp++;
         }
 
+        /* Split bucket from key on the first '/' BEFORE the query string: a
+         * legal unencoded '/' in a query value (?delimiter=/, ?prefix=d/)
+         * must not be mistaken for the bucket/key separator.  (Most SDKs
+         * percent-encode query values, which masked this.) */
         slash = strchr(urlp, '/');
+        {
+            const char *query0 = strchr(urlp, '?');
+
+            if (slash && query0 && slash > query0) {
+                slash = NULL;
+            }
+        }
 
         if (slash) {
             s3_request->bucket_name    = urlp;
@@ -1005,6 +1074,14 @@ s3_server_dispatch(
 
     s3_request->file_left       = s3_request->file_length;
     s3_request->file_cur_offset = s3_request->file_offset;
+
+    /* Requests are recycled without being zeroed, and only the handlers that
+     * serve object bytes (GET/List/Copy/...) set file_real_length.  A handler
+     * that never touches it (PutObject, DeleteObject, UploadPart) would
+     * otherwise inherit the previous request's value and trip the
+     * file_length != file_real_length test in s3_server_respond, turning its
+     * 200/204 into a 206 with a fabricated Content-Range. */
+    s3_request->file_real_length = 0;
     chimera_s3_dump_request(s3_request);
 
     {
@@ -1204,6 +1281,26 @@ chimera_s3_add_cred(
 
     return chimera_s3_cred_cache_add(shared->cred_cache, access_key, secret_key, pinned);
 } /* chimera_s3_add_cred */
+
+SYMBOL_EXPORT int
+chimera_s3_remove_cred(
+    void       *s3_shared,
+    const char *access_key)
+{
+    struct chimera_server_s3_shared *shared = s3_shared;
+
+    return chimera_s3_cred_cache_remove(shared->cred_cache, access_key);
+} /* chimera_s3_remove_cred */
+
+SYMBOL_EXPORT void
+chimera_s3_advance_cred_clock(
+    void   *s3_shared,
+    int64_t seconds)
+{
+    struct chimera_server_s3_shared *shared = s3_shared;
+
+    chimera_s3_cred_cache_advance(shared->cred_cache, seconds);
+} /* chimera_s3_advance_cred_clock */
 
 static void *
 s3_server_init(
