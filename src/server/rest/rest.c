@@ -9,6 +9,7 @@
 #include "evpl/evpl.h"
 #include "evpl/evpl_http.h"
 #include "common/macros.h"
+#include "common/tcp_flavor.h"
 #include "server/server.h"
 #include "rest.h"
 #include "rest_internal.h"
@@ -165,6 +166,11 @@ void chimera_rest_handle_debug_fsop(
     const char *,
     int);
 
+static void
+chimera_rest_handle_not_found(
+    struct evpl              *evpl,
+    struct evpl_http_request *request);
+
 /* Deferred POST handler types */
 enum chimera_rest_post_handler {
     REST_POST_USERS_CREATE,
@@ -175,6 +181,9 @@ enum chimera_rest_post_handler {
     REST_POST_FILESYSTEMS_CREATE,
     REST_POST_DEBUG_FSOP,
     REST_POST_AUTH_LOGIN,
+    /* Answer an error only once the request body has been consumed; see
+     * chimera_rest_reply_not_found. */
+    REST_POST_NOT_FOUND,
 };
 
 #define REST_POST_MAX_BODY 65536
@@ -287,6 +296,9 @@ chimera_rest_notify(
             chimera_rest_handle_auth_login(evpl, request, thread,
                                            body, body_len);
             break;
+        case REST_POST_NOT_FOUND:
+            chimera_rest_handle_not_found(evpl, request);
+            break;
     } /* switch */
 
     free(ctx);
@@ -375,6 +387,40 @@ chimera_rest_handle_not_found(
     chimera_rest_send_json_response(evpl, request, 404,
                                     "{\"error\":\"Not Found\"}");
 } /* chimera_rest_handle_not_found */
+
+/* Answer 404 for a path that matched no route.
+ *
+ * A reply dispatched from chimera_rest_dispatch runs at HEADER time, and
+ * libevpl only flushes a response once its request is on the connection's
+ * pending list -- which happens when the body finishes parsing
+ * (evpl_http_server_flush walks conn->pending_requests; a request is appended
+ * there from the body handler).  For a GET or DELETE there is no body and the
+ * two coincide, but answering a POST that is still sending leaves the reply
+ * sitting unflushed behind a body nobody is waiting on, and the client waits
+ * for a response that has already been decided.
+ *
+ * So defer it the same way every real POST route here does: register a
+ * context and answer from the RECEIVE_COMPLETE notification, which runs after
+ * the body has been drained.  (Seen as a 120s ctest timeout on the first POST
+ * to an unrouted path in a slow build.) */
+static void
+chimera_rest_reply_not_found(
+    struct evpl                *evpl,
+    struct evpl_http_request   *request,
+    enum evpl_http_request_type req_type,
+    void                      **notify_data)
+{
+    if (req_type == EVPL_HTTP_REQUEST_TYPE_POST ||
+        req_type == EVPL_HTTP_REQUEST_TYPE_PUT) {
+        struct chimera_rest_post_ctx *ctx = calloc(1, sizeof(*ctx));
+
+        ctx->handler = REST_POST_NOT_FOUND;
+        *notify_data = ctx;
+        return;
+    }
+
+    chimera_rest_handle_not_found(evpl, request);
+} /* chimera_rest_reply_not_found */
 
 static void
 chimera_rest_handle_method_not_allowed(
@@ -742,7 +788,7 @@ chimera_rest_dispatch(
         return;
     }
 
-    chimera_rest_handle_not_found(evpl, request);
+    chimera_rest_reply_not_found(evpl, request, req_type, notify_data);
 } /* chimera_rest_dispatch */
 
 SYMBOL_EXPORT struct chimera_rest_server *
@@ -768,6 +814,7 @@ chimera_rest_init(
 
     rest->http_port    = http_port;
     rest->https_port   = https_port;
+    rest->flavor       = chimera_server_config_get_tcp_flavor(config);
     rest->server       = server;
     rest->debug_fsops  = chimera_server_config_get_rest_debug_fsops(config);
     rest->auth_enabled = chimera_server_config_get_rest_auth_enabled(config);
@@ -787,7 +834,13 @@ chimera_rest_init(
     }
 
     if (http_port != 0) {
-        rest->http_endpoint = evpl_endpoint_create("0.0.0.0", http_port);
+        /* The plain-HTTP listener follows the server's configured transport
+         * flavor, so an in-process deployment (tests) reaches the whole REST
+         * API over inproc without binding a port.  TLS has no inproc form, so
+         * the HTTPS listener below stays a real socket regardless. */
+        rest->http_endpoint = chimera_tcp_flavor_endpoint_create(rest->flavor,
+                                                                 "0.0.0.0",
+                                                                 http_port);
         rest->http_listener = evpl_listener_create();
         chimera_rest_info("REST API HTTP initialized on port %d", http_port);
     }
@@ -811,7 +864,8 @@ chimera_rest_start(struct chimera_rest_server *rest)
     }
 
     if (rest->http_listener) {
-        rc = evpl_listen(rest->http_listener, EVPL_STREAM_SOCKET_TCP,
+        rc = evpl_listen(rest->http_listener,
+                         chimera_tcp_flavor_to_protocol(rest->flavor),
                          rest->http_endpoint);
         chimera_rest_abort_if(rc, "failed to listen for REST HTTP on port %d",
                               rest->http_port);

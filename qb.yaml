@@ -327,6 +327,13 @@ tasks:
   # replay ctests are never registered.  The quick corpus-free *_probe quint
   # tests still run.  ctest_kvm is unaffected -- it runs in its own container
   # with its own oras.  Drop the mv lines once upstream fixes the hang.
+  #
+  # Every ctest below passes -C extended: upstream's test tiers (see the
+  # add_test override in the top-level CMakeLists.txt) put everything except
+  # the quint model-based tests in the extended tier, so a bare `ctest` here
+  # would run only the quick tier -- and with oras hidden and no quint in the
+  # builder image, that tier is nearly empty and the leg would pass having
+  # tested nothing.  -C extended runs the quick tier plus everything else.
   ctest_release:
     type: run_container
     architecture: [ amd64, arm64 ]
@@ -350,7 +357,7 @@ tasks:
         -S /context -B /build
       - ninja --quiet
       - >
-        ctest --output-on-failure --test-output-size-failed 65536
+        ctest -C extended --output-on-failure --test-output-size-failed 65536
         --timeout 300 -j 12 ${CTEST_FILTER}
     dependencies:
       builder:
@@ -381,7 +388,7 @@ tasks:
         -S /context -B /build
       - ninja --quiet
       - >
-        ctest --output-on-failure --test-output-size-failed 65536
+        ctest -C extended --output-on-failure --test-output-size-failed 65536
         --timeout 300 -j 12 ${CTEST_FILTER}
     dependencies:
       builder:
@@ -428,11 +435,11 @@ tasks:
       # VFS code is still covered by the posix/cthon/fsx suites in the second
       # pass.  Multiple -L options are ANDed by ctest.
       - >
-        ctest --output-on-failure --test-output-size-failed 65536
+        ctest -C extended --output-on-failure --test-output-size-failed 65536
         --timeout 300 -j 12 -L pynfs -L memfs ${CTEST_FILTER} ||
         echo "ctest (pynfs/memfs) reported failures; continuing"
       - >
-        ctest --output-on-failure --test-output-size-failed 65536
+        ctest -C extended --output-on-failure --test-output-size-failed 65536
         --timeout 300 -j 12 -LE pynfs ${CTEST_FILTER} ||
         echo "ctest (non-pynfs) reported failures; continuing"
       - >
@@ -604,7 +611,7 @@ tasks:
       # unquoted ( or | is a shell syntax error).  The ${KVM_FILTER} token here
       # stays UNQUOTED so the flag and regex split into separate args; empty (the
       # default) runs every kvm test for the platform.
-      - ctest --output-on-failure -L kvm -L "^${PLATFORM}$" ${KVM_FILTER} -j 12
+      - ctest -C extended --output-on-failure -L kvm -L "^${PLATFORM}$" ${KVM_FILTER} -j 12
     dependencies:
       builder:
         project: chimera

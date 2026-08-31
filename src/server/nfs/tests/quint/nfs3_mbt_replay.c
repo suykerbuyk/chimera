@@ -34,6 +34,7 @@
 
 #include "nfs3_mbt_common.h"
 #include "common/mbt_trace_dir.h"
+#include "common/mbt_watchdog.h"
 
 #define MBT_MAX_FIDS           16384
 #define MBT_MAX_MISM           16
@@ -1586,7 +1587,7 @@ run_trace(
     /* Backstop for a server deadlock: with everything in one process a
      * hung reply spins in mbt_call_wait forever; SIGALRM's default
      * disposition kills the test with a nonzero status. */
-    alarm(120);
+    mbt_watchdog_arm(120);
 
     o = calloc(1, sizeof(*o));
     mbt_env_fs_setup(env, fsname);
@@ -1599,11 +1600,15 @@ run_trace(
     o->fileid_known = calloc(MBT_MAX_FIDS, sizeof(*o->fileid_known));
     o->scratch      = malloc(MBT_MAX_DATA);
 
-    struct mbt_result *res = mbt_mnt(env, "/share");
+    char               mntpath[80];
+
+    snprintf(mntpath, sizeof(mntpath), "/%s", fsname);
+
+    struct mbt_result *res = mbt_mnt(env, mntpath);
 
     if (res->rpc_err != 0 || res->status != MNT3_OK || !res->obj_fh.has) {
-        fprintf(stderr, "%s: MNT /share failed: rpc_err=%d status=%u\n",
-                trace_path, res->rpc_err, res->status);
+        fprintf(stderr, "%s: MNT %s failed: rpc_err=%d status=%u\n",
+                trace_path, mntpath, res->rpc_err, res->status);
         failed = 1;
         goto out;
     }
@@ -1632,6 +1637,7 @@ run_trace(
         }
 
         memset(&m, 0, sizeof(m));
+        mbt_watchdog_at(trace_path, (int) idx, tag);
         mbt_set_cred(env, op);
         fn(o, op, fs, &m);
         history_push(o, (int) idx, tag, op, env->res.status);
@@ -1670,7 +1676,7 @@ run_trace(
     free(o->scratch);
     free(o);
     json_decref(root);
-    alarm(0);
+    mbt_watchdog_disarm();
     return failed;
 } /* run_trace */
 
@@ -1746,7 +1752,7 @@ main(
                 fprintf(stderr,
                         "usage: %s [--trace FILE ...] [--trace-dir DIR] "
                         "[--block-size N] [--max-attr-skip-rate F] "
-                        "[--backend memfs|diskfs|cairn] "
+                        "[--backend memfs|diskfs|cairn|linux|io_uring] "
                         "[--dry-run] [--verbose]\n", argv[0]);
                 mbt_free_traces(traces, ntraces);
                 return 2;

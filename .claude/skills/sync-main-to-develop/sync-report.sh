@@ -16,7 +16,10 @@ set -uo pipefail
 
 cd "$(git rev-parse --show-toplevel)" || exit 1
 
-last_tag() { git tag --list 'sync-code-*' --sort=-creatordate | head -1; }
+# The newest sync-code tag already merged into HEAD: the checklist tags
+# origin/main (step 1) before running this report (step 2), so the newest
+# tag overall is the one being synced, not the previous sync's baseline.
+last_tag() { git tag --list 'sync-code-*' --sort=-creatordate --merged HEAD | head -1; }
 
 hr() { printf '\n=== %s ===\n' "$1"; }
 

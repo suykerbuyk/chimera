@@ -173,6 +173,12 @@ struct nfs_request {
      * owner seqid + caches the reply iff this is non-NULL and the status
      * is in nfs4_seqid_should_advance(). */
     struct nfs_open_owner            *open_4_0_owner;
+    /* An OPEN/UNCHECKED of an existing file asked for size 0.  The truncate
+     * is held back until the share reservation is granted (see
+     * chimera_nfs4_open_complete) so a denied OPEN cannot destroy the
+     * file's contents. */
+    bool                              open_trunc_pending;
+    struct chimera_vfs_attrs          open_trunc_attr;
     /* Per-owner seqid bookkeeping for the 4.0 LOCK flow.  For
      * new_lock_owner=true both open_owner (open_seqid) and lock_owner
      * (lock_seqid) advance; for new_lock_owner=false only the lock_owner
@@ -432,6 +438,8 @@ struct chimera_server_nfs_shared {
 /* Forward decl for the per-thread lease sweeper (defined in nfs4_lease.h). */
 struct nfs_lease_sweeper;
 
+struct nlm_lock_resume;
+
 struct chimera_server_nfs_thread {
     struct evpl_rpc2_thread          *rpc2_thread;
     struct chimera_server_nfs_shared *shared;
@@ -475,6 +483,18 @@ struct chimera_server_nfs_thread {
      * protected by cb_recall_lock.  See nfs4_callback.c. */
     struct nfs4_cb_client            *cb_teardown_queue;
     uint8_t                           cb_doorbell_armed;
+
+    /* NLM deferred lock-acquire completions bounced back to their home
+     * thread.  A blocking LOCK's grant lands on whichever thread released
+     * the conflict (or on the claim core's service thread), but the reply
+     * rides the connection's evpl and the teardown uses this thread's VFS
+     * thread -- neither is cross-thread safe.  Its own doorbell rather than
+     * cb_doorbell, so NLM does not pull the NFSv4 callback machinery into
+     * targets that link one without the other.  See nfs_nlm.c. */
+    struct evpl_doorbell              nlm_doorbell;
+    pthread_mutex_t                   nlm_resume_lock;
+    struct nlm_lock_resume           *nlm_resume_queue;
+    uint8_t                           nlm_doorbell_armed;
 };
 
 static inline struct nfs_request *
@@ -564,6 +584,12 @@ chimera_nfs_map_cred(
                                         CHIMERA_VFS_ANON_UID,
                                         CHIMERA_VFS_ANON_GID);
     }
+
+    /* NFS callers are stateless remote clients: their open(2)s happened on
+     * machines this server never saw, so the engine's per-op data gates
+     * apply the nfsd-style owner override for them (see the flag's comment
+     * in vfs_cred.h). */
+    vfs_cred->flags |= CHIMERA_VFS_CRED_FLAG_OWNER_OVERRIDE;
 } /* chimera_nfs_map_cred */
 
 /*

@@ -114,6 +114,21 @@ the replays — and they still wedge (trace `stepFds_128_0x1_2` before another
 trace leaves the reset's umount waiting on a VFS close that never completes).
 Every ctest leg would burn its timeout instead of reporting.
 
+### Upstream merges are gated on the quick tier only
+
+Since upstream 5295fc89/54a1451c (2026-08-31 sync), a bare `ctest` runs
+only the *quick* tier (the quint model-based tests); everything else is
+`-C extended`.  Two standing consequences:
+
+- Every downstream ctest invocation (qb.yaml legs, ad-hoc local runs)
+  must pass `-C extended` or it runs almost nothing and passes.
+- Upstream's merge queue gates on the quick tier; the extended tier runs
+  in a periodic workflow.  An upstream regression in extended-tier tests
+  (pjd, pynfs, unit suites) can land on main green and arrive here via
+  the sync -- the 2026-08-31 sync brought one (nfs4 client open gate,
+  96 pjd failures).  Expect the qb ctest legs, not the merge, to be the
+  step that finds these; diagnose before assuming a downstream cause.
+
 ### Verifying with qb: the builder image is not rebuilt by default
 
 Every `ctest_*`, `syntax` and `static_analysis_*` leg declares

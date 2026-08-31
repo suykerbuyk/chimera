@@ -7,11 +7,19 @@ name: PR checks
 # The heavy build/test matrix (build-test.yml) and docker image builds
 # (docker-build.yml) run ONLY in the merge queue (merge_group), not on pull
 # requests -- so a PR's check list isn't cluttered with a wall of skipped
-# matrix jobs.  But the branch-protection ruleset still requires the
-# "CI complete", "Flake review gate" and "Docker build complete" checks on a PR
-# before it can be added to the queue.  This workflow satisfies them with
-# instant no-op placeholders; the real checks of the same names run in the queue
-# (where the actual matrix / image builds / flake review happen).
+# matrix jobs.  The branch-protection ruleset requires "CI complete" and
+# "Docker build complete" on a PR before it can be added to the queue, and the
+# jobs of those names here are what report them at PR time; the real checks of
+# the same names run in the queue.
+#
+# "CI complete" is a real gate, not a placeholder: it depends on every
+# pre-merge job below, so a PR cannot enter the queue until all of them are
+# green.  It used to be a bare echo, which meant the required set went green in
+# about a second and the pre-merge signal -- ten minutes of static analysis and
+# model-based tests -- gated nothing at all.  Queueing early simply skipped it.
+#
+# "Docker build complete" stays a no-op here, because no docker image is built
+# at PR time; that check only carries meaning in the queue.
 #
 # It also carries the pre-merge signal that is cheap enough to be worth having
 # before the queue: clang static analysis on devcontainer and macOS, and the
@@ -21,6 +29,10 @@ name: PR checks
 # breaks, so catching that here rather than in the queue is worth one image
 # build.  macOS runs the quint suite post-merge, in build-test.yml's macOS job,
 # rather than twice.
+#
+# The queue now runs this same pair -- quick-tier ctest and static analysis --
+# across every supported OS, so what this job buys is earliness, not extra
+# coverage.
 on:
   pull_request:
 
@@ -39,33 +51,42 @@ permissions:
 
 env:
   DEV_IMAGE_TAG_PREFIX: repository.mdh.quantum.com:5004/cache/chimera-dev
+  # Internal pull-through cache for the mirrored ccache image (mirrors
+  # ghcr.io/chimera-nas/ccache).  Public default lives in the Dockerfiles.
+  CCACHE_IMAGE_REGISTRY: repository.mdh.quantum.com:5009/chimera-nas/ccache
+  # Where the Extended workflow publishes ccache bundles.  Not a secret -- the same
+  # literal is in build-test.yml -- so a fork PR can at least attempt a read.
+  NEXUS_SCRATCH_URL: http://repository.mdh.quantum.com/repository/scratch
   APT_MIRROR: http://repository.mdh.quantum.com/repository/pkgs/ubuntu
   DOCKER_MIRROR: repository.mdh.quantum.com/
 
 jobs:
   ci-complete:
     name: CI complete
+    needs: [build-devcontainer, analyze-dev, quint-coverage, analyze-macos]
+    if: ${{ always() }}
     runs-on: arc-small
     steps:
-      - name: PR placeholder
-        run: echo "PR placeholder -- the full build/test matrix runs in the merge queue (merge_group)."
-
-  flake-gate:
-    name: Flake review gate
-    runs-on: arc-small
-    # No environment here: flaky-test review only applies to the real test run,
-    # which happens in the merge queue.  Keeping this a plain no-op means a PR
-    # never sits waiting on a manual approval just to be queued.
-    steps:
-      - name: PR placeholder
-        run: echo "PR placeholder -- flaky-test review happens in the merge queue (merge_group)."
+      - name: Verify every pre-merge job succeeded
+        run: |
+          # Every dependency must be `success`.  Checking results rather than
+          # using success() means a job that was skipped -- never actually run --
+          # cannot pass this for the wrong reason.
+          results='${{ join(needs.*.result, ' ') }}'
+          echo "dependency results: ${results}"
+          for r in ${results}; do
+            if [ "$r" != "success" ]; then
+              echo "a required job did not succeed"
+              exit 1
+            fi
+          done
 
   docker-build-complete:
     name: Docker build complete
     runs-on: arc-small
     steps:
       - name: PR placeholder
-        run: echo "PR placeholder -- docker image builds run in the merge queue (merge_group)."
+        run: echo "No docker image is built at PR time; the real check runs in the merge queue."
 
   # ---------------------------------------------------------------------------
   # Pre-merge signal.  The devcontainer image is built once here and consumed by
@@ -108,6 +129,7 @@ jobs:
           build-args: |
             APT_MIRROR=${{ env.APT_MIRROR }}
             DOCKER_MIRROR=${{ env.DOCKER_MIRROR }}
+            CCACHE_REGISTRY=${{ env.CCACHE_IMAGE_REGISTRY }}
 
   analyze-dev:
     name: Analyze devcontainer amd64 Release (pre-merge)
@@ -121,7 +143,40 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Perform clang static analysis
+      # Try to prime from the same bundle the queue uses.  Whether this can
+      # work is an open question and the point of trying: org secrets are
+      # withheld from a fork's pull_request run, so NEXUS_SCRATCH_USER is empty
+      # here and the request goes out unauthenticated.  If the scratch repo
+      # allows anonymous reads -- as the internal registry on :5004 evidently
+      # does, since pr-checks pushes images to it with no credentials at all --
+      # this lands a warm cache on every PR.  If it refuses, the step says so
+      # and the build runs cold exactly as it does today.
+      #
+      # -u is passed only when a user actually exists: `-u ":"` sends an empty
+      # Authorization header, which a server can reject outright even where it
+      # would have served the object anonymously.
+      - name: Restore the ccache bundle
+        env:
+          NEXUS_USER: ${{ secrets.NEXUS_SCRATCH_USER }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_SCRATCH_PASSWORD }}
+        run: |
+          key="analyze-devcontainer-amd64-Release"
+          auth=()
+          if [ -n "${NEXUS_USER:-}" ]; then
+            auth=(-u "${NEXUS_USER}:${NEXUS_PASSWORD}")
+            echo "restoring ${key} with credentials"
+          else
+            echo "no scratch credentials (expected on a fork PR); trying anonymously"
+          fi
+          if curl -fsS --retry 3 --retry-all-errors --retry-delay 5 \
+               "${auth[@]}" -o ccache-bundle.tar.gz \
+               "${{ env.NEXUS_SCRATCH_URL }}/chimera/ccache/${key}.tar.gz"; then
+            echo "restored $(stat -c%s ccache-bundle.tar.gz) bytes"
+          else
+            echo "no ccache bundle for ${key}; this analysis starts cold"
+          fi
+
+      - name: Run the clang static analyzer
         id: static-analysis
         run: |
           set -o pipefail
@@ -129,15 +184,28 @@ jobs:
           docker run --rm --privileged \
             -e DOCKER_MIRROR=${{ env.DOCKER_MIRROR }} \
             -e APT_MIRROR=${{ env.APT_MIRROR }} \
+            -e CCACHE_DIR=/build/ccache \
             -v "${{ github.workspace }}:/workspace" \
             -v "${{ github.workspace }}/scan-report:/scan-report" \
             -v /build \
             -w /build \
             ${{ env.DEV_IMAGE_TAG_PREFIX }}:${{ github.sha }}-amd64 \
-            bash -euxc '\
-              scan-build --status-bugs --exclude /workspace/ext -o /scan-report \
-              sh -c "cmake -D CMAKE_BUILD_TYPE=Release -D IO_URING_NVME_ENABLED=OFF -B /build -S /workspace -G Ninja && ninja -C /build"' \
-            2>&1 | tee "${{ github.workspace }}/scan-report/scan-build-output.txt"
+            bash -euxc '
+              mkdir -p /build/ccache
+              if [ -f /workspace/ccache-bundle.tar.gz ]; then
+                tar -C /build/ccache -xzf /workspace/ccache-bundle.tar.gz
+              fi
+              # Zero the counters the bundle brought with it, so --show-stats
+              # below describes this run rather than this run plus the Extended run
+              # that produced the cache.
+              ccache -z > /dev/null
+              cmake -D CMAKE_BUILD_TYPE=Release -D CMAKE_C_COMPILER=clang -D CMAKE_EXPORT_COMPILE_COMMANDS=ON -D IO_URING_NVME_ENABLED=OFF -B /build -S /workspace -G Ninja
+              ninja -C /build
+              python3 /workspace/scripts/analyze_cached.py \
+                      --build-dir /build --report-dir /scan-report \
+                      --exclude /workspace/ext/ -j "$(nproc)"
+              ccache --show-stats || true' \
+            2>&1 | tee "${{ github.workspace }}/scan-report/analyzer-output.txt"
 
       - name: Upload static analysis report
         if: ${{ failure() && steps.static-analysis.outcome == 'failure' }}
@@ -160,6 +228,20 @@ jobs:
         uses: actions/checkout@v5
         with:
           submodules: recursive
+          # A pull_request checkout is the refs/pull/N/merge commit, whose
+          # first parent is the merge base -- so `git diff HEAD^1 HEAD` is
+          # exactly this PR's diff, and depth 2 is all it takes to have it.
+          # The default depth 1 has no parent at all.
+          fetch-depth: 2
+
+      # Captured on the runner rather than in the container below: the
+      # bind-mounted checkout is not owned by the container's root, so git
+      # there refuses the repository as dubiously owned (the same trap
+      # cmake/SpecsBundle.cmake documents).  -U0 keeps hunk headers to exactly
+      # the changed runs, with no context lines to subtract back out.
+      - name: Capture the pull request diff
+        if: ${{ github.event_name == 'pull_request' }}
+        run: git diff -U0 HEAD^1 HEAD > pr.diff
 
       # oras lets cmake fetch the prebuilt trace bundle for the pinned
       # ext/specs commit instead of regenerating it with quint; the image
@@ -177,15 +259,24 @@ jobs:
       #
       # --no-tests=error is the point of the label: a configuration that
       # silently loses its MBT suites (no quint, no bundle) must fail here
-      # rather than report a vacuous pass.
+      # rather than report a vacuous pass.  It only catches losing the label
+      # ENTIRELY, though, so REQUIRE_CTL_MBT=ON covers the narrower case of
+      # the in-tree control-plane corpus alone going missing.
       - name: Build instrumented and run the quint suite
         env:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          GH_REPO: ${{ github.repository }}
+          # The PR head, not the merge commit: a link to a merge ref's blob
+          # dies with the ref.  Empty on a non-PR run, which only costs the
+          # uncovered lines their hyperlinks.
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           docker run --rm --privileged \
             -e DOCKER_MIRROR=${{ env.DOCKER_MIRROR }} \
             -e APT_MIRROR=${{ env.APT_MIRROR }} \
             -e RUN_URL="$RUN_URL" \
+            -e GH_REPO="$GH_REPO" \
+            -e PR_HEAD_SHA="$PR_HEAD_SHA" \
             -v "${{ github.workspace }}:/workspace" \
             -v "${{ github.workspace }}/oras:/usr/local/bin/oras:ro" \
             -v /build \
@@ -197,18 +288,34 @@ jobs:
               export LLVM_PROFDATA="$(command -v llvm-profdata || ls /usr/lib/llvm-*/bin/llvm-profdata | tail -n1)"
               export LLVM_COV="$(command -v llvm-cov || ls /usr/lib/llvm-*/bin/llvm-cov | tail -n1)"
               cmake -G Ninja -DCMAKE_BUILD_TYPE=Coverage -DCMAKE_C_COMPILER=clang \
-                    -DKVM_TESTING=OFF /workspace
+                    -DKVM_TESTING=OFF -DREQUIRE_CTL_MBT=ON /workspace
               ninja
               mkdir -p /build/coverage/profraw
               LLVM_PROFILE_FILE=/build/coverage/profraw/%m-%p.profraw \
                 ctest -L quint --output-on-failure --no-tests=error \
                       --test-output-size-failed 65536 --timeout 600 -j "$(nproc)"
+              # Which of the changed files are worth an lcov export; empty
+              # (or absent, on a non-PR run) means the export is skipped.
+              : > /workspace/pr-sources.txt
+              if [ -f /workspace/pr.diff ]; then
+                python3 /workspace/scripts/ci_patch_coverage.py \
+                        --sources /workspace/pr.diff \
+                        > /workspace/pr-sources.txt
+              fi
               COVERAGE_JSON=/workspace/coverage-export.json \
+              COVERAGE_LCOV=/workspace/patch-coverage.lcov \
+              COVERAGE_LCOV_SOURCES=/workspace/pr-sources.txt \
                 bash /workspace/etc/coverage-report.sh /build
               # Rendered in here, where the paths in the export still resolve.
               python3 /workspace/scripts/ci_coverage_report.py \
                       /workspace/coverage-export.json /workspace "$RUN_URL" \
-                      > /workspace/coverage-report.md'
+                      > /workspace/coverage-report.md
+              if [ -f /workspace/pr.diff ]; then
+                python3 /workspace/scripts/ci_patch_coverage.py \
+                        /workspace/pr.diff /workspace/patch-coverage.lcov \
+                        /workspace "$GH_REPO" "$PR_HEAD_SHA" \
+                        >> /workspace/coverage-report.md
+              fi'
 
       # Best-effort: a report that cannot be posted is still in the run summary,
       # and a comment API hiccup should not fail an otherwise-green job.
@@ -258,37 +365,73 @@ jobs:
           submodules: recursive
 
       - name: Install dependencies
+        env:
+          CCACHE_REF: ghcr.io/chimera-nas/ccache:4.14-darwin
         run: |
           brew update
-          # llvm carries scan-build -- Apple's clang does not ship the analyzer
-          # driver.  The rest mirrors the merge queue's macOS job: bison 3.x for
-          # the ndrzcc grammar, libxcrypt for full crypt(5) verification.
-          brew install llvm cmake ninja bison jansson userspace-rcu rocksdb krb5 \
-                       xxhash libxcrypt uthash openssl@3 libnghttp2
+          # No llvm: it was only ever here to supply the scan-build driver, and
+          # driving `clang --analyze` directly does not need it.  Dropping it
+          # also keeps this job on Apple's clang -- the compiler ccc-analyzer
+          # was always actually compiling with -- which is what the merge queue
+          # settled on after pinning brew's LLVM turned a warning it alone emits
+          # into a -Werror failure.
+          brew install cmake ninja bison jansson userspace-rcu rocksdb krb5 \
+                       xxhash libxcrypt uthash openssl@3 libnghttp2 oras
+          oras pull "${CCACHE_REF}" --output "${RUNNER_TEMP}"
+          install -m 0755 "${RUNNER_TEMP}/ccache-darwin" /usr/local/bin/ccache
+          ccache --version | head -1
 
-      - name: Perform clang static analysis
+      # Unlike the Linux half of this workflow, this needs no secrets: the
+      # Actions cache is available to a fork's pull_request run, and a run can
+      # read the default branch's scope.  extended.yml writes that scope on main,
+      # so this restores a cache a PR could never reach through Nexus.
+      - name: Restore the ccache directory
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ccache-macos-analyze-Release-${{ github.sha }}
+          restore-keys: |
+            ccache-macos-analyze-Release-
+
+      - name: Run the clang static analyzer
         id: static-analysis
         env:
-          BUILD_DIR: ${{ runner.temp }}/build
+          # Must match the directory extended.yml builds analyze-macos in.
+          # The producer and the consumer of a ccache have to agree on it:
+          # generated headers are reached through -I<build-dir>/... paths, which
+          # are part of the command line ccache hashes, so building somewhere
+          # else misses on every translation unit that includes one -- which is
+          # most of them.
+          BUILD_DIR: ${{ runner.temp }}/build-analyze
+          CCACHE_DIR: ${{ runner.temp }}/ccache
+          CCACHE_MAXSIZE: 2G
         run: |
           set -o pipefail
           mkdir -p "$GITHUB_WORKSPACE/scan-report"
+          # Zero the counters restored with the cache, so the stats below
+          # describe this run and not the Extended run that filled it.
+          ccache -z > /dev/null
+          cmake -G Ninja -D CMAKE_BUILD_TYPE=Release \
+                -D CMAKE_EXPORT_COMPILE_COMMANDS=ON \
+                -S "$GITHUB_WORKSPACE" -B "$BUILD_DIR"
+          # compile_commands.json is not sufficient alone: several entries
+          # include generated headers, so the tree has to be built first.
+          ninja -C "$BUILD_DIR"
           # --exclude ext: the vendored submodules are analysed in their own
-          # repos and cannot be fixed from a chimera PR.  etc/coverage-report.sh
-          # draws the same line for the same reason.
-          "$(brew --prefix llvm)/bin/scan-build" --status-bugs \
-              --exclude "$GITHUB_WORKSPACE/ext" \
-              -o "$GITHUB_WORKSPACE/scan-report" \
-              sh -c "cmake -D CMAKE_BUILD_TYPE=Release \
-                           -B \"$BUILD_DIR\" -S \"$GITHUB_WORKSPACE\" -G Ninja \
-                     && ninja -C \"$BUILD_DIR\"" \
-              2>&1 | tee "$GITHUB_WORKSPACE/scan-report/scan-build-output.txt"
+          # repos and cannot be fixed from a chimera PR.
+          python3 "$GITHUB_WORKSPACE/scripts/analyze_cached.py" \
+                  --build-dir "$BUILD_DIR" \
+                  --report-dir "$GITHUB_WORKSPACE/scan-report" \
+                  --exclude "$GITHUB_WORKSPACE/ext/" \
+                  -j "$(sysctl -n hw.ncpu)" \
+            2>&1 | tee "$GITHUB_WORKSPACE/scan-report/analyzer-output.txt"
+          ccache --show-stats || true
 
       - name: Upload static analysis report
         if: ${{ failure() && steps.static-analysis.outcome == 'failure' }}
         uses: actions/upload-artifact@v6
         with:
-          name: scan-report-pr-macos-Release
+          name: analyzer-report-pr-macos-Release
           path: scan-report/
           if-no-files-found: warn
           retention-days: 30

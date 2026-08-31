@@ -593,6 +593,19 @@ nfs_state_owner_client(
     } // switch
 } /* nfs_state_owner_client */
 
+/*
+ * A stateid belongs to the client that created it, so it designates no state
+ * for any other client and using it from one is NFS4ERR_BAD_STATEID -- RFC
+ * 8881 15.1.5.2 defines that error as "a stateid does not properly designate
+ * any valid state", which is exactly this case.  NFS4ERR_ACCESS would be
+ * wrong twice over: it claims the caller lacks permission on the object, and
+ * it sends the client into permission recovery when the state-recovery path
+ * (RFC 8881 8.2.4 / 8.4) is the one that applies.
+ *
+ * `client` is NULL on 4.0, where a COMPOUND carries no identity of its own:
+ * the stateid is the only client binding, so there is nothing to compare it
+ * against and the check does not apply.
+ */
 static inline nfsstat4
 nfs_state_check_client(
     void              *state,
@@ -602,7 +615,7 @@ nfs_state_check_client(
     struct nfs_client *owner = nfs_state_owner_client(state, type);
 
     if (!owner) {
-        return NFS4ERR_ACCESS;
+        return NFS4ERR_BAD_STATEID;
     }
 
     if (!client) {
@@ -610,7 +623,7 @@ nfs_state_check_client(
     }
 
     if (owner != client) {
-        return NFS4ERR_ACCESS;
+        return NFS4ERR_BAD_STATEID;
     }
 
     return NFS4_OK;
@@ -906,7 +919,7 @@ nfs_client_check_io_denied(
 
 /* True if `client` holds any open state keyed by `fh` (i.e. it has this file
  * open).  Used to keep a filehandle valid after its last link is removed
- * while an open still references the inode (RFC 7530 §16.2.5). */
+ * while an open still references the inode (RFC 7530 §16.26.5). */
 SYMBOL_EXPORT bool
 nfs_client_has_open_state_for_fh(
     struct nfs_client *client,

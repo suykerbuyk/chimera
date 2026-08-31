@@ -142,7 +142,17 @@ chimera_nfs_destroy(void *private_data)
         }
     }
 
-    free(shared->mounts);
+    /* shared->mounts is a DL list head, not an array: freeing the head alone
+     * leaks every other mount.  Invisible with a single mount, which is why it
+     * stood -- a server that mounts two exports (e.g. an MDS with two pNFS data
+     * servers) leaks all but one. */
+    while (shared->mounts) {
+        struct chimera_nfs_client_mount *mount = shared->mounts;
+
+        DL_DELETE(shared->mounts, mount);
+        free(mount);
+    }
+
     free(shared->servers);
 
     pthread_mutex_destroy(&shared->pnfs_devcache.lock);
@@ -396,7 +406,8 @@ SYMBOL_EXPORT struct chimera_vfs_module vfs_nfs = {
      * by its upstream RPC reply (it reassigns request->read.iov), so the VFS
      * core must not pre-allocate buffers for it. */
     .capabilities   = CHIMERA_VFS_CAP_OPEN_FILE_REQUIRED | CHIMERA_VFS_CAP_FS | CHIMERA_VFS_CAP_FS_RELATIVE_OP |
-        CHIMERA_VFS_CAP_FS_LOCK | CHIMERA_VFS_CAP_READ_PROVIDES_BUFFERS | CHIMERA_VFS_CAP_DELEGATES_DAC,
+        CHIMERA_VFS_CAP_FS_LOCK | CHIMERA_VFS_CAP_READ_PROVIDES_BUFFERS | CHIMERA_VFS_CAP_DELEGATES_DAC |
+        CHIMERA_VFS_CAP_REMOTE_DAC,
     .init           = chimera_nfs_init,
     .destroy        = chimera_nfs_destroy,
     .thread_init    = chimera_nfs_thread_init,

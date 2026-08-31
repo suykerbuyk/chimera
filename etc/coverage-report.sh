@@ -80,7 +80,14 @@ echo "coverage: merging ${raw_count} raw profile(s) ..."
 # handed an object with no coverage mapping, so we must filter rather than glob.
 objs=()
 while IFS= read -r f; do
-    if readelf -SW "$f" 2>/dev/null | grep -q '__llvm_covmap'; then
+    # Deliberately not `readelf | grep -q`.  grep -q exits at its first match,
+    # readelf then dies of SIGPIPE, and `set -o pipefail` reports the pipeline
+    # as failed -- so the object is silently dropped.  Whether that happens is
+    # a race on how much readelf has already written, so the object set, and
+    # every number derived from it, varied run to run: this tree reported 3,
+    # 14 and 423 instrumented binaries on three consecutive runs.  No pipe,
+    # no race.
+    if [[ "$(readelf -SW "$f" 2>/dev/null)" == *__llvm_covmap* ]]; then
         objs+=("$f")
     fi
 done < <(find "${BUILD_DIR}" -type f \
@@ -115,6 +122,28 @@ if [[ -n "${COVERAGE_JSON:-}" ]]; then
         -instr-profile="${PROFDATA}" \
         -ignore-filename-regex="${IGNORE_REGEX}" \
         -summary-only > "${COVERAGE_JSON}"
+fi
+
+# Per-line hit counts for a named handful of sources, as an lcov tracefile.
+# This is the full (non-summary) export, which is why it is restricted: over the
+# whole tree it runs to hundreds of megabytes, but over the files one pull
+# request touched it is tens of kilobytes.  scripts/ci_patch_coverage.py reads
+# it to say which of the lines a PR changed were actually executed.
+#
+# Emitted here rather than from a second llvm-cov invocation elsewhere because
+# collecting the instrumented objects above means readelf'ing every binary in
+# the build tree, which costs more than the export itself.
+#
+# An empty source list means "no sources to measure" and must NOT fall through
+# to a bare `export`: llvm-cov would then happily export the entire tree.
+if [[ -n "${COVERAGE_LCOV:-}" && -s "${COVERAGE_LCOV_SOURCES:-/dev/null}" ]]; then
+    mapfile -t lcov_sources < "${COVERAGE_LCOV_SOURCES}"
+    echo
+    echo "coverage: exporting ${#lcov_sources[@]} source(s) to ${COVERAGE_LCOV} ..."
+    "${COV_TOOL}" export "${objs[0]}" "${object_args[@]}" \
+        -instr-profile="${PROFDATA}" \
+        -ignore-filename-regex="${IGNORE_REGEX}" \
+        --format=lcov --sources "${lcov_sources[@]}" > "${COVERAGE_LCOV}"
 fi
 
 if [[ "${COVERAGE_HTML:-0}" == "1" ]]; then

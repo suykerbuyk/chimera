@@ -73,6 +73,16 @@ int chimera_vfs_gate_needed_dac(
     const struct chimera_vfs_cred *cred);
 
 /*
+ * Whether the engine must authorize an OPEN's requested access itself.  Same
+ * as chimera_vfs_gate_needed() plus remote-DAC proxy backends
+ * (CHIMERA_VFS_CAP_REMOTE_DAC): their server enforces every wire operation
+ * but has no open to enforce, so open(2) semantics fall to the engine.
+ */
+int chimera_vfs_open_gate_needed(
+    uint64_t                       module_capabilities,
+    const struct chimera_vfs_cred *cred);
+
+/*
  * The enforcement decision itself: CHIMERA_VFS_OK if every bit in `required`
  * (canonical CHIMERA_ACE_* mask) is granted to `cred` on the object described
  * by `attr` (which must carry mode/uid/gid and, for a natively-stored ACL, the
@@ -140,6 +150,21 @@ struct chimera_vfs_gate_ctx {
 
 /* Require `required` (CHIMERA_ACE_* mask) on the object named by `fh`. */
 void chimera_vfs_gate_fh(
+    struct chimera_vfs_gate_ctx   *ctx,
+    struct chimera_vfs_thread     *thread,
+    const struct chimera_vfs_cred *cred,
+    const void                    *fh,
+    int                            fhlen,
+    uint32_t                       required,
+    chimera_vfs_gate_callback_t    callback,
+    void                          *private_data);
+
+/* As chimera_vfs_gate_fh(), but evaluated even where gate_needed() would
+ * defer to the backend -- for the few spots where the ENGINE is about to
+ * deny an operation itself and POSIX orders an access denial ahead of it,
+ * on a backend that will never see the op (see the unprivileged
+ * device-mknod EPERM in vfs_proc_mknod_at.c). */
+void chimera_vfs_gate_fh_always(
     struct chimera_vfs_gate_ctx   *ctx,
     struct chimera_vfs_thread     *thread,
     const struct chimera_vfs_cred *cred,

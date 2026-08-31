@@ -32,6 +32,7 @@
  */
 
 #include "nfs3_mbt_common.h"
+#include "common/mbt_watchdog.h"
 
 #define P_DELAY      10008
 #define P_BLOCK      8192
@@ -508,7 +509,7 @@ main(void)
     int                 i;
 
     setvbuf(stdout, NULL, _IONBF, 0);
-    alarm(60);
+    mbt_watchdog_arm(60);
     mbt_env_start_opts(env, &opts);
     env->nfs_v4_cb.recv_call_CB_COMPOUND = pc_cb_compound;
 
@@ -521,8 +522,8 @@ main(void)
         memset(&ops, 0, sizeof(ops));
         ops[0].argop                 = OP_PUTROOTFH;
         ops[1].argop                 = OP_LOOKUP;
-        ops[1].oplookup.objname.data = "share";
-        ops[1].oplookup.objname.len  = 5;
+        ops[1].oplookup.objname.data = "fs0";
+        ops[1].oplookup.objname.len  = 3;
         ops[2].argop                 = OP_GETFH;
         /* minorversion 0 compound: reuse pc_compound without SEQUENCE but
          * with minorversion 1 is invalid; send raw. */
@@ -882,7 +883,7 @@ main(void)
 
         /* M0: FH identity -- the NFS3 MOUNT root vs the NFS4 export
          * root, and a file's handle via both protocols. */
-        r3 = mbt_mnt(env, "/share");
+        r3 = mbt_mnt(env, "/fs0");
         expect("NFS3 MOUNT of the shared export",
                r3->status == MNT3_OK && r3->obj_fh.has, "mnt");
         root3 = r3->obj_fh;

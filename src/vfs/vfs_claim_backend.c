@@ -2,7 +2,6 @@
 //
 // SPDX-License-Identifier: LGPL-2.1-only
 
-#include <sched.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -490,6 +489,7 @@ chimera_vfs_claim_backend_service(struct chimera_vfs_state *state)
 {
     struct chimera_vfs_file_state *head, *file, *next;
     struct chimera_vfs_bl_work    *w;
+    bool                           is_rel;
 
     if (!state || !chimera_vfs_claim_backend_capable(state)) {
         return;
@@ -530,12 +530,49 @@ chimera_vfs_claim_backend_service(struct chimera_vfs_state *state)
      * in exactly the order the local state changed.  Entries are popped ONE
      * AT A TIME under service_lock -- never spliced -- so a concurrent
      * chimera_vfs_claim_cancel can always find (and yank) a still-pending
-     * TICKET in the FIFO; a popped TICKET is published as work_active_ticket
-     * for the duration of its confirm so cancel can wait out the inline
-     * completion instead of freeing the ticket under the confirm's feet. */
+     * TICKET in the FIFO.
+     *
+     * The lane is STRICTLY SERIAL across a confirm: dispatching a TICKET
+     * sets work_confirming and the drain stops until that confirm
+     * completes.  Nothing here may assume the backend answers inline --
+     * chimera_vfs_dispatch routes a module's op to a delegation thread
+     * whenever async delegation is configured, and a clustered arbiter will
+     * never answer inline -- and if the next entry dispatched anyway, an
+     * unlock's token release could reach the backend BEFORE the confirm it
+     * was queued behind, which is exactly the collision this FIFO exists to
+     * prevent.  When the backend does answer inline the completion clears
+     * the gate before project_range returns, so this loop keeps draining
+     * without a doorbell round trip. */
     for (;;) {
+        /* Peek the head's type before committing.  A RELEASE has to be
+         * selected AND dispatched under bl_dispatch_lock, so that an inline
+         * confirm's drain cannot slip between the two and miss it; a TICKET
+         * must NOT hold that lock, because its project_range takes it. */
+        pthread_mutex_lock(&state->service_lock);
+        if (state->work_confirming) {
+            /* A confirm is in flight; its completion resumes the drain. */
+            pthread_mutex_unlock(&state->service_lock);
+            break;
+        }
+        w      = state->work_head;
+        is_rel = w && w->type == CHIMERA_VFS_BL_WORK_RELEASE;
+        pthread_mutex_unlock(&state->service_lock);
+
+        if (!w) {
+            break;
+        }
+
+        if (is_rel) {
+            pthread_mutex_lock(&state->bl_dispatch_lock);
+        }
+
+        /* Re-read: the head may have changed while the lock was not held.
+         * Only take it if it still matches what we prepared for. */
         pthread_mutex_lock(&state->service_lock);
         w = state->work_head;
+        if (w && (w->type == CHIMERA_VFS_BL_WORK_RELEASE) != is_rel) {
+            w = NULL;
+        }
         if (w) {
             state->work_head = w->next;
             if (!state->work_head) {
@@ -543,32 +580,29 @@ chimera_vfs_claim_backend_service(struct chimera_vfs_state *state)
             }
             w->next = NULL;
             if (w->type == CHIMERA_VFS_BL_WORK_TICKET) {
-                state->work_active_ticket = w->ticket;
+                state->work_confirming = true;
             }
         }
         pthread_mutex_unlock(&state->service_lock);
 
         if (!w) {
-            break;
+            if (is_rel) {
+                pthread_mutex_unlock(&state->bl_dispatch_lock);
+            }
+            continue;
         }
 
         switch (w->type) {
             case CHIMERA_VFS_BL_WORK_TICKET:
-                /* The confirm completes inline (a CAP_LEASE arbiter must not
-                 * be CAP_BLOCKING-delegated), so the ticket's callback has
-                 * fired by the time project_range returns and the active
-                 * marker can drop. */
                 chimera_vfs_claim_backend_project_range(state->service_thread,
-                                                        state, w->ticket);
-                pthread_mutex_lock(&state->service_lock);
-                state->work_active_ticket = NULL;
-                pthread_mutex_unlock(&state->service_lock);
+                                                        state, w->ticket, true);
                 break;
             case CHIMERA_VFS_BL_WORK_RELEASE:
                 chimera_vfs_lease_release_backend(state->service_thread,
                                                   w->fh, w->fh_len,
                                                   w->fh_hash, w->token, 0,
                                                   NULL, NULL);
+                pthread_mutex_unlock(&state->bl_dispatch_lock);
                 break;
         } /* switch */
         free(w);
@@ -615,10 +649,17 @@ chimera_vfs_claim_backend_detach(struct chimera_vfs_state *state)
 /* RANGE projection                                                   */
 /* ------------------------------------------------------------------ */
 
+/* One in-flight backend RANGE confirm.  Core-owned, and carrying a SNAPSHOT
+ * of what the completion needs out of the ticket: a cancel that loses hands
+ * the completion to the callback, and the core reads nothing more from the
+ * ticket once the confirm is dispatched. */
 struct chimera_vfs_bl_range_op {
-    struct chimera_vfs_state           *state;
-    struct chimera_vfs_file_state      *file;
-    struct chimera_vfs_pending_acquire *ticket;
+    struct chimera_vfs_state      *state;
+    struct chimera_vfs_file_state *file;
+    struct chimera_vfs_claim      *claim;
+    chimera_vfs_claim_acquire_cb_t cb;
+    void                          *cb_private;
+    bool                           serial_lane;
 };
 
 static void
@@ -628,19 +669,34 @@ chimera_vfs_bl_range_complete(
     uint64_t               token,
     void                  *private_data)
 {
-    struct chimera_vfs_bl_range_op     *op     = private_data;
-    struct chimera_vfs_state           *state  = op->state;
-    struct chimera_vfs_file_state      *file   = op->file;
-    struct chimera_vfs_pending_acquire *ticket = op->ticket;
-    struct chimera_vfs_claim           *claim  = ticket->claim;
+    struct chimera_vfs_bl_range_op *op          = private_data;
+    struct chimera_vfs_state       *state       = op->state;
+    struct chimera_vfs_file_state  *file        = op->file;
+    struct chimera_vfs_claim       *claim       = op->claim;
+    chimera_vfs_claim_acquire_cb_t  cb          = op->cb;
+    void                           *cb_private  = op->cb_private;
+    bool                            serial_lane = op->serial_lane;
+
+    free(op);
+
+    /* Resume the serial lane before the callback runs: the callback is
+     * protocol code that can take arbitrary locks, and nothing it does
+     * needs the lane held. */
+    if (serial_lane) {
+        pthread_mutex_lock(&state->service_lock);
+        state->work_confirming = false;
+        if (state->work_head && state->service_doorbell) {
+            evpl_ring_doorbell(state->service_doorbell);
+        }
+        pthread_mutex_unlock(&state->service_lock);
+    }
 
     if (error_code == CHIMERA_VFS_OK && granted) {
         pthread_mutex_lock(&file->lock);
         claim->backend_token = token;
         pthread_mutex_unlock(&file->lock);
 
-        ticket->cb(CHIMERA_CLAIM_GRANTED, claim, NULL,
-                   ticket->private_data);
+        cb(CHIMERA_CLAIM_GRANTED, claim, NULL, cb_private);
     } else {
         struct chimera_vfs_claim_conflict conflict;
 
@@ -651,23 +707,24 @@ chimera_vfs_bl_range_complete(
         memset(&conflict, 0, sizeof(conflict));
         conflict.offset = 0;
         conflict.length = UINT64_MAX;
-        ticket->cb(CHIMERA_CLAIM_DENIED, NULL, &conflict,
-                   ticket->private_data);
+        cb(CHIMERA_CLAIM_DENIED, NULL, &conflict, cb_private);
     }
 
     chimera_vfs_state_put(state, file);
-    free(op);
 } /* chimera_vfs_bl_range_complete */
 
 /* Confirm a locally-granted RANGE claim with the backend before its
  * callback fires.  `thread` must be the calling vfs thread.  Fires the
  * ticket's callback on completion (GRANTED with the token recorded, or
- * DENIED after rollback). */
+ * DENIED after rollback), unless a concurrent cancel claims the ticket
+ * first.  `serial_lane` is true only for the service drain's dispatch, so
+ * the completion knows whether to release the lane gate. */
 void
 chimera_vfs_claim_backend_project_range(
     struct chimera_vfs_thread          *thread,
     struct chimera_vfs_state           *state,
-    struct chimera_vfs_pending_acquire *ticket)
+    struct chimera_vfs_pending_acquire *ticket,
+    bool                                serial_lane)
 {
     struct chimera_vfs_claim       *claim = ticket->claim;
     struct chimera_vfs_file_state  *file  = ticket->file;
@@ -676,10 +733,16 @@ chimera_vfs_claim_backend_project_range(
     /* Any queued releases for this file's records must land first. */
     chimera_vfs_claim_backend_drain_releases(thread, state, file);
 
-    op         = calloc(1, sizeof(*op));
-    op->state  = state;
-    op->file   = file;
-    op->ticket = ticket;
+    op              = calloc(1, sizeof(*op));
+    op->state       = state;
+    op->file        = file;
+    op->serial_lane = serial_lane;
+    /* Snapshot the ticket now, while it is unambiguously ours: from the
+     * moment a cancel claims this op the ticket is the canceller's to free
+     * and the completion must not read it. */
+    op->claim      = claim;
+    op->cb         = ticket->cb;
+    op->cb_private = ticket->private_data;
 
     chimera_vfs_state_get(state, file->fh, file->fh_len, file->fh_hash, false);
 
@@ -734,6 +797,9 @@ chimera_vfs_claim_backend_drain_releases(
     struct chimera_vfs_bl_work *w, **pp;
     struct chimera_vfs_bl_work *mine = NULL, **mtail = &mine;
 
+    /* Selection and dispatch together: see bl_dispatch_lock in vfs_claim.h. */
+    pthread_mutex_lock(&state->bl_dispatch_lock);
+
     pthread_mutex_lock(&state->service_lock);
     pp = &state->work_head;
     while ((w = *pp)) {
@@ -767,26 +833,35 @@ chimera_vfs_claim_backend_drain_releases(
                                           NULL, NULL);
         free(w);
     }
+
+    pthread_mutex_unlock(&state->bl_dispatch_lock);
 } /* chimera_vfs_claim_backend_drain_releases */
 
-/* Cancel a pump-deferred RANGE acquire confirm (a CHIMERA_VFS_BL_WORK_TICKET
- * queued by chimera_vfs_claim_backend_defer_ticket whose callback has not
- * fired).  Returns true when the ticket was yanked from the FIFO -- the
- * callback will NEVER fire and the caller must roll back the optimistic
- * local grant.  Returns false only once the ticket's callback has FIRED:
- * if the service thread is mid-confirm on this very ticket (popped but the
- * callback not yet returned), this waits out the inline completion first,
- * so the teardown paths can free the ticket's containing memory on a false
- * return exactly as they did before the deferred lane existed (R21). */
+/* Cancel a RANGE acquire confirm that is still QUEUED on the work FIFO --
+ * the confirm has not started, so yanking the entry means the callback will
+ * never be invoked and the caller owns the ticket.  Returns true then.
+ *
+ * NEVER blocks.  False means the callback owns the completion: it is
+ * running, or about to run, on the thread that dispatched the confirm.  A
+ * ticket whose confirm has been dispatched is deliberately NOT reclaimable
+ * (see chimera_vfs_claim_cancel in vfs_claim.h for why the caller-owned
+ * claim makes that unsafe).
+ *
+ * This used to spin on sched_yield() until the in-flight confirm's callback
+ * returned, so that false could promise the callback had FINISHED.  That
+ * turned any caller holding a lock its callback also takes into a deadlock:
+ * an NLM client teardown cancels under nlm_state.mutex while the confirm it
+ * waits for is blocked taking that same mutex in NLM's acquire callback. */
 bool
 chimera_vfs_claim_backend_ticket_cancel(
     struct chimera_vfs_state           *state,
     struct chimera_vfs_pending_acquire *ticket)
 {
     struct chimera_vfs_bl_work *w, **pp;
-    bool                        busy;
+    struct chimera_vfs_bl_work *yanked = NULL;
 
     pthread_mutex_lock(&state->service_lock);
+
     pp = &state->work_head;
     while ((w = *pp)) {
         if (w->type == CHIMERA_VFS_BL_WORK_TICKET && w->ticket == ticket) {
@@ -801,28 +876,17 @@ chimera_vfs_claim_backend_ticket_cancel(
                     }
                 }
             }
-            pthread_mutex_unlock(&state->service_lock);
-            free(w);
-            return true;
+            yanked = w;
+            break;
         }
         pp = &w->next;
     }
+
     pthread_mutex_unlock(&state->service_lock);
 
-    /* Not in the FIFO: either it was never deferred, its callback already
-     * ran, or the service thread popped it and its inline confirm is in
-     * flight right now.  Wait that confirm out -- the loop reads only
-     * state memory, never the ticket (whose containing struct the caller
-     * will free once we return false). */
-    for (;;) {
-        pthread_mutex_lock(&state->service_lock);
-        busy = (state->work_active_ticket == ticket);
-        pthread_mutex_unlock(&state->service_lock);
-        if (!busy) {
-            return false;
-        }
-        sched_yield();
-    }
+    free(yanked);
+
+    return yanked != NULL;
 } /* chimera_vfs_claim_backend_ticket_cancel */
 
 /* Append one entry to the ordered backend-RANGE work FIFO. */

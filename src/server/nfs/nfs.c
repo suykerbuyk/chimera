@@ -682,6 +682,14 @@ nfs_server_destroy(void *data)
 
     if (shared->portmap_server) {
         evpl_rpc2_server_destroy(shared->portmap_server);
+    }
+
+    /* The portmap programs' per-proc metrics are allocated whenever an internal
+     * portmap was configured, which is not the same as ending up with a portmap
+     * *server*: a data server initializes the programs and then discards the
+     * server, because it binds only the NFS service.  Free on the condition
+     * they were allocated under, not on the server pointer. */
+    if (!chimera_server_config_get_external_portmap(shared->config)) {
         free(shared->portmap_v2.rpc2.metrics);
         free(shared->portmap_v3.rpc2.metrics);
         free(shared->portmap_v4.rpc2.metrics);
@@ -924,6 +932,9 @@ nfs_server_thread_init(
     /* Delegation callback recall doorbell + queue. */
     nfs4_cb_thread_init(thread);
 
+    /* NLM deferred lock-acquire resume doorbell + queue. */
+    chimera_nfs_nlm4_thread_init(thread);
+
     /* Run-once cold-start: reload the persisted NSM state + monitor list and
      * notify monitored hosts that we restarted (so they reclaim during the NLM
      * grace window).  Idempotent across threads; no-op on a non-persistent
@@ -948,6 +959,7 @@ nfs_server_thread_destroy(void *data)
     }
 
     nfs4_cb_thread_destroy(thread);
+    chimera_nfs_nlm4_thread_destroy(thread);
 
     if (thread->shared->mount_server) {
         evpl_rpc2_server_detach(thread->rpc2_thread, thread->shared->mount_server);
