@@ -286,6 +286,13 @@ quint_coverage:
     - ${RUN_QB} -a amd64 -v ctest_quint_coverage -V RUN_URL="${CI_PIPELINE_URL}" &> quint_coverage_amd64.log
     - qb assets download --strip -p ${QB_PROJECT} -t ${QB_TAG} --asset-name quint_coverage_report/amd64/coverage-report.md --output-dir .
     - qb assets download --strip -p ${QB_PROJECT} -t ${QB_TAG} --asset-name quint_coverage_report/amd64/report.tar.gz --output-dir .
+    # Extracted rather than shipped as the tarball: the artifact browser
+    # serves HTML, so the llvm-cov report is readable in the browser at
+    # quint_coverage_report/index.html.  The tarball itself stays
+    # downloadable as a qb asset, so it is not stored twice.
+    - mkdir -p quint_coverage_report
+    - tar -C quint_coverage_report --strip-components=1 -xzf report.tar.gz
+    - rm -f report.tar.gz
   after_script:
     - tail -1000 quint_coverage_amd64.log || true
   artifacts:
@@ -293,7 +300,7 @@ quint_coverage:
     expose_as: 'Quint coverage report'
     paths:
       - coverage-report.md
-      - report.tar.gz
+      - quint_coverage_report/
       - quint_coverage_amd64.log
     expire_in: 1 week
 
@@ -314,6 +321,12 @@ coverage:
     - ${RUN_QB} -a amd64 -v ctest_coverage &> ctest_coverage_amd64.log
     - qb assets download --strip -p ${QB_PROJECT} -t ${QB_TAG} --asset-name coverage_report/amd64/report.tar.gz --output-dir .
     - qb assets download --strip -p ${QB_PROJECT} -t ${QB_TAG} --asset-name coverage_report/amd64/coverage-report.txt --output-dir .
+    # Extracted for the same reason as quint_coverage: the artifact browser
+    # serves the llvm-cov HTML directly at coverage_report/index.html, and
+    # the tarball remains downloadable as a qb asset.
+    - mkdir -p coverage_report
+    - tar -C coverage_report --strip-components=1 -xzf report.tar.gz
+    - rm -f report.tar.gz
   after_script:
     - tail -1000 ctest_coverage_amd64.log || true
   # Scrape the line-coverage percentage from the llvm-cov TOTAL row (echoed by
@@ -322,10 +335,11 @@ coverage:
   coverage: '/^\s*TOTAL(?:\s+\d+){2}\s+[\d.]+%(?:\s+\d+){2}\s+([\d.]+)%/'
   artifacts:
     when: always
+    expose_as: 'Coverage report extended'
     paths:
       - ctest_coverage_amd64.log
       - coverage-report.txt
-      - report.tar.gz
+      - coverage_report/
     expire_in: 1 week
 
 # Full-matrix smbtorture measurement.  The gating ctest legs only run the enabled
