@@ -79,6 +79,46 @@ if(NOT DISABLE_TESTS)
 	qtm_install_test_targets(src/server/smb/tests smb)
 endif()
 
+# Ship the caller-side chimera_vfs headers with the test suites.  The module
+# SDK installed by src/vfs/CMakeLists.txt is the boundary a VFS *backend*
+# builds against; these are the other side of the library -- what an
+# in-process *caller* of chimera_vfs uses (chimera_vfs_init, thread_init,
+# mount, get_root_fh, the dispatch and xattr procs), the same layer the
+# in-tree NFS/SMB servers sit on.  A downstream test fixture that loads the
+# packaged libchimera_vfs.so needs them, and with nothing shipped it vendors
+# its own copies: those still compile after an upstream signature change --
+# the local prototypes are the only ones the compiler sees -- and fail at run
+# time instead.  Deliberately under tests/ rather than beside the SDK, and in
+# the quantum-chimera-tests package rather than the server one, so no
+# stability is implied: these are internals that move with the library.
+#
+# The list is the include closure of vfs/vfs_procs.h, not just the two
+# headers a caller names, and it is maintained by hand -- an upstream header
+# that grows a new #include silently falls outside it.
+# qtm_build/verify_test_includes.sh is what catches that: it compiles a
+# standalone translation unit against the staged install tree, and the
+# package build tasks in qb.yaml run it right after `ninja install`.  Keep
+# the two in step, along with the include roots documented in
+# tests-include.README.
+set(QTM_TEST_VFS_HEADERS
+	vfs.h            # chimera_vfs, _thread, mounts, attr vocabulary
+	vfs_procs.h      # the dispatch and xattr procs callers drive
+	vfs_dump.h       # included by vfs.h
+	vfs_pnfs.h       # included by vfs.h
+	vfs_clock.h)     # included by vfs.h
+list(TRANSFORM QTM_TEST_VFS_HEADERS PREPEND ${CMAKE_SOURCE_DIR}/src/vfs/)
+install(FILES ${QTM_TEST_VFS_HEADERS} DESTINATION tests/include/vfs)
+
+# vfs_dump.h includes common/logging.h and vfs.h includes common/tcp_flavor.h,
+# so the C utility layer these two reach for travels with them.
+install(FILES
+	${CMAKE_SOURCE_DIR}/src/common/logging.h
+	${CMAKE_SOURCE_DIR}/src/common/tcp_flavor.h
+	DESTINATION tests/include/common)
+
+install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/tests-include.README
+	DESTINATION tests/include RENAME README)
+
 # WPTS / pike SMB conformance fixtures (ptfconfig files + case maps) and the
 # wrapper scripts that drive the installed daemon.  The wrappers locate their
 # external prerequisites and these fixtures via environment variables

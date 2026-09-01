@@ -48,6 +48,14 @@ conformance fixtures and wrapper scripts; and fio/elbencho benchmark
 configs for the installed plugin libraries. These let a deployed system
 validate VFS modules such as snfs without a development tree.
 
+Also installs the caller-side chimera_vfs headers under
+/opt/quantum/chimera/tests/include, so a downstream in-process test fixture
+can build against the packaged libchimera_vfs.so rather than keeping its own
+copies of those declarations. They are chimera internals with no stability
+guarantee -- unlike the module SDK in quantum-chimera-server, which is the
+supported boundary for an out-of-tree VFS backend. See
+tests/include/README for the include roots.
+
 
 %build
 # nothing to build
