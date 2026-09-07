@@ -88,7 +88,7 @@ chimera_nfs4_deallocate_typecheck_complete(
 
     if ((attr->va_set_mask & CHIMERA_VFS_ATTR_MODE) &&
         !S_ISREG(attr->va_mode)) {
-        res->dr_status = chimera_nfs4_data_nonreg_status(attr->va_mode);
+        res->dr_status = chimera_nfs4_sparse_nonreg_status(attr->va_mode);
         chimera_vfs_release(req->thread->vfs_thread, req->handle);
         req->handle = NULL;
         chimera_nfs4_compound_complete(req, res->dr_status);
@@ -160,6 +160,16 @@ chimera_nfs4_deallocate(
      * path opens it directly, and the state-table path must name it. */
     if (req->fhlen == 0) {
         res->dr_status = NFS4ERR_NOFILEHANDLE;
+        chimera_nfs4_compound_complete(req, res->dr_status);
+        return;
+    }
+
+    /* RFC 7862 §15.2 punches [da_offset, da_offset + da_length); a range whose
+     * end does not fit in a uint64 names no such interval, so reject it rather
+     * than letting the wrapped end reach a backend. */
+    if (args->da_length &&
+        args->da_offset > UINT64_MAX - args->da_length) {
+        res->dr_status = NFS4ERR_INVAL;
         chimera_nfs4_compound_complete(req, res->dr_status);
         return;
     }

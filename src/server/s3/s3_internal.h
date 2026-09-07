@@ -71,6 +71,11 @@ struct chimera_s3_delete_entry {
 struct chimera_s3_config {
     int      port;
     uint64_t io_size;
+    /* Identity used for an access key configured without one.  Defaults to
+     * nobody (65534) rather than root, so a key that was never bound to a user
+     * gets no privilege by omission. */
+    uint32_t anon_uid;
+    uint32_t anon_gid;
 };
 
 struct chimera_s3_io {
@@ -84,6 +89,21 @@ struct chimera_s3_request {
     enum chimera_s3_status           status;
     enum chimera_s3_vfs_state        vfs_state;
     enum chimera_s3_http_state       http_state;
+    /*
+     * The POSIX identity the authenticated access key acts as.  Every VFS
+     * operation this request issues runs under it, so the store's ownership
+     * and mode bits are what keep one key out of another key's objects -- the
+     * S3 layer itself performs no authorization.  Stamped from the matched
+     * credential once authentication succeeds, and never from a server-wide
+     * identity: sharing one privileged credential across requests is what made
+     * every valid key root over every bucket.
+     */
+    struct chimera_vfs_cred          cred;
+    /* S3 identity of the authenticated requester, reported as the <Owner> in
+    * an ACL reply.  Copied out of the credential cache at authentication time
+    * because the cached entry is only valid inside that RCU read section. */
+    char                             owner_id[CHIMERA_S3_CANON_ID_MAX];
+    char                             owner_display[CHIMERA_S3_DISPLAY_MAX];
     const char                      *bucket_name;
     int                              bucket_namelen;
     int                              bucket_fhlen;
@@ -118,6 +138,11 @@ struct chimera_s3_request {
     int                              has_part_number;
     /* ?tagging subresource (object/bucket tag get/put/delete). */
     int                              has_tagging;
+    /* ?acl subresource (Get/PutObjectAcl, Get/PutBucketAcl). */
+    int                              has_acl;
+    /* The x-amz-acl canned ACL parsed into an id; CHIMERA_S3_CANNED_NONE when
+     * the header is absent, in which case the backend default mode stands. */
+    int                              canned_acl;
     /* Set when the request targets a bucket itself (Create/Delete/Head/List
      * bucket, ListBuckets) rather than an object; tells the body notifier to
      * drain any request body instead of treating it as object data. */
@@ -276,7 +301,6 @@ struct chimera_server_s3_shared {
      * built from it too, since the in-process transport is named rather
      * than bound. */
     enum chimera_tcp_flavor            tcp_flavor;
-    struct chimera_vfs_cred            cred;
     uint32_t                           root_fh_len;
     uint8_t                            root_fh[CHIMERA_VFS_FH_SIZE];
     /* VFS path (relative to root_fh) under which dynamically created buckets

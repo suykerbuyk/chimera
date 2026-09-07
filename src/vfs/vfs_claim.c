@@ -517,6 +517,32 @@ chimera_vfs_claim_init_common(
 } /* chimera_vfs_claim_init_common */
 
 SYMBOL_EXPORT void
+chimera_vfs_claim_foreach_smb_open(
+    struct chimera_vfs_file_state *file,
+    chimera_vfs_smb_open_cb_t      cb,
+    void                          *private_data)
+{
+    struct chimera_vfs_claim *cur;
+
+    if (!file) {
+        return;
+    }
+
+    pthread_mutex_lock(&file->lock);
+    for (cur = file->claims[CHIMERA_CLAIM_CLASS_ACCESS]; cur; cur = cur->next) {
+        if (cur->construct != CHIMERA_CONSTRUCT_SMB_OPEN &&
+            cur->construct != CHIMERA_CONSTRUCT_SMB_OPEN_INERT) {
+            continue;
+        }
+        if (!cur->cb_private) {
+            continue;
+        }
+        cb(cur->cb_private, private_data);
+    }
+    pthread_mutex_unlock(&file->lock);
+} /* chimera_vfs_claim_foreach_smb_open */
+
+SYMBOL_EXPORT void
 chimera_vfs_claim_init_smb_open(
     struct chimera_vfs_claim         *claim,
     uint8_t                           access,
@@ -1595,11 +1621,21 @@ chimera_vfs_claim_pump_pending(
         /* A pump-granted projectable lock is confirmed by the service
          * thread (the pump runs on whatever thread released the blocker
          * and has no dispatch context of its own); the callback fires from
-         * there after confirmation. */
+         * there after confirmation.
+         *
+         * The test is the RANGE capability and the RANGE per-file flag --
+         * not the aggregate ones, which say nothing about whether this
+         * backend arbitrates byte ranges.  The per-file flag may still be
+         * unresolved here (resolving it needs a thread to identify the
+         * module), in which case the service thread discovers the answer
+         * and a backend that does not arbitrate ranges reports ENOTSUP,
+         * which chimera_vfs_bl_range_complete turns back into the local
+         * grant rather than a denial. */
         if (result == CHIMERA_CLAIM_GRANTED &&
             t->claim->klass == CHIMERA_CLAIM_CLASS_RANGE &&
-            !file->bl_disabled &&
-            chimera_vfs_claim_backend_capable(state)) {
+            !file->bl_range_disabled &&
+            t->claim->owner.proto == CHIMERA_CLAIM_PROTO_POSIX &&
+            chimera_vfs_claim_backend_range_capable(state)) {
             chimera_vfs_claim_backend_defer_ticket(state, t);
             continue;
         }
@@ -1666,7 +1702,7 @@ chimera_vfs_claim_acquire(
      * only threadless teardown releases ride the queued lane. */
     if (result == CHIMERA_CLAIM_GRANTED &&
         claim->klass == CHIMERA_CLAIM_CLASS_RANGE &&
-        chimera_vfs_claim_backend_range_projects(state, file, thread)) {
+        chimera_vfs_claim_backend_range_projects(state, file, thread, claim)) {
         chimera_vfs_claim_backend_project_range(thread, state, ticket, false);
         return;
     }
@@ -1757,6 +1793,33 @@ chimera_vfs_claim_test(
 } /* chimera_vfs_claim_test */
 
 SYMBOL_EXPORT bool
+chimera_vfs_claim_range_owner_holds(
+    struct chimera_vfs_file_state    *file,
+    const struct chimera_claim_owner *owner,
+    const struct chimera_vfs_claim   *except,
+    uint64_t                          offset,
+    uint64_t                          length)
+{
+    struct chimera_vfs_claim *cur;
+    bool                      held = false;
+
+    pthread_mutex_lock(&file->lock);
+    for (cur = file->claims[CHIMERA_CLAIM_CLASS_RANGE]; cur; cur = cur->next) {
+        if (cur == except ||
+            !chimera_claim_owner_equal(&cur->owner, owner) ||
+            !chimera_vfs_claim_range_overlap(cur->offset, cur->length,
+                                             offset, length)) {
+            continue;
+        }
+        held = true;
+        break;
+    }
+    pthread_mutex_unlock(&file->lock);
+
+    return held;
+} /* chimera_vfs_claim_range_owner_holds */
+
+SYMBOL_EXPORT bool
 chimera_vfs_claim_cancel(
     struct chimera_vfs_state           *state,
     struct chimera_vfs_pending_acquire *ticket)
@@ -1804,6 +1867,7 @@ chimera_vfs_claim_range_replace(
     struct chimera_vfs_state         *state,
     struct chimera_vfs_file_state    *file,
     const struct chimera_claim_owner *owner,
+    const struct chimera_vfs_claim   *except,
     uint64_t                          offset,
     uint64_t                          length,
     uint8_t                           new_mask,
@@ -1830,6 +1894,9 @@ chimera_vfs_claim_range_replace(
     for (cur = file->claims[CHIMERA_CLAIM_CLASS_RANGE]; cur; cur = next) {
         next = cur->next;
 
+        if (cur == except) {
+            continue;
+        }
         if (!chimera_claim_owner_equal(&cur->owner, owner)) {
             continue;
         }
@@ -1856,14 +1923,23 @@ chimera_vfs_claim_range_replace(
                 has_right = (cur_off + cur_len) > carve_end;
             }
 
+            /* A remainder is a NEW claim with the carved geometry, not the
+             * record the backend knows: the parent's token is released
+             * below, so a remainder that inherited it would name a freed
+             * record and re-release it later -- onto whatever record has
+             * since reused the id.  Clear it.  CLAIMTODO: the remainder is
+             * consequently held locally but unprojected until it is
+             * re-locked; projecting it needs a vfs thread here, which the
+             * carve path does not have. */
             if (has_left && n_spare < 2 && spare && spare[n_spare]) {
                 struct chimera_vfs_claim *left = spare[n_spare++];
 
-                *left        = *cur;
-                left->offset = cur_off;
-                left->length = offset - cur_off;
-                left->prev   = NULL;
-                left->next   = NULL;
+                *left               = *cur;
+                left->offset        = cur_off;
+                left->length        = offset - cur_off;
+                left->backend_token = 0;
+                left->prev          = NULL;
+                left->next          = NULL;
                 chimera_vfs_claim_link_locked(file, left);
             }
             if (has_right && n_spare < 2 && spare && spare[n_spare]) {
@@ -1873,8 +1949,9 @@ chimera_vfs_claim_range_replace(
                 right->offset = carve_end;
                 right->length = (cur_len == UINT64_MAX) ? UINT64_MAX
                     : (cur_off + cur_len) - carve_end;
-                right->prev = NULL;
-                right->next = NULL;
+                right->backend_token = 0;
+                right->prev          = NULL;
+                right->next          = NULL;
                 chimera_vfs_claim_link_locked(file, right);
             }
         }

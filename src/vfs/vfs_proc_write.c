@@ -137,8 +137,8 @@ chimera_vfs_write_gate_complete(
         return;
     }
 
-    gate->handle->granted_access = chimera_vfs_access_check(attr, gate->cred,
-                                                            CHIMERA_ACE_MASK_ALL);
+    uint32_t                       granted = chimera_vfs_access_check(attr, gate->cred,
+                                                                      CHIMERA_ACE_MASK_ALL);
 
     /* Owner override, as Linux nfsd applies to READ/WRITE (NFSD_MAY_OWNER_
      * OVERRIDE): a POSIX caller who OWNS the file may move its data through
@@ -154,12 +154,25 @@ chimera_vfs_write_gate_complete(
         gate->cred->flavor == CHIMERA_VFS_AUTH_UNIX &&
         (attr->va_set_mask & CHIMERA_VFS_ATTR_UID) &&
         gate->cred->uid == attr->va_uid) {
-        gate->handle->granted_access |= CHIMERA_ACE_READ_DATA |
+        granted |= CHIMERA_ACE_READ_DATA |
             CHIMERA_ACE_WRITE_DATA;
     }
-    gate->handle->granted_valid = 1;
 
-    if (!(gate->handle->granted_access & CHIMERA_ACE_WRITE_DATA)) {
+    /* The stamp on a handle records ONE credential's effective access -- the
+     * cache shards handles per (fh, access_mode, cred_hash), so for a
+     * cache-acquired handle every consumer shares that credential.  A
+     * stateful protocol server's handle (the NFSv4 open-state handle) is the
+     * exception: one handle serves every principal of the open-owner, so a
+     * different caller must evaluate for itself and must NOT overwrite the
+     * stamp -- a non-owner's narrow evaluation would otherwise revoke the
+     * opener's own bound rights. */
+    if (!gate->handle->granted_bound &&
+        gate->handle->cred_hash == chimera_vfs_cred_hash(gate->cred)) {
+        gate->handle->granted_access = granted;
+        gate->handle->granted_valid  = 1;
+    }
+
+    if (!(granted & CHIMERA_ACE_WRITE_DATA)) {
         gate->callback(CHIMERA_VFS_EACCES, 0, 0, NULL, NULL, gate->private_data);
         chimera_vfs_gate_scratch_free(gate->thread, gate);
         return;
@@ -199,7 +212,12 @@ chimera_vfs_write_owned(
      * opens.  The engine must enforce write access itself against the real
      * on-disk attrs, exactly as it already does for the path prefix. */
     if (chimera_vfs_gate_needed_dac(handle->vfs_module->capabilities, cred)) {
-        if (handle->granted_valid) {
+        if (handle->granted_valid && handle->granted_bound) {
+            /* Fast path only for an OPEN-bound grant (NFSv4/SMB bind write
+             * rights at OPEN).  An unbound grant computed for a stateless
+             * (NFSv3) caller is never revalidated on a mode/ACL change, so an
+             * unbound handle re-gates against current attrs on every write --
+             * see the matching note in vfs_proc_read.c. */
             if (!(handle->granted_access & CHIMERA_ACE_WRITE_DATA)) {
                 callback(CHIMERA_VFS_EACCES, 0, 0, NULL, NULL, private_data);
                 return;

@@ -445,7 +445,8 @@ diskfs_inherit_acl_async(
 
         if (len >= 0) {
             if (derive_mode) {
-                child->mode = (child->mode & S_IFMT) | chimera_acl_to_mode(store);
+                child->mode = (child->mode & CHIMERA_MODE_ACL_PRESERVE) |
+                    chimera_acl_to_mode(store);
             }
             diskfs_acl_serial_install(child, sbuf, len);
             /* The child is brand new, so there is no existing record to
@@ -894,6 +895,10 @@ diskfs_setattr_inode_cb(
         request->setattr.set_attr->va_size < inode->size) {
 
         p->inode_stash[0] = inode;
+        /* Not carried over from the pooled request's previous life: the trunc
+         * walk's ext_release acquires the refcount inode lazily on the first
+         * reflink-shared extent it frees, keyed on this being NULL. */
+        p->inode_stash[2] = NULL;
         p->loop_off       = request->setattr.set_attr->va_size;
 
         op = diskfs_bt_op_alloc(thread);
@@ -978,7 +983,8 @@ diskfs_setattr_inode_cb(
         int                       slen = -1;
 
         if (acl && acl->num_aces) {
-            inode->mode = (inode->mode & S_IFMT) | chimera_acl_to_mode(acl);
+            inode->mode = (inode->mode & CHIMERA_MODE_ACL_PRESERVE) |
+                chimera_acl_to_mode(acl);
         }
         if (acl && acl->num_aces && acl->num_aces <= DISKFS_ACL_REC_MAX_ACES) {
             slen = chimera_acl_serialize(acl, sbuf, sizeof(sbuf));
@@ -2893,7 +2899,15 @@ diskfs_get_layout_process(struct chimera_vfs_request *request)
             ext->file_offset : end;
 
         if (!rw) {
-            /* Read of a hole: skip it (the client reads zeros). */
+            /* RFC 5663 2.3.1: the extents of a block/SCSI layout describe its
+             * whole range, so a hole is reported as a NONE_DATA extent (which
+             * the client reads as zeroes).  Skipping it left a sub-range with
+             * no extent at all inside the lo_length the server then advertised
+             * from the last segment's end.  vol_id and storage_offset are not
+             * meaningful for NONE_DATA; device 0 always exists. */
+            diskfs_layout_emit(request, shared, p->loop_off,
+                               gap_end - p->loop_off, 0, 0,
+                               CHIMERA_VFS_BLOCK_NONE_DATA);
             p->loop_off = gap_end;
             diskfs_get_layout_process(request);
             return;

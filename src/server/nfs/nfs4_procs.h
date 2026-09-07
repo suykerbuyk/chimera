@@ -313,6 +313,13 @@ chimera_nfs4_lookup(
     struct nfs_resop4                *resop);
 
 void
+chimera_nfs4_openattr(
+    struct chimera_server_nfs_thread *thread,
+    struct nfs_request               *req,
+    struct nfs_argop4                *argop,
+    struct nfs_resop4                *resop);
+
+void
 chimera_nfs4_lookupp(
     struct chimera_server_nfs_thread *thread,
     struct nfs_request               *req,
@@ -858,6 +865,23 @@ chimera_nfs4_validate_name(const xdr_opaque *name)
 
     return NFS4_OK;
 } /* chimera_nfs4_validate_name */
+
+/*
+ * Fill in the result of an operation that will not be dispatched, with the
+ * status it is to fail on.  Zeroes the result, sets its discriminant from the
+ * argument, and releases any WRITE payload the XDR unmarshal cloned -- which
+ * nothing else will, because the op never runs.
+ *
+ * Used by the compound dispatcher for an op refused before dispatch, and by the
+ * SEQUENCE handler to place NFS4ERR_RETRY_UNCACHED_REP on the operation after
+ * SEQUENCE, where RFC 8881 Section 2.10.6.1.3 requires it to go.
+ */
+void
+nfs4_fail_undispatched_op(
+    struct chimera_server_nfs_thread *thread,
+    struct nfs_argop4                *argop,
+    struct nfs_resop4                *resop,
+    nfsstat4                          status);
 
 static inline void
 chimera_nfs4_compound_complete(

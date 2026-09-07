@@ -101,6 +101,10 @@ int
 chimera_server_config_get_smb_named_streams(
     const struct chimera_server_config *config);
 
+int
+chimera_server_config_get_named_streams(
+    const struct chimera_server_config *config);
+
 void
 chimera_server_config_set_smb_signing_required(
     struct chimera_server_config *config,
@@ -162,6 +166,30 @@ chimera_server_config_set_smb_acl_inherited_canonicalize(
 
 int
 chimera_server_config_get_smb_acl_inherited_canonicalize(
+    const struct chimera_server_config *config);
+
+/* Emit the POSIX mode as a modefromsid ACE on QUERY SECURITY (default off) so a
+ * POSIX/CIFS-style client reads the exact mode rather than the translated
+ * Windows ACL.  Used by the POSIX-over-SMB loopback. */
+void
+chimera_server_config_set_smb_mode_from_sid(
+    struct chimera_server_config *config,
+    int                           enable);
+
+int
+chimera_server_config_get_smb_mode_from_sid(
+    const struct chimera_server_config *config);
+
+/* POSIX rename semantics: skip the SMB contained-open recall and destination-
+ * parent dir-lease probe so a rename never fails because of open handles (POSIX
+ * rename does not).  Default 0; the POSIX-over-SMB loopback enables it. */
+void
+chimera_server_config_set_smb_posix_rename(
+    struct chimera_server_config *config,
+    int                           enable);
+
+int
+chimera_server_config_get_smb_posix_rename(
     const struct chimera_server_config *config);
 
 /* Answer a replayed durable-v2 CREATE that collides with a still-deferred
@@ -409,6 +437,26 @@ void
 chimera_server_config_set_s3_port(
     struct chimera_server_config *config,
     int                           port);
+
+/* Identity an S3 access key acts as when its configuration binds it to no
+ * user: nobody/nogroup, the conventional unprivileged pair.  An unbound key
+ * must not inherit privilege by omission. */
+#define CHIMERA_S3_ANON_UID 65534
+#define CHIMERA_S3_ANON_GID 65534
+
+void
+chimera_server_config_set_s3_anon_ids(
+    struct chimera_server_config *config,
+    uint32_t                      uid,
+    uint32_t                      gid);
+
+uint32_t
+chimera_server_config_get_s3_anon_uid(
+    const struct chimera_server_config *config);
+
+uint32_t
+chimera_server_config_get_s3_anon_gid(
+    const struct chimera_server_config *config);
 
 int
 chimera_server_config_get_s3_port(
@@ -967,6 +1015,9 @@ chimera_server_add_s3_cred(
     struct chimera_server *server,
     const char            *access_key,
     const char            *secret_key,
+    const char            *username,
+    const char            *canon_id,
+    const char            *display_name,
     int                    pinned);
 
 int
@@ -1035,6 +1086,35 @@ chimera_server_config_set_nfs_kerberos_keytab(
 const char *
 chimera_server_config_get_nfs_kerberos_keytab(
     const struct chimera_server_config *config);
+
+/*
+ * The static principal map: an authenticated Kerberos principal and the UNIX
+ * identity it stands for.  Consulted before nsswitch, which stays the
+ * fallback.  See the struct comment in server.c for why an explicit map
+ * exists at all.
+ */
+int
+chimera_server_config_add_nfs_principal_map(
+    struct chimera_server_config *config,
+    const char                   *principal,
+    uint32_t                      uid,
+    uint32_t                      gid,
+    uint32_t                      num_gids,
+    const uint32_t               *gids);
+
+int
+chimera_server_config_get_nfs_principal_map_count(
+    const struct chimera_server_config *config);
+
+/* Returns the principal, or NULL when index is out of range. */
+const char *
+chimera_server_config_get_nfs_principal_map_entry(
+    const struct chimera_server_config *config,
+    int                                 index,
+    uint32_t                           *uid,
+    uint32_t                           *gid,
+    uint32_t                           *num_gids,
+    const uint32_t                    **gids);
 
 void
 chimera_server_config_set_smb_kerberos_realm(

@@ -2,6 +2,11 @@
 #
 # SPDX-License-Identifier: Unlicense
 
+# Global scope, ahead of every FROM: an ARG reaches a FROM line only if it is
+# declared before the first FROM.  Below one it belongs to that stage instead
+# and the prefix expands to empty, sending the pull to Docker Hub unmirrored.
+ARG DOCKER_MIRROR=""
+
 # Current ccache, mirrored into GHCR by .github/workflows/mirror-ccache.yml.
 # CI overrides CCACHE_REGISTRY to the internal pull-through proxy so an image
 # build never reaches out to ghcr.io -- the same public-default/internal-override
@@ -11,25 +16,60 @@
 # rocky9 and ubuntu22 ship 4.6, which reads the pre-rename name and so silently
 # ignored the shared cache -- those cells compiled everything cold, every run.
 # One pinned upstream binary everywhere retires that whole class of skew.
+# No quint in this image, deliberately.  quint's Rust evaluator is published
+# only as *-unknown-linux-gnu and is built against glibc 2.39, which is newer
+# than this distro's, so it loads and then dies the first time a generator runs:
+#   quint_evaluator: /lib/.../libc.so.6: version `GLIBC_2.39' not found
+# There is no musl build upstream to mirror instead.  libevpl's Core/HTTP/RPC2
+# conformance suites and its quint_model checks therefore stay disabled here,
+# exactly as they always have been; they run on ubuntu 24.04/26.04, rocky 10,
+# the devcontainer and macOS, which is the same code on four other platforms.
+#
+# chimera's own model-based suites are NOT affected and must keep running: they
+# replay the prebuilt specs bundle that cmake/SpecsBundle.cmake fetches with
+# oras, and need quint only as the fallback when no bundle can be had.  This
+# image is unchanged from before in that respect.
+
 ARG CCACHE_REGISTRY=ghcr.io/chimera-nas/ccache
 ARG CCACHE_VERSION=4.14
 FROM ${CCACHE_REGISTRY}:${CCACHE_VERSION} AS ccache
 
-ARG DOCKER_MIRROR=""
 FROM ${DOCKER_MIRROR}ubuntu:22.04
 ARG ENABLE_XLIO=1
 ARG ENABLE_FIO=0
 ARG APT_MIRROR=""
+ARG UBUNTU_MIRROR=""
 
 ENV DEBIAN_FRONTEND=noninteractive
 
 # The mirrored ccache, ahead of anything the distro might provide on PATH.
 COPY --from=ccache /ccache /usr/local/bin/ccache
 
+# Two mirror mechanisms, both off by default, so a plain `docker build` reaches
+# whatever the base image ships and nothing unexpected.
+#
+# APT_MIRROR=<url> replaces the sources list outright.  The public CI has no
+# such mirror, but private forks do, and this is what they set.
+#
+# UBUNTU_MIRROR=azure instead swaps the archive hosts for Azure's, which is
+# what the public CI passes: the GitHub-hosted runners are Azure VMs -- their
+# own host apt is pointed there for the same reason -- and the public mirrors
+# are periodically caught mid-sync, serving an index whose size disagrees with
+# its Release file, which fails the whole image build.  A host swap rather than
+# a rewritten sources list, so the suites, components and Signed-By the base
+# image chose all survive; archive and security are amd64's two hosts, ports is
+# arm64's, and each keeps its path under the Azure name.
+#
+# APT_MIRROR wins if both are set: a fork that has stood one up means it.
 RUN if [ -n "$APT_MIRROR" ]; then \
     echo "deb $APT_MIRROR jammy main universe" > /etc/apt/sources.list && \
     echo "deb $APT_MIRROR jammy-updates main universe" >> /etc/apt/sources.list && \
     echo "deb $APT_MIRROR jammy-security main universe" >> /etc/apt/sources.list; \
+    elif [ "$UBUNTU_MIRROR" = azure ]; then \
+        sed -i -e 's|//archive\.ubuntu\.com|//azure.archive.ubuntu.com|g' \
+               -e 's|//security\.ubuntu\.com|//azure.archive.ubuntu.com|g' \
+               -e 's|//ports\.ubuntu\.com|//azure.ports.ubuntu.com|g' \
+            /etc/apt/sources.list; \
     fi
 
 RUN apt-get -y update && \

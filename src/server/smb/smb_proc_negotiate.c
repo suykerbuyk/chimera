@@ -165,9 +165,11 @@ chimera_smb_negotiate(struct chimera_smb_request *request)
     }
     request->negotiate.r_capabilities      = conn->capabilities;
     request->negotiate.r_max_transact_size = CHIMERA_SMB_MAX_TRANSACT_SIZE;
-    request->negotiate.r_max_read_size     = 8 * 1024 * 1024;
-    request->negotiate.r_max_write_size    = 8 * 1024 * 1024;
-    request->negotiate.r_system_time       = chimera_nt_time(&now);
+    /* Same helper the READ/WRITE handlers bound against, so what is advertised
+     * and what is enforced cannot diverge. */
+    request->negotiate.r_max_read_size  = chimera_smb_max_rw_size(conn);
+    request->negotiate.r_max_write_size = chimera_smb_max_rw_size(conn);
+    request->negotiate.r_system_time    = chimera_nt_time(&now);
     /* ServerStartTime is the SMB server instance start time (captured once at
      * init), not the OS boot time -- so an in-place chimera restart is visible
      * to clients keying off this field (issue #1225, MS-SMB2 3.3.1.5). */

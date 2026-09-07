@@ -62,6 +62,15 @@ struct nfs4_replay_slot {
     _Atomic uint64_t state_word;       /* (seqid << NFS4_SLOT_SEQID_SHIFT) | state */
     uint32_t         cached_len;       /* bytes in cached_buf (CACHED only) */
     void            *cached_buf;       /* RPC reply (header+body); malloc'd */
+    /* Who sent the request this slot holds.  RFC 8881 Section 2.10.6.1.3.1: a
+     * retry "that uses a different principal in the RPC request's credential
+     * field that translates to a different user" is a false retry, and "if the
+     * replier determines the users are different between the original request
+     * and a retry, then the replier MUST return NFS4ERR_SEQ_FALSE_RETRY".
+     * Without it, one user's reply answers another's request.  Written by the
+     * thread that owns the slot, under the same IN_PROGRESS exclusion as
+     * cached_buf. */
+    uint64_t         principal;
     /* Diagnostics for a wedged compound: when the slot entered IN_PROGRESS
      * and when a stuck-slot report was last logged for it.  Written only by
      * the CAS winner / the retry path observing it, both monotonic-seconds;
@@ -200,6 +209,20 @@ struct nfs4_client {
     uint8_t               nfs4_client_scid_confirm[NFS4_VERIFIER_SIZE];
     uint8_t               nfs4_client_scid_confirm_valid;
     uint64_t              nfs4_client_scid_pending_id;
+    /* Callback path (cb_client4) carried by a SETCLIENTID that has not been
+     * confirmed yet.  RFC 7530 §16.33.5: the update "is only confirmed if
+     * followed up by a SETCLIENTID_CONFIRM", so it is staged here instead of
+     * being applied to the live unified record -- a stray or never-confirmed
+     * SETCLIENTID must not disturb a confirmed client's working back-channel.
+     * Committed and cleared by nfs4_client_commit_cb_path.  The two buffers
+     * are sized to match nfs4_cb_path's cb_netid/cb_addr. */
+    uint8_t               nfs4_client_scid_cb_valid;
+    uint32_t              nfs4_client_scid_cb_program;
+    uint32_t              nfs4_client_scid_cb_ident;
+    uint32_t              nfs4_client_scid_cb_netid_len;
+    uint32_t              nfs4_client_scid_cb_addr_len;
+    char                  nfs4_client_scid_cb_netid[8];
+    char                  nfs4_client_scid_cb_addr[64];
     /* Unified state hierarchy.  Created when this nfs4_client is first
      * registered; freed when the nfs4_client is unregistered or the table
      * is torn down.  See nfs4_state.h. */
@@ -348,14 +371,17 @@ nfs4_client_setclientid(
  * named by `clientid`/`confirm`.  On a client reboot this promotes the
  * superseding record and tears the old one down, returning its unified state
  * hierarchy via *destroy_unified for teardown outside the table lock.
- * Returns NFS4ERR_STALE_CLIENTID (no such clientid) or NFS4ERR_CLID_INUSE
- * (confirm verifier mismatch) on failure. */
+ * `principal` is the confirming request's principal, which §16.34.5 requires
+ * to be the one that created the record.  Returns NFS4ERR_STALE_CLIENTID (no
+ * such clientid, or no record awaiting this confirm verifier) or
+ * NFS4ERR_CLID_INUSE (principal mismatch) on failure. */
 nfsstat4
 nfs4_client_setclientid_confirm(
-    struct nfs4_client_table *table,
-    uint64_t                  clientid,
-    const uint8_t            *confirm,
-    struct nfs_client       **destroy_unified);
+    struct nfs4_client_table           *table,
+    uint64_t                            clientid,
+    const uint8_t                      *confirm,
+    const struct nfs4_client_principal *principal,
+    struct nfs_client                 **destroy_unified);
 
 /* RFC 8881 §18.35.4 EXCHANGE_ID client-record matching state machine.  Runs
  * entirely under the table lock and fills *out (see nfs4_exchange_id_result).
@@ -533,6 +559,13 @@ nfs4_create_session(
  * On NFS4_OK the slot pointer and slot id are stashed on req for the
  * compound dispatcher to consume at finalize time.  cachethis is recorded
  * for the in-flight request and consulted only at finalize. */
+/* A digest of the identity a request was made under, for the comparison
+ * above.  Two credentials that translate to the same user may still digest
+ * differently -- squashing happens later, per export -- which costs a
+ * false-retry error where a replay would have done, and never the reverse. */
+uint64_t nfs4_replay_principal_digest(
+    const struct nfs_request *req);
+
 nfsstat4 nfs4_replay_slot_acquire(
     struct nfs4_session *session,
     uint32_t             slotid,
@@ -571,6 +604,27 @@ nfs4_client_set_cb_path(
     int                       netid_len,
     const char               *addr,
     int                       addr_len);
+
+/* Stage a 4.0 SETCLIENTID's callback path on the client record without
+ * touching the live one, and commit a staged path once the matching
+ * SETCLIENTID_CONFIRM lands (RFC 7530 §16.33.5/§16.34.5).  Committing is a
+ * one-shot: a retransmitted SETCLIENTID_CONFIRM finds nothing staged and
+ * leaves the path (and any channel already built on it) alone. */
+void
+nfs4_client_stage_cb_path(
+    struct nfs4_client_table *table,
+    uint64_t                  client_id,
+    uint32_t                  cb_program,
+    uint32_t                  cb_ident,
+    const char               *netid,
+    int                       netid_len,
+    const char               *addr,
+    int                       addr_len);
+
+void
+nfs4_client_commit_cb_path(
+    struct nfs4_client_table *table,
+    uint64_t                  client_id);
 
 /* Record the callback-channel RPC auth (CREATE_SESSION csa_sec_parms /
  * BACKCHANNEL_CTL).  flavor is an ONC RPC flavor (AUTH_NONE=0, AUTH_SYS=1);

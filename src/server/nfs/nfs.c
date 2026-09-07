@@ -94,7 +94,20 @@ nfs_fh_key_init(
         return;
     }
 
-    if (hexkey && strlen(hexkey) == 32) {
+    if (hexkey && *hexkey) {
+        /* A configured key that is not exactly 32 hex chars is a typo, not a
+         * request to fall back: silently ignoring it would leave each node
+         * with its own persisted/random key, so handles minted on one node
+         * fail verification on another.  Fail the same way a bad hex digit
+         * does, loudly and with signing off. */
+        if (strlen(hexkey) != 32) {
+            chimera_nfs_error("nfs_fh_key must be 32 hex chars (128-bit key), "
+                              "got %zu; disabling FH signing",
+                              strlen(hexkey));
+            shared->fh_sign = 0;
+            return;
+        }
+
         for (i = 0; i < 16; i++) {
             unsigned int byte;
             if (sscanf(hexkey + i * 2, "%2x", &byte) != 1) {
@@ -199,8 +212,10 @@ nfs_server_init(
 
     /* RPCSEC_GSS (Kerberos): register the acceptor keytab once at startup.
      * Per-thread provider registration happens in nfs_server_thread_init. */
-    if (chimera_server_config_get_nfs_kerberos_enabled(config)) {
+    shared->gss_enabled = chimera_server_config_get_nfs_kerberos_enabled(config);
+    if (shared->gss_enabled) {
         chimera_nfs_gss_init(chimera_server_config_get_nfs_kerberos_keytab(config));
+        chimera_nfs_gss_set_principal_map(config);
         chimera_nfs_info("RPCSEC_GSS: Kerberos authentication enabled");
     }
 
@@ -759,6 +774,10 @@ nfs_server_destroy(void *data)
     free(shared->nlm_v4.rpc2.metrics);
     free(shared->nsm_v1.rpc2.metrics);
 
+    /* Drain any export removed at runtime whose free is still queued behind a
+     * grace period (see chimera_nfs_remove_export). */
+    rcu_barrier();
+
     while (shared->exports) {
         export = shared->exports;
         LL_DELETE(shared->exports, export);
@@ -1215,6 +1234,12 @@ chimera_nfs_get_export_by_id(
 } /* chimera_nfs_get_export_by_id */
 
 
+static void
+chimera_nfs_export_free_rcu(struct rcu_head *head)
+{
+    free(container_of(head, struct chimera_nfs_export, rcu));
+} /* chimera_nfs_export_free_rcu */
+
 SYMBOL_EXPORT int
 chimera_nfs_remove_export(
     void       *nfs_shared,
@@ -1238,7 +1263,13 @@ chimera_nfs_remove_export(
             LL_DELETE(shared->exports, export);
             shared->num_exports--;
             chimera_nfs_abort_if(shared->num_exports < 0, "num_exports went negative");
-            free(export);
+            /* Request threads resolve exports_by_id[] locklessly and then read
+             * the export's sec/squash policy, so freeing here (this runs on the
+             * REST thread) would let an in-flight request touch freed memory,
+             * or a recycled id hand it another export's policy.  Defer the free
+             * to a grace period: the evpl loops report their quiescent state
+             * between requests, never inside one. */
+            call_rcu(&export->rcu, chimera_nfs_export_free_rcu);
             found = 1;
             break;
         }

@@ -350,6 +350,19 @@ foreach(image_spec ${KVM_IMAGES})
         PROPERTIES LABELS "kvm;${IMAGE_NAME};rpcsec_gss" PROCESSORS 2
         SKIP_RETURN_CODE 77
         ENVIRONMENT "MOUNT_SEC=sys;NFS_EXPORT_SEC=krb5;NFS_EXPECT_DENY=1")
+    # Privacy service (krb5p): same real-client mount but with sec=krb5p, so the
+    # kernel client GSS-wraps (encrypts + seals) every call's arguments and the
+    # server wraps every reply symmetrically.  The RW post-mount command drives a
+    # multi-block WRITE + READ through the encrypted path.  memfs only; NFSv4.1.
+    add_test(NAME chimera/kvm/${IMAGE_NAME}/kerberos/krb5p_mount_memfs_nfs4.1
+        COMMAND bash ${NFS_KRB_WRAPPER}
+                ${IMAGE_DIR}/vmlinuz ${IMAGE_DIR}/rootfs.qcow2
+                ${CHIMERA_BINARY} memfs 4.1
+                "stat /mnt && echo hello-krb5p > /mnt/f && grep -q hello-krb5p /mnt/f && dd if=/dev/zero of=/mnt/big bs=4k count=64 2>/dev/null && rm /mnt/f /mnt/big && echo KRB5P_RW_OK")
+    set_tests_properties(chimera/kvm/${IMAGE_NAME}/kerberos/krb5p_mount_memfs_nfs4.1
+        PROPERTIES LABELS "kvm;${IMAGE_NAME};rpcsec_gss" PROCESSORS 2
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "MOUNT_SEC=krb5p")
 
     # NFS cthon04 tests
     foreach(nfsver ${NFS_VERSIONS})
@@ -458,19 +471,16 @@ foreach(image_spec ${KVM_IMAGES})
                        NOT (backend STREQUAL "memfs" OR backend MATCHES "diskfs"))
                         continue()
                     endif()
-                    # nfstest_alloc is disabled on diskfs pending a space-
-                    # accounting fix (tracking issue #733).  diskfs reports
-                    # statfs free as the sum of the AGs' live free counts, which
-                    # is unstable at the ENOSPC boundary: reservation-cache
-                    # remainders and async deleted-inode reclaim return bytes to
-                    # the free pool concurrently with the test's fill, so a write
-                    # the suite expects to fail with ENOSPC finds the drained-back
-                    # space and succeeds (memfs/cairn/linux account synchronously
-                    # and pass).  Keep memfs coverage; re-enable diskfs once free
-                    # is reported from a stable base (see issue #733).
-                    if(prog STREQUAL "nfstest_alloc" AND backend MATCHES "diskfs")
-                        continue()
-                    endif()
+                    # nfstest_alloc now runs on diskfs too (issue #733 fixed).
+                    # The ENOSPC-boundary instability is gone: data-space
+                    # reservation moved from the per-thread cache to a per-inode
+                    # reservation (inode->space_resv) whose unused tail is a
+                    # *volatile* reservation -- live only in memory, discarded
+                    # without a durable FREE on last close -- so a closed file no
+                    # longer strands space, and statfs (the AGs' live free sum)
+                    # reports exactly what a fresh write can still allocate.
+                    # Confirmed reliably green (616/616 x3 on both diskfs_io_uring
+                    # and diskfs_aio).
                     # nfstest_posix asserts read() updates st_atime.  The
                     # passthrough backends (linux/io_uring) defer atime to the
                     # host filesystem's mount policy (relatime/noatime), which

@@ -31,11 +31,54 @@ chimera_vfs_umount_wake(struct chimera_vfs_thread *thread)
     evpl_ring_doorbell(&thread->doorbell);
 } /* chimera_vfs_umount_wake */
 
+/*
+ * Reclaim a torn-down mount after an RCU grace period.
+ *
+ * Mount-table readers run chimera_vfs_mount_table_lookup() under
+ * urcu_qsbr_read_lock() and dereference entry->mount->root_fh to match the
+ * mount id.  chimera_vfs_mount_table_remove() unlinks the entry and gives the
+ * ENTRY a grace period (call_rcu) before freeing it -- but the mount it points
+ * at used to be freed the instant the backend's UMOUNT completed, with no
+ * grace period at all.  A reader that entered the lookup before the unlink
+ * still walks that entry and follows the now-dangling entry->mount.
+ *
+ * Seen as an intermittent ASAN heap-use-after-free (read of 16 bytes in the
+ * lookup's memcmp) when the deferred-close sweep resolved a mount on one
+ * thread while a per-trace filesystem recycle unmounted it on another.  Give
+ * the mount the same grace period its entry gets.
+ *
+ * struct chimera_vfs_mount cannot carry the rcu_head itself: vfs.h is
+ * deliberately urcu-free, so the head lives in this wrapper instead.
+ */
+struct chimera_vfs_mount_reclaim {
+    struct rcu_head           rcu;
+    struct chimera_vfs_mount *mount;
+};
+
+static void
+chimera_vfs_mount_reclaim_rcu(struct rcu_head *head)
+{
+    struct chimera_vfs_mount_reclaim *reclaim =
+        container_of(head, struct chimera_vfs_mount_reclaim, rcu);
+    struct chimera_vfs_mount         *mount = reclaim->mount;
+
+    free(mount->path);
+    free(mount->module_path);
+    free(mount->options);
+    free(mount);
+    free(reclaim);
+} /* chimera_vfs_mount_reclaim_rcu */
+
 static void
 chimera_vfs_umount_complete(struct chimera_vfs_request *request)
 {
-    struct chimera_vfs_thread    *thread   = request->thread;
-    chimera_vfs_umount_callback_t callback = request->proto_callback;
+    struct chimera_vfs_thread        *thread   = request->thread;
+    chimera_vfs_umount_callback_t     callback = request->proto_callback;
+    /* Read the mount out before the request is freed -- the frees below used
+     * to reach through request->umount.mount after chimera_vfs_request_free()
+     * had already returned the request to its magazine. */
+    struct chimera_vfs_mount         *mount = request->umount.mount;
+    struct chimera_vfs_mount_reclaim *reclaim;
 
     chimera_vfs_complete(request);
 
@@ -45,12 +88,17 @@ chimera_vfs_umount_complete(struct chimera_vfs_request *request)
 
     chimera_vfs_umount_wake(thread);
 
-    free(request->umount.mount->path);
-    free(request->umount.mount->module_path);
-    free(request->umount.mount->options);
-    free(request->umount.mount);
+    reclaim = malloc(sizeof(*reclaim));
 
-} /* chimera_vfs_umount */
+    if (likely(reclaim)) {
+        reclaim->mount = mount;
+        call_rcu(&reclaim->rcu, chimera_vfs_mount_reclaim_rcu);
+    }
+    /* Out of memory: leak the mount rather than free it early.  It is one
+     * small allocation on a path that only runs at umount, and the alternative
+     * is the use-after-free this exists to prevent. */
+
+} /* chimera_vfs_umount_complete */
 
 
 /*
@@ -253,6 +301,7 @@ chimera_vfs_umount_progress(struct chimera_vfs_request *request)
     struct chimera_vfs             *vfs    = thread->vfs;
     struct chimera_vfs_umount_wait *wait;
     uint64_t                        referenced;
+    int                             fence_wait = 0;
 
     /* Held across the sweeps so a close completing inline cannot finish the
      * umount while handles are still being issued. */
@@ -276,9 +325,34 @@ chimera_vfs_umount_progress(struct chimera_vfs_request *request)
     }
 
     if (referenced == 0) {
-        chimera_vfs_umount_wait_stop(request);
-        chimera_vfs_umount_dispatch(request);
-        return;
+        /*
+         * The cache is clear of this mount, but that is not the same as the
+         * mount being quiet.  The close thread takes a handle out of the cache
+         * before issuing its backend CLOSE, so between those two points the
+         * handle is in neither place the sweep above looks -- and its CLOSE may
+         * still be on the wire.  Dispatching the backend UMOUNT here is what
+         * lets an NFSv4 DESTROY_CLIENTID overtake this client's own CLOSEs, and
+         * the server is then right to refuse it: state remains on the lease.
+         *
+         * Snapshot the close thread's issued count and wait for its completed
+         * count to reach it.  That drains the closes outstanding at this
+         * instant without waiting for global quiescence, so a busy unrelated
+         * mount cannot starve this umount.
+         */
+        if (!request->umount.close_fence_valid) {
+            request->umount.close_fence =
+                __atomic_load_n(&vfs->close_thread.closes_issued, __ATOMIC_ACQUIRE);
+            request->umount.close_fence_valid = 1;
+        }
+
+        if (__atomic_load_n(&vfs->close_thread.closes_completed, __ATOMIC_ACQUIRE) >=
+            request->umount.close_fence) {
+            chimera_vfs_umount_wait_stop(request);
+            chimera_vfs_umount_dispatch(request);
+            return;
+        }
+
+        fence_wait = 1;
     }
 
     /* Someone else still holds a handle.  Wait for them to drop it.
@@ -292,21 +366,46 @@ chimera_vfs_umount_progress(struct chimera_vfs_request *request)
     wait = request->umount.wait;
 
     if (!wait) {
-        chimera_vfs_info(
-            "umount %s: %lu handle(s) still open after purging the cache; "
-            "waiting up to %lu ms for the holder(s) to close them",
-            request->umount.mount->path, referenced,
-            vfs->umount_timeout_us / 1000);
+        if (fence_wait) {
+            chimera_vfs_info(
+                "umount %s: cache clear, waiting up to %lu ms for %lu deferred "
+                "close(s) still in flight",
+                request->umount.mount->path,
+                vfs->umount_timeout_us / 1000,
+                (unsigned long) (request->umount.close_fence -
+                                 __atomic_load_n(&vfs->close_thread.closes_completed,
+                                                 __ATOMIC_ACQUIRE)));
+        } else {
+            chimera_vfs_info(
+                "umount %s: %lu handle(s) still open after purging the cache; "
+                "waiting up to %lu ms for the holder(s) to close them",
+                request->umount.mount->path, referenced,
+                vfs->umount_timeout_us / 1000);
+        }
         wait                 = calloc(1, sizeof(*wait));
         wait->request        = request;
         request->umount.wait = wait;
     } else if (wait->waited_us >= vfs->umount_timeout_us) {
-        chimera_vfs_error(
-            "umount %s: giving up with %lu handle(s) still open after %lu ms "
-            "-- the mount stays registered and callers will see EBUSY",
-            request->umount.mount->path, referenced,
-            wait->waited_us / 1000);
-        chimera_vfs_umount_dump_referenced(vfs, request->umount.mount);
+        if (fence_wait) {
+            /* A close that never completes is a backend still holding the
+             * request, not a busy mount -- name it as such rather than
+             * reporting handles that are not, in fact, open. */
+            chimera_vfs_error(
+                "umount %s: giving up after %lu ms with %lu deferred close(s) "
+                "unfinished -- the mount stays registered and callers will see "
+                "EBUSY",
+                request->umount.mount->path, wait->waited_us / 1000,
+                (unsigned long) (request->umount.close_fence -
+                                 __atomic_load_n(&vfs->close_thread.closes_completed,
+                                                 __ATOMIC_ACQUIRE)));
+        } else {
+            chimera_vfs_error(
+                "umount %s: giving up with %lu handle(s) still open after %lu ms "
+                "-- the mount stays registered and callers will see EBUSY",
+                request->umount.mount->path, referenced,
+                wait->waited_us / 1000);
+            chimera_vfs_umount_dump_referenced(vfs, request->umount.mount);
+        }
         chimera_vfs_umount_wait_stop(request);
         chimera_vfs_umount_abandon(request);
         return;
@@ -376,8 +475,10 @@ chimera_vfs_umount(
     request->proto_callback       = callback;
     request->proto_private_data   = private_data;
 
-    request->umount.pending_closes = 0;
-    request->umount.wait           = NULL;
+    request->umount.pending_closes    = 0;
+    request->umount.close_fence       = 0;
+    request->umount.close_fence_valid = 0;
+    request->umount.wait              = NULL;
 
     chimera_vfs_umount_progress(request);
 

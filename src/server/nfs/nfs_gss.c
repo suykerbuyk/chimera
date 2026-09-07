@@ -19,6 +19,7 @@
 
 #include "evpl/evpl.h"          /* struct evpl_iovec, for verify_mic_iov */
 #include "nfs_gss.h"
+#include "server/server.h"
 #include "nfs_internal.h"
 #include "vfs/sdk/vfs_cred.h"
 
@@ -215,8 +216,9 @@ chimera_nfs_gss_wrap(
     void       *gss_ctx,
     const void *in,
     size_t      in_len,
-    void      **out,
-    size_t     *out_len)
+    void       *out,
+    size_t      out_cap,
+    size_t     *r_out_len)
 {
     OM_uint32       major, minor;
     int             conf_state;
@@ -224,8 +226,7 @@ chimera_nfs_gss_wrap(
     gss_buffer_desc o = GSS_C_EMPTY_BUFFER;
 
     (void) arg;
-    *out     = NULL;
-    *out_len = 0;
+    *r_out_len = 0;
 
     major = gss_wrap(&minor, (gss_ctx_id_t) gss_ctx, 1 /* conf_req */,
                      GSS_C_QOP_DEFAULT, &i, &conf_state, &o);
@@ -233,13 +234,18 @@ chimera_nfs_gss_wrap(
         return -1;
     }
 
-    *out = malloc(o.length);
-    if (!*out) {
+    /* The mechanism owns o and we own out, so this copy is the one the GSS
+     * interface makes unavoidable.  It used to be two: the result was copied
+     * into a malloc'd buffer here purely so rpc2 could free() it, and rpc2
+     * then copied that into the iovec it actually wanted.  rpc2 now hands
+     * down the destination, so the middle buffer is gone. */
+    if (o.length > out_cap) {
         gss_release_buffer(&minor, &o);
         return -1;
     }
-    memcpy(*out, o.value, o.length);
-    *out_len = o.length;
+
+    memcpy(out, o.value, o.length);
+    *r_out_len = o.length;
     gss_release_buffer(&minor, &o);
     return 0;
 } /* chimera_nfs_gss_wrap */
@@ -250,8 +256,9 @@ chimera_nfs_gss_unwrap(
     void       *gss_ctx,
     const void *in,
     size_t      in_len,
-    void      **out,
-    size_t     *out_len)
+    void       *out,
+    size_t      out_cap,
+    size_t     *r_out_len)
 {
     OM_uint32       major, minor;
     int             conf_state;
@@ -260,8 +267,7 @@ chimera_nfs_gss_unwrap(
     gss_buffer_desc o = GSS_C_EMPTY_BUFFER;
 
     (void) arg;
-    *out     = NULL;
-    *out_len = 0;
+    *r_out_len = 0;
 
     major = gss_unwrap(&minor, (gss_ctx_id_t) gss_ctx, &i, &o, &conf_state,
                        &qop);
@@ -269,13 +275,18 @@ chimera_nfs_gss_unwrap(
         return -1;
     }
 
-    *out = malloc(o.length);
-    if (!*out) {
+    /* The mechanism owns o and we own out, so this copy is the one the GSS
+     * interface makes unavoidable.  It used to be two: the result was copied
+     * into a malloc'd buffer here purely so rpc2 could free() it, and rpc2
+     * then copied that into the iovec it actually wanted.  rpc2 now hands
+     * down the destination, so the middle buffer is gone. */
+    if (o.length > out_cap) {
         gss_release_buffer(&minor, &o);
         return -1;
     }
-    memcpy(*out, o.value, o.length);
-    *out_len = o.length;
+
+    memcpy(out, o.value, o.length);
+    *r_out_len = o.length;
     gss_release_buffer(&minor, &o);
     return 0;
 } /* chimera_nfs_gss_unwrap */
@@ -306,6 +317,81 @@ const struct evpl_rpc2_gss_provider chimera_nfs_gss_provider = {
     .unwrap  = chimera_nfs_gss_unwrap,
     .destroy = chimera_nfs_gss_destroy,
 };
+
+/*
+ * The static principal map (see chimera_server_config_add_nfs_principal_map).
+ *
+ * Process-global for the same reason the acceptor identity above is: a
+ * principal means one local identity to this process, and the acceptor keytab
+ * is already registered process-wide by gsskrb5_register_acceptor_identity.
+ */
+struct chimera_nfs_gss_map_entry {
+    char     principal[256];
+    uint32_t uid;
+    uint32_t gid;
+    uint32_t num_gids;
+    uint32_t gids[CHIMERA_VFS_CRED_MAX_GIDS];
+};
+
+static struct chimera_nfs_gss_map_entry chimera_nfs_gss_map[64];
+static int                              chimera_nfs_gss_map_count;
+
+void
+chimera_nfs_gss_set_principal_map(const struct chimera_server_config *config)
+{
+    int         i, n;
+    const char *principal;
+
+    chimera_nfs_gss_map_count = 0;
+
+    if (!config) {
+        return;
+    }
+
+    n = chimera_server_config_get_nfs_principal_map_count(config);
+
+    for (i = 0; i < n && i < (int) (sizeof(chimera_nfs_gss_map) /
+                                    sizeof(chimera_nfs_gss_map[0])); i++) {
+        struct chimera_nfs_gss_map_entry *e = &chimera_nfs_gss_map[i];
+        const uint32_t                   *gids;
+        uint32_t                          j;
+
+        principal = chimera_server_config_get_nfs_principal_map_entry(
+            config, i, &e->uid, &e->gid, &e->num_gids, &gids);
+
+        if (!principal) {
+            break;
+        }
+
+        snprintf(e->principal, sizeof(e->principal), "%s", principal);
+
+        for (j = 0; j < e->num_gids; j++) {
+            e->gids[j] = gids[j];
+        }
+
+        chimera_nfs_gss_map_count++;
+    }
+
+    if (chimera_nfs_gss_map_count) {
+        chimera_nfs_info("rpcsec_gss: %d principal mapping(s) configured",
+                         chimera_nfs_gss_map_count);
+    }
+} /* chimera_nfs_gss_set_principal_map */
+
+/* The mapping for `name` (realm already stripped), or NULL. */
+static const struct chimera_nfs_gss_map_entry *
+chimera_nfs_gss_map_lookup(const char *name)
+{
+    int i;
+
+    for (i = 0; i < chimera_nfs_gss_map_count; i++) {
+        if (!strcmp(chimera_nfs_gss_map[i].principal, name)) {
+            return &chimera_nfs_gss_map[i];
+        }
+    }
+
+    return NULL;
+} /* chimera_nfs_gss_map_lookup */
 
 int
 chimera_nfs_gss_init(const char *keytab)
@@ -353,6 +439,30 @@ chimera_nfs_gss_map_principal(
     }
     memcpy(user, principal, ulen);
     user[ulen] = '\0';
+
+    /*
+     * An explicit mapping wins over everything below it: it is the operator
+     * saying what this principal means, which is not a question nsswitch can
+     * answer for a Kerberos principal with no local account.  Matched on the
+     * full name for a service principal and on the primary component for a
+     * user one, which is why it is consulted before the '/' split below.
+     */
+    {
+        const struct chimera_nfs_gss_map_entry *e;
+
+        e = chimera_nfs_gss_map_lookup(user);
+
+        if (!e && at) {
+            /* Also allow an entry written with its realm. */
+            e = chimera_nfs_gss_map_lookup(principal);
+        }
+
+        if (e) {
+            chimera_vfs_cred_init_unix(cred, e->uid, e->gid, e->num_gids,
+                                       e->num_gids ? e->gids : NULL);
+            return;
+        }
+    }
 
     /*
      * A machine/service principal ("host/h", "nfs/h", "root/h") is the

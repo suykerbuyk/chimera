@@ -218,11 +218,9 @@ chimera_vfs_claim_trigger_ns_unlink(
 /* Backend projection internals                                       */
 /* ------------------------------------------------------------------ */
 
-/* Lazy CAP_LEASE capability probe (modules register after the service
- * attaches; scans once, caches).  Safe from any thread post-registration. */
-bool
-chimera_vfs_claim_backend_capable(
-    struct chimera_vfs_state *state);
+/* chimera_vfs_claim_backend_capable() is declared in vfs_claim.h: callers
+ * outside the claim core use it to decide whether an acquire has to reach a
+ * VFS thread at all. */
 
 /* Confirm a locally-granted RANGE claim with the backend before its ticket
  * callback fires; `thread` must be the CALLING vfs thread (its request pool
@@ -237,9 +235,10 @@ chimera_vfs_claim_backend_project_range(
 
 bool
 chimera_vfs_claim_backend_range_projects(
-    struct chimera_vfs_state      *state,
-    struct chimera_vfs_file_state *file,
-    struct chimera_vfs_thread     *thread);
+    struct chimera_vfs_state       *state,
+    struct chimera_vfs_file_state  *file,
+    struct chimera_vfs_thread      *thread,
+    const struct chimera_vfs_claim *claim);
 
 /* Cancel a pump-deferred RANGE confirm TICKET: true = yanked from the work
  * FIFO (cb will never fire; caller rolls back the local grant); false only
@@ -257,15 +256,10 @@ chimera_vfs_claim_backend_drain_releases(
     struct chimera_vfs_state      *state,
     struct chimera_vfs_file_state *file);
 
-/* Queue a projected RANGE token for release on the service thread (safe
- * from any thread; fire-and-forget).  May be called with file->lock HELD —
- * the enqueue takes only service_lock (ordering: file->lock before
- * service_lock, matching reeval->bl_post). */
-void
-chimera_vfs_claim_backend_release_token(
-    struct chimera_vfs_state      *state,
-    struct chimera_vfs_file_state *file,
-    uint64_t                       token);
+/* chimera_vfs_claim_backend_release_token() is declared in vfs_claim.h:
+ * holders outside the core (the posix client's SEEK_END records) release
+ * by token too. */
+
 
 /* Hand a pump-granted projectable ticket to the service thread (the pump
  * has no vfs thread of its own to dispatch from). */

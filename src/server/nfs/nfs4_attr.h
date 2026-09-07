@@ -53,6 +53,22 @@ chimera_nfs4_change_from_attrs(const struct chimera_vfs_attrs *attr)
 #define OPEN_ARGS_OPEN_CLAIM_PREVIOUS                1
 #define OPEN_ARGS_OPEN_CLAIM_DELEGATE_CUR            2
 #define OPEN_ARGS_OPEN_CLAIM_FH                      4
+
+/*
+ * suppattr_exclcreat (RFC 8881 5.8.1.14): the attributes this server can
+ * honour in an EXCLUSIVE4_1 cva_attrs.  time_access_set/time_modify_set are
+ * deliberately absent because the create verifier is stored in atime/mtime
+ * (the Linux nfsd strategy), so a client value for them could not survive the
+ * create.  Defined here so the advertisement (chimera_nfs4_marshall_attrs) and
+ * the cva_attrs check (chimera_nfs4_validate_exclcreat_attrs) cannot drift
+ * apart -- RFC 8881 18.16.3 requires the second to be exactly the first.
+ */
+#define CHIMERA_NFS4_SUPPATTR_EXCLCREAT_WORD0        (1U << FATTR4_SIZE)
+#define CHIMERA_NFS4_SUPPATTR_EXCLCREAT_WORD1        ( \
+            (1U << (FATTR4_MODE - 32)) | \
+            (1U << (FATTR4_OWNER - 32)) | \
+            (1U << (FATTR4_OWNER_GROUP - 32)))
+
 /*
  * The single pNFS layouttype4 this file's backend supports, for FATTR4
  * advertisement: LAYOUT4_FLEX_FILES (0x4) for an orchestrated backend
@@ -161,21 +177,22 @@ chimera_nfs4_attr2mask(
                         attr_mask |= CHIMERA_VFS_ATTR_MODE;
                         break;
                     case FATTR4_NAMED_ATTR:
-                        attr_mask |= CHIMERA_VFS_ATTR_MODE;
+                        attr_mask |= CHIMERA_VFS_ATTR_NAMED_ATTR;
                         break;
                     case FATTR4_FSID:
                         attr_mask |= CHIMERA_VFS_ATTR_FSID;
                         break;
                     case FATTR4_FILES_AVAIL:
-                        attr_mask |= CHIMERA_VFS_ATTR_SPACE_AVAIL;
+                        attr_mask |= CHIMERA_VFS_ATTR_FILES_AVAIL;
                         break;
                     case FATTR4_FILES_FREE:
-                        attr_mask |= CHIMERA_VFS_ATTR_SPACE_FREE;
+                        attr_mask |= CHIMERA_VFS_ATTR_FILES_FREE;
                         break;
                     case FATTR4_FILES_TOTAL:
-                        attr_mask |= CHIMERA_VFS_ATTR_SPACE_TOTAL;
+                        attr_mask |= CHIMERA_VFS_ATTR_FILES_TOTAL;
                         break;
                     case FATTR4_UNIQUE_HANDLES:
+                    case FATTR4_MOUNTED_ON_FILEID:
                         attr_mask |= CHIMERA_VFS_ATTR_INUM;
                         break;
                     case FATTR4_LEASE_TIME:
@@ -204,6 +221,11 @@ chimera_nfs4_attr2mask(
                         break;
                     case FATTR4_SPACE_USED:
                         attr_mask |= CHIMERA_VFS_ATTR_SPACE_USED;
+                        break;
+                    case FATTR4_TIME_CREATE:
+                        /* Birth time is optional in the VFS, so backends fill
+                         * it only when it is asked for by name. */
+                        attr_mask |= CHIMERA_VFS_ATTR_BTIME;
                         break;
                     default:
                         break;
@@ -241,8 +263,6 @@ chimera_nfs4_mask2attr(
     uint32_t                 *req_mask,
     uint32_t                 *rsp_mask)
 {
-    int max_word_used = 0;
-
     /*
      * num_req_mask is the client-supplied request bitmap length and is
      * unbounded (the XDR decoder does not cap it).  This routine only ever
@@ -259,32 +279,57 @@ chimera_nfs4_mask2attr(
     if (num_req_mask >= 2 &&
         (req_mask[1] & (1 << (FATTR4_MODE - 32))) &&
         (attr->va_set_mask & CHIMERA_VFS_ATTR_MODE)) {
-        rsp_mask[1]  |= (1 << (FATTR4_MODE - 32));
-        max_word_used = 2;
+        rsp_mask[1] |= (1 << (FATTR4_MODE - 32));
     }
 
     if (num_req_mask >= 1 &&
         (req_mask[0] & (1 << FATTR4_SIZE)) &&
         (attr->va_set_mask & CHIMERA_VFS_ATTR_SIZE)) {
-        rsp_mask[0]  |= (1 << FATTR4_SIZE);
-        max_word_used = 1;
+        rsp_mask[0] |= (1 << FATTR4_SIZE);
+    }
+
+    if (num_req_mask >= 1 &&
+        (req_mask[0] & (1 << FATTR4_ACL)) &&
+        (attr->va_set_mask & CHIMERA_VFS_ATTR_ACL)) {
+        rsp_mask[0] |= (1 << FATTR4_ACL);
+    }
+
+    if (num_req_mask >= 2 &&
+        (req_mask[1] & (1 << (FATTR4_OWNER - 32))) &&
+        (attr->va_set_mask & CHIMERA_VFS_ATTR_UID)) {
+        rsp_mask[1] |= (1 << (FATTR4_OWNER - 32));
+    }
+
+    if (num_req_mask >= 2 &&
+        (req_mask[1] & (1 << (FATTR4_OWNER_GROUP - 32))) &&
+        (attr->va_set_mask & CHIMERA_VFS_ATTR_GID)) {
+        rsp_mask[1] |= (1 << (FATTR4_OWNER_GROUP - 32));
     }
 
     if (num_req_mask >= 2 &&
         (req_mask[1] & (1 << (FATTR4_TIME_ACCESS_SET - 32))) &&
         (attr->va_set_mask & CHIMERA_VFS_ATTR_ATIME)) {
-        rsp_mask[1]  |= (1 << (FATTR4_TIME_ACCESS_SET - 32));
-        max_word_used = 2;
+        rsp_mask[1] |= (1 << (FATTR4_TIME_ACCESS_SET - 32));
     }
 
     if (num_req_mask >= 2 &&
         (req_mask[1] & (1 << (FATTR4_TIME_MODIFY_SET - 32))) &&
         (attr->va_set_mask & CHIMERA_VFS_ATTR_MTIME)) {
-        rsp_mask[1]  |= (1 << (FATTR4_TIME_MODIFY_SET - 32));
-        max_word_used = 2;
+        rsp_mask[1] |= (1 << (FATTR4_TIME_MODIFY_SET - 32));
     }
 
-    return max_word_used;
+    /*
+     * Derive the reply bitmap length from the words actually set rather than
+     * tracking it as each block runs: a per-block assignment is order
+     * dependent, and a word-0 attribute reported after a word-1 one (SIZE after
+     * MODE, say) would shorten the bitmap back to one word and drop the word-1
+     * attributes the client just set.
+     */
+    if (rsp_mask[1]) {
+        return 2;
+    }
+
+    return rsp_mask[0] ? 1 : 0;
 } /* chimera_nfs4_mask2attr */
 
 static inline void
@@ -364,7 +409,9 @@ chimera_nfs4_attr_append_acl(
     const struct chimera_acl *acl,
     const char               *domain)
 {
-    uint32_t num = acl ? acl->num_aces : 0;
+    uint32_t num     = acl ? acl->num_aces : 0;
+    void    *countp  = *attrs;
+    uint32_t emitted = 0;
 
     chimera_nfs4_attr_append_uint32(attrs, num);
 
@@ -389,14 +436,23 @@ chimera_nfs4_attr_append_acl(
         wholen = chimera_idmap_principal_to_who(&ace->who, domain,
                                                 who, sizeof(who));
         if (wholen < 0) {
-            /* Should not happen; emit EVERYONE@ as a safe fallback. */
-            wholen = snprintf(who, sizeof(who), "EVERYONE@");
+            /* Nameless principals are dropped, not renamed: substituting a
+             * real who (EVERYONE@, as this used to) presents an ACL granting
+             * access the server never enforces, and a client read-modify-write
+             * then turns that fiction into a genuine grant.  RFC 7530 §6.2.1
+             * forbids reporting more access than is enforced. */
+            continue;
         }
 
         chimera_nfs4_attr_append_uint32(attrs, ace->type);
         chimera_nfs4_attr_append_uint32(attrs, flag);
         chimera_nfs4_attr_append_uint32(attrs, ace->access_mask);
         chimera_nfs4_attr_append_utf8str(attrs, who, wholen);
+        emitted++;
+    }
+
+    if (emitted != num) {
+        *(uint32_t *) countp = chimera_nfs_hton32(emitted);
     }
 } /* chimera_nfs4_attr_append_acl */
 
@@ -418,7 +474,8 @@ chimera_nfs4_marshall_attrs(
     uint32_t                        lease_time_s,
     uint16_t                        export_id,
     const uint8_t                  *fh_key,
-    int                             fh_sign)
+    int                             fh_sign,
+    uint32_t                        type_override)
 {
     /* pnfs_layout_type is the single layouttype4 this file's backend supports
      * (LAYOUT4_FLEX_FILES 0x4 or LAYOUT4_BLOCK_VOLUME 0x3), or 0 when pNFS is
@@ -466,9 +523,9 @@ chimera_nfs4_marshall_attrs(
                                             (1 << FATTR4_FILES_TOTAL) |
                                             /* fs_locations */
                                             /* hidden */
-                                            /* homogeneous */
-                                            /* maxfilesize */
-                                            /* maxlink */
+                                            (1 << FATTR4_HOMOGENEOUS) |
+                                            (1 << FATTR4_MAXFILESIZE) |
+                                            (1 << FATTR4_MAXLINK) |
                                             (1 << FATTR4_MAXNAME) |
                                             (1 << FATTR4_MAXREAD) |
                                             (1 << FATTR4_MAXWRITE));
@@ -482,9 +539,11 @@ chimera_nfs4_marshall_attrs(
                                             (1UL << (FATTR4_SPACE_USED - 32)) |
                                             (1UL << (FATTR4_TIME_ACCESS - 32)) |
                                             (1UL << (FATTR4_TIME_ACCESS_SET - 32)) |
+                                            (1UL << (FATTR4_TIME_CREATE - 32)) |
                                             (1UL << (FATTR4_TIME_MODIFY - 32)) |
                                             (1UL << (FATTR4_TIME_MODIFY_SET - 32)) |
                                             (1UL << (FATTR4_TIME_METADATA - 32)) |
+                                            (1UL << (FATTR4_MOUNTED_ON_FILEID - 32)) |
                                             (1UL << (FATTR4_SPACE_AVAIL - 32)) |
                                             (1UL << (FATTR4_SPACE_FREE - 32)) |
                                             (1UL << (FATTR4_SPACE_TOTAL - 32)) |
@@ -524,11 +583,16 @@ chimera_nfs4_marshall_attrs(
         }
 
         if (req_mask[0] & (1 << FATTR4_TYPE) &&
-            (attr->va_set_mask & CHIMERA_VFS_ATTR_MODE)) {
+            ((attr->va_set_mask & CHIMERA_VFS_ATTR_MODE) || type_override)) {
             rsp_mask[0]  |= (1 << FATTR4_TYPE);
             *num_rsp_mask = 1;
 
-            if (S_ISREG(attr->va_mode)) {
+            if (type_override) {
+                /* Named-attribute namespace: the synthetic attr directory
+                 * (NF4ATTRDIR) and its entries (NF4NAMEDATTR) carry a type the
+                 * underlying mode bits cannot express. */
+                chimera_nfs4_attr_append_uint32(&attrs, type_override);
+            } else if (S_ISREG(attr->va_mode)) {
                 chimera_nfs4_attr_append_uint32(&attrs, NF4REG);
             } else if (S_ISDIR(attr->va_mode)) {
                 chimera_nfs4_attr_append_uint32(&attrs, NF4DIR);
@@ -554,7 +618,14 @@ chimera_nfs4_marshall_attrs(
             chimera_nfs4_attr_append_uint32(&attrs, FH4_PERSISTENT);
         }
 
-        if (req_mask[0] & (1 << FATTR4_CHANGE)) {
+        /* change is REQUIRED, but so are type and size, and both are dropped
+         * from the reply when the backend did not supply their source.  Doing
+         * the same here matters more, not less: with neither a native counter
+         * nor a ctime to derive from, the fallback below would read unset
+         * fields and hand every object the same change value, which defeats
+         * the cache validation the attribute exists for (RFC 7530 §5.8.1.4). */
+        if (req_mask[0] & (1 << FATTR4_CHANGE) &&
+            (attr->va_set_mask & (CHIMERA_VFS_ATTR_CHANGE | CHIMERA_VFS_ATTR_CTIME))) {
             rsp_mask[0]  |= (1 << FATTR4_CHANGE);
             *num_rsp_mask = 1;
 
@@ -592,10 +663,16 @@ chimera_nfs4_marshall_attrs(
         }
 
         if (req_mask[0] & (1 << FATTR4_NAMED_ATTR)) {
+            /* Backend-reported (CHIMERA_VFS_ATTR_NAMED_ATTR): true iff the object
+             * currently has >=1 named stream (SMB ADS / NFSv4 named attribute).
+             * Backends without named-stream support leave the bit unset, which we
+             * report as false. */
             rsp_mask[0]  |= (1 << FATTR4_NAMED_ATTR);
             *num_rsp_mask = 1;
 
-            chimera_nfs4_attr_append_uint32(&attrs, 0);
+            chimera_nfs4_attr_append_uint32(&attrs,
+                                            (attr->va_set_mask & CHIMERA_VFS_ATTR_NAMED_ATTR) &&
+                                            attr->va_named_attr ? 1 : 0);
         }
 
         if ((req_mask[0] & (1 << FATTR4_FSID)) &&
@@ -735,7 +812,7 @@ chimera_nfs4_marshall_attrs(
         }
 
         if (req_mask[0] & (1 << FATTR4_FILES_AVAIL) &&
-            (attr->va_set_mask & CHIMERA_VFS_ATTR_FILES_FREE)) {
+            (attr->va_set_mask & CHIMERA_VFS_ATTR_FILES_AVAIL)) {
             rsp_mask[0]  |= (1 << FATTR4_FILES_AVAIL);
             *num_rsp_mask = 1;
 
@@ -756,6 +833,32 @@ chimera_nfs4_marshall_attrs(
             *num_rsp_mask = 1;
 
             chimera_nfs4_attr_append_uint64(&attrs, attr->va_fs_files_total);
+        }
+
+        /* The three fs-wide limits below carry the same answers the NFSv3 side
+         * of this server already gives for the same filesystem: FSF3_HOMOGENEOUS
+         * and maxfilesize UINT64_MAX from FSINFO, linkmax UINT32_MAX from
+         * PATHCONF.  Values are packed in ascending attribute order, so they
+         * precede maxname (29). */
+        if (req_mask[0] & (1 << FATTR4_HOMOGENEOUS)) {
+            rsp_mask[0]  |= (1 << FATTR4_HOMOGENEOUS);
+            *num_rsp_mask = 1;
+
+            chimera_nfs4_attr_append_uint32(&attrs, 1);
+        }
+
+        if (req_mask[0] & (1 << FATTR4_MAXFILESIZE)) {
+            rsp_mask[0]  |= (1 << FATTR4_MAXFILESIZE);
+            *num_rsp_mask = 1;
+
+            chimera_nfs4_attr_append_uint64(&attrs, UINT64_MAX);
+        }
+
+        if (req_mask[0] & (1 << FATTR4_MAXLINK)) {
+            rsp_mask[0]  |= (1 << FATTR4_MAXLINK);
+            *num_rsp_mask = 1;
+
+            chimera_nfs4_attr_append_uint32(&attrs, UINT32_MAX);
         }
 
         if (req_mask[0] & (1 << FATTR4_MAXNAME)) {
@@ -867,6 +970,20 @@ chimera_nfs4_marshall_attrs(
             chimera_nfs4_attr_append_uint32(&attrs, attr->va_atime.tv_nsec);
         }
 
+        /* time_create (RFC 7530 §5.7) is emitted between time_access (47) and
+         * time_metadata (52) to keep the attribute values in ascending bitmap
+         * order.  Only backends that track a real birth time set BTIME, so a
+         * backend without one simply leaves the bit out of the response
+         * bitmap, as for any other attribute it cannot supply. */
+        if ((req_mask[1] & (1 << (FATTR4_TIME_CREATE - 32))) &&
+            (attr->va_set_mask & CHIMERA_VFS_ATTR_BTIME)) {
+            rsp_mask[1]  |= (1 << (FATTR4_TIME_CREATE - 32));
+            *num_rsp_mask = 2;
+
+            chimera_nfs4_attr_append_uint64(&attrs, attr->va_btime.tv_sec);
+            chimera_nfs4_attr_append_uint32(&attrs, attr->va_btime.tv_nsec);
+        }
+
         if ((req_mask[1] & (1 << (FATTR4_TIME_METADATA - 32))) &&
             (attr->va_set_mask & CHIMERA_VFS_ATTR_CTIME)) {
             rsp_mask[1]  |= (1 << (FATTR4_TIME_METADATA - 32));
@@ -883,6 +1000,22 @@ chimera_nfs4_marshall_attrs(
 
             chimera_nfs4_attr_append_uint64(&attrs, attr->va_mtime.tv_sec);
             chimera_nfs4_attr_append_uint32(&attrs, attr->va_mtime.tv_nsec);
+        }
+
+        /* mounted_on_fileid (RFC 7530 5.8.2) is the fileid the parent
+        * directory's READDIR reports for this object.  Chimera grafts each
+        * export directly into the pseudo-fs root, and nfs4_root_readdir
+        * reports the export root's own fileid for that entry -- there is no
+        * separate junction inode -- so the mounted-on fileid IS the object's
+        * fileid at every boundary, and trivially so away from one.  Clients
+        * (notably Linux, which requests this on every crossing) need it to
+        * fill in d_ino for a mount point without a second GETATTR. */
+        if ((req_mask[1] & (1 << (FATTR4_MOUNTED_ON_FILEID - 32))) &&
+            (attr->va_set_mask & CHIMERA_VFS_ATTR_INUM)) {
+            rsp_mask[1]  |= (1 << (FATTR4_MOUNTED_ON_FILEID - 32));
+            *num_rsp_mask = 2;
+
+            chimera_nfs4_attr_append_uint64(&attrs, attr->va_ino);
         }
 
         /* fs_layout_types is server-static (no backing VFS attribute); emit it
@@ -936,11 +1069,9 @@ chimera_nfs4_marshall_attrs(
             * encodes the verifier into atime/mtime (same as Linux nfsd). */
             chimera_nfs4_attr_append_uint32(&attrs, 2);
             chimera_nfs4_attr_append_uint32(&attrs,
-                                            (1 << FATTR4_SIZE));
+                                            CHIMERA_NFS4_SUPPATTR_EXCLCREAT_WORD0);
             chimera_nfs4_attr_append_uint32(&attrs,
-                                            (1UL << (FATTR4_MODE - 32)) |
-                                            (1UL << (FATTR4_OWNER - 32)) |
-                                            (1UL << (FATTR4_OWNER_GROUP - 32)));
+                                            CHIMERA_NFS4_SUPPATTR_EXCLCREAT_WORD1);
         }
 
         if ((req_mask[2] & (1 << (FATTR4_CHANGE_ATTR_TYPE - 64))) &&
@@ -1083,6 +1214,20 @@ chimera_nfs4_unmarshall_attrs(
                  * AUDIT/ALARM ACE that would never be enforced. */
                 if (type != ACE4_ACCESS_ALLOWED_ACE_TYPE &&
                     type != ACE4_ACCESS_DENIED_ACE_TYPE) {
+                    return NFS4ERR_ATTRNOTSUPP;
+                }
+
+                /* RFC 7530 §6.2.1.4.1: ACE4_INHERIT_ONLY_ACE with neither
+                 * ACE4_FILE_INHERIT_ACE nor ACE4_DIRECTORY_INHERIT_ACE set
+                 * describes an ACE that is never enforced and never inherited,
+                 * so setting it SHOULD fail with NFS4ERR_ATTRNOTSUPP rather
+                 * than store an entry that silently does nothing.  The ACEs the
+                 * server itself materialises always carry an inherit bit
+                 * alongside INHERIT_ONLY (vfs_acl.c), so a GETATTR/SETATTR
+                 * round trip is unaffected. */
+                if ((flag & CHIMERA_ACE_FLAG_INHERIT_ONLY) &&
+                    !(flag & (CHIMERA_ACE_FLAG_FILE_INHERIT |
+                              CHIMERA_ACE_FLAG_DIR_INHERIT))) {
                     return NFS4ERR_ATTRNOTSUPP;
                 }
 
@@ -1276,7 +1421,10 @@ chimera_nfs4_validate_createattrs(
         (1 << FATTR4_FILES_AVAIL) |
         (1 << FATTR4_FILES_FREE) |
         (1 << FATTR4_FILES_TOTAL) |
-        /* no fs_locations=24, hidden=25, homogeneous=26, maxfilesize=27, maxlink=28 */
+        /* no fs_locations=24, hidden=25 */
+        (1 << FATTR4_HOMOGENEOUS) |
+        (1 << FATTR4_MAXFILESIZE) |
+        (1 << FATTR4_MAXLINK) |
         (1 << FATTR4_MAXNAME) |
         (1 << FATTR4_MAXREAD) |
         (1U << FATTR4_MAXWRITE);
@@ -1295,7 +1443,8 @@ chimera_nfs4_validate_createattrs(
         (1 << (FATTR4_TIME_ACCESS_SET - 32)) |
         (1 << (FATTR4_TIME_METADATA - 32)) |
         (1 << (FATTR4_TIME_MODIFY - 32)) |
-        (1 << (FATTR4_TIME_MODIFY_SET - 32));
+        (1 << (FATTR4_TIME_MODIFY_SET - 32)) |
+        (1 << (FATTR4_MOUNTED_ON_FILEID - 32));
 
     static const uint32_t writable_word0 =
         (1 << FATTR4_SIZE) |
@@ -1340,6 +1489,35 @@ chimera_nfs4_validate_createattrs(
 
     return NFS4_OK;
 } /* chimera_nfs4_validate_createattrs */
+
+/*
+ * EXCLUSIVE4_1 create attributes.  RFC 8881 §18.16.3: "If the client attempts
+ * to set in cva_attrs an attribute that is not in suppattr_exclcreat, the
+ * server MUST return NFS4ERR_INVAL."  Run in addition to (after)
+ * chimera_nfs4_validate_createattrs, which keeps reporting NFS4ERR_ATTRNOTSUPP
+ * for attributes the server does not implement at all.
+ */
+static inline nfsstat4
+chimera_nfs4_validate_exclcreat_attrs(
+    uint32_t        num_attrmask,
+    const uint32_t *attrmask)
+{
+    if (num_attrmask >= 1 &&
+        (attrmask[0] & ~CHIMERA_NFS4_SUPPATTR_EXCLCREAT_WORD0)) {
+        return NFS4ERR_INVAL;
+    }
+
+    if (num_attrmask >= 2 &&
+        (attrmask[1] & ~CHIMERA_NFS4_SUPPATTR_EXCLCREAT_WORD1)) {
+        return NFS4ERR_INVAL;
+    }
+
+    if (num_attrmask >= 3 && attrmask[2] != 0) {
+        return NFS4ERR_INVAL;
+    }
+
+    return NFS4_OK;
+} /* chimera_nfs4_validate_exclcreat_attrs */
 
 /* GETATTR: requested attrs must be supported and readable. The "*_set"
  * attributes (FATTR4_TIME_ACCESS_SET, FATTR4_TIME_MODIFY_SET) are write-only

@@ -24,6 +24,7 @@
 #include "vfs/sdk/vfs_cred.h"
 #include "vfs/vfs_pnfs.h"
 #include "server/server_internal.h"
+#include "server/nfs/nfs.h"
 #include "common/logging.h"
 #include "common/common_config.h"
 #include "common/chimera_tracing.h"
@@ -338,6 +339,27 @@ main(
     evpl_global_config = evpl_global_config_init();
     evpl_global_config_set_rdmacm_datagram_size_override(evpl_global_config, 8192);
     evpl_global_config_set_buffer_size(evpl_global_config, 8 * 1024 * 1024);
+
+    /*
+     * State the ceiling one RPC message needs rather than inheriting whatever
+     * libevpl derives from the buffer size, so that raising the NFS transfer
+     * size cannot silently outgrow what a message can carry.
+     *
+     * The relationship is not decorative.  RPCSEC_GSS privacy (sec=krb5p)
+     * seals a call into a single opaque, and gss_unwrap takes one contiguous
+     * token, so a sealed WRITE has to be gathered into a single allocation --
+     * which cannot exceed one buffer.  A transfer size larger than a message
+     * would therefore arrive on the wire and then fail to unseal, visible only
+     * under krb5p and only above a size nobody routinely tests at.  Saying it
+     * here means evpl_init refuses the configuration instead, with a message
+     * naming both numbers.
+     *
+     * The margin covers the RPC and record-marking headers, the GSS credential
+     * and verifier, and the framing a seal adds around the payload.
+     */
+    evpl_global_config_set_rpc2_max_message_size(
+        evpl_global_config,
+        CHIMERA_NFS_MAX_XFER + CHIMERA_NFS_RPC_OVERHEAD);
     evpl_global_config_set_spin_ns(evpl_global_config, 1000000UL);
     evpl_global_config_set_huge_pages(evpl_global_config, 1);
     evpl_global_config_set_libaio_max_pending(evpl_global_config, 1024);
@@ -997,6 +1019,17 @@ main(
         }
     }
 
+    json_t *s3_anon = json_object_get(config, "s3_anon");
+    if (s3_anon && json_is_object(s3_anon)) {
+        json_t *anon_uid = json_object_get(s3_anon, "uid");
+        json_t *anon_gid = json_object_get(s3_anon, "gid");
+
+        chimera_server_config_set_s3_anon_ids(
+            server_config,
+            anon_uid ? (uint32_t) json_integer_value(anon_uid) : CHIMERA_S3_ANON_UID,
+            anon_gid ? (uint32_t) json_integer_value(anon_gid) : CHIMERA_S3_ANON_GID);
+    }
+
     server = chimera_server_init(server_config, chimera_metrics_get(metrics));
 
     json_t *users = json_object_get(config, "users");
@@ -1049,14 +1082,19 @@ main(
         {
             const char *access_key = json_string_value(json_object_get(key_entry, "access_key"));
             const char *secret_key = json_string_value(json_object_get(key_entry, "secret_key"));
+            const char *key_user   = json_string_value(json_object_get(key_entry, "username"));
+            const char *key_canon  = json_string_value(json_object_get(key_entry, "user_id"));
+            const char *key_disp   = json_string_value(json_object_get(key_entry, "display_name"));
 
             if (!access_key || !secret_key) {
                 chimera_server_error("S3 access key entry missing access_key or secret_key, skipping");
                 continue;
             }
 
-            chimera_server_info("Adding S3 access key %s", access_key);
-            chimera_server_add_s3_cred(server, access_key, secret_key, 1);
+            chimera_server_info("Adding S3 access key %s (user %s)", access_key,
+                                key_user ? key_user : "<unbound>");
+            chimera_server_add_s3_cred(server, access_key, secret_key, key_user,
+                                       key_canon, key_disp, 1);
         }
     }
 

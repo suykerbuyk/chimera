@@ -418,6 +418,12 @@ chimera_vfs_open_lookup_complete(
                 chimera_vfs_access_check(attr, request->cred,
                                          CHIMERA_ACE_MASK_ALL);
             request->open.granted_valid = 1;
+        } else {
+            /* Gate-exempt credential (root, AUTH_NONE): DAC grants this open
+             * everything; bind the full grant to the descriptor so a later
+             * setuid() does not revoke I/O on it. */
+            request->open.granted_access = CHIMERA_ACE_MASK_ALL;
+            request->open.granted_valid  = 1;
         }
     }
 
@@ -516,8 +522,34 @@ chimera_vfs_open(
         request->open.set_attr                     = &request->open.scratch_set_attr;
     }
 
-    if (request->module->capabilities & CHIMERA_VFS_CAP_FS_PATH_OP) {
+    /* An O_PATH-style resolution (chmod/chown/utimes/statfs/readlink by path)
+     * takes no data access, so the engine's open gate requires nothing of it --
+     * route it through the FOLLOW/NOFOLLOW lookup path below (like an FH-relative
+     * backend) so a path-only mount's final symlink is followed and typed by the
+     * shared lookup machinery, rather than by open_at + op_complete (whose
+     * synthesized attrs cannot tell a symlink from a special file).  A data open
+     * (O_RDONLY/O_WRONLY/O_RDWR) keeps the direct open_at dispatch so its DAC
+     * stays with the remote server. */
+    unsigned int pathonly_metadata = (flags & CHIMERA_VFS_OPEN_PATH) &&
+        !(flags & (CHIMERA_VFS_OPEN_CREATE | CHIMERA_VFS_OPEN_NOFOLLOW));
+
+    if ((request->module->capabilities & CHIMERA_VFS_CAP_FS_PATH_OP) &&
+        !pathonly_metadata) {
+        int i;
+
         request->open.name_offset = 0;
+
+        /* The whole path is the name for a path-only backend, but the symlink-
+         * follow logic still needs the parent-directory prefix to resolve a
+         * relative link target (and reads parent_len unconditionally, so it
+         * must be set rather than left as free-list garbage). */
+        request->open.parent_len = 0;
+        for (i = request->open.pathlen - 1; i >= 0; i--) {
+            if (request->open.path[i] == '/') {
+                request->open.parent_len = i;
+                break;
+            }
+        }
 
         memcpy(request->open.parent_fh, fh, fhlen);
         request->open.parent_fh_len = fhlen;
@@ -541,8 +573,16 @@ chimera_vfs_open(
                                                  request->open.parent_fh,
                                                  &request->open.parent_fh_len);
 
-        if (rebase >= 0 && rebase < request->open.pathlen) {
+        if (rebase >= 0 && rebase < request->open.pathlen && !pathonly_metadata) {
+            const char *rslash = strrchr(request->open.path, '/');
+
             request->open.name_offset = rebase;
+            /* Parent-directory prefix for symlink-follow: the re-open runs from
+             * the same (vfs-root) fh with the whole resolved path, so the prefix
+             * is the full path's dirname.  Must be set -- the follow logic reads
+             * it unconditionally. */
+            request->open.parent_len = rslash ?
+                (int) (rslash - request->open.path) : 0;
 
             chimera_vfs_open_fh(
                 thread,

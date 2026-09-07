@@ -23,7 +23,10 @@ chimera_vfs_access_check(
     int                       is_dir;
 
     /* AUTH_NONE means the caller did not establish an identity; treat as a
-     * full grant (the protocol layer is responsible for export-level policy). */
+     * full grant (the protocol layer is responsible for export-level policy).
+     * Anonymous access is therefore an export-level decision only: an
+     * ANONYMOUS@ ACE on an object is never consulted for such a caller, so a
+     * DENY ANONYMOUS@ ACE cannot restrict one. */
     if (cred->flavor == CHIMERA_VFS_AUTH_NONE) {
         return requested;
     }
@@ -93,7 +96,8 @@ chimera_vfs_gate_needed_dac(
      * forwards to authorizes every operation itself, with the credential the
      * proxy chooses to send (the opening credential for I/O -- see
      * nfs3_open_state.h).  Engine-side per-op gating on top would re-check
-     * with the per-call credential and break rights-bind-at-open. */
+     * with the per-call credential and break rights-bind-at-open.  (The
+     * lookup prefix is the exception -- see gate_needed_prefix below.) */
     if (module_capabilities & CHIMERA_VFS_CAP_REMOTE_DAC) {
         return 0;
     }
@@ -104,6 +108,31 @@ chimera_vfs_gate_needed_dac(
 
     return (module_capabilities & CHIMERA_VFS_CAP_DELEGATES_DAC) ? 1 : 0;
 } /* chimera_vfs_gate_needed_dac */
+
+SYMBOL_EXPORT int
+chimera_vfs_gate_needed_prefix(
+    uint64_t                       module_capabilities,
+    const struct chimera_vfs_cred *cred)
+{
+    /* Whether the engine must evaluate path-prefix search (EXECUTE) on
+     * lookup.  Everything chimera_vfs_gate_needed_dac() gates is gated here
+     * too, plus one case it deliberately exempts: a remote-DAC proxy.  The
+     * proxy's server does authorize each wire operation -- but the engine
+     * resolves components through the name and attribute caches, so a
+     * repeated traversal never reaches the server at all, and the follow-on
+     * operation arrives there parent-by-handle with no prefix left to check.
+     * Nobody but the engine can evaluate prefix search once resolution is
+     * cache-served, so the proxy takes the same engine-side prefix gate as a
+     * DELEGATES_DAC passthrough.  Only the lookup gate widens: the per-op
+     * data gates stay deferred to the server, preserving
+     * rights-bind-at-open (see gate_needed_dac). */
+    if (chimera_vfs_gate_needed_dac(module_capabilities, cred)) {
+        return 1;
+    }
+
+    return (module_capabilities & CHIMERA_VFS_CAP_REMOTE_DAC) &&
+           cred->flavor == CHIMERA_VFS_AUTH_UNIX && cred->uid != 0;
+} /* chimera_vfs_gate_needed_prefix */
 
 SYMBOL_EXPORT int
 chimera_vfs_open_gate_needed(
@@ -117,8 +146,18 @@ chimera_vfs_open_gate_needed(
     /* Remote-DAC proxy: the server enforces per-op but has no open on the
      * wire to enforce open(2) access against, so the engine gates the open
      * itself from the looked-up attributes -- what a kernel NFS client's
-     * ACCESS call at open does.  Root and AUTH_NONE stay exempt. */
-    if (!(module_capabilities & CHIMERA_VFS_CAP_REMOTE_DAC)) {
+     * ACCESS call at open does.  Root and AUTH_NONE stay exempt.
+     *
+     * A DELEGATES_DAC passthrough needs the same gate for a POSIX caller:
+     * the module opens by handle under a privileged process, so the kernel
+     * never evaluates open(2) access for the caller -- and the grant this
+     * gate stamps on the handle is what binds I/O rights at open time.
+     * Without it the first per-op READ/WRITE gate evaluates the file's
+     * CURRENT mode instead, denying a creator its own descriptor on a
+     * mode-restricted create (the created-file exemption lives in the open
+     * gate) and revoking descriptors on a later chmod. */
+    if (!(module_capabilities &
+          (CHIMERA_VFS_CAP_REMOTE_DAC | CHIMERA_VFS_CAP_DELEGATES_DAC))) {
         return 0;
     }
 

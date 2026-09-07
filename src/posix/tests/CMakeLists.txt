@@ -138,9 +138,15 @@ generate_posix_backend_tests(io_uring CHIMERA_VFS_IO_URING)
 # knobs exist only there, so these stay out of the all-backend matrix)
 add_posix_testprog(test_lease_deny)
 add_posix_testprog(test_lease_recall)
+add_posix_testprog(test_lock_project)
+add_posix_testprog(test_lock_seek_end)
+add_posix_testprog(test_lock_posix_semantics)
 if(CHIMERA_LIMITS_TESTING)
     add_posix_test(lease_deny_memfs test_lease_deny memfs)
     add_posix_test(lease_recall_memfs test_lease_recall memfs)
+    add_posix_test(lock_project_memfs test_lock_project memfs)
+    add_posix_test(lock_seek_end_memfs test_lock_seek_end memfs)
+    add_posix_test(lock_posix_semantics_memfs test_lock_posix_semantics memfs)
 endif()
 
 # diskfs-only cache-eviction / cold-remount stress (not part of the
@@ -734,7 +740,11 @@ generate_cthon_backend_tests(cairn CAIRN_ENABLED)
 generate_cthon_backend_tests(linux CHIMERA_LINUX)
 generate_cthon_backend_tests(io_uring CHIMERA_VFS_IO_URING)
 
-# Cthon lock test programs (backends with CHIMERA_VFS_CAP_FS_LOCK)
+# Cthon lock test programs.  These fork and assert that a SECOND PROCESS
+# sees the lock, so they need a backend whose files are shared between
+# processes -- not memfs, whose storage is per-process (the child does not
+# even find the file).  In-process lock semantics are covered by the quint
+# posix model and by test_lock_project.
 set(CTHON_LOCK_TEST_PROGRAMS
     cthon_lock_tlock
 )
@@ -749,7 +759,8 @@ if(CHIMERA_VFS_IO_URING)
     add_cthon_test(cthon_lock_tlock_io_uring cthon_lock_tlock io_uring)
 endif()
 
-# Independent POSIX fcntl/lockf tests: backends with CHIMERA_VFS_CAP_FS_LOCK
+# Independent POSIX fcntl/lockf tests.  Cross-process, like the cthon lock
+# tests above, so they run on the backends that front shared storage.
 foreach(prog test_fcntl test_lockf)
     add_posix_testprog(${prog})
     string(REGEX REPLACE "^test_" "" test_name ${prog})

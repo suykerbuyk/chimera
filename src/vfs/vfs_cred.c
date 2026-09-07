@@ -9,6 +9,7 @@
  * time; see the SDK boundary rules in sdk/chimera_vfs_sdk.h.
  */
 
+#include <stdio.h>
 #include <string.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -111,15 +112,29 @@ chimera_vfs_cred_init_attr(
     uint32_t                 ngids,
     const uint32_t          *gids)
 {
-    (void) ngids;
-    (void) gids;
-
     cred->flavor = CHIMERA_VFS_AUTH_ATTR;
     cred->uid    = uid;
     cred->gid    = gid;
-    cred->ngids  = 0;
     cred->origin = NULL;
     cred->flags  = 0;
+
+    /* The caller's whole group set matters to the access decision, not just
+     * its primary group: MS-DTYP 2.5.2 evaluates every group SID in the token,
+     * and cred_in_group() (the ACL engine's GROUP@/named-group test, and the
+     * POSIX group class behind it) can only see what is carried here.  Dropping
+     * them denied an SMB caller whose membership is supplementary -- the normal
+     * AD case -- access that the same identity is granted over NFS, where
+     * cred_init_unix keeps the list. */
+    if (ngids > CHIMERA_VFS_CRED_MAX_GIDS) {
+        ngids = CHIMERA_VFS_CRED_MAX_GIDS;
+    }
+
+    cred->ngids = ngids;
+    if (ngids > 0 && gids) {
+        memcpy(cred->gids, gids, ngids * sizeof(uint32_t));
+    } else {
+        cred->ngids = 0;
+    }
 } /* chimera_vfs_cred_init_attr */
 
 SYMBOL_EXPORT int
@@ -136,6 +151,24 @@ chimera_setup_credential(
         case CHIMERA_VFS_AUTH_UNIX:
             if ((cred->uid == sc->uid) &&
                 (cred->gid == sc->gid)) {
+#ifdef __linux__
+                /* This op runs as the server identity, which is also this
+                 * thread's base state -- but verify it: an error path that
+                 * skipped chimera_restore_privilege would otherwise leak a
+                 * previous op's impersonation into this one.  setfsuid
+                 * returns the previous fsuid, so this both detects and
+                 * repairs the leak. */
+                uint32_t prev = (uint32_t) setfsuid(sc->uid);
+
+                if (prev != sc->uid) {
+                    fprintf(stderr,
+                            "chimera_vfs: impersonation leak: thread fsuid %u "
+                            "at a server-credential op; restoring base "
+                            "identity\n", prev);
+                    setfsgid(sc->gid);
+                    syscall(SYS_setgroups, (size_t) 0, NULL);
+                }
+#endif /* ifdef __linux__ */
                 return 0;
             }
 #ifdef __linux__

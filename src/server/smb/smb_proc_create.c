@@ -4,7 +4,7 @@
 
 #include <sys/time.h>
 #include <strings.h>
-#include "server/smb/smb2.h"
+#include "smb_common/smb2.h"
 #include "server/smb/smb_session.h"
 #include "smb_internal.h"
 #include "smb_procs.h"
@@ -218,6 +218,22 @@ chimera_smb_create_error_status(enum chimera_vfs_error error_code)
     } /* switch */
 } /* chimera_smb_create_error_status */
 
+/* As above, but for a failure resolving the *parent* path of a create.  A
+ * missing component is an OBJECT_PATH_NOT_FOUND (an intermediate path element),
+ * not OBJECT_NAME_NOT_FOUND (the final name); ENOTDIR/EACCES/ELOOP still map to
+ * their specific statuses so, e.g., mkdir under a non-directory reports
+ * NOT_A_DIRECTORY (ENOTDIR) rather than a bare ENOENT. */
+static inline uint32_t
+chimera_smb_create_parent_error_status(enum chimera_vfs_error error_code)
+{
+    uint32_t status = chimera_smb_create_error_status(error_code);
+
+    if (status == SMB2_STATUS_OBJECT_NAME_NOT_FOUND) {
+        status = SMB2_STATUS_OBJECT_PATH_NOT_FOUND;
+    }
+    return status;
+} /* chimera_smb_create_parent_error_status */
+
 /* Emit the SMB2 ERROR Response carrying a SymbolicLinkErrorResponse body
  * (MS-SMB2 2.2.2 / 2.2.2.2.1) for a create that STATUS_STOPPED_ON_SYMLINK'd.
  * The link target (UTF-8, already '\'-separated) and its relative flag were
@@ -272,7 +288,7 @@ chimera_smb_create_emit_symlink_error(
     evpl_iovec_cursor_append_uint32(cursor, SMB2_SYMLINK_ERROR_TAG);     /* 'SYML' */
     evpl_iovec_cursor_append_uint32(cursor, SMB2_IO_REPARSE_TAG_SYMLINK);
     evpl_iovec_cursor_append_uint16(cursor, reparse_data_length);
-    evpl_iovec_cursor_append_uint16(cursor, 0);        /* UnparsedPathLength */
+    evpl_iovec_cursor_append_uint16(cursor, request->create.r_symlink_unparsed); /* UnparsedPathLength */
     evpl_iovec_cursor_append_uint16(cursor, 0);        /* SubstituteNameOffset */
     evpl_iovec_cursor_append_uint16(cursor, name_len); /* SubstituteNameLength */
     evpl_iovec_cursor_append_uint16(cursor, name_len); /* PrintNameOffset */
@@ -1807,6 +1823,25 @@ chimera_smb_create_after_share(
         chimera_smb_create_grant_durable(request, open_file);
     }
 
+    /* Record which CREATE contexts the client supplied BEFORE the open becomes
+     * findable, because the replay lookup keys on it.
+     *
+     * chimera_smb_create_guid_replay's live-open arm matches a replayed DH2Q
+     * create against an existing open by (ctx_present_mask & DH2Q) plus the
+     * create_guid.  It used to be stamped only when the reply was marshaled
+     * (chimera_smb_create_reply), which leaves a window: from the HASH_ADD
+     * below until the reply, the open is hashed, live and replay-eligible, has
+     * already been dropped from tree->pending_creates, and is NOT CREATE_PENDING
+     * (it did not park) -- so a replay arriving in that window missed all three
+     * lookups and opened a second handle instead of returning the first.  The
+     * window is not narrow: the reply is emitted only once every request in the
+     * compound has completed, and an EA-carrying create issues async setxattrs
+     * inside it.  A compound whose reply is abandoned (connection recycled or
+     * closing) never stamped it at all, so the open stayed unmatchable for its
+     * whole life.  Stamping here makes the lookup key and the open's
+     * findability become true at the same instant. */
+    open_file->ctx_present_mask = request->create.ctx_present_mask;
+
     open_file_bucket = open_file->file_id.vid & CHIMERA_SMB_OPEN_FILE_BUCKET_MASK;
 
     pthread_mutex_lock(&tree->open_files_lock[open_file_bucket]);
@@ -2250,9 +2285,8 @@ chimera_smb_create_mkdir_callback(
         }
 
         chimera_smb_create_release_parent(request);
-        chimera_smb_complete_request(request, error_code == CHIMERA_VFS_EEXIST ?
-                                     SMB2_STATUS_OBJECT_NAME_COLLISION :
-                                     SMB2_STATUS_OBJECT_NAME_NOT_FOUND);
+        chimera_smb_complete_request(request,
+                                     chimera_smb_create_error_status(error_code));
         return;
     }
 
@@ -2426,6 +2460,39 @@ chimera_smb_create_open_stream_callback(
     chimera_vfs_release(vfs_thread, base_oh);
     request->create.base_oh = NULL;
 
+    /*
+     * A stream that did not exist before now does: MS-FSA 2.1.5.1 raises
+     * FILE_NOTIFY_CHANGE_STREAM_NAME for it, and a client watching the
+     * containing directory expects to be woken (WPTS
+     * BVT_SMB2Basic_ChangeNotify_ChangeStreamName registers exactly that filter
+     * on the directory, with WATCH_TREE, and then has a second client create a
+     * stream on a file that already existed).
+     *
+     * This path returns through chimera_smb_create_finish_with_eas rather than
+     * chimera_smb_create_open_finish, so it never reached the emit there and a
+     * stream create notified nobody at all.
+     *
+     * STREAM_NAME alone: no directory entry appeared.  Raising FILE_ADDED as
+     * the file-create path does would wake FILE_NOTIFY_CHANGE_FILE_NAME
+     * watchers for a file that was already there.  The name reported is the
+     * base file's -- the entry the directory actually holds -- since the stream
+     * is not one of its entries.
+     */
+    if (request->create.r_created && request->create.parent_handle) {
+        uint64_t skip_lo, skip_hi;
+        bool     has_skip = chimera_smb_parent_lease_skip(
+            open_file->parent_lease_key, &skip_lo, &skip_hi);
+
+        chimera_vfs_notify_emit_lease(request->compound->thread->shared->vfs->vfs_notify,
+                                      request->create.parent_handle->fh,
+                                      request->create.parent_handle->fh_len,
+                                      CHIMERA_VFS_NOTIFY_STREAM_NAME,
+                                      request->create.name,
+                                      request->create.name_len,
+                                      NULL, 0,
+                                      skip_lo, skip_hi, has_skip);
+    }
+
     chimera_smb_create_release_parent(request);
     chimera_smb_create_finish_with_eas(request, open_file);
 } /* chimera_smb_create_open_stream_callback */
@@ -2532,11 +2599,84 @@ chimera_smb_create_symlink_readlink_cb(
             }
         }
         request->create.r_symlink_target_len = target_length;
+        request->create.r_symlink_unparsed   = 0;  /* final component: no suffix */
         request->create.r_symlink_error      = 1;
     }
 
     chimera_smb_complete_request(request, SMB2_STATUS_STOPPED_ON_SYMLINK);
 } /* chimera_smb_create_symlink_readlink_cb */
+
+/* An intermediate (parent-path) component is a symbolic link: readlink it so the
+ * STATUS_STOPPED_ON_SYMLINK reply carries the target AND the unparsed suffix
+ * ("/" + create name), letting the client splice the link and retry.  Without
+ * the body the client can only surface ELOOP -- so a create/stat/rmdir THROUGH a
+ * symlinked directory would wrongly fail where POSIX follows the link. */
+static void
+chimera_smb_create_parent_symlink_readlink_cb(
+    enum chimera_vfs_error    error_code,
+    int                       target_length,
+    struct chimera_vfs_attrs *attr,
+    void                     *private_data)
+{
+    struct chimera_smb_request *request    = private_data;
+    struct chimera_vfs_thread  *vfs_thread = request->compound->thread->vfs_thread;
+    int                         i;
+
+    (void) attr;
+
+    if (request->create.r_symlink_handle) {
+        chimera_vfs_release(vfs_thread, request->create.r_symlink_handle);
+        request->create.r_symlink_handle = NULL;
+    }
+
+    if (error_code == CHIMERA_VFS_OK && target_length > 0 &&
+        target_length < CHIMERA_VFS_PATH_MAX) {
+        request->create.r_symlink_relative =
+            (request->create.r_symlink_target[0] != '/');
+        for (i = 0; i < target_length; i++) {
+            if (request->create.r_symlink_target[i] == '/') {
+                request->create.r_symlink_target[i] = '\\';
+            }
+        }
+        request->create.r_symlink_target_len = target_length;
+        /* Unparsed suffix = "/" + create name, in UTF-16 bytes (the part of the
+         * path after the parent-path symlink the server stopped on). */
+        request->create.r_symlink_unparsed =
+            (uint16_t) ((request->create.name_len + 1) * 2);
+        request->create.r_symlink_error = 1;
+    }
+
+    chimera_smb_complete_request(request, SMB2_STATUS_STOPPED_ON_SYMLINK);
+} /* chimera_smb_create_parent_symlink_readlink_cb */
+
+/* Reopen the parent-path symlink (by the fh the lookup returned) to read its
+ * target for the SymbolicLinkErrorResponse body. */
+static void
+chimera_smb_create_parent_symlink_open_cb(
+    enum chimera_vfs_error          error_code,
+    struct chimera_vfs_open_handle *oh,
+    void                           *private_data)
+{
+    struct chimera_smb_request *request    = private_data;
+    struct chimera_vfs_thread  *vfs_thread = request->compound->thread->vfs_thread;
+
+    if (error_code != CHIMERA_VFS_OK) {
+        chimera_smb_complete_request(request, SMB2_STATUS_STOPPED_ON_SYMLINK);
+        return;
+    }
+
+    request->create.r_symlink_handle = oh;
+
+    chimera_vfs_readlink(
+        vfs_thread,
+        &request->session_handle->session->cred,
+        oh,
+        request->create.r_symlink_target,
+        CHIMERA_VFS_PATH_MAX,
+        0,
+        chimera_smb_create_parent_symlink_readlink_cb,
+        request);
+} /* chimera_smb_create_parent_symlink_open_cb */
 
 static void
 chimera_smb_create_symlink_open_cb(
@@ -3174,50 +3314,52 @@ chimera_smb_create_open_finish(
         }
     }
 
-    /* Emit notification on parent directory for any disposition that can
-     * create a new file.  OPEN never creates; CREATE always creates;
-     * OPEN_IF / OVERWRITE_IF / SUPERSEDE may create or may open/truncate
-     * an existing file.  We emit ADDED for all create-capable
-     * dispositions — this can yield a spurious ADDED when an existing
-     * file was opened or truncated, but that is preferable to missing
-     * notifications for newly-created files (Windows CREATE_ALWAYS maps
-     * to OVERWRITE_IF and is the common case).
+    /* What this open reports to watchers of the parent directory (MS-FSA
+     * 2.1.5.1).  Three outcomes, keyed on what the open actually DID rather
+     * than on the disposition it asked for:
      *
-     * Pick FILE_ADDED vs DIR_ADDED based on the result attrs.  A
-     * directory creation (FILE_DIRECTORY_FILE create option) must
-     * emit DIR_ADDED so SMB clients filtering on DIR_NAME only
-     * receive the event. */
-    if (request->create.create_disposition == SMB2_FILE_CREATE        ||
-        request->create.create_disposition == SMB2_FILE_OPEN_IF       ||
-        request->create.create_disposition == SMB2_FILE_OVERWRITE     ||
-        request->create.create_disposition == SMB2_FILE_OVERWRITE_IF  ||
-        request->create.create_disposition == SMB2_FILE_SUPERSEDE) {
-        uint32_t action = request->create.r_is_directory ?
-            CHIMERA_VFS_NOTIFY_DIR_ADDED : CHIMERA_VFS_NOTIFY_FILE_ADDED;
+     *   created      the entry appeared: FILE_ADDED (DIR_ADDED for a
+     *                directory), plus STREAM_NAME for a regular file, whose
+     *                default $DATA stream appears with it (WPTS
+     *                BVT_SMB2Basic_ChangeNotify_ChangeStreamName)
+     *   overwritten  the entry was already there and its data was replaced:
+     *                that is a MODIFIED, not an ADDED, and it changes the
+     *                size and the write time
+     *   opened       nothing.  Opening a file does not change the directory
+     *                that holds it, and a watcher must not be woken for it.
+     *
+     * Reporting ADDED for every create-capable disposition -- what this used
+     * to do, on the grounds that a spurious ADDED beat a missed one -- is
+     * wrong in both directions once a filter is involved: a client watching
+     * FILE_NOTIFY_CHANGE_SIZE or _ATTRIBUTES is told nothing about an
+     * overwrite that changed both (ADDED maps to neither filter), while a
+     * client watching FILE_NOTIFY_CHANGE_FILE_NAME is woken for opens that
+     * created nothing. */
+    {
+        uint32_t action = 0;
 
-        /* Creating/opening a (regular) file's data fork introduces its
-         * $DATA stream into the file's stream namespace, so also raise the
-         * STREAM_NAME class for non-directories.  This lets a watcher that
-         * requested only FILE_NOTIFY_CHANGE_STREAM_NAME observe the stream
-         * appearing (WPTS BVT_SMB2Basic_ChangeNotify_ChangeStreamName). */
-        if (!request->create.r_is_directory) {
-            action |= CHIMERA_VFS_NOTIFY_STREAM_NAME;
+        if (request->create.r_created) {
+            action = request->create.r_is_directory ?
+                CHIMERA_VFS_NOTIFY_DIR_ADDED :
+                (CHIMERA_VFS_NOTIFY_FILE_ADDED |
+                 CHIMERA_VFS_NOTIFY_STREAM_NAME);
+        } else if (request->create.create_disposition == SMB2_FILE_OVERWRITE ||
+                   request->create.create_disposition == SMB2_FILE_OVERWRITE_IF ||
+                   request->create.create_disposition == SMB2_FILE_SUPERSEDE) {
+            action = CHIMERA_VFS_NOTIFY_FILE_MODIFIED |
+                CHIMERA_VFS_NOTIFY_SIZE_CHANGED |
+                CHIMERA_VFS_NOTIFY_ATTRS_CHANGED |
+                CHIMERA_VFS_NOTIFY_STREAM_SIZE;
         }
 
-        /* A directory read lease must break only when the directory's contents
-         * actually changed — i.e. the file was newly created, or its data was
-         * replaced (OVERWRITE/SUPERSEDE truncate an existing file).  A
-         * create-capable disposition that merely OPENED an existing file
-         * (OPEN_IF on an existing name) changes nothing in the directory, so it
-         * delivers the (conservative) CHANGE_NOTIFY event WITHOUT breaking the
-         * lease — otherwise re-opening a file would spuriously recall the parent
-         * directory lease (smbtorture dirlease.rename re-opens before renaming). */
-        bool content_changed = request->create.r_created ||
-            request->create.create_disposition == SMB2_FILE_OVERWRITE ||
-            request->create.create_disposition == SMB2_FILE_OVERWRITE_IF ||
-            request->create.create_disposition == SMB2_FILE_SUPERSEDE;
-
-        if (content_changed) {
+        /* A directory read lease breaks exactly when there is an event to
+         * raise: the directory's contents changed.  An open that changed
+         * nothing raises nothing and so recalls nothing -- otherwise
+         * re-opening a file would spuriously recall the parent directory lease
+         * (smbtorture dirlease.rename re-opens before renaming), which is why
+         * the previous shape needed a separate break-free emit path for the
+         * opened-an-existing-file case.  With the event gone, so is that path. */
+        if (action) {
             /* Self-exempt the directory lease whose ParentLeaseKey this create
             * supplied: the client creating the file holds (or is updating) that
             * directory's cached view and must not have its own lease broken
@@ -3246,14 +3388,6 @@ chimera_smb_create_open_finish(
                                               NULL, 0,
                                               skip_lo, skip_hi, has_skip);
             }
-        } else {
-            chimera_vfs_notify_emit_nobreak(thread->shared->vfs->vfs_notify,
-                                            request->create.parent_handle->fh,
-                                            request->create.parent_handle->fh_len,
-                                            action,
-                                            request->create.name,
-                                            request->create.name_len,
-                                            NULL, 0);
         }
     }
 
@@ -4156,7 +4290,8 @@ chimera_smb_create_open_parent_callback(
 
     if (error_code != CHIMERA_VFS_OK) {
         chimera_smb_error("Open parent error_code %d", error_code);
-        chimera_smb_complete_request(request, SMB2_STATUS_OBJECT_PATH_NOT_FOUND);
+        chimera_smb_complete_request(request,
+                                     chimera_smb_create_parent_error_status(error_code));
         return;
     }
 
@@ -4210,7 +4345,8 @@ chimera_smb_create_lookup_parent_callback(
     struct chimera_vfs_thread  *vfs_thread = request->compound->thread->vfs_thread;
 
     if (error_code != CHIMERA_VFS_OK) {
-        chimera_smb_complete_request(request, SMB2_STATUS_OBJECT_PATH_NOT_FOUND);
+        chimera_smb_complete_request(request,
+                                     chimera_smb_create_parent_error_status(error_code));
         return;
     }
 
@@ -4218,9 +4354,20 @@ chimera_smb_create_lookup_parent_callback(
      * reparse point on the server, it returns STATUS_STOPPED_ON_SYMLINK so the
      * client resolves the link and retries (MS-SMB2 2.2.2.2.1).  The parent-path
      * lookup is issued without LOOKUP_FOLLOW, so a symlink as the final component
-     * of the parent path resolves to the link itself here. */
+     * of the parent path resolves to the link itself here.  Readlink it (by the
+     * fh the lookup returned) so the reply carries the target AND the unparsed
+     * suffix -- a bare STOPPED body leaves the client with only ELOOP, breaking
+     * every op that traverses a symlinked directory. */
     if ((attr->va_set_mask & CHIMERA_VFS_ATTR_MODE) && S_ISLNK(attr->va_mode)) {
-        chimera_smb_complete_request(request, SMB2_STATUS_STOPPED_ON_SYMLINK);
+        request->create.r_symlink_handle = NULL;
+        chimera_vfs_open_fh(
+            vfs_thread,
+            &request->session_handle->session->cred,
+            attr->va_fh,
+            attr->va_fh_len,
+            CHIMERA_VFS_OPEN_NOFOLLOW | CHIMERA_VFS_OPEN_PATH,
+            chimera_smb_create_parent_symlink_open_cb,
+            request);
         return;
     }
 
@@ -4388,6 +4535,19 @@ chimera_smb_durable_rehome(
     if (open_file->share_lease_inserted) {
         chimera_vfs_claim_park(&open_file->share_lease, false);
     }
+
+    /* Re-home the open onto the RECONNECTING tree.  open_file->tree is the
+     * authority for which bucket lock protects this open and which hash it
+     * must be removed from -- chimera_smb_open_file_release and
+     * chimera_smb_open_file_close_hashed both read it rather than
+     * request->tree, precisely so an open reached through another tree-connect
+     * is handled correctly.  Without this the open stays pointed at the tree it
+     * was parked from, which chimera_smb_tree_free already returned to
+     * shared->free_trees (with share = NULL, and not zeroed on reuse): the next
+     * release would lock a recycled tree's mutex and HASH_DELETE the open from
+     * the wrong table, corrupting both it and the table the open actually
+     * lives in. */
+    open_file->tree = tree;
 
     bucket = open_file->file_id.vid & CHIMERA_SMB_OPEN_FILE_BUCKET_MASK;
     pthread_mutex_lock(&tree->open_files_lock[bucket]);
@@ -5708,9 +5868,11 @@ chimera_smb_create_reply(
         evpl_iovec_cursor_append_uint32(reply_cursor, 0);
     }
 
-    /* Phase-0 housekeeping: propagate which CREATE contexts the client supplied
-     * onto the open file so later phases (lease/durable break, reconnect) can
-     * tell which contracts the client expects. */
+    /* ctx_present_mask is stamped onto the open in
+     * chimera_smb_create_after_share, before it is hashed -- the replay lookup
+     * keys on it, so it cannot wait until the reply is marshaled.  A reclaimed
+     * (durable rehome) open never runs through that path, so refresh it here
+     * for the reconnect case; it is the same value either way. */
     if (request->create.r_open_file) {
         request->create.r_open_file->ctx_present_mask = request->create.ctx_present_mask;
     }
