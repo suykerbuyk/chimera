@@ -80,6 +80,30 @@ post() {
             else printf '  MISSING %s\n' "$h"; rc=1; fi
         done
 
+    hr "snfs claim-range projection is still a rename of linux.c's"
+    # snfs carries linux.c's CHIMERA_VFS_CAP_CLAIM_RANGE code (registry
+    # structs + snfs_claim_acquire/_release) with chimera_linux_ -> snfs_,
+    # CHIMERA_LINUX_LOCK_ -> SNFS_LOCK_ and linux_open_by_handle ->
+    # snfs_open_by_handle, since the 2026-09-07 sync.  Upstream changing that
+    # code is a change snfs needs too, and nothing conflicts when it does.
+    # -w: uncrustify re-aligns columns around the shorter snfs_ names.
+    rename() { sed -e 's/chimera_linux_/snfs_/g' -e 's/CHIMERA_LINUX_LOCK_/SNFS_LOCK_/g' \
+                   -e 's/linux_open_by_handle/snfs_open_by_handle/g'; }
+    if diff -w <(sed -n '/^\/\* Look up the descriptor this (file handle, owner) pair/,/^} \/\* chimera_linux_claim_release \*\//p' \
+                    src/vfs/linux/linux.c | rename) \
+               <(sed -n '/^\/\* Look up the descriptor this (file handle, owner) pair/,/^} \/\* snfs_claim_release \*\//p' \
+                    src/vfs/snfs/snfs.c) > /dev/null &&
+       diff -w <(sed -n '/^ \* CHIMERA_VFS_CAP_CLAIM_RANGE registry\./,/^struct chimera_linux_range {/p' \
+                    src/vfs/linux/linux.c | rename) \
+               <(sed -n '/^ \* CHIMERA_VFS_CAP_CLAIM_RANGE registry\./,/^struct snfs_range {/p' \
+                    src/vfs/snfs/snfs.c) > /dev/null; then
+        echo "IN SYNC"
+    else
+        echo "DRIFTED -- linux.c's claim-range code changed; re-port it into snfs.c"
+        echo "           (reference.md, 'snfs lag')"
+        rc=1
+    fi
+
     hr "vendor fh-magic slots keep upstream's positional names"
     # Match the enumerator, not a mention: the broken state this catches
     # kept "VENDOR0" as a trailing comment on the renamed line, so a bare
