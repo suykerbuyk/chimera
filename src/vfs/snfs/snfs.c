@@ -15,10 +15,12 @@
 #include <sys/uio.h>
 #include <dirent.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <errno.h>
 #include <sys/ioctl.h>
 #include <linux/fs.h>
 #include <uthash.h>
+#include <utlist.h>
 #include <jansson.h>
 #include <linux/version.h>
 #include "vfs/sdk/vfs_error.h"
@@ -41,12 +43,76 @@
 
 extern struct chimera_vfs_module vfs_snfs;
 
+/*
+ * CHIMERA_VFS_CAP_CLAIM_RANGE registry.
+ *
+ * A byte-range claim reaches this backend only after the claim core has
+ * arbitrated it against every other claim on this node; the real fcntl() adds
+ * exactly one thing, visibility to holders OUTSIDE this process (a local
+ * application, or another chimera node sharing the same filesystem).
+ *
+ * The claim wire is file-handle based and carries no open handle, so the
+ * projection owns its own descriptors: one per (file handle, claim owner),
+ * refcounted by the records standing on it and closed once the last one goes
+ * away.  Keying the descriptor on the owner is what makes same-owner upgrades
+ * coalesce the way POSIX expects while still letting two distinct owners
+ * conflict with each other in the kernel.
+ *
+ * Open file description locks (F_OFD_*) are used where the host provides them:
+ * they belong to the descriptor we hold rather than to the process, so an
+ * unrelated close() of the same file elsewhere in the server cannot silently
+ * drop them, and each owner's descriptor is a distinct lock owner.  A kernel
+ * without them falls back to process-wide record locks, where neither property
+ * holds -- the projection is then only an approximation of cross-process
+ * visibility, which is all the old CHIMERA_VFS_OP_LOCK wire ever was.
+ */
+
+#ifdef F_OFD_SETLK
+#define SNFS_LOCK_GET  F_OFD_GETLK
+#define SNFS_LOCK_SET  F_OFD_SETLK
+#define SNFS_LOCK_SETW F_OFD_SETLKW
+#else /* ifdef F_OFD_SETLK */
+#define SNFS_LOCK_GET  F_GETLK
+#define SNFS_LOCK_SET  F_SETLK
+#define SNFS_LOCK_SETW F_SETLKW
+#endif /* ifdef F_OFD_SETLK */
+
+struct snfs_range_file {
+    uint8_t                    fh[CHIMERA_VFS_FH_SIZE];
+    uint32_t                   fh_len;
+    uint64_t                   fh_hash;
+    struct chimera_claim_owner owner;
+    int                        fd;
+    uint32_t                   refcnt;
+    struct snfs_range_file    *next;
+};
+
+/* One granted range record, named by the token the core hands back to us on
+ * CHIMERA_VFS_OP_CLAIM_RELEASE.  offset/length are absolute (SEEK_SET) so the
+ * unlock reproduces exactly the bytes that were locked; length 0 means to-EOF
+ * in the fcntl spelling.  projected == 0 marks a record the host cannot
+ * express, which the release must not try to undo. */
+struct snfs_range {
+    uint64_t                token;
+    struct snfs_range_file *file;
+    uint64_t                offset;
+    uint64_t                length;
+    uint8_t                 projected;
+    struct snfs_range      *next;
+};
+
 struct snfs_shared {
-    int readdir_verifier;
+    int                     readdir_verifier;
+
+    pthread_mutex_t         range_lock;
+    struct snfs_range_file *range_files;
+    struct snfs_range      *ranges;
+    uint64_t                range_next_token;
 };
 
 struct snfs_thread {
     struct evpl            *evpl;
+    struct snfs_shared     *shared;
     struct snfs_mount_table mount_table;
     int                     readdir_verifier;
 };
@@ -60,6 +126,8 @@ snfs_init(
     struct snfs_shared *shared;
 
     shared = calloc(1, sizeof(*shared));
+
+    pthread_mutex_init(&shared->range_lock, NULL);
 
     if (cfgdata && cfgdata[0] != '\0') {
         json_error_t json_error;
@@ -82,7 +150,24 @@ snfs_init(
 static void
 snfs_destroy(void *private_data)
 {
-    free(private_data);
+    struct snfs_shared     *shared = private_data;
+    struct snfs_range_file *file;
+    struct snfs_range      *range;
+
+    while ((range = shared->ranges)) {
+        LL_DELETE(shared->ranges, range);
+        free(range);
+    }
+
+    while ((file = shared->range_files)) {
+        LL_DELETE(shared->range_files, file);
+        close(file->fd);
+        free(file);
+    }
+
+    pthread_mutex_destroy(&shared->range_lock);
+
+    free(shared);
 } /* snfs_destroy */ /* snfs_destroy */
 
 static void *
@@ -95,6 +180,7 @@ snfs_thread_init(
         (struct snfs_thread *) calloc(1, sizeof(*thread));
 
     thread->evpl             = evpl;
+    thread->shared           = shared;
     thread->readdir_verifier = shared->readdir_verifier;
 
     return thread;
@@ -1604,77 +1690,511 @@ snfs_link_at(
     request->complete(request);
 
 } /* snfs_link_at */
+
+/* Look up the descriptor this (file handle, owner) pair locks through, without
+ * opening one.  Called with range_lock held; takes no reference. */
+static struct snfs_range_file *
+snfs_range_file_find(
+    struct snfs_shared               *shared,
+    const uint8_t                    *fh,
+    uint32_t                          fh_len,
+    uint64_t                          fh_hash,
+    const struct chimera_claim_owner *owner)
+{
+    struct snfs_range_file *file;
+
+    for (file = shared->range_files; file; file = file->next) {
+        if (file->fh_hash == fh_hash && file->fh_len == fh_len &&
+            memcmp(file->fh, fh, fh_len) == 0 &&
+            chimera_claim_owner_equal(&file->owner, owner)) {
+            return file;
+        }
+    }
+
+    return NULL;
+} /* snfs_range_file_find */
+
+/* Find (or open) the descriptor this (file handle, owner) pair locks through
+ * and take a reference on it.  Called with range_lock held. */
+static struct snfs_range_file *
+snfs_range_file_get(
+    struct snfs_thread               *thread,
+    const uint8_t                    *fh,
+    uint32_t                          fh_len,
+    uint64_t                          fh_hash,
+    const struct chimera_claim_owner *owner)
+{
+    struct snfs_shared     *shared = thread->shared;
+    struct snfs_range_file *file;
+    int                     fd;
+
+    file = snfs_range_file_find(shared, fh, fh_len, fh_hash, owner);
+
+    if (file) {
+        file->refcnt++;
+        return file;
+    }
+
+    /* A read lock needs a readable descriptor and a write lock a writable one,
+     * so ask for both and settle for read-only on a read-only file. */
+    fd = snfs_open_by_handle(&thread->mount_table, fh, fh_len, O_RDWR);
+
+    if (fd < 0) {
+        fd = snfs_open_by_handle(&thread->mount_table, fh, fh_len, O_RDONLY);
+    }
+
+    if (fd < 0) {
+        return NULL;
+    }
+
+    file = calloc(1, sizeof(*file));
+
+    memcpy(file->fh, fh, fh_len);
+    file->fh_len  = fh_len;
+    file->fh_hash = fh_hash;
+    file->owner   = *owner;
+    file->fd      = fd;
+    file->refcnt  = 1;
+
+    LL_PREPEND(shared->range_files, file);
+
+    return file;
+} /* snfs_range_file_get */
+
+/* Drop a reference; the last one closes the descriptor.  No record of ours can
+ * still be standing on it at that point, so nothing is unlocked by surprise.
+ * Called with range_lock held. */
 static void
-snfs_lock(
+snfs_range_file_put(
+    struct snfs_shared     *shared,
+    struct snfs_range_file *file)
+{
+    if (--file->refcnt) {
+        return;
+    }
+
+    LL_DELETE(shared->range_files, file);
+    close(file->fd);
+    free(file);
+} /* snfs_range_file_put */
+
+/* Translate a RANGE claim into the flock the host understands.  Returns 0 if
+ * the range is projectable, or -1 if it is one the kernel cannot express (a
+ * genuine zero-byte range, or one starting past the largest representable
+ * offset) and the caller should grant it unprojected. */
+static int
+snfs_range_to_flock(
+    const struct chimera_vfs_request *request,
+    struct flock                     *fl)
+{
+    uint64_t offset = request->claim_acquire.offset;
+    uint64_t length = request->claim_acquire.length;
+
+    fl->l_type = request->claim_acquire.exclusive ? F_WRLCK : F_RDLCK;
+    fl->l_pid  = 0;
+
+    if (request->claim_acquire.whence == SEEK_END) {
+        /* Handed to the kernel untouched so EOF is resolved atomically with
+         * the lock.  offset and length are bit-casts of signed values and keep
+         * the POSIX flock conventions intact -- l_len 0 is to-EOF here, and a
+         * negative l_len runs backwards from l_start. */
+        fl->l_whence = SEEK_END;
+        fl->l_start  = (off_t) (int64_t) offset;
+        fl->l_len    = (off_t) (int64_t) length;
+        return 0;
+    }
+
+    fl->l_whence = SEEK_SET;
+    fl->l_start  = (off_t) offset;
+
+    if (length == UINT64_MAX) {
+        fl->l_len = 0;                 /* to-EOF, which fcntl spells as 0 */
+    } else if (length == 0) {
+        /* A genuine zero-byte range, which fcntl cannot express at all since
+         * l_len 0 already means to-EOF.  The core has arbitrated it locally;
+         * granting it unprojected beats refusing an SMB zero-byte lock. */
+        return -1;
+    } else if (offset > (uint64_t) INT64_MAX) {
+        return -1;
+    } else if (length > (uint64_t) INT64_MAX - offset) {
+        fl->l_len = 0;                 /* runs past the last byte an off_t has */
+    } else {
+        fl->l_len = (off_t) length;
+    }
+
+    return 0;
+} /* snfs_range_to_flock */
+
+/* Record the absolute bytes a granted lock covers, so the release can undo
+ * exactly them.  A SEEK_END lock was resolved by the kernel against the size
+ * it saw; re-resolving it at release time -- arbitrarily much later -- would
+ * unlock the wrong bytes, so resolve it here instead, while the size is still
+ * the one the lock was placed against. */
+static void
+snfs_range_resolve(
+    const struct flock *fl,
+    int                 fd,
+    uint64_t           *r_offset,
+    uint64_t           *r_length)
+{
+    struct stat st;
+    int64_t     base;
+
+    if (fl->l_whence != SEEK_END || fstat(fd, &st) < 0) {
+        *r_offset = (uint64_t) fl->l_start;
+        *r_length = (uint64_t) fl->l_len;
+        return;
+    }
+
+    base = (int64_t) st.st_size + (int64_t) fl->l_start;
+
+    if (fl->l_len < 0) {
+        base += (int64_t) fl->l_len;
+    }
+
+    if (base < 0) {
+        base = 0;
+    }
+
+    *r_offset = (uint64_t) base;
+    *r_length = (fl->l_len < 0)
+        ? 0 - (uint64_t) fl->l_len
+        : (uint64_t) fl->l_len;
+} /* snfs_range_resolve */
+
+/* Describe the holder an F_GETLK found back to the caller.  F_GETLK returns
+ * the conflict in SEEK_SET terms whatever whence was asked about. */
+static void
+snfs_range_report_conflict(
+    struct chimera_vfs_request *request,
+    const struct flock         *fl)
+{
+    if (fl->l_type == F_UNLCK) {
+        return;
+    }
+
+    request->claim_acquire.r_conflict_type = (fl->l_type == F_RDLCK)
+        ? CHIMERA_VFS_LOCK_READ
+        : CHIMERA_VFS_LOCK_WRITE;
+    request->claim_acquire.r_conflict_offset = (uint64_t) fl->l_start;
+    /* fcntl reports to-EOF as 0; the claim wire spells it UINT64_MAX. */
+    request->claim_acquire.r_conflict_length = (fl->l_len == 0)
+        ? UINT64_MAX
+        : (uint64_t) fl->l_len;
+    /* An OFD holder reports l_pid -1, meaning "no process owns this". */
+    request->claim_acquire.r_conflict_pid = (fl->l_pid > 0)
+        ? (uint32_t) fl->l_pid
+        : 0;
+} /* snfs_range_report_conflict */
+
+static void
+snfs_claim_acquire(
     struct chimera_vfs_request *request,
     void                       *private_data)
 {
-    int          fd = (int) request->lock.handle->vfs_private;
-    int          cmd;
-    struct flock fl = { 0 };
-    int          rc;
+    struct snfs_thread     *thread = private_data;
+    struct snfs_shared     *shared = thread->shared;
+    struct snfs_range_file *file;
+    struct snfs_range      *range     = NULL;
+    struct flock            fl        = { 0 };
+    int                     projected = 1;
+    int                     cmd, rc;
 
-    switch (request->lock.lock_type) {
-        case CHIMERA_VFS_LOCK_READ:
-            fl.l_type = F_RDLCK;
-            break;
-        case CHIMERA_VFS_LOCK_WRITE:
-            fl.l_type = F_WRLCK;
-            break;
-        case CHIMERA_VFS_LOCK_UNLOCK:
-            fl.l_type = F_UNLCK;
-            break;
-        default:
-            request->status = snfs_errno_to_status(EINVAL);
-            request->complete(request);
-            return;
-    } /* switch */
-
-    fl.l_whence = request->lock.whence;
-    if (request->lock.whence == SEEK_END) {
-        fl.l_start = (off_t) (int64_t) request->lock.offset;
-        fl.l_len   = (off_t) (int64_t) request->lock.length;
-    } else {
-        fl.l_start = (off_t) request->lock.offset;
-        fl.l_len   = (off_t) request->lock.length; /* 0 = to EOF */
-    }
-    fl.l_pid = 0;
-
-    if (request->lock.flags & CHIMERA_VFS_LOCK_TEST) {
-        cmd = F_GETLK;
-    } else if (request->lock.flags & CHIMERA_VFS_LOCK_WAIT) {
-        cmd = F_SETLKW;
-    } else {
-        cmd = F_SETLK;
-    }
-
-    rc = fcntl(fd, cmd, &fl);
-
-    if (rc < 0) {
-        request->status = snfs_errno_to_status(errno);
+    if (request->claim_acquire.klass != CHIMERA_VFS_CLAIM_KLASS_RANGE) {
+        /* This module arbitrates ranges only; it does not declare
+         * CHIMERA_VFS_CAP_CLAIM_AGGREGATE. */
+        request->status = CHIMERA_VFS_ENOTSUP;
         request->complete(request);
         return;
     }
 
-    if (request->lock.flags & CHIMERA_VFS_LOCK_TEST) {
-        if (fl.l_type == F_UNLCK) {
-            request->lock.r_conflict_type   = CHIMERA_VFS_LOCK_UNLOCK;
-            request->lock.r_conflict_offset = 0;
-            request->lock.r_conflict_length = 0;
-            request->lock.r_conflict_pid    = 0;
+    if (snfs_range_to_flock(request, &fl) < 0) {
+        projected = 0;
+    }
+
+    if (request->claim_acquire.flags & CHIMERA_VFS_CLAIM_TEST) {
+        cmd = SNFS_LOCK_GET;
+    } else if (request->claim_acquire.flags & CHIMERA_VFS_CLAIM_WAIT) {
+        cmd = SNFS_LOCK_SETW;
+    } else {
+        cmd = SNFS_LOCK_SET;
+    }
+
+    if (!projected) {
+        /* Nothing to ask the host about.  A probe sees no conflict; an acquire
+         * gets a record that releases as a no-op. */
+        if (!(request->claim_acquire.flags & CHIMERA_VFS_CLAIM_TEST)) {
+            range = calloc(1, sizeof(*range));
+
+            pthread_mutex_lock(&shared->range_lock);
+            range->token = ++shared->range_next_token;
+            LL_PREPEND(shared->ranges, range);
+            pthread_mutex_unlock(&shared->range_lock);
+
+            request->claim_acquire.r_token   = range->token;
+            request->claim_acquire.r_granted = 1;
+        }
+
+        request->status = CHIMERA_VFS_OK;
+        request->complete(request);
+        return;
+    }
+
+    pthread_mutex_lock(&shared->range_lock);
+
+    file = snfs_range_file_get(thread,
+                               request->fh,
+                               request->fh_len,
+                               request->fh_hash,
+                               &request->claim_acquire.owner);
+
+    rc = file ? 0 : errno;
+
+    pthread_mutex_unlock(&shared->range_lock);
+
+    if (!file) {
+        request->status = snfs_errno_to_status(rc);
+        request->complete(request);
+        return;
+    }
+
+    /* Outside the registry lock: F_SETLKW blocks until the contending lock
+     * goes away, and every other claim on this module would be stuck behind it
+     * -- including the release that would let it through.  The reference taken
+     * above keeps file->fd alive meanwhile. */
+    rc = fcntl(file->fd, cmd, &fl);
+
+    if (rc < 0) {
+        int err = errno;
+
+        if (err == EACCES || err == EAGAIN) {
+            /* Held by somebody else: a refusal, not a failure.  Ask who, so
+             * the caller can describe the denial. */
+            if (snfs_range_to_flock(request, &fl) == 0 &&
+                fcntl(file->fd, SNFS_LOCK_GET, &fl) == 0) {
+                snfs_range_report_conflict(request, &fl);
+            }
+            request->status = CHIMERA_VFS_OK;
         } else {
-            request->lock.r_conflict_type = (fl.l_type == F_RDLCK)
-                ? CHIMERA_VFS_LOCK_READ
-                : CHIMERA_VFS_LOCK_WRITE;
-            request->lock.r_conflict_offset = fl.l_start;
-            request->lock.r_conflict_length = fl.l_len;
-            request->lock.r_conflict_pid    = fl.l_pid;
+            request->status = snfs_errno_to_status(err);
+        }
+    } else if (request->claim_acquire.flags & CHIMERA_VFS_CLAIM_TEST) {
+        /* A probe acquires nothing: the answer is the conflict block. */
+        snfs_range_report_conflict(request, &fl);
+        request->status = CHIMERA_VFS_OK;
+    } else {
+        range            = calloc(1, sizeof(*range));
+        range->file      = file;
+        range->projected = 1;
+
+        snfs_range_resolve(&fl, file->fd, &range->offset, &range->length);
+    }
+
+    pthread_mutex_lock(&shared->range_lock);
+
+    if (range) {
+        range->token = ++shared->range_next_token;
+        LL_PREPEND(shared->ranges, range);
+
+        request->claim_acquire.r_token   = range->token;
+        request->claim_acquire.r_granted = 1;
+        request->status                  = CHIMERA_VFS_OK;
+    } else {
+        /* Nothing standing on the descriptor from this request. */
+        snfs_range_file_put(shared, file);
+    }
+
+    pthread_mutex_unlock(&shared->range_lock);
+
+    request->complete(request);
+} /* snfs_claim_acquire */
+
+/* Release by GEOMETRY (claim_release.token == 0): the caller never learned the
+ * absolute bytes it holds -- a SEEK_END lock is resolved down here and the
+ * resolution is never reported back -- so it names the range to drop in exactly
+ * the spelling it named the lock, and this side resolves EOF again.  Every
+ * record of this owner's that overlaps the resolved range goes, each unlocked
+ * over its own bytes so the kernel is left holding precisely what the registry
+ * still describes.  Matching nothing is success. */
+static void
+snfs_claim_release_ranged(
+    struct chimera_vfs_request *request,
+    struct snfs_thread         *thread)
+{
+    struct snfs_shared     *shared = thread->shared;
+    struct snfs_range_file *file;
+    struct snfs_range      *range, *tmp, *matched = NULL;
+    struct flock            fl     = { 0 };
+    uint64_t                offset = request->claim_release.offset;
+    uint64_t                length = request->claim_release.length;
+    int                     err    = 0;
+
+    pthread_mutex_lock(&shared->range_lock);
+
+    file = snfs_range_file_find(shared,
+                                request->fh,
+                                request->fh_len,
+                                request->fh_hash,
+                                &request->claim_release.owner);
+
+    if (file) {
+        /* Pin it across the syscalls below, which run unlocked. */
+        file->refcnt++;
+    }
+
+    pthread_mutex_unlock(&shared->range_lock);
+
+    if (!file) {
+        /* This owner locks nothing on this file, so there is nothing of ours
+         * to drop and no size worth resolving against. */
+        request->status = CHIMERA_VFS_OK;
+        request->complete(request);
+        return;
+    }
+
+    if (request->claim_release.whence == SEEK_END) {
+        /* offset and length are bit-casts of the caller's signed l_start and
+         * l_len and keep POSIX's conventions: l_len 0 is to-EOF and a negative
+         * l_len runs backwards from l_start.  The descriptor is the one the
+         * locks were taken through, so its size is the one the kernel would
+         * resolve an F_UNLCK against. */
+        struct stat st;
+        int64_t     start = (int64_t) offset;
+        int64_t     len   = (int64_t) length;
+
+        if (fstat(file->fd, &st) < 0) {
+            err = errno;
+        } else {
+            start += (int64_t) st.st_size;
+
+            if (len < 0) {
+                start += len;
+                len    = -len;
+            }
+
+            if (start < 0) {
+                err = EINVAL;
+            } else {
+                offset = (uint64_t) start;
+                length = (len == 0) ? UINT64_MAX : (uint64_t) len;
+            }
         }
     }
 
+    if (err) {
+        pthread_mutex_lock(&shared->range_lock);
+        snfs_range_file_put(shared, file);
+        pthread_mutex_unlock(&shared->range_lock);
+
+        request->status = snfs_errno_to_status(err);
+        request->complete(request);
+        return;
+    }
+
+    pthread_mutex_lock(&shared->range_lock);
+
+    LL_FOREACH_SAFE(shared->ranges, range, tmp)
+    {
+        /* One descriptor per (file handle, owner), so having been taken through
+         * this one is the fh and chimera_claim_owner_equal() test already. */
+        if (range->file != file) {
+            continue;
+        }
+
+        /* The record keeps fcntl's spelling, where a length of 0 is to-EOF;
+         * the overlap test speaks the claim wire's, where UINT64_MAX is. */
+        if (!chimera_vfs_claim_range_overlap_i(range->offset,
+                                               range->length ? range->length : UINT64_MAX,
+                                               offset, length)) {
+            continue;
+        }
+
+        LL_DELETE(shared->ranges, range);
+        LL_PREPEND(matched, range);
+    }
+
+    pthread_mutex_unlock(&shared->range_lock);
+
+    /* Outside the registry lock, as every other lock syscall on this module is.
+     * F_UNLCK does not block, but the descriptor put below wants the lock and
+     * there is no reason to hold it across a syscall at all. */
+    LL_FOREACH(matched, range)
+    {
+        fl.l_type   = F_UNLCK;
+        fl.l_whence = SEEK_SET;
+        fl.l_start  = (off_t) range->offset;
+        fl.l_len    = (off_t) range->length;
+        fl.l_pid    = 0;
+
+        fcntl(file->fd, SNFS_LOCK_SET, &fl);
+    }
+
+    pthread_mutex_lock(&shared->range_lock);
+
+    while (matched) {
+        range = matched;
+        LL_DELETE(matched, range);
+        snfs_range_file_put(shared, range->file);
+        free(range);
+    }
+
+    snfs_range_file_put(shared, file);
+
+    pthread_mutex_unlock(&shared->range_lock);
+
     request->status = CHIMERA_VFS_OK;
     request->complete(request);
-} /* snfs_lock */
+} /* snfs_claim_release_ranged */
+
+static void
+snfs_claim_release(
+    struct chimera_vfs_request *request,
+    void                       *private_data)
+{
+    struct snfs_thread *thread = private_data;
+    struct snfs_shared *shared = thread->shared;
+    struct snfs_range  *range;
+    struct flock        fl = { 0 };
+
+    /* claim_release.retained is an AGGREGATE downgrade mask; a RANGE record is
+     * binding and all-or-nothing, so the release simply drops it. */
+
+    if (request->claim_release.token == 0 &&
+        request->claim_release.klass == CHIMERA_VFS_CLAIM_KLASS_RANGE) {
+        snfs_claim_release_ranged(request, thread);
+        return;
+    }
+
+    pthread_mutex_lock(&shared->range_lock);
+
+    for (range = shared->ranges; range; range = range->next) {
+        if (range->token == request->claim_release.token) {
+            LL_DELETE(shared->ranges, range);
+            break;
+        }
+    }
+
+    pthread_mutex_unlock(&shared->range_lock);
+
+    if (range && range->projected) {
+        fl.l_type   = F_UNLCK;
+        fl.l_whence = SEEK_SET;
+        fl.l_start  = (off_t) range->offset;
+        fl.l_len    = (off_t) range->length;
+        fl.l_pid    = 0;
+
+        fcntl(range->file->fd, SNFS_LOCK_SET, &fl);
+
+        pthread_mutex_lock(&shared->range_lock);
+        snfs_range_file_put(shared, range->file);
+        pthread_mutex_unlock(&shared->range_lock);
+    }
+
+    free(range);
+
+    request->status = CHIMERA_VFS_OK;
+    request->complete(request);
+} /* snfs_claim_release */
 
 static void
 snfs_dispatch(
@@ -1751,8 +2271,11 @@ snfs_dispatch(
         case CHIMERA_VFS_OP_SEEK:
             snfs_seek(request, private_data);
             break;
-        case CHIMERA_VFS_OP_LOCK:
-            snfs_lock(request, private_data);
+        case CHIMERA_VFS_OP_CLAIM_ACQUIRE:
+            snfs_claim_acquire(request, private_data);
+            break;
+        case CHIMERA_VFS_OP_CLAIM_RELEASE:
+            snfs_claim_release(request, private_data);
             break;
         default:
             snfs_error("snfs_dispatch: unknown operation %d",
@@ -1764,11 +2287,12 @@ snfs_dispatch(
 } /* snfs_dispatch */
 
 SYMBOL_EXPORT struct chimera_vfs_module vfs_snfs = {
+    .sdk_version  = CHIMERA_VFS_SDK_VERSION,
     .name         = "snfs",
     .fh_magic     = CHIMERA_VFS_FH_MAGIC_SNFS,
     .capabilities = CHIMERA_VFS_CAP_BLOCKING | CHIMERA_VFS_CAP_OPEN_PATH_REQUIRED | CHIMERA_VFS_CAP_OPEN_FILE_REQUIRED |
         CHIMERA_VFS_CAP_FS | CHIMERA_VFS_CAP_FS_RELATIVE_OP | CHIMERA_VFS_CAP_FS_PATH_OP |
-        CHIMERA_VFS_CAP_FS_LOCK |
+        CHIMERA_VFS_CAP_CLAIM_RANGE |
         CHIMERA_VFS_CAP_COPY_RANGE | CHIMERA_VFS_CAP_CLONE_RANGE
     ,
     .init           = snfs_init,
