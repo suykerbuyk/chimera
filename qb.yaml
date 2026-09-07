@@ -1,8 +1,12 @@
 project: chimera
 default_builder_tag: develop
-variables:
-  VERSION: 0.0.0
-  REVISION: 1
+# No VERSION/REVISION here on purpose.  The package version is derived from the
+# nearest reachable <X.Y.Z>-myriad* git tag by qtm_build/pkg_version.sh, which
+# every packaging task sources as its first command; a default here would be a
+# stale 0.0.0-1 that silently wins whenever the tag lookup is the thing that
+# broke.  To force a version, pass `-V VERSION=X.Y.Z [-V REVISION=r]` -- qb
+# exports every manifest variable into the build container as QB_<NAME>, and
+# pkg_version.sh honours QB_VERSION / QB_REVISION.
 
 tasks:
   # Ubuntu22.04 Section
@@ -25,7 +29,8 @@ tasks:
     image: builder_ubuntu22
     context: .
     commands:
-      - export DESTDIR=/build/quantum-chimera-server_${VERSION}-${REVISION}_$arch
+      - . /context/qtm_build/pkg_version.sh
+      - export DESTDIR=/build/quantum-chimera-server_${PKG_VERSION}-${PKG_REVISION}_$arch
       - mkdir -p ${DESTDIR} /dist
       - >
         cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug
@@ -38,7 +43,7 @@ tasks:
       - /context/qtm_build/verify_test_includes.sh ${DESTDIR}/opt/quantum/chimera
       - cd ${DESTDIR}
       - tar cfz /dist/chimera.tar.gz .
-      - /context/qtm_build/make_debian_pkg.sh ${VERSION} ${REVISION} $arch
+      - /context/qtm_build/make_debian_pkg.sh "${PKG_VERSION}" "${PKG_REVISION}" $arch
     assets:
       - from: /dist
         to: debug/Ubuntu22
@@ -54,7 +59,8 @@ tasks:
     image: builder_ubuntu22
     context: .
     commands:
-      - export DESTDIR=/build/quantum-chimera-server_${VERSION}-${REVISION}_$arch
+      - . /context/qtm_build/pkg_version.sh
+      - export DESTDIR=/build/quantum-chimera-server_${PKG_VERSION}-${PKG_REVISION}_$arch
       - mkdir -p ${DESTDIR} /dist
       - >
         cmake -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -67,7 +73,7 @@ tasks:
       - /context/qtm_build/verify_test_includes.sh ${DESTDIR}/opt/quantum/chimera
       - cd ${DESTDIR}
       - tar cfz /dist/chimera.tar.gz .
-      - /context/qtm_build/make_debian_pkg.sh ${VERSION} ${REVISION} $arch
+      - /context/qtm_build/make_debian_pkg.sh "${PKG_VERSION}" "${PKG_REVISION}" $arch
     assets:
       - from: /dist
         to: release/Ubuntu22
@@ -97,7 +103,8 @@ tasks:
     image: builder_ubuntu24
     context: .
     commands:
-      - export DESTDIR=/build/quantum-chimera-server_${VERSION}-${REVISION}_$arch
+      - . /context/qtm_build/pkg_version.sh
+      - export DESTDIR=/build/quantum-chimera-server_${PKG_VERSION}-${PKG_REVISION}_$arch
       - mkdir -p ${DESTDIR} /dist
       - >
         cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug
@@ -110,7 +117,7 @@ tasks:
       - /context/qtm_build/verify_test_includes.sh ${DESTDIR}/opt/quantum/chimera
       - cd ${DESTDIR}
       - tar cfz /dist/chimera.tar.gz .
-      - /context/qtm_build/make_debian_pkg.sh ${VERSION} ${REVISION} $arch
+      - /context/qtm_build/make_debian_pkg.sh "${PKG_VERSION}" "${PKG_REVISION}" $arch
     assets:
       - from: /dist
         to: debug/Ubuntu24
@@ -126,7 +133,8 @@ tasks:
     image: builder_ubuntu24
     context: .
     commands:
-      - export DESTDIR=/build/quantum-chimera-server_${VERSION}-${REVISION}_$arch
+      - . /context/qtm_build/pkg_version.sh
+      - export DESTDIR=/build/quantum-chimera-server_${PKG_VERSION}-${PKG_REVISION}_$arch
       - mkdir -p ${DESTDIR} /dist
       - >
         cmake -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -139,7 +147,7 @@ tasks:
       - /context/qtm_build/verify_test_includes.sh ${DESTDIR}/opt/quantum/chimera
       - cd ${DESTDIR}
       - tar cfz /dist/chimera.tar.gz .
-      - /context/qtm_build/make_debian_pkg.sh ${VERSION} ${REVISION} $arch
+      - /context/qtm_build/make_debian_pkg.sh "${PKG_VERSION}" "${PKG_REVISION}" $arch
     assets:
       - from: /dist
         to: release/Ubuntu24
@@ -169,7 +177,8 @@ tasks:
     image: builder_ubuntu26
     context: .
     commands:
-      - export DESTDIR=/build/quantum-chimera-server_${VERSION}-${REVISION}_$arch
+      - . /context/qtm_build/pkg_version.sh
+      - export DESTDIR=/build/quantum-chimera-server_${PKG_VERSION}-${PKG_REVISION}_$arch
       - mkdir -p ${DESTDIR} /dist
       - >
         cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug
@@ -182,7 +191,7 @@ tasks:
       - /context/qtm_build/verify_test_includes.sh ${DESTDIR}/opt/quantum/chimera
       - cd ${DESTDIR}
       - tar cfz /dist/chimera.tar.gz .
-      - /context/qtm_build/make_debian_pkg.sh ${VERSION} ${REVISION} $arch
+      - /context/qtm_build/make_debian_pkg.sh "${PKG_VERSION}" "${PKG_REVISION}" $arch
     assets:
       - from: /dist
         to: debug/Ubuntu26
@@ -198,7 +207,8 @@ tasks:
     image: builder_ubuntu26
     context: .
     commands:
-      - export DESTDIR=/build/quantum-chimera-server_${VERSION}-${REVISION}_$arch
+      - . /context/qtm_build/pkg_version.sh
+      - export DESTDIR=/build/quantum-chimera-server_${PKG_VERSION}-${PKG_REVISION}_$arch
       - mkdir -p ${DESTDIR} /dist
       - >
         cmake -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -211,7 +221,7 @@ tasks:
       - /context/qtm_build/verify_test_includes.sh ${DESTDIR}/opt/quantum/chimera
       - cd ${DESTDIR}
       - tar cfz /dist/chimera.tar.gz .
-      - /context/qtm_build/make_debian_pkg.sh ${VERSION} ${REVISION} $arch
+      - /context/qtm_build/make_debian_pkg.sh "${PKG_VERSION}" "${PKG_REVISION}" $arch
     assets:
       - from: /dist
         to: release/Ubuntu26
@@ -246,6 +256,7 @@ tasks:
         task: builder_Rocky9
         tag: develop
     commands:
+      - . /context/qtm_build/pkg_version.sh
       - export DESTDIR=/build/root
       - mkdir -p ${DESTDIR} /dist
       - >
@@ -259,7 +270,7 @@ tasks:
       - /context/qtm_build/verify_test_includes.sh ${DESTDIR}/opt/quantum/chimera
       - cd ${DESTDIR}
       - tar cfz /dist/chimera.tar.gz .
-      - /context/qtm_build/make_rpm_pkg.sh ${VERSION} ${REVISION} $xarch
+      - /context/qtm_build/make_rpm_pkg.sh "${PKG_VERSION}" "${PKG_REVISION}" $xarch
     assets:
       - from: /dist
         to: debug/Rocky9
@@ -275,6 +286,7 @@ tasks:
         task: builder_Rocky9
         tag: develop
     commands:
+      - . /context/qtm_build/pkg_version.sh
       - export DESTDIR=/build/root
       - mkdir -p ${DESTDIR} /dist
       - >
@@ -288,7 +300,7 @@ tasks:
       - /context/qtm_build/verify_test_includes.sh ${DESTDIR}/opt/quantum/chimera
       - cd ${DESTDIR}
       - tar cfz /dist/chimera.tar.gz .
-      - /context/qtm_build/make_rpm_pkg.sh ${VERSION} ${REVISION} $xarch
+      - /context/qtm_build/make_rpm_pkg.sh "${PKG_VERSION}" "${PKG_REVISION}" $xarch
     assets:
       - from: /dist
         to: release/Rocky9
