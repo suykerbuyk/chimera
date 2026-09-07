@@ -4,6 +4,10 @@ default:
 variables:
   QB_TAG: ci-${CI_PROJECT_NAME}-${CI_PIPELINE_IID}
   GIT_SUBMODULE_STRATEGY: recursive
+  # Full history: qtm_build/pkg_version.sh derives the package version from the
+  # nearest <X.Y.Z>-myriad* tag, and GitLab's default shallow clone (depth 20)
+  # leaves no tag reachable on develop / merge-train / nightly pipelines.
+  GIT_DEPTH: 0
   QB_PROJECT: chimera
   RUN_QB: qb --plain -o ${QB_TAG} -i ${QB_PROJECT}/${QB_TAG} -b ${CI_PIPELINE_IID} --pod-running-timeout=10m
 
