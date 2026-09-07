@@ -129,6 +129,38 @@ only the *quick* tier (the quint model-based tests); everything else is
   96 pjd failures).  Expect the qb ctest legs, not the merge, to be the
   step that finds these; diagnose before assuming a downstream cause.
 
+### Attributing an extended-tier failure before fixing it
+
+The qb ctest legs report only the test names without `-v`; the failure
+detail appears in the run's final error block, or in a re-run of the one
+leg with `-v` (`qb -o arenaud-claude-sa --plain -a amd64 -v chimera-dev
+ctest_release`, ~40 min, separate tag so it does not collide with the
+check run).  Then decide whose bug it is:
+
+- **Upstream's own Extended runs**: `gh run list --repo chimera-nas/chimera
+  --workflow extended.yml --branch main`, then `gh run view <id> --json jobs`
+  for the per-category job conclusions and `gh api
+  repos/chimera-nas/chimera/actions/jobs/<job>/logs` for the log (the
+  `gh run view --log` form comes back empty).  Extended has been red since
+  at least 2026-09-02 and hits its 6 h timeout, so a job that is absent or
+  cancelled there proves nothing.
+- **develop before the sync**: `glab ci list -R chimera/chimera`, the failed
+  jobs of a nightly pipeline via `glab api
+  "projects/chimera%2Fchimera/pipelines/<id>/jobs?scope[]=failed"`, and
+  `glab ci trace <job>` grepped for `(Failed)`.
+- **Locally**: the smbtorture and WPTS drivers run one case in a few seconds
+  (`smbtorture_test -b <backend> <subtest>` under
+  `scripts/netns_test_wrapper.sh`, `SMBTORTURE_LOG_LEVEL=debug`;
+  `scripts/wpts_smb_test_wrapper.sh <chimera> memfs <Case>` with
+  `CHIMERA_DEBUG=1`).  A failure at ~0.3 s with
+  `io_uring_queue_init_params() failed: Cannot allocate memory` is this
+  box, not the code: export `EVPL_IO_URING_ENTRIES=1024`.
+
+The 2026-09-07 sync brought four such regressions (WPTS ChangeStreamName,
+smbtorture dup_extents on linux, KVM nfstest_alloc on diskfs, two analyzer
+findings); all but the KVM one were fixed as upstream-bound commits, the
+KVM one gated in `.gitlab-ci.yml` with the reason beside it.
+
 ### Verifying with qb: the builder image is not rebuilt by default
 
 Every `ctest_*`, `syntax` and `static_analysis_*` leg declares
