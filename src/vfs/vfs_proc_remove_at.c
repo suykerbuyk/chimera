@@ -10,6 +10,7 @@
 #include "vfs/vfs_internal.h"
 #include "vfs/vfs_name_cache.h"
 #include "vfs/vfs_attr_cache.h"
+#include "vfs/vfs_open_cache.h"
 #include "vfs/vfs_notify.h"
 #include "vfs/sdk/vfs_access.h"
 #include "vfs/sdk/vfs_acl.h"
@@ -106,6 +107,56 @@ chimera_vfs_remove_at_complete(struct chimera_vfs_request *request)
                                           request->remove_at.r_removed_attr.va_fh,
                                           request->remove_at.r_removed_attr.va_fh_len,
                                           &request->remove_at.r_removed_attr);
+        } else if (request->remove_at.child_fh &&
+                   request->remove_at.child_fh_len > 0) {
+            /* The backend did not report the removed object's attrs (the NFS
+             * proxies have no post-op attrs for the victim), but the caller
+             * resolved the child before the remove -- invalidate its attr
+             * cache entry by that handle, or a hardlink survivor keeps
+             * serving the pre-unlink nlink. */
+            struct chimera_vfs_attrs inval;
+
+            inval.va_set_mask = 0;
+            inval.va_req_mask = 0;
+
+            chimera_vfs_attr_cache_insert(thread, attr_cache,
+                                          chimera_vfs_hash(request->remove_at.child_fh,
+                                                           request->remove_at.child_fh_len),
+                                          request->remove_at.child_fh,
+                                          request->remove_at.child_fh_len,
+                                          &inval);
+        }
+
+        /* A path-only backend's fh is a reused interned-path id: after this
+         * remove, a create at the same name reuses that id, so a cached open
+         * handle (holding the now-dead server file id) would be handed back for
+         * the new object and every op through it fails.  Evict the removed
+         * object's handle from both open caches so the next open re-resolves.
+         * Handle-based backends have stable per-object fhs and are unaffected;
+         * an in-use handle is detached, so an unlinked-but-open file keeps
+         * working for its current holders (POSIX). */
+        if (chimera_vfs_module_is_path_only(request->module)) {
+            const void *rfh    = NULL;
+            int         rfhlen = 0;
+
+            if (request->remove_at.child_fh &&
+                request->remove_at.child_fh_len > 0) {
+                rfh    = request->remove_at.child_fh;
+                rfhlen = request->remove_at.child_fh_len;
+            } else if (request->remove_at.r_removed_attr.va_set_mask &
+                       CHIMERA_VFS_ATTR_FH) {
+                rfh    = request->remove_at.r_removed_attr.va_fh;
+                rfhlen = request->remove_at.r_removed_attr.va_fh_len;
+            }
+
+            if (rfh) {
+                chimera_vfs_open_cache_evict(thread,
+                                             thread->vfs->vfs_open_path_cache,
+                                             rfh, rfhlen);
+                chimera_vfs_open_cache_evict(thread,
+                                             thread->vfs->vfs_open_file_cache,
+                                             rfh, rfhlen);
+            }
         }
     }
 
@@ -234,6 +285,28 @@ static void chimera_vfs_remove_at_gate_complete(
  * name-based REMOVE), resolve the child by name so the sticky-directory owner
  * rule and any per-object DELETE grant can be evaluated -- otherwise a sticky
  * directory's owner check is silently skipped. */
+/* Completion of the parent getattr taken when a name-based remove could not
+ * resolve its child: a non-directory parent is ENOTDIR, anything else keeps the
+ * child-resolution error (ENOENT). */
+static void
+chimera_vfs_remove_at_parent_type_check(
+    enum chimera_vfs_error    error_code,
+    struct chimera_vfs_attrs *attr,
+    void                     *private_data)
+{
+    struct chimera_vfs_remove_at_gate *gate   = private_data;
+    enum chimera_vfs_error             status = CHIMERA_VFS_ENOENT;
+
+    if (error_code == CHIMERA_VFS_OK &&
+        (attr->va_set_mask & CHIMERA_VFS_ATTR_MODE) &&
+        !S_ISDIR(attr->va_mode)) {
+        status = CHIMERA_VFS_ENOTDIR;
+    }
+
+    gate->callback(status, NULL, NULL, gate->private_data);
+    chimera_vfs_gate_scratch_free(gate->thread, gate);
+} /* chimera_vfs_remove_at_parent_type_check */
+
 static void
 chimera_vfs_remove_at_sticky_lookup(
     enum chimera_vfs_error    error_code,
@@ -243,9 +316,15 @@ chimera_vfs_remove_at_sticky_lookup(
     struct chimera_vfs_remove_at_gate *gate = private_data;
 
     if (error_code != CHIMERA_VFS_OK) {
-        /* Name absent/unreadable: surface the natural removal error (ENOENT). */
-        gate->callback(error_code, NULL, NULL, gate->private_data);
-        chimera_vfs_gate_scratch_free(gate->thread, gate);
+        /* The child could not be resolved.  Before surfacing the error, settle
+         * ENOTDIR vs ENOENT from the parent itself: resolving the child by name
+         * re-derived the parent by FH, which on a path-only backend re-opens a
+         * (possibly unlinked-while-open) path and returns ENOENT even when the
+         * live parent is a non-directory descriptor -- for which POSIX requires
+         * ENOTDIR.  The already-open parent handle answers authoritatively. */
+        chimera_vfs_getattr(gate->thread, gate->cred, gate->handle,
+                            CHIMERA_VFS_ATTR_MASK_STAT,
+                            chimera_vfs_remove_at_parent_type_check, gate);
         return;
     }
 
@@ -254,10 +333,10 @@ chimera_vfs_remove_at_sticky_lookup(
     gate->child_fh_len      = attr->va_fh_len;
     gate->child_fh_resolved = 1;
 
-    chimera_vfs_gate_delete(&gate->gate_ctx, gate->thread, gate->cred,
-                            gate->handle->fh, gate->handle->fh_len,
-                            gate->child_fh, gate->child_fh_len,
-                            chimera_vfs_remove_at_gate_complete, gate);
+    chimera_vfs_gate_delete_handle(&gate->gate_ctx, gate->thread, gate->cred,
+                                   gate->handle,
+                                   gate->child_fh, gate->child_fh_len,
+                                   chimera_vfs_remove_at_gate_complete, gate);
 } /* chimera_vfs_remove_at_sticky_lookup */
 
 static void
@@ -352,10 +431,10 @@ chimera_vfs_remove_at_common(
         gate->private_data = private_data;
 
         if (child_fh && child_fh_len > 0) {
-            chimera_vfs_gate_delete(&gate->gate_ctx, thread, cred,
-                                    handle->fh, handle->fh_len,
-                                    child_fh, child_fh_len,
-                                    chimera_vfs_remove_at_gate_complete, gate);
+            chimera_vfs_gate_delete_handle(&gate->gate_ctx, thread, cred,
+                                           handle,
+                                           child_fh, child_fh_len,
+                                           chimera_vfs_remove_at_gate_complete, gate);
         } else {
             /* No child FH from the caller (e.g. an NFS name-based REMOVE):
             * resolve it by name so the sticky-directory owner rule and any

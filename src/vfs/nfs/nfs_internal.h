@@ -337,6 +337,14 @@ struct chimera_nfs_client_mount {
     struct chimera_nfs_client_mount  *next;
     struct chimera_vfs_request       *mount_request;
     char                              path[CHIMERA_VFS_PATH_MAX];
+
+    /* The export root's wire handle (NFS4 mounts).  A ".." at the mount root
+     * must resolve to the root itself: the real parent on the server is the
+     * pseudo-fs node above the export, which a mounted client must never see
+     * (the kernel client likewise never sends LOOKUPP across its mount root).
+     * chimera_nfs4_lookup_at compares against this to clamp. */
+    uint8_t                           root_fh[CHIMERA_NFS_PROXY_REMOTE_FH_MAX];
+    int                               root_fh_len;
 };
 
 struct chimera_nfs_client_open_handle {
@@ -364,6 +372,33 @@ struct chimera_nfs4_client_devcache {
     struct chimera_nfs4_client_devcache_entry entries[CHIMERA_NFS4_CLIENT_DEVCACHE_MAX];
 };
 
+/*
+ * CHIMERA_VFS_CAP_CLAIM_RANGE bookkeeping (nfs3_lock.c).
+ *
+ * The proxy arbitrates byte ranges by taking a real NLM lock on the upstream
+ * server, which is how a conflict with any other client of that server reaches
+ * the claim core.  NLM has no token concept, though: an unlock is identified by
+ * (fh, owner handle, offset, length), while CHIMERA_VFS_OP_CLAIM_RELEASE hands
+ * us nothing but the token we minted at grant time.  Every granted range is
+ * therefore remembered here so the NLM UNLOCK can be rebuilt from its token.
+ *
+ * The owner handle is derived from the claim's cluster-stable owner identity
+ * rather than from a node-local pointer, so the same POSIX owner coalesces on
+ * the server even if its requests arrive through two different chimera nodes.
+ */
+#define CHIMERA_NFS3_LOCK_OH_SIZE 25
+
+struct chimera_nfs3_range {
+    uint64_t                   token;
+    uint8_t                    fh[CHIMERA_VFS_FH_SIZE];
+    int                        fh_len;
+    uint64_t                   offset;
+    uint64_t                   length;  /* UINT64_MAX = to-EOF */
+    uint8_t                    oh[CHIMERA_NFS3_LOCK_OH_SIZE];
+    struct chimera_nfs3_range *prev;
+    struct chimera_nfs3_range *next;
+};
+
 struct chimera_nfs_shared {
     struct chimera_nfs_client_mount    *mounts;
 
@@ -385,6 +420,12 @@ struct chimera_nfs_shared {
      * layout->reg_next under pnfs_layout_lock. */
     pthread_mutex_t                     pnfs_layout_lock;
     struct chimera_nfs4_layout         *pnfs_layouts;
+
+    /* Granted byte-range claims, keyed by the token we minted for them (see
+     * struct chimera_nfs3_range above). */
+    pthread_mutex_t                     nlm_range_lock;
+    struct chimera_nfs3_range          *nlm_ranges;
+    uint64_t                            nlm_next_token;
 
     struct PORTMAP_V2                   portmap_v2;
     struct NFS_MOUNT_V3                 mount_v3;
@@ -484,9 +525,16 @@ chimera_nfs_thread_get_server_thread(
     }
 
     if (unlikely(thread->max_server_threads != thread->shared->max_servers && index >= thread->max_server_threads)) {
+        int old_max = thread->max_server_threads;
+
         thread->max_server_threads = thread->shared->max_servers;
         thread->server_threads     = realloc(thread->server_threads,
                                              thread->max_server_threads * sizeof(*thread->server_threads));
+        /* realloc does not zero the extension; the not-NULL test below would
+         * otherwise read garbage as a live server_thread. */
+        memset(thread->server_threads + old_max, 0,
+               (thread->max_server_threads - old_max) *
+               sizeof(*thread->server_threads));
     }
 
     if (unlikely(!thread->server_threads[index])) {
@@ -706,6 +754,23 @@ chimera_nfs4_unmarshall_fh(
  * in the fattr4 structure.
  */
 static inline void
+chimera_nfs4_attr_request_stat(uint32_t *attr_request)
+{
+    /* The full stat attribute set, matching what chimera_nfs4_unmarshall_fattr
+     * decodes.  Every GETATTR the proxy embeds requests this same set so any
+     * reply can satisfy a stat() (and, being MASK_STAT-complete, is eligible
+     * for the engine's attribute cache).  FSID in particular is what gives
+     * st_dev a defined value -- without it the field is uninitialized. */
+    attr_request[0] = (1 << FATTR4_TYPE) | (1 << FATTR4_SIZE) |
+        (1 << FATTR4_FSID) | (1 << FATTR4_FILEID);
+    attr_request[1] = (1 << (FATTR4_MODE - 32)) | (1 << (FATTR4_NUMLINKS - 32)) |
+        (1 << (FATTR4_OWNER - 32)) | (1 << (FATTR4_OWNER_GROUP - 32)) |
+        (1 << (FATTR4_RAWDEV - 32)) | (1 << (FATTR4_SPACE_USED - 32)) |
+        (1 << (FATTR4_TIME_ACCESS - 32)) | (1 << (FATTR4_TIME_METADATA - 32)) |
+        (1 << (FATTR4_TIME_MODIFY - 32));
+} /* chimera_nfs4_attr_request_stat */
+
+static inline void
 chimera_nfs4_unmarshall_fattr(
     const struct fattr4      *fattr,
     struct chimera_vfs_attrs *attr)
@@ -761,6 +826,23 @@ chimera_nfs4_unmarshall_fattr(
         attr->va_size      = chimera_nfs_ntoh64(*(uint64_t *) data);
         data              += sizeof(uint64_t);
         attr->va_set_mask |= CHIMERA_VFS_ATTR_SIZE;
+    }
+
+    if (fattr->attrmask[0] & (1 << FATTR4_FSID)) {
+        uint64_t fsid_major;
+
+        if (data + 2 * sizeof(uint64_t) > dataend) {
+            return;
+        }
+        fsid_major = chimera_nfs_ntoh64(*(uint64_t *) data);
+        data      += 2 * sizeof(uint64_t);   /* major + minor */
+        /* The server's fsid identifies the exported filesystem; surface it as
+         * both the fsid and the device so stat() reports a stable st_dev for
+         * every object on the mount (the field is otherwise uninitialized,
+         * which the model tests catch as identity instability). */
+        attr->va_fsid      = fsid_major;
+        attr->va_dev       = fsid_major;
+        attr->va_set_mask |= CHIMERA_VFS_ATTR_FSID | CHIMERA_VFS_ATTR_DEV;
     }
 
     if (fattr->attrmask[0] & (1 << FATTR4_FILEID)) {
@@ -842,6 +924,15 @@ chimera_nfs4_unmarshall_fattr(
         /* Canonical VFS rdev packing: (major << 32) | minor. */
         attr->va_rdev      = ((uint64_t) specdata1 << 32) | specdata2;
         attr->va_set_mask |= CHIMERA_VFS_ATTR_RDEV;
+    }
+
+    if (fattr->attrmask[1] & (1 << (FATTR4_SPACE_USED - 32))) {
+        if (data + sizeof(uint64_t) > dataend) {
+            return;
+        }
+        attr->va_space_used = chimera_nfs_ntoh64(*(uint64_t *) data);
+        data               += sizeof(uint64_t);
+        attr->va_set_mask  |= CHIMERA_VFS_ATTR_SPACE_USED;
     }
 
     if (fattr->attrmask[1] & (1 << (FATTR4_TIME_ACCESS - 32))) {
@@ -1153,7 +1244,12 @@ void chimera_nfs3_link_at(
     struct chimera_nfs_shared *,
     struct chimera_vfs_request *,
     void *);
-void chimera_nfs3_lock(
+void chimera_nfs3_claim_acquire(
+    struct chimera_nfs_thread *,
+    struct chimera_nfs_shared *,
+    struct chimera_vfs_request *,
+    void *);
+void chimera_nfs3_claim_release(
     struct chimera_nfs_thread *,
     struct chimera_nfs_shared *,
     struct chimera_vfs_request *,
@@ -1228,7 +1324,7 @@ void chimera_nfs4_close_send(
  * to open the file.  `stateid` is the one OPEN returned, or NULL for a caller
  * that has none.  See nfs4_open_state.h for why this is counted apart from the
  * per-handle open state. */
-void chimera_nfs4_open_file_get(
+int chimera_nfs4_open_file_get(
     struct chimera_nfs_client_server *server,
     const uint8_t                    *fh,
     int                               fh_len,
@@ -1241,6 +1337,11 @@ int chimera_nfs4_open_file_put(
     const uint8_t                    *fh,
     int                               fh_len,
     struct stateid4                  *r_stateid);
+
+void chimera_nfs4_open_file_close_done(
+    struct chimera_nfs_client_server *server,
+    const uint8_t                    *fh,
+    int                               fh_len);
 
 /* Free any entries left on a server at module teardown. */
 void chimera_nfs4_open_file_drain(

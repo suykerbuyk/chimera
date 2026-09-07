@@ -37,7 +37,8 @@ reads the file:
 | `buckets` | object | server | S3 buckets. |
 | `fuse_mounts` | object | server | Local kernel FUSE mounts (Linux only). |
 | `users` | array | server + client | Built-in user accounts (uid/gid, passwords). |
-| `s3_access_keys` | array | server | S3 access/secret key pairs. |
+| `s3_access_keys` | array | server | S3 access/secret key pairs, each bound to a user. |
+| `s3_anon` | object | server | Identity an S3 key with no user binding acts as. |
 | `config` | object | client | Client-library settings (the client's analogue of `server`). |
 
 A typical server config wires a **mount** (a VFS backend) and then publishes it
@@ -84,6 +85,7 @@ the canonical place to set them.
 | `slab_size` | size | libevpl default | libevpl memory slab size. |
 | `preallocate_slabs` | int | libevpl default | Number of memory slabs to preallocate at startup. |
 | `preallocate_threads` | int | libevpl default | Threads used to preallocate slabs in parallel. |
+| `io_uring_entries` | int | `8192` | io_uring submission/completion ring depth, per event-loop thread. Each ring costs roughly 1.5 MB of kernel-accounted memory at the default (`SQE128`/`CQE32` double both entry sizes) and SQPOLL adds a kernel thread per ring, so a host running many threads or many Chimera processes can be refused with `ENOMEM`. The value is honoured or the ring fails; it is never reduced silently. Can also be set with `EVPL_IO_URING_ENTRIES`. |
 | `rdmacm_tos` | int | `0` | RoCEv2 traffic class stamped on every RDMA QP. ToS = DSCP x 4 (e.g. `104` for DSCP 26) so the fabric's lossless/PFC class carries Chimera traffic. |
 | `metrics_file` | string | - | On shutdown, write a final Prometheus scrape to this file (so short runs keep their metrics). |
 | `umount_timeout_ms` | int | `1000` | How long an unmount waits for the mount's open handles to be closed and released before giving up and returning `EBUSY`. Raise it for backends whose closes are slow; it exists so that unmounting a genuinely busy mount fails rather than hanging. |
@@ -335,12 +337,78 @@ An **array** of built-in accounts (used by NFS/SMB auth and ownership mapping).
 
 ### `s3_access_keys`
 
-An **array** of S3 credentials. Both keys are required per entry.
+An **array** of S3 credentials. `access_key` and `secret_key` are required per
+entry.
 
 | Key | Type | Description |
 |---|---|---|
 | `access_key` | string | S3 access key ID. |
 | `secret_key` | string | S3 secret access key. |
+| `username` | string | Name of a `users` entry this key acts as. |
+| `user_id` | string | S3 canonical user id reported as the `<Owner>` in ACL replies. Defaults to the access key. |
+| `display_name` | string | Display name reported alongside it. Defaults to `username`. |
+
+Every request authenticated with a key runs against the store as that user's
+uid/gid, and objects and buckets it creates are owned by them. Authorization is
+therefore the store's own ownership and mode bits — the same ones NFS and SMB
+enforce — so a key can only reach what its user could reach over any other
+protocol. Give two tenants two keys bound to two users and neither can read or
+write the other's buckets.
+
+```json
+"users": [
+    { "username": "alice", "uid": 1001, "gid": 1001 },
+    { "username": "bob",   "uid": 1002, "gid": 1002 }
+],
+"s3_access_keys": [
+    { "access_key": "AKIAALICE", "secret_key": "...", "username": "alice" },
+    { "access_key": "AKIABOB",   "secret_key": "...", "username": "bob" }
+]
+```
+
+`user_id` and `display_name` are S3 identity strings with no POSIX equivalent;
+they name the principal in `GET ?acl` output and nowhere else. Access is decided
+by the uid/gid `username` resolves to, never by these.
+
+A key with no `username` — or one naming a user that does not exist — is
+**unbound**: it acts as the anonymous identity below rather than as root, and is
+logged at startup. Such a key authenticates successfully but will be denied
+anything the anonymous user may not do, so bind every key you expect to work.
+
+### `s3_anon`
+
+Identity an unbound S3 access key acts as. Defaults to nobody/nogroup.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `uid` | int | `65534` | POSIX user ID for unbound keys. |
+| `gid` | int | `65534` | POSIX group ID for unbound keys. |
+
+### S3 access control
+
+Buckets and objects are ordinary directories and files, so S3 access control is
+projected onto their mode bits and enforced by the same VFS permission gate NFS
+and SMB go through — there is no separate S3 ACL store to keep in agreement.
+
+`x-amz-acl` on PutObject, CreateBucket and `PUT ?acl` maps to a mode:
+
+| canned ACL | file | directory |
+|---|---|---|
+| `private` | 0600 | 0700 |
+| `public-read` | 0644 | 0755 |
+| `public-read-write` | 0666 | 0777 |
+| `authenticated-read` | 0644 | 0755 |
+
+An object created with no `x-amz-acl` is **private** (0600), matching S3's
+default. A bucket created with none stays world-traversable (0755), because
+reaching a public object requires search permission on the directory holding it.
+
+`authenticated-read` is an approximation: a POSIX mode has no bit that
+distinguishes "any authenticated principal" from "everyone", so it is treated as
+`public-read` — slightly more permissive than S3.
+
+`GET ?acl` reverses the projection, reporting the owner with FULL_CONTROL plus
+an AllUsers READ or WRITE grant when the world bits are set.
 
 ### Full server example
 
@@ -379,7 +447,7 @@ An **array** of S3 credentials. Both keys are required per entry.
         { "username": "alice", "password": "secret", "uid": 1000, "gid": 1000 }
     ],
     "s3_access_keys": [
-        { "access_key": "AKIDEXAMPLE", "secret_key": "wJalrXUtnFEMI..." }
+        { "access_key": "AKIDEXAMPLE", "secret_key": "wJalrXUtnFEMI...", "username": "alice" }
     ]
 }
 ```

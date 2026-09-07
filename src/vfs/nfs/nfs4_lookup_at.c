@@ -175,11 +175,25 @@ chimera_nfs4_lookup_at(
         op_type = LOOKUP_OP_NORMAL;
     }
 
-    ctx          = request->plugin_data;
-    ctx->server  = server;
-    ctx->op_type = op_type;
+    ctx         = request->plugin_data;
+    ctx->server = server;
 
     chimera_nfs4_map_fh(request->fh, request->fh_len, &fh, &fhlen);
+
+    /* ".." at the mount root resolves to the root itself.  The server-side
+     * parent is the pseudo-fs node above the export, which this client must
+     * not surface (the kernel NFS client likewise never crosses its mount
+     * root); a self-lookup is exactly the LOOKUP_OP_DOT compound. */
+    if (op_type == LOOKUP_OP_DOTDOT) {
+        struct chimera_nfs_client_mount *cm = request->mount_private;
+
+        if (cm && cm->root_fh_len == fhlen &&
+            memcmp(cm->root_fh, fh, fhlen) == 0) {
+            op_type = LOOKUP_OP_DOT;
+        }
+    }
+
+    ctx->op_type = op_type;
 
     memset(&args, 0, sizeof(args));
     args.tag.len      = 0;
@@ -221,12 +235,7 @@ chimera_nfs4_lookup_at(
      * evaluate ownership; without them the gate sees uid/gid 0 and mis-decides
      * owner/group access (pjdfstest open/06). */
     argarray[getattr_idx].argop = OP_GETATTR;
-    attr_request[0]             = (1 << FATTR4_TYPE) | (1 << FATTR4_SIZE) | (1 << FATTR4_FILEID);
-    attr_request[1]             = (1 << (FATTR4_MODE - 32)) | (1 << (FATTR4_NUMLINKS - 32)) |
-        (1 << (FATTR4_OWNER - 32)) | (1 << (FATTR4_OWNER_GROUP - 32)) |
-        (1 << (FATTR4_RAWDEV - 32)) |
-        (1 << (FATTR4_TIME_ACCESS - 32)) | (1 << (FATTR4_TIME_METADATA - 32)) |
-        (1 << (FATTR4_TIME_MODIFY - 32));
+    chimera_nfs4_attr_request_stat(attr_request);
     argarray[getattr_idx].opgetattr.attr_request     = attr_request;
     argarray[getattr_idx].opgetattr.num_attr_request = 2;
 

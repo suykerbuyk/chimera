@@ -744,9 +744,19 @@ op_access(
     res = mbt_access(o->env, fh, (uint32_t) op_i64(op, "mask"));
     if (check_status(o, "OAccess", expected, res->status, m) &&
         expected == NFS3_OK) {
-        if (res->access != (uint32_t) op_i64(op, "access")) {
+        uint32_t eacc = (uint32_t) op_i64(op, "access");
+
+        /* Tolerate chimera's root/AUTH_NONE DAC override granting
+         * ACCESS3_EXECUTE (0x20) on a file with no execute mode bit -- the
+         * mirror of the NFSv4 D4-19 case.  ACCESS is advisory (RFC 1813
+         * 3.3.4), the Linux server and NFS-Ganesha withhold exec-override
+         * absent an x bit, and every other bit matches. */
+        int      exec_overgrant = (eacc & 0x20) == 0 &&
+            res->access == (eacc | 0x20);
+
+        if (res->access != eacc && !exec_overgrant) {
             mism_add(m, "access: expected %#x, got %#x",
-                     (unsigned) op_i64(op, "access"), res->access);
+                     (unsigned) eacc, res->access);
         }
         check_attrs(o, op_i64(op, "obj"), &res->obj_attrs, post_fs, m,
                     "obj_attrs");
@@ -1435,7 +1445,29 @@ find_handler(const char *tag)
  */
 static uint32_t mbt_cred_gids[64];
 
-static void
+/* Traces abandoned because the flavor in force cannot express them (see
+ * mbt_set_cred).  Reported at the end so a run that covered less than the
+ * corpus says so rather than looking complete. */
+static int      g_traces_skipped;
+
+/*
+ * Returns 0 when the operation can be replayed under the harness's security
+ * flavor, and -1 when it cannot.
+ *
+ * Under RPCSEC_GSS there is no uid on the wire: the caller is whoever the
+ * context authenticated.  Calling as a second user therefore means a second
+ * context under that user's own principal -- which is what a real client's
+ * rpc.gssd builds, one per user, from each user's credential cache -- so that
+ * is what this asks for, and the server maps the principal back to the uid
+ * through its configured principal map.
+ *
+ * What the map cannot express is a gid unrelated to the uid, or supplementary
+ * groups: those come from the server's idea of the user, not from the call.
+ * An operation asking for one is abandoned rather than replayed under an
+ * identity that only resembles it, which would turn a DAC trace into a false
+ * pass.
+ */
+static int
 mbt_set_cred(
     struct mbt_env *env,
     json_t         *op)
@@ -1444,6 +1476,25 @@ mbt_set_cred(
     json_t *gids;
     size_t  n, i, cap = sizeof(mbt_cred_gids) / sizeof(mbt_cred_gids[0]);
 
+    if (env->sec != MBT_SEC_SYS) {
+        uint32_t uid = 0, gid = 0;
+
+        if (cred) {
+            uid  = (uint32_t) op_i64(cred, "uid");
+            gid  = (uint32_t) op_i64(cred, "gid");
+            gids = json_object_get(cred, "gids");
+
+            if (gid != uid ||
+                (gids && json_array_size(itf_seq(gids)) > 0)) {
+                return -1;
+            }
+        }
+
+        env->cred = *mbt_cred_for_uid(env, env->nfs_conn, &env->nfs_v3.rpc2,
+                                      uid);
+        return 0;
+    }
+
     env->cred.flavor = EVPL_RPC2_AUTH_SYS;
 
     if (!cred) {
@@ -1451,7 +1502,7 @@ mbt_set_cred(
         env->cred.authsys.gid      = 0;
         env->cred.authsys.num_gids = 0;
         env->cred.authsys.gids     = NULL;
-        return;
+        return 0;
     }
 
     env->cred.authsys.uid = (uint32_t) op_i64(cred, "uid");
@@ -1471,7 +1522,70 @@ mbt_set_cred(
     }
     env->cred.authsys.num_gids = (uint32_t) n;
     env->cred.authsys.gids     = n ? mbt_cred_gids : NULL;
+    return 0;
 } /* mbt_set_cred */
+
+/*
+ * The distinct uids a corpus calls as.
+ *
+ * The server reads its principal map once, at start-up, so the identities a
+ * replay will need have to be known before the first trace runs.  Reading the
+ * traces twice is cheaper than the alternative -- a map wide enough for any
+ * uid a corpus might one day use -- and it stays right when the corpus
+ * changes.
+ */
+static int
+mbt_collect_cred_uids(
+    char    **traces,
+    int       ntraces,
+    uint32_t *out,
+    int       cap)
+{
+    int n = 0, i;
+
+    for (i = 0; i < ntraces; i++) {
+        json_error_t jerr;
+        json_t      *root = json_load_file(traces[i], 0, &jerr);
+        json_t      *states, *st;
+        size_t       k;
+
+        if (!root) {
+            continue;   /* run_trace reports the parse error properly */
+        }
+
+        states = json_object_get(root, "states");
+
+        json_array_foreach(states, k, st)
+        {
+            json_t  *last_op = json_object_get(st, "lastOp");
+            json_t  *op      = last_op ? json_object_get(last_op, "value") : NULL;
+            json_t  *cred    = op ? json_object_get(op, "cred") : NULL;
+            uint32_t uid;
+            int      seen = 0, j;
+
+            if (!cred) {
+                continue;
+            }
+
+            uid = (uint32_t) op_i64(cred, "uid");
+
+            for (j = 0; j < n; j++) {
+                if (out[j] == uid) {
+                    seen = 1;
+                    break;
+                }
+            }
+
+            if (!seen && n < cap) {
+                out[n++] = uid;
+            }
+        }
+
+        json_decref(root);
+    }
+
+    return n;
+} /* mbt_collect_cred_uids */
 
 /* ---- replay driver -------------------------------------------------------- */
 
@@ -1558,7 +1672,8 @@ run_trace(
     struct oracle *o;
     size_t         idx;
     size_t         nstates;
-    int            failed = 0;
+    int            failed  = 0;
+    int            skipped = 0;
     double         rate;
     int            total;
     struct mism    m;
@@ -1638,7 +1753,16 @@ run_trace(
 
         memset(&m, 0, sizeof(m));
         mbt_watchdog_at(trace_path, (int) idx, tag);
-        mbt_set_cred(env, op);
+
+        if (mbt_set_cred(env, op)) {
+            if (verbose) {
+                printf("  [%4zu] %s -> skipped: identity is the principal's "
+                       "under %s\n", idx, tag, mbt_sec_name(env->sec));
+            }
+            skipped = 1;
+            goto out;
+        }
+
         fn(o, op, fs, &m);
         history_push(o, (int) idx, tag, op, env->res.status);
         if (verbose) {
@@ -1666,6 +1790,10 @@ run_trace(
            trace_path, nstates - 1, o->attr_checks, o->attr_skips);
 
  out:
+    if (skipped) {
+        g_traces_skipped++;
+    }
+
     mbt_env_fs_teardown(env, fsname);
     while (o->nhist) {
         free(o->history[--o->nhist].op_dump);
@@ -1686,23 +1814,27 @@ main(
     char **argv)
 {
     static struct option long_options[] = {
-        { "trace",              required_argument,              0,
+        { "trace",              required_argument,                0,
           't'                                                                           },
-        { "trace-dir",          required_argument,              0,
+        { "trace-dir",          required_argument,                0,
           'D'                                                                           },
-        { "exclude-prefix",     required_argument,              0,
+        { "exclude-prefix",     required_argument,                0,
           'X'                                                                           },
-        { "block-size",         required_argument,              0,
+        { "block-size",         required_argument,                0,
           'b'                                                                                                         },
-        { "max-attr-skip-rate", required_argument,              0,
+        { "max-attr-skip-rate", required_argument,                0,
           'r'                                                                                                                                      },
-        { "dry-run",            no_argument,                    0,
+        { "dry-run",            no_argument,                      0,
           'n'                                                                                                                                                                   },
-        { "verbose",            no_argument,                    0,
+        { "verbose",            no_argument,                      0,
           'v'                                                                                                                                                                                                },
-        { "backend",            required_argument,              0,
+        { "backend",            required_argument,                0,
           'B'                                                                           },
-        { 0,                    0,                              0,                             0 },
+        { "rdma",               no_argument,                      0,
+          'R'                                                                           },
+        { "sec",                required_argument,                0,
+          'S'                                                                           },
+        { 0,                    0,                                0,                               0 },
     };
     char               **traces;
     int                  ntraces            = 0;
@@ -1710,7 +1842,9 @@ main(
     double               max_attr_skip_rate = 0.1;
     int                  dry_run            = 0;
     int                  verbose            = 0;
+    int                  sec                = MBT_SEC_SYS;
     const char          *backend            = "memfs";
+    int                  rdma               = 0;
     int                  failures           = 0;
     int                  c;
     int                  i;
@@ -1719,6 +1853,16 @@ main(
     /* Neutralize the host umask so passthrough backends (linux/io_uring) apply
      * client-sent modes verbatim and the export root keeps its 0777.  The mkfs
      * backends store modes directly and are unaffected. */
+    /* Line-buffer stdout so a crash cannot swallow the progress output.
+     * These drivers print one line per trace, and both that and chimera's log
+     * (which defaults to stdout) are block-buffered when stdout is a pipe --
+     * which it always is under ctest.  glibc's abort() does not flush stdio,
+     * so on Linux an aborting run loses everything since the last 4 KB
+     * boundary, including the line naming the trace that was executing and
+     * the fatal log message itself.  That is exactly what made a CI abort
+     * here undiagnosable from its artifacts. */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
     umask(0);
 
     /* --trace/--trace-dir/--exclude-prefix are gathered from the raw argv by
@@ -1726,7 +1870,7 @@ main(
      * error, and skips them here (the 't'/'D'/'X' cases). */
     traces = mbt_collect_traces(argc, argv, &ntraces);
 
-    while ((c = getopt_long(argc, argv, "t:D:X:b:r:nvB:", long_options,
+    while ((c = getopt_long(argc, argv, "t:D:X:b:r:nvB:RS:", long_options,
                             NULL)) != -1) {
         switch (c) {
             case 't':
@@ -1748,12 +1892,25 @@ main(
             case 'B':
                 backend = optarg;
                 break;
+            case 'R':
+                rdma = 1;
+                break;
+            case 'S':
+                sec = mbt_sec_parse(optarg);
+                if (sec < 0) {
+                    fprintf(stderr, "%s: unknown security flavor '%s'\n",
+                            argv[0], optarg);
+                    mbt_free_traces(traces, ntraces);
+                    return 2;
+                }
+                break;
             default:
                 fprintf(stderr,
                         "usage: %s [--trace FILE ...] [--trace-dir DIR] "
                         "[--block-size N] [--max-attr-skip-rate F] "
                         "[--backend memfs|diskfs|cairn|linux|io_uring] "
-                        "[--dry-run] [--verbose]\n", argv[0]);
+                        "[--sec sys|krb5|krb5i|krb5p] "
+                        "[--rdma] [--dry-run] [--verbose]\n", argv[0]);
                 mbt_free_traces(traces, ntraces);
                 return 2;
         } /* switch */
@@ -1771,7 +1928,13 @@ main(
      * isolation.  A single-fs backend (linux/io_uring) would instead clear the
      * backing directory between traces. */
     if (!dry_run) {
-        struct mbt_env_opts opts = { .module = backend };
+        uint32_t            uids[MBT_MAX_MAPPED_UIDS];
+        struct mbt_env_opts opts = { .module = backend, .rdma = rdma,
+                                     .sec    = sec };
+
+        opts.num_principal_uids = mbt_collect_cred_uids(traces, ntraces, uids,
+                                                        MBT_MAX_MAPPED_UIDS);
+        opts.principal_uids = uids;
         mbt_env_open_opts(&env, &opts);
     }
 
@@ -1785,6 +1948,12 @@ main(
 
     if (!dry_run) {
         mbt_env_stop(&env);
+    }
+
+    if (g_traces_skipped) {
+        printf("%d of %d traces not applicable under %s (identity is the "
+               "principal's)\n", g_traces_skipped, (int) ntraces,
+               mbt_sec_name(sec));
     }
 
     mbt_free_traces(traces, ntraces);

@@ -5,6 +5,7 @@
 #pragma once
 
 #include <utlist.h>
+#include <urcu/urcu-qsbr.h>
 
 #include "nfs.h"
 #include "nfs_fh_wrap.h"
@@ -201,6 +202,11 @@ struct nfs_request {
      * at completion time (nfs4_replay_slot_finalize) and on replay
      * short-circuit. */
     struct nfs4_replay_slot          *replay_slot;
+    /* The session that owns replay_slot.  Distinct from req->session, which
+     * a CREATE_SESSION later in the same compound reassigns to the session
+     * it creates -- the reply capture and slot finalize must keep charging
+     * the slot's owner. */
+    struct nfs4_session              *replay_session;
     uint32_t                          replay_slot_id;
     uint8_t                           replay_action;
     /* Continuation parked while nfs4_root_junction_check resolves the "/"
@@ -276,6 +282,10 @@ struct chimera_nfs_export {
     uint32_t                   anonuid;
     uint32_t                   anongid;
     uint32_t                   sec_allowed;  /* CHIMERA_NFS_SEC_* mask; 0 = any */
+    /* Deferred-reclaim head: request threads reach an export locklessly via
+     * exports_by_id[], so a removal must wait out a grace period before the
+     * struct is freed. */
+    struct rcu_head            rcu;
     struct chimera_nfs_export *prev;
     struct chimera_nfs_export *next;
 };
@@ -384,6 +394,11 @@ struct chimera_server_nfs_shared {
      * survive a restart (a config-supplied key overrides). */
     int                                 fh_sign;
     uint8_t                             fh_key[16];
+
+    /* True once the RPCSEC_GSS (Kerberos) acceptor is installed, snapshotted
+     * from server.nfs_kerberos_enabled at init.  Security-flavor advertisement
+     * consults it so we never offer a flavor the RPC layer cannot accept. */
+    int                                 gss_enabled;
 
     struct chimera_nfs_mount_entry     *mount_entries;
     pthread_mutex_t                     mount_entries_lock;
@@ -518,6 +533,7 @@ nfs_request_alloc(
     req->encoding = encoding;
 
     req->replay_slot    = NULL;
+    req->replay_session = NULL;
     req->replay_slot_id = 0;
     req->replay_action  = NFS4_REPLAY_ACTION_NONE;
 
@@ -790,13 +806,15 @@ chimera_nfs_fh_encode(
 /*
  * Populate `out` (capacity >= 4) with the secinfo4 entries advertising an
  * export's allowed security flavors.  An export with no explicit policy
- * (sec_allowed == 0) advertises everything chimera supports.  Returns the
+ * (sec_allowed == 0) advertises everything chimera supports.  `gss_enabled` is
+ * the server's live RPCSEC_GSS state (shared->gss_enabled).  Returns the
  * number of entries written, in the server's preference order.
  */
 static inline int
 chimera_nfs_fill_secinfo(
     struct secinfo4 *out,
-    uint32_t         sec_allowed)
+    uint32_t         sec_allowed,
+    int              gss_enabled)
 {
     /* Kerberos v5 mechanism OID 1.2.840.113554.1.2.2 (RFC 1964). */
     static const uint8_t krb5_oid[9] = {
@@ -819,6 +837,17 @@ chimera_nfs_fill_secinfo(
     };
     /* *INDENT-ON* */
     unsigned i;
+
+    /* RFC 7530 §3.2.1.1 / §16.31: SECINFO must report flavors the server will
+     * actually accept.  Without the Kerberos acceptor installed (default:
+     * server.nfs_kerberos_enabled is off) an RPCSEC_GSS client would be
+     * rejected at the RPC layer, so suppress the krb5 triples -- but only when
+     * AUTH_SYS survives, since an export explicitly configured for GSS alone
+     * must not be silently downgraded to an empty (or AUTH_SYS) list. */
+    if (!gss_enabled && (mask & CHIMERA_NFS_SEC_SYS)) {
+        mask &= ~(CHIMERA_NFS_SEC_KRB5 | CHIMERA_NFS_SEC_KRB5I |
+                  CHIMERA_NFS_SEC_KRB5P);
+    }
 
     if (mask & CHIMERA_NFS_SEC_SYS) {
         out[n++].flavor = AUTH_SYS;

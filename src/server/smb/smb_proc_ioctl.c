@@ -5,7 +5,7 @@
 #include "smb_internal.h"
 #include "smb_procs.h"
 #include "smb_string.h"
-#include "smb2.h"
+#include "smb_common/smb2.h"
 #include "common/misc.h"
 
 /* MS-SMB2 3.3.5.15.12: validate an FSCTL_VALIDATE_NEGOTIATE_INFO request
@@ -142,6 +142,17 @@ chimera_smb_ioctl(struct chimera_smb_request *request)
             if (unlikely(!open_file)) {
                 evpl_iovecs_release(thread->evpl, request->ioctl.input_iov, request->ioctl.input_niov);
                 chimera_smb_complete_request(request, SMB2_STATUS_FILE_CLOSED);
+                return;
+            }
+
+            /* Only named-pipe opens carry a transceive handler; a normal file
+             * open leaves it NULL.  MS-SMB2 3.3.5.15 wants an FSCTL that is
+             * invalid for the file type rejected rather than dispatched, which
+             * is also what the ncacn_np READ and WRITE paths do. */
+            if (unlikely(open_file->type != CHIMERA_SMB_OPEN_FILE_TYPE_PIPE)) {
+                chimera_smb_open_file_release(request, open_file);
+                evpl_iovecs_release(thread->evpl, request->ioctl.input_iov, request->ioctl.input_niov);
+                chimera_smb_complete_request(request, SMB2_STATUS_INVALID_DEVICE_REQUEST);
                 return;
             }
 

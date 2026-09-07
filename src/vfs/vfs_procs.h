@@ -783,6 +783,12 @@ typedef void (*chimera_vfs_rename_at_callback_t)(
     struct chimera_vfs_attrs *todir_post_attr,
     void                     *private_data);
 
+/* rename_at `flags`: the caller knows the renamed object is a DIRECTORY, so
+ * the change notification it raises is a directory-name change rather than a
+ * file-name one.  Only the SMB path knows this (the open carries the type);
+ * everything else leaves it clear and gets the both-filters class. */
+#define CHIMERA_VFS_RENAME_SRC_IS_DIR 0x00000001
+
 void
 chimera_vfs_rename_at(
     struct chimera_vfs_thread       *thread,
@@ -1065,27 +1071,6 @@ chimera_vfs_seek(
     chimera_vfs_seek_callback_t     callback,
     void                           *private_data);
 
-typedef void (*chimera_vfs_lock_callback_t)(
-    enum chimera_vfs_error error_code,
-    uint32_t               conflict_type,
-    uint64_t               conflict_offset,
-    uint64_t               conflict_length,
-    pid_t                  conflict_pid,
-    void                  *private_data);
-
-void
-chimera_vfs_lock(
-    struct chimera_vfs_thread      *thread,
-    const struct chimera_vfs_cred  *cred,
-    struct chimera_vfs_open_handle *handle,
-    int32_t                         whence,
-    uint64_t                        offset,
-    uint64_t                        length,
-    uint32_t                        lock_type,
-    uint32_t                        flags,
-    chimera_vfs_lock_callback_t     callback,
-    void                           *private_data);
-
 typedef void (*chimera_vfs_getparent_callback_t)(
     enum chimera_vfs_error error_code,
     const uint8_t         *parent_fh,
@@ -1230,6 +1215,7 @@ chimera_vfs_list_streams(
     uint64_t                            cookie,
     void                               *buffer,
     uint32_t                            max_bytes,
+    int                                 want_fh,
     chimera_vfs_list_streams_callback_t callback,
     void                               *private_data);
 
@@ -1251,21 +1237,22 @@ chimera_vfs_remove_stream(
     void                                *private_data);
 
 /* --------------------------------------------------------------------
- * Backend lease projection (CHIMERA_VFS_CAP_LEASE)
+ * Backend lease projection (CHIMERA_VFS_CAP_CLAIM_AGGREGATE)
  * -------------------------------------------------------------------- */
 
-typedef void (*chimera_vfs_lease_acquire_backend_cb_t)(
-    enum chimera_vfs_error error_code,
-    uint8_t                granted,
-    uint64_t               token,
-    void                  *private_data);
+typedef void (*chimera_vfs_claim_acquire_backend_cb_t)(
+    enum chimera_vfs_error                     error_code,
+    uint8_t                                    granted,
+    uint64_t                                   token,
+    const struct chimera_claim_range_conflict *conflict,
+    void                                      *private_data);
 
-typedef void (*chimera_vfs_lease_release_backend_cb_t)(
+typedef void (*chimera_vfs_claim_release_backend_cb_t)(
     enum chimera_vfs_error error_code,
     void                  *private_data);
 
 void
-chimera_vfs_lease_acquire_backend(
+chimera_vfs_claim_acquire_backend(
     struct chimera_vfs_thread             *thread,
     const uint8_t                         *fh,
     uint8_t                                fh_len,
@@ -1274,6 +1261,8 @@ chimera_vfs_lease_acquire_backend(
     uint8_t                                rev_used,
     uint8_t                                bind_deny,
     uint8_t                                exclusive,
+    uint8_t                                flags,
+    int32_t                                whence,
     uint64_t                               offset,
     uint64_t                               length,
     const struct chimera_claim_owner      *owner,
@@ -1286,16 +1275,22 @@ chimera_vfs_lease_acquire_backend(
         uint64_t       token,
         uint8_t        retain),
     void                                  *recall_arg,
-    chimera_vfs_lease_acquire_backend_cb_t callback,
+    chimera_vfs_claim_acquire_backend_cb_t callback,
     void                                  *private_data);
 
 void
-chimera_vfs_lease_release_backend(
+chimera_vfs_claim_release_backend(
     struct chimera_vfs_thread             *thread,
     const uint8_t                         *fh,
     uint8_t                                fh_len,
     uint64_t                               fh_hash,
+    uint8_t                                klass,
     uint64_t                               token,
     uint8_t                                retained,
-    chimera_vfs_lease_release_backend_cb_t callback,
+    /* Only read when token == 0 (release a RANGE by geometry). */
+    int32_t                                whence,
+    uint64_t                               offset,
+    uint64_t                               length,
+    const struct chimera_claim_owner      *owner,
+    chimera_vfs_claim_release_backend_cb_t callback,
     void                                  *private_data);

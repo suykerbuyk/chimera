@@ -28,6 +28,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <ftw.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -44,6 +45,7 @@
 #include "posix/posix_internal.h"
 #include "client/client.h"
 #include "server/server.h"
+#include "common/test_users.h"
 #include "common/logging.h"
 #include "common/platform.h"
 #include "common/tcp_flavor.h"
@@ -53,6 +55,46 @@
 #define DRIVER_BLOCK_SIZE 4096
 #define MAX_PIDS          4
 #define MAX_DIRS          64
+
+/* SMB2 loopback (smb_<module>): the client mounts the in-process chimera SMB
+ * server through the smb VFS proxy module.  Unlike NFS's per-request AUTH_SYS
+ * credential, an SMB session authenticates ONE account for the life of the
+ * mount, so the driver binds it to root -- the only identity under which the
+ * model's fsInit normalization (chmod/chown of the export root) can run at
+ * all.  Every model process therefore reaches the server as uid 0 -- one of
+ * the reasons this backend cannot satisfy the POSIX model yet; the SD* list in
+ * CMakeLists.txt has the rest. */
+#define SMB_LOOPBACK_PATH "127.0.0.1:share"
+#define SMB_LOOPBACK_OPTS \
+        "user=root,password=" CHIMERA_TEST_USER_SMBPASSWD ",domain=WORKGROUP"
+
+/* Dialect to pin the SMB loopback mount to (a vers= value: "2.1", "3.0",
+ * "3.0.2", "3.1.1", ...), or NULL to offer the client's full set and let the
+ * server select -- which always lands on the highest it speaks.  A caller sets
+ * this BEFORE posix_env_setup; smb_loopback_probe drives it from argv so one
+ * binary covers the whole dialect matrix. */
+static const char                *g_smb_vers;
+
+/* Wire policy the in-process SMB SERVER is configured with, for the loopback
+ * matrix.  These are server demands, not client capabilities: the point of
+ * varying them is to find out what the client does when the far end insists on
+ * something.  Set BEFORE posix_env_setup; defaults match the server's own
+ * (everything off).  See smb_loopback_probe.c for what each combination is
+ * expected to prove. */
+static int                        g_smb_sign_required;  /* advertise SIGNING_REQUIRED */
+static int                        g_smb_encryption;     /* 0 off, 1 offer, 2 require   */
+static int                        g_smb_compression;    /* offer compression           */
+static int                        g_smb_leases;         /* grant oplocks + leases      */
+static int                        g_smb_seal;           /* client asks to encrypt      */
+static int                        g_smb_client_compress; /* client asks to compress    */
+
+/* Set when the CALLER's expected result is a refused mount.  A refused mount
+* leaves a half-built environment -- a running server, a client with no mount,
+* evpl pools on both -- and unwinding that is the hazardous part, not the
+* refusal itself.  A caller whose verdict is already decided sets this and
+* _exit()s instead, which cannot abort on any platform.  See
+* posix_env_setup_unwind for what is being skipped and why it is a hazard. */
+static int                        g_expect_mount_failure;
 
 static struct chimera_vfs_cred    driver_creds[MAX_PIDS];
 static mode_t                     driver_umasks[MAX_PIDS];
@@ -69,11 +111,90 @@ static FILE                      *proto_out;
  * MBT batches get from a per-trace fsname.  Set once in main(). */
 static const char                *g_module;     /* VFS module (memfs/...)     */
 static int                        g_nfs_version; /* 0 = direct; 3/4 = loopback */
+static int                        g_smb;         /* 1 = SMB2 loopback          */
+static int                        g_strict_dac; /* chimera enforces DAC beyond
+                                                 * the model: NFS loopback or a
+                                                 * passthrough backend (engine
+                                                 * prefix/search gates) */
 static int                        g_fs_counter; /* bumped per newfs -> fsN     */
 static char                       g_fsname[32] = "fs0";
 static struct chimera_vfs_cred    g_root_cred;
 static struct chimera_server     *g_server;     /* loopback server (nfs only) */
 static struct prometheus_metrics *g_metrics;
+static char                       g_pt_root[300]; /* passthrough scratch root */
+
+/* memfs/diskfs/cairn create named filesystems (mkfs); linux and io_uring are
+ * passthrough onto a host directory -- the path IS the filesystem, and the
+ * per-trace recycle makes a fresh subdirectory instead of a fresh fs. */
+static int
+posix_module_is_passthrough(const char *module)
+{
+    return strcmp(module, "linux") == 0 || strcmp(module, "io_uring") == 0;
+} /* posix_module_is_passthrough */
+
+/* Backends that record where a file's data actually lives, and so answer
+ * SEEK_DATA/SEEK_HOLE from a real extent map: the passthroughs (whose host
+ * filesystem tracks holes) and cairn (whose extents are its own RocksDB
+ * records).  memfs and diskfs instead report every byte below EOF as data
+ * with the sole hole at EOF, which is what the model abstracts.  Both are
+ * POSIX-valid; see the PT2 reconciliation for the resulting refinement. */
+static int
+posix_module_tracks_holes(const char *module)
+{
+    return posix_module_is_passthrough(module) || strcmp(module, "cairn") == 0;
+} /* posix_module_tracks_holes */
+
+static int
+pt_rm_cb(
+    const char        *path,
+    const struct stat *st,
+    int                type,
+    struct FTW        *ftw)
+{
+    (void) st;
+    (void) ftw;
+    return (type == FTW_DP ? rmdir(path) : unlink(path));
+} /* pt_rm_cb */
+
+/* Build the SMB loopback's mount option string, appending the pinned dialect
+ * when one was requested.  Shared by the initial mount and the newfs remount so
+ * a recycled mount cannot silently drop back to the negotiated default. */
+static const char *
+smb_mount_options(
+    char  *buf,
+    size_t cap)
+{
+    int n = snprintf(buf, cap, "%s", SMB_LOOPBACK_OPTS);
+
+    if (g_smb_vers) {
+        n += snprintf(buf + n, cap - n, ",vers=%s", g_smb_vers);
+    }
+    if (g_smb_seal) {
+        n += snprintf(buf + n, cap - n, ",seal=yes");
+    }
+    if (g_smb_client_compress) {
+        snprintf(buf + n, cap - n, ",compress=yes");
+    }
+    return buf;
+} /* smb_mount_options */
+
+/* Recursively remove a passthrough backing tree.  Space on the scratch
+ * filesystem is a real budget (CI roots it on a shared volume), so the old
+ * tree goes away at each recycle rather than accumulating. */
+static int
+pt_remove_tree(const char *path)
+{
+    return nftw(path, pt_rm_cb, 16, FTW_DEPTH | FTW_PHYS);
+} /* pt_remove_tree */
+
+/* Path of the current passthrough backing directory (g_pt_root/g_fsname). */
+static void
+pt_tree_path(
+    char  *buf,
+    size_t cap)
+{
+    snprintf(buf, cap, "%s/%s", g_pt_root, g_fsname);
+} /* pt_tree_path */
 
 /* Decode standard base64 (no whitespace); returns length or -1. */
 static int
@@ -220,6 +341,13 @@ apply_pid(json_t *req)
         pid = 0;
     }
     chimera_posix_set_cred(&driver_creds[pid]);
+    /* See posix_mbt_replay.c: one owner per model process, so locks taken by
+     * different model processes genuinely conflict. */
+    {
+        uint64_t owner = (((uint64_t) 0x9105ULL << 32) | (uint32_t) pid);
+
+        chimera_posix_set_lock_owner(&owner);
+    }
     (void) chimera_posix_umask(driver_umasks[pid]);
 } /* apply_pid */
 
@@ -235,8 +363,12 @@ normalize_root(void)
     }
     chimera_posix_set_cred(&g_root_cred);
     (void) chimera_posix_umask(0);
-    if (chimera_posix_chmod("/test", 0777) != 0 ||
-        chimera_posix_chown("/test", 0, 0) != 0) {
+    if (chimera_posix_chmod("/test", 0777) != 0) {
+        fprintf(stderr, "posix_driver: normalize chmod: %s\n", strerror(errno));
+        return -1;
+    }
+    if (chimera_posix_chown("/test", 0, 0) != 0) {
+        fprintf(stderr, "posix_driver: normalize chown: %s\n", strerror(errno));
         return -1;
     }
     return 0;
@@ -924,17 +1056,19 @@ handle(json_t *req)
                 driver_dirs[i] = NULL;
             }
         }
-        if (g_nfs_version) {
+        if (g_nfs_version || g_smb) {
             /* Loopback recycle: the filesystem lives server-side, so cycle it
              * there while the server, client, and RPC connection stay up.
              * Unmount the client (the proxy's UMNT/session teardown), re-point
              * the server-side share at a fresh uniquely-named fs, and remount:
-             * the fresh MOUNT/PUTROOTFH hands back a new root FH, so neither
-             * content nor a cached handle can cross traces.  The client umount
-             * races the async close sweep exactly like the direct path below,
-             * and the server-side rmfs races the NFS server's own cached open
-             * handles, so both get the same bounded retry (5s ceiling). */
+             * the fresh MOUNT/PUTROOTFH (SMB: TREE_CONNECT) hands back a new
+             * root FH, so neither content nor a cached handle can cross
+             * traces.  The client umount races the async close sweep exactly
+             * like the direct path below, and the server-side rmfs races the
+             * protocol server's own cached open handles, so both get the same
+             * bounded retry (5s ceiling). */
             char mount_options[64];
+            char smb_options[192];
             int  rc;
             int  tries = 0;
 
@@ -953,6 +1087,11 @@ handle(json_t *req)
                 usleep(1000);
             }
             tries = 0;
+            if (g_smb) {
+                /* An SMB share holds a reference on its mount; drop it before
+                 * unmounting (mirrors smb2_env_fs_teardown). */
+                chimera_server_remove_share(g_server, "share");
+            }
             while ((rc = chimera_server_unmount(g_server, "share")) != 0) {
                 if (rc != CHIMERA_VFS_EBUSY || ++tries >= 15) {
                     fprintf(stderr,
@@ -962,39 +1101,92 @@ handle(json_t *req)
                 }
                 usleep(1000);
             }
-            tries = 0;
-            while ((rc = chimera_server_rmfs(g_server, g_module,
-                                             g_fsname)) != 0) {
-                if (rc != CHIMERA_VFS_EBUSY || ++tries >= 15) {
+            if (posix_module_is_passthrough(g_module)) {
+                /* Passthrough recycle under the loopback: a fresh
+                 * uniquely-named backing directory is the fresh filesystem
+                 * (see the direct-path recycle below for the rationale). */
+                char old_dir[340], new_dir[340];
+
+                pt_tree_path(old_dir, sizeof(old_dir));
+                if (pt_remove_tree(old_dir) != 0) {
                     fprintf(stderr,
-                            "posix_driver: newfs server rmfs %s failed: %d\n",
+                            "posix_driver: newfs remove %s failed: %s\n",
+                            old_dir, strerror(errno));
+                    return res_int(-1, errno);
+                }
+                snprintf(g_fsname, sizeof(g_fsname), "fs%d", ++g_fs_counter);
+                pt_tree_path(new_dir, sizeof(new_dir));
+                if (mkdir(new_dir, 0777) != 0) {
+                    fprintf(stderr,
+                            "posix_driver: newfs mkdir %s failed: %s\n",
+                            new_dir, strerror(errno));
+                    return res_int(-1, errno);
+                }
+                rc = chimera_server_mount(g_server, "share", g_module,
+                                          new_dir, NULL);
+                if (rc != 0) {
+                    fprintf(stderr,
+                            "posix_driver: newfs share mount %s failed: %d\n",
+                            new_dir, rc);
+                    return res_int(-1, chimera_posix_errno_from_status(rc));
+                }
+            } else {
+                tries = 0;
+                while ((rc = chimera_server_rmfs(g_server, g_module,
+                                                 g_fsname)) != 0) {
+                    if (rc != CHIMERA_VFS_EBUSY || ++tries >= 15) {
+                        fprintf(stderr,
+                                "posix_driver: newfs server rmfs %s failed: %d\n",
+                                g_fsname, rc);
+                        return res_int(-1, chimera_posix_errno_from_status(rc));
+                    }
+                    usleep(1000);
+                }
+                snprintf(g_fsname, sizeof(g_fsname), "fs%d", ++g_fs_counter);
+                rc = chimera_server_mkfs(g_server, g_module, g_fsname, NULL);
+                if (rc != 0) {
+                    fprintf(stderr,
+                            "posix_driver: newfs server mkfs %s failed: %d\n",
                             g_fsname, rc);
                     return res_int(-1, chimera_posix_errno_from_status(rc));
                 }
-                usleep(1000);
+                rc = chimera_server_mount(g_server, "share", g_module,
+                                          g_fsname, NULL);
+                if (rc != 0) {
+                    fprintf(stderr,
+                            "posix_driver: newfs share mount %s failed: %d\n",
+                            g_fsname, rc);
+                    return res_int(-1, chimera_posix_errno_from_status(rc));
+                }
             }
-            snprintf(g_fsname, sizeof(g_fsname), "fs%d", ++g_fs_counter);
-            rc = chimera_server_mkfs(g_server, g_module, g_fsname, NULL);
-            if (rc != 0) {
-                fprintf(stderr, "posix_driver: newfs server mkfs %s failed: %d\n",
-                        g_fsname, rc);
-                return res_int(-1, chimera_posix_errno_from_status(rc));
-            }
-            rc = chimera_server_mount(g_server, "share", g_module, g_fsname,
-                                      NULL);
-            if (rc != 0) {
-                fprintf(stderr, "posix_driver: newfs share mount %s failed: %d\n",
-                        g_fsname, rc);
-                return res_int(-1, chimera_posix_errno_from_status(rc));
-            }
-            snprintf(mount_options, sizeof(mount_options), "vers=%d",
-                     g_nfs_version);
-            if (chimera_posix_mount_with_options("/test", "nfs",
-                                                 "127.0.0.1:/share",
-                                                 mount_options) != 0) {
-                fprintf(stderr, "posix_driver: newfs nfs%d remount failed: %s\n",
-                        g_nfs_version, strerror(errno));
-                return res_int(-1, errno);
+            if (g_smb) {
+                rc = chimera_server_create_share(g_server, "share", "share", 0);
+                if (rc != 0) {
+                    fprintf(stderr,
+                            "posix_driver: newfs share creation failed: %d\n",
+                            rc);
+                    return res_int(-1, chimera_posix_errno_from_status(rc));
+                }
+                if (chimera_posix_mount_with_options(
+                        "/test", "smb", SMB_LOOPBACK_PATH,
+                        smb_mount_options(smb_options,
+                                          sizeof(smb_options))) != 0) {
+                    fprintf(stderr,
+                            "posix_driver: newfs smb remount failed: %s\n",
+                            strerror(errno));
+                    return res_int(-1, errno);
+                }
+            } else {
+                snprintf(mount_options, sizeof(mount_options), "vers=%d",
+                         g_nfs_version);
+                if (chimera_posix_mount_with_options("/test", "nfs",
+                                                     "127.0.0.1:/share",
+                                                     mount_options) != 0) {
+                    fprintf(stderr,
+                            "posix_driver: newfs nfs%d remount failed: %s\n",
+                            g_nfs_version, strerror(errno));
+                    return res_int(-1, errno);
+                }
             }
             if (normalize_root() != 0) {
                 fprintf(stderr, "posix_driver: newfs normalize failed: %s\n",
@@ -1015,6 +1207,39 @@ handle(json_t *req)
                 return res_int(-1, errno);
             }
             usleep(1000);
+        }
+        if (posix_module_is_passthrough(g_module)) {
+            /* Passthrough recycle: a fresh uniquely-named backing directory is
+             * the fresh filesystem.  Remove the old tree (scratch space is a
+             * real budget) and mount the new one; the new directory's fresh
+             * inode gives the mount a fresh root handle, so no cached FH can
+             * cross traces. */
+            char old_dir[340], new_dir[340];
+
+            pt_tree_path(old_dir, sizeof(old_dir));
+            if (pt_remove_tree(old_dir) != 0) {
+                fprintf(stderr, "posix_driver: newfs remove %s failed: %s\n",
+                        old_dir, strerror(errno));
+                return res_int(-1, errno);
+            }
+            snprintf(g_fsname, sizeof(g_fsname), "fs%d", ++g_fs_counter);
+            pt_tree_path(new_dir, sizeof(new_dir));
+            if (mkdir(new_dir, 0777) != 0) {
+                fprintf(stderr, "posix_driver: newfs mkdir %s failed: %s\n",
+                        new_dir, strerror(errno));
+                return res_int(-1, errno);
+            }
+            if (chimera_posix_mount("/test", g_module, new_dir) != 0) {
+                fprintf(stderr, "posix_driver: newfs mount %s failed: %s\n",
+                        new_dir, strerror(errno));
+                return res_int(-1, errno);
+            }
+            if (normalize_root() != 0) {
+                fprintf(stderr, "posix_driver: newfs normalize failed: %s\n",
+                        strerror(errno));
+                return res_int(-1, errno);
+            }
+            return res_int(0, 0);
         }
         /* Remove the old filesystem rather than leaking it.  The replayer has
          * dropped every handle and the unmount drained them, so rmfs succeeds
@@ -1057,6 +1282,27 @@ handle(json_t *req)
     return res_int(-1, ENOSYS);
 } /* handle */
 
+/* Unwind a loopback bring-up that got as far as a running server and client but
+ * failed to mount.  Both sides own evpl thread pools, and returning with those
+ * threads live races process teardown: they keep entering evpl_run while the
+ * global evpl state under them is destroyed, which SIGSEGVs in evpl_now_ticks
+ * about one run in five.  A caller whose RESULT is "the mount was refused" --
+ * the vers= dialect matrix does exactly that -- would flake on it.
+ *
+ * The server is destroyed first: its threads are the ones that crash, and the
+ * client shutdown is what pulls the shared evpl state out from under them. */
+static void
+posix_env_setup_unwind(
+    struct chimera_server     *server,
+    struct prometheus_metrics *metrics)
+{
+    if (server) {
+        chimera_server_destroy(server);
+    }
+    chimera_posix_shutdown();
+    prometheus_metrics_destroy(metrics);
+} /* posix_env_setup_unwind */
+
 /* Bring up the chimera POSIX client (plus an in-process loopback NFS server
  * for the nfs3_/nfs4_ backends), create and mount fs0, and normalize the root
  * to the model's fsInit(0777, 0, 0).  Returns 0 on success.  Extracted from
@@ -1074,7 +1320,9 @@ posix_env_setup(
     struct chimera_vfs_cred       root_cred;
     const char                   *module      = backend;
     int                           nfs_version = 0;
+    int                           smb         = 0;
     char                          module_cfg[4096];
+    char                          session_dir[256];
 
     /* The VFS releases closed handles on an async sweep thread, so a filesystem
      * stays EBUSY for a window after its last close.  A fast sweep keeps the
@@ -1089,16 +1337,39 @@ posix_env_setup(
 
     chimera_vfs_cred_init_unix(&root_cred, 0, 0, 0, NULL);
 
-    /* Backend selection: `backend` names the VFS module (default memfs), or an
-     * NFS loopback path nfs3_<module>/nfs4_<module> (an in-process chimera
-     * server exports the module and the client mounts it over localhost NFS).
-     * `storage` is a scratch directory for backends with real storage. */
+    /* Backend selection: `backend` names the VFS module (default memfs), or a
+     * loopback path -- nfs3_<module>/nfs4_<module>/smb_<module> -- in which an
+     * in-process chimera server exports the module and the client mounts it
+     * back over that protocol's proxy VFS module.  `storage` is a scratch
+     * directory for backends with real storage. */
     if (strncmp(backend, "nfs3_", 5) == 0) {
         nfs_version = 3;
         module      = backend + 5;
     } else if (strncmp(backend, "nfs4_", 5) == 0) {
         nfs_version = 4;
         module      = backend + 5;
+    } else if (strncmp(backend, "smb_", 4) == 0) {
+        smb    = 1;
+        module = backend + 4;
+    }
+
+    /* diskfs/cairn need real scratch storage.  The interactive driver takes
+     * it as argv[2]; the batched replayer passes NULL and the store is
+     * self-provisioned under a fresh temp dir instead, the way the NFS MBT
+     * harness provisions its per-process session dir.  The paths land inside
+     * module_cfg below, so the buffer can be local. */
+    if (!storage &&
+        (strcmp(module, "diskfs") == 0 || strcmp(module, "cairn") == 0)) {
+        const char *tmp = getenv("TMPDIR");
+
+        snprintf(session_dir, sizeof(session_dir), "%s/posix_mbt_%s.XXXXXX",
+                 tmp && tmp[0] ? tmp : "/tmp", module);
+        if (!mkdtemp(session_dir)) {
+            fprintf(stderr, "posix_driver: mkdtemp(%s): %s\n", session_dir,
+                    strerror(errno));
+            return 1;
+        }
+        storage = session_dir;
     }
 
     /* Backend module configuration, shared by the direct-mount and
@@ -1140,6 +1411,36 @@ posix_env_setup(
         }
         snprintf(module_cfg, sizeof(module_cfg),
                  "{\"initialize\":true,\"path\":\"%s\"}", storage);
+    } else if (posix_module_is_passthrough(module)) {
+        /* Passthrough backing store.  The host filesystem must support
+         * name_to_handle_at (the linux/io_uring modules derive their file
+         * handles with it) -- tmpfs and overlayfs do not, so the usual /tmp
+         * will not do.  Root the trees at $CHIMERA_MBT_SCRATCH (default: the
+         * current directory, which under ctest is the build tree); an
+         * unsupported filesystem surfaces as an ENOTSUP mount that the mount
+         * below turns into a clean skip.  Mirrors the NFS3 MBT harness. */
+        const char *scratch = getenv("CHIMERA_MBT_SCRATCH");
+        char       *abs_scratch;
+
+        if (!scratch || !scratch[0]) {
+            scratch = ".";
+        }
+        /* The module opens this path from a worker thread, so it must be
+         * absolute. */
+        abs_scratch = realpath(scratch, NULL);
+        if (!abs_scratch) {
+            fprintf(stderr, "posix_driver: realpath(%s): %s\n", scratch,
+                    strerror(errno));
+            return 1;
+        }
+        snprintf(g_pt_root, sizeof(g_pt_root),
+                 "%s/posix_mbt_pt_XXXXXX", abs_scratch);
+        free(abs_scratch);
+        if (!mkdtemp(g_pt_root)) {
+            fprintf(stderr, "posix_driver: mkdtemp(%s): %s\n", g_pt_root,
+                    strerror(errno));
+            return 1;
+        }
     } else {
         fprintf(stderr, "posix_driver: unknown backend %s\n", backend);
         return 1;
@@ -1147,27 +1448,67 @@ posix_env_setup(
 
     config = chimera_client_config_init();
 
-    if (nfs_version) {
-        /* Loopback NFS: an in-process server exports the module as /share and
-         * the client mounts it over the nfs proxy module.  Both sides use the
-         * libevpl INPROC transport (named endpoints, no real ports), so the
-         * server's services never collide with concurrent drivers and no
-         * network namespace, root, or Linux-specific isolation is needed --
-         * every driver process gets its own inproc endpoint namespace, exactly
-         * like the NFS/SMB MBT harnesses. */
+    if (nfs_version || smb) {
+        /* Protocol loopback: an in-process server exports the module as the
+         * "share" and the client mounts it back over that protocol's proxy VFS
+         * module.  Both sides use the libevpl INPROC transport (named
+         * endpoints, no real ports), so the server's services never collide
+         * with concurrent drivers and no network namespace, root, or
+         * Linux-specific isolation is needed -- every driver process gets its
+         * own inproc endpoint namespace, exactly like the NFS/SMB MBT
+         * harnesses. */
         struct chimera_server_config *server_config;
         char                          mount_options[64];
+        char                          smb_options[192];
 
         chimera_client_config_set_tcp_flavor(config, CHIMERA_TCP_FLAVOR_INPROC);
+        if (smb) {
+            /* The smb proxy is not in the client's default module set. */
+            chimera_client_config_add_module(config, "smb", "", "");
+            /* One worker thread.  The smb proxy authenticates ONE session, on
+             * the connection belonging to the thread that ran the MOUNT, and a
+             * second thread's connection replays that session id on a fresh
+             * connection -- which the server rejects
+             * (STATUS_USER_SESSION_DELETED -> ESTALE) because binding a
+             * session to another connection is SMB3 multichannel, which
+             * neither side implements.  The POSIX client round-robins requests
+             * across core_threads workers, so anything above 1 makes the very
+             * first post-mount operation fail.  See SD1. */
+            config->core_threads = 1;
+        }
 
         server_config = chimera_server_config_init();
         chimera_server_config_set_tcp_flavor(server_config,
                                              CHIMERA_TCP_FLAVOR_INPROC);
-        /* Protocols are opt-in (default off): the loopback path needs the NFS
-         * server, or chimera_server_create_export has no nfs_shared to add to. */
-        chimera_server_config_set_nfs_enabled(server_config, 1);
-        chimera_server_config_add_module(server_config, module, NULL,
-                                         module_cfg);
+        /* Protocols are opt-in (default off): the loopback path needs its own
+         * server, or chimera_server_create_export/_share has nothing to add
+         * the export to. */
+        if (smb) {
+            chimera_server_config_set_smb_enabled(server_config, 1);
+            chimera_server_config_set_smb_signing_required(server_config,
+                                                           g_smb_sign_required);
+            chimera_server_config_set_smb_encryption(server_config,
+                                                     g_smb_encryption);
+            chimera_server_config_set_smb_compression(server_config,
+                                                      g_smb_compression);
+            chimera_server_config_set_smb_oplocks(server_config, g_smb_leases);
+            chimera_server_config_set_smb_leases(server_config, g_smb_leases);
+            /* Report the POSIX mode as a modefromsid ACE on QUERY SECURITY so
+             * the proxy reads the exact mode back (matching a Linux CIFS mount
+             * with modefromsid), rather than the Windows ACL memfs synthesizes
+             * from the mode -- which the proxy's engine DAC gate would then
+             * misjudge. */
+            chimera_server_config_set_smb_mode_from_sid(server_config, 1);
+            chimera_server_config_set_smb_posix_rename(server_config, 1);
+        } else {
+            chimera_server_config_set_nfs_enabled(server_config, 1);
+        }
+        if (!posix_module_is_passthrough(module)) {
+            /* linux/io_uring are already in the server's default module set
+             * (Linux builds); adding them again would double-register. */
+            chimera_server_config_add_module(server_config, module, NULL,
+                                             module_cfg);
+        }
 
         server = chimera_server_init(server_config, metrics);
         if (!server) {
@@ -1175,21 +1516,63 @@ posix_env_setup(
             return 1;
         }
 
-        /* Named-filesystem backend (memfs/diskfs/cairn): create the fs first. */
-        if (chimera_server_mkfs(server, module, "fs0", NULL) != 0) {
-            fprintf(stderr, "posix_driver: mkfs %s fs0 failed\n", module);
-            return 1;
+        if (posix_module_is_passthrough(module)) {
+            /* Passthrough under the loopback: the share's backing directory
+             * is the filesystem (no mkfs).  ENOTSUP from the mount means the
+             * scratch filesystem cannot produce file handles
+             * (name_to_handle_at) -- skip, as on the direct path. */
+            char dir[340];
+            int  mrc;
+
+            snprintf(dir, sizeof(dir), "%s/fs0", g_pt_root);
+            if (mkdir(dir, 0777) != 0) {
+                fprintf(stderr, "posix_driver: mkdir %s: %s\n", dir,
+                        strerror(errno));
+                return 1;
+            }
+            mrc = chimera_server_mount(server, "share", module, dir, NULL);
+            if (mrc == CHIMERA_VFS_ENOTSUP) {
+                fprintf(stderr,
+                        "SKIP: %s backend needs a name_to_handle_at-capable "
+                        "scratch fs; %s is not one (set CHIMERA_MBT_SCRATCH)\n",
+                        module, dir);
+                exit(77);
+            }
+            if (mrc != 0) {
+                fprintf(stderr, "posix_driver: share mount %s failed: %d\n",
+                        dir, mrc);
+                return 1;
+            }
+        } else {
+            /* Named-filesystem backend (memfs/diskfs/cairn): create the fs
+             * first. */
+            if (chimera_server_mkfs(server, module, "fs0", NULL) != 0) {
+                fprintf(stderr, "posix_driver: mkfs %s fs0 failed\n", module);
+                return 1;
+            }
+
+            chimera_server_mount(server, "share", module, "fs0", NULL);
         }
 
-        chimera_server_mount(server, "share", module, "fs0", NULL);
-
-        if (chimera_server_create_export(server, "/share", "/share",
-                                         4242, NULL) != 0) {
+        if (smb) {
+            if (chimera_server_create_share(server, "share", "share", 0) != 0) {
+                fprintf(stderr, "posix_driver: share creation failed\n");
+                return 1;
+            }
+        } else if (chimera_server_create_export(server, "/share", "/share",
+                                                4242, NULL) != 0) {
             fprintf(stderr, "posix_driver: export creation failed\n");
             return 1;
         }
 
         chimera_server_start(server);
+
+        if (smb) {
+            /* SESSION_SETUP authenticates against the server's user table, so
+             * the account the mount binds to has to exist before the client
+             * connects. */
+            chimera_test_add_server_users(server);
+        }
 
         posix = chimera_posix_init(config, &root_cred, metrics);
         if (!posix) {
@@ -1197,14 +1580,31 @@ posix_env_setup(
             return 1;
         }
 
-        snprintf(mount_options, sizeof(mount_options), "vers=%d",
-                 nfs_version);
-        if (chimera_posix_mount_with_options("/test", "nfs",
-                                             "127.0.0.1:/share",
-                                             mount_options) != 0) {
-            fprintf(stderr, "posix_driver: nfs%d mount failed\n",
-                    nfs_version);
-            return 1;
+        if (smb) {
+            if (chimera_posix_mount_with_options(
+                    "/test", "smb", SMB_LOOPBACK_PATH,
+                    smb_mount_options(smb_options,
+                                      sizeof(smb_options))) != 0) {
+                fprintf(stderr, "posix_driver: smb mount failed: %s\n",
+                        strerror(errno));
+                if (!g_expect_mount_failure) {
+                    posix_env_setup_unwind(server, metrics);
+                }
+                return 1;
+            }
+        } else {
+            snprintf(mount_options, sizeof(mount_options), "vers=%d",
+                     nfs_version);
+            if (chimera_posix_mount_with_options("/test", "nfs",
+                                                 "127.0.0.1:/share",
+                                                 mount_options) != 0) {
+                fprintf(stderr, "posix_driver: nfs%d mount failed\n",
+                        nfs_version);
+                if (!g_expect_mount_failure) {
+                    posix_env_setup_unwind(server, metrics);
+                }
+                return 1;
+            }
         }
     } else {
         if (strcmp(module, "memfs") == 0) {
@@ -1215,7 +1615,9 @@ posix_env_setup(
                              "%s", module_cfg);
                 }
             }
-        } else {
+        } else if (!posix_module_is_passthrough(module)) {
+            /* linux/io_uring are already in the default client module set
+             * (Linux builds); adding them again would double-register. */
             chimera_client_config_add_module(config, module, "", module_cfg);
         }
 
@@ -1225,15 +1627,47 @@ posix_env_setup(
             return 1;
         }
 
-        /* Named-filesystem backend (memfs/diskfs/cairn): create the fs first. */
-        if (chimera_posix_mkfs(module, "fs0", NULL) != 0) {
-            fprintf(stderr, "posix_driver: mkfs %s fs0 failed\n", module);
-            return 1;
-        }
+        if (posix_module_is_passthrough(module)) {
+            /* Passthrough: the backing directory is the filesystem.  The
+             * model's root is 0777 root:root; create the tree that way
+             * (normalize_root below re-asserts it through the mount). */
+            char dir[340];
 
-        if (chimera_posix_mount("/test", module, "fs0") != 0) {
-            fprintf(stderr, "posix_driver: %s mount failed\n", backend);
-            return 1;
+            snprintf(dir, sizeof(dir), "%s/fs0", g_pt_root);
+            if (mkdir(dir, 0777) != 0) {
+                fprintf(stderr, "posix_driver: mkdir %s: %s\n", dir,
+                        strerror(errno));
+                return 1;
+            }
+            if (chimera_posix_mount("/test", module, dir) != 0) {
+                if (errno == ENOTSUP || errno == EOPNOTSUPP) {
+                    /* The scratch filesystem cannot produce file handles
+                     * (name_to_handle_at): tmpfs/overlayfs, e.g. a /tmp or
+                     * overlay build tree.  Skip rather than fail -- point
+                     * CHIMERA_MBT_SCRATCH at an ext4/xfs/btrfs path to
+                     * actually exercise the backend. */
+                    fprintf(stderr,
+                            "SKIP: %s backend needs a name_to_handle_at-capable "
+                            "scratch fs; %s is not one (set CHIMERA_MBT_SCRATCH)\n",
+                            module, dir);
+                    exit(77);
+                }
+                fprintf(stderr, "posix_driver: %s mount failed: %s\n",
+                        backend, strerror(errno));
+                return 1;
+            }
+        } else {
+            /* Named-filesystem backend (memfs/diskfs/cairn): create the fs
+             * first. */
+            if (chimera_posix_mkfs(module, "fs0", NULL) != 0) {
+                fprintf(stderr, "posix_driver: mkfs %s fs0 failed\n", module);
+                return 1;
+            }
+
+            if (chimera_posix_mount("/test", module, "fs0") != 0) {
+                fprintf(stderr, "posix_driver: %s mount failed\n", backend);
+                return 1;
+            }
         }
     }
 
@@ -1241,13 +1675,16 @@ posix_env_setup(
      * the server/metrics handles so posix_env_teardown can release them. */
     g_module      = module;
     g_nfs_version = nfs_version;
+    g_smb         = smb;
+    g_strict_dac  = nfs_version != 0 || posix_module_is_passthrough(module);
     g_root_cred   = root_cred;
     g_server      = server;
     g_metrics     = metrics;
 
     /* Normalize the root to the model's fsInit(0777, 0, 0). */
     if (normalize_root() != 0) {
-        fprintf(stderr, "posix_driver: root normalization failed\n");
+        fprintf(stderr, "posix_driver: root normalization failed: %s\n",
+                strerror(errno));
         return 1;
     }
     return 0;
@@ -1256,8 +1693,31 @@ posix_env_setup(
 static void
 posix_env_teardown(void)
 {
-    chimera_posix_umount("/test");
+    /* The client umount is what dispatches the module-level UMOUNT that owns
+     * per-mount state (the linux module's root identity, for one); an EBUSY
+     * here (cached handles inside the holder timeout) would leak it, so give
+     * it the same bounded retry the newfs recycle uses. */
+    {
+        int tries = 0;
+        while (chimera_posix_umount("/test") != 0 &&
+               errno == EBUSY && ++tries < 15) {
+            usleep(1000);
+        }
+    }
+    if (g_server) {
+        int tries = 0;
+        if (g_smb) {
+            chimera_server_remove_share(g_server, "share");
+        }
+        while (chimera_server_unmount(g_server, "share") != 0 &&
+               ++tries < 15) {
+            usleep(1000);
+        }
+    }
     chimera_posix_shutdown();
+    if (g_pt_root[0]) {
+        (void) pt_remove_tree(g_pt_root);
+    }
     if (g_server) {
         chimera_server_destroy(g_server);
     }

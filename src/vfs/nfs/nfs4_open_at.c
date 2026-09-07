@@ -14,7 +14,21 @@ struct chimera_nfs4_open_at_ctx {
     int                               nocreate;
     uint32_t                          attr_mask[2];
     uint8_t                           attr_vals[128];
+    uint8_t                           lookup_fallback; /* resolve a leaf symlink
+                                                        * via LOOKUP, see below */
 };
+
+/* private_data sentinel marking the symlink-fallback re-entry into
+ * chimera_nfs4_open_at, which must preserve ctx->lookup_fallback.  Every other
+ * entry (dispatch, including a slot-park replay) starts a fresh attempt. */
+#define CHIMERA_NFS4_OPEN_AT_LOOKUP_RETRY ((void *) (uintptr_t) 1)
+
+void
+chimera_nfs4_open_at(
+    struct chimera_nfs_thread  *thread,
+    struct chimera_nfs_shared  *shared,
+    struct chimera_vfs_request *request,
+    void                       *private_data);
 
 static void
 chimera_nfs4_open_at_send(
@@ -40,8 +54,9 @@ chimera_nfs4_open_at_callback(
     struct chimera_nfs4_open_state  *state;
     int                              path_open;
 
-    path_open = (request->open_at.flags & CHIMERA_VFS_OPEN_PATH) &&
-        !(request->open_at.flags & CHIMERA_VFS_OPEN_CREATE);
+    path_open = ((request->open_at.flags & CHIMERA_VFS_OPEN_PATH) &&
+                 !(request->open_at.flags & CHIMERA_VFS_OPEN_CREATE)) ||
+        ctx->lookup_fallback;
 
     if (unlikely(status)) {
         request->status = CHIMERA_VFS_EFAULT;
@@ -80,6 +95,24 @@ chimera_nfs4_open_at_callback(
             (request->open_at.flags & CHIMERA_VFS_OPEN_NOFOLLOW) &&
             !(request->open_at.flags & CHIMERA_VFS_OPEN_PATH)) {
             request->status = CHIMERA_VFS_ELOOP;
+        } else if ((res->status == NFS4ERR_SYMLINK ||
+                    res->status == NFS4ERR_WRONG_TYPE) &&
+                   !ctx->lookup_fallback) {
+            /* A data open of a non-regular object: NFSv4 OPEN refuses it on
+             * the wire (SYMLINK for a link, WRONG_TYPE for a fifo, socket, or
+             * device at 4.1+), but the POSIX answer depends on the object and
+             * the flags -- follow a symlink by restarting resolution on its
+             * target, ELOOP under O_NOFOLLOW (handled above), ENXIO for the
+             * other types.  The engine's open completion implements exactly
+             * those rules from the returned attrs, so re-issue the request
+             * LOOKUP-shaped -- the same compound a path open uses -- and let
+             * it see the object.  Mirrors the NFS3 client, whose
+             * GUARDED-create EEXIST recovery likewise returns the existing
+             * object. */
+            ctx->lookup_fallback = 1;
+            chimera_nfs4_open_at(ctx->thread, ctx->thread->shared, request,
+                                 CHIMERA_NFS4_OPEN_AT_LOOKUP_RETRY);
+            return;
         } else {
             request->status = chimera_nfs4_status_to_errno(res->status);
         }
@@ -155,6 +188,23 @@ chimera_nfs4_open_at_callback(
      * (synthetic handles which don't call close) and for path opens (resolved
      * via LOOKUP, so there is no OPEN stateid). */
     if (!(request->open_at.flags & CHIMERA_VFS_OPEN_INFERRED) && !path_open) {
+        /* Count this handle against the file's open on the server, which every
+         * handle on the file shares.  Keyed on the handle OPEN just returned
+         * (unmarshalled into r_attr above), not request->fh, which still names
+         * the parent directory here.  A refusal means this OPEN raced an
+         * in-flight CLOSE of the same file and coalesced into the state that
+         * CLOSE destroys (see chimera_nfs4_open_file_get) -- the returned
+         * stateid is dead on arrival, so re-send the OPEN; once the CLOSE has
+         * landed the retry receives a fresh state. */
+        if (chimera_nfs4_open_file_get(ctx->server,
+                                       request->open_at.r_attr.va_fh,
+                                       request->open_at.r_attr.va_fh_len,
+                                       &open_res->opopen.resok4.stateid) != 0) {
+            chimera_nfs4_open_at_send(ctx->thread, ctx->shared, request,
+                                      ctx->dispatch_private);
+            return;
+        }
+
         state = chimera_nfs4_open_state_alloc();
 
         if (!state) {
@@ -166,15 +216,6 @@ chimera_nfs4_open_at_callback(
         /* Store the stateid from OPEN response */
         state->server_index = ctx->server->index;
         state->stateid      = open_res->opopen.resok4.stateid;
-
-        /* Count this handle against the file's open on the server, which every
-         * handle on the file shares.  Keyed on the handle OPEN just returned
-         * (unmarshalled into r_attr above), not request->fh, which still names
-         * the parent directory here. */
-        chimera_nfs4_open_file_get(ctx->server,
-                                   request->open_at.r_attr.va_fh,
-                                   request->open_at.r_attr.va_fh_len,
-                                   &state->stateid);
 
         request->open_at.r_vfs_private = (uint64_t) state;
     } else {
@@ -218,12 +259,19 @@ chimera_nfs4_open_at_send(
 
     ctx = request->plugin_data;
 
+    if (private_data != CHIMERA_NFS4_OPEN_AT_LOOKUP_RETRY) {
+        ctx->lookup_fallback = 0;
+    }
+
     /* A metadata/path open (OPEN_PATH without O_CREAT) must not issue OP_OPEN:
      * NFSv4 OPEN only works on regular files (EISDIR on a directory, EINVAL on
      * a fifo/socket/device), but a path handle is needed for setattr/utimensat
-     * on any file type.  Resolve the leaf with OP_LOOKUP instead. */
-    path_open = (request->open_at.flags & CHIMERA_VFS_OPEN_PATH) &&
-        !(request->open_at.flags & CHIMERA_VFS_OPEN_CREATE);
+     * on any file type.  Resolve the leaf with OP_LOOKUP instead.  The same
+     * LOOKUP shape resolves a leaf symlink a data open must follow
+     * (ctx->lookup_fallback, set by the reply callback on NFS4ERR_SYMLINK). */
+    path_open = ((request->open_at.flags & CHIMERA_VFS_OPEN_PATH) &&
+                 !(request->open_at.flags & CHIMERA_VFS_OPEN_CREATE)) ||
+        ctx->lookup_fallback;
 
     if (!server_thread) {
         request->status = CHIMERA_VFS_ESTALE;
@@ -344,10 +392,7 @@ chimera_nfs4_open_at_send(
      * these attributes, and without ownership it would evaluate the caller
      * against the file's "other" mode bits. */
     argarray[4].argop = OP_GETATTR;
-    attr_request[0]   = (1 << FATTR4_TYPE) | (1 << FATTR4_SIZE) | (1 << FATTR4_FILEID);
-    attr_request[1]   = (1 << (FATTR4_MODE - 32)) | (1 << (FATTR4_NUMLINKS - 32)) |
-        (1 << (FATTR4_OWNER - 32)) | (1 << (FATTR4_OWNER_GROUP - 32)) |
-        (1 << (FATTR4_TIME_ACCESS - 32)) | (1 << (FATTR4_TIME_MODIFY - 32));
+    chimera_nfs4_attr_request_stat(attr_request);
     argarray[4].opgetattr.attr_request     = attr_request;
     argarray[4].opgetattr.num_attr_request = 2;
 

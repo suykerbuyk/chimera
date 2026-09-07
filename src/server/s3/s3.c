@@ -18,6 +18,7 @@
 #include "s3_dump.h"
 #include "s3_bucket_map.h"
 #include "s3_auth.h"
+#include "s3_acl.h"
 #include "s3_multipart.h"
 #include "s3_tagging.h"
 #include "s3.h"
@@ -507,6 +508,25 @@ chimera_s3_dispatch_callback(
     memcpy(s3_request->bucket_fh, attr->va_fh, attr->va_fh_len);
     s3_request->bucket_fhlen = attr->va_fh_len;
 
+    /* ?acl subresource (object or bucket): the ACL is a projection of the
+     * target's owner and mode, so both directions run against the same
+     * filehandle the normal routing would have used. */
+    if (s3_request->has_acl) {
+        switch (evpl_http_request_type(s3_request->http_request)) {
+            case EVPL_HTTP_REQUEST_TYPE_GET:
+                chimera_s3_get_acl(evpl, thread, s3_request);
+                return;
+            case EVPL_HTTP_REQUEST_TYPE_PUT:
+                chimera_s3_put_acl(evpl, thread, s3_request);
+                return;
+            default:
+                s3_request->status    = CHIMERA_S3_STATUS_METHOD_NOT_ALLOWED;
+                s3_request->vfs_state = CHIMERA_S3_VFS_STATE_COMPLETE;
+                s3_server_respond(evpl, s3_request);
+                return;
+        } /* switch */
+    }
+
     /* ?tagging subresource (object or bucket): route to the tagging handlers
      * before the normal object/bucket method routing. */
     if (s3_request->has_tagging) {
@@ -648,6 +668,8 @@ s3_server_dispatch(
     s3_request->has_versions       = 0;
     s3_request->has_part_number    = 0;
     s3_request->has_tagging        = 0;
+    s3_request->has_acl            = 0;
+    s3_request->canned_acl         = chimera_s3_parse_canned_acl(request);
     s3_request->tagging            = NULL;
     s3_request->bucket_fhlen       = 0;
     s3_request->op_bucket          = 0;
@@ -676,7 +698,13 @@ s3_server_dispatch(
     *notify_data     = s3_request;
 
     /* Verify AWS authentication */
-    auth_result = chimera_s3_auth_verify(shared->cred_cache, request);
+    s3_request->owner_id[0]      = '\0';
+    s3_request->owner_display[0] = '\0';
+
+    auth_result = chimera_s3_auth_verify(shared->cred_cache, request,
+                                         &s3_request->cred,
+                                         s3_request->owner_id,
+                                         s3_request->owner_display);
 
     switch (auth_result) {
         case CHIMERA_S3_AUTH_OK:
@@ -894,6 +922,8 @@ s3_server_dispatch(
                     upload_id_marker_len       = copy;
                 } else if (key_len == 7 && memcmp(key_start, "tagging", 7) == 0) {
                     s3_request->has_tagging = 1;
+                } else if (key_len == 3 && memcmp(key_start, "acl", 3) == 0) {
+                    s3_request->has_acl = 1;
                 } else if (key_len == 6 && memcmp(key_start, "prefix", 6) == 0) {
                     prefix_len = chimera_s3_pct_decode(prefix_buf, sizeof(prefix_buf),
                                                        value_start, value_len);
@@ -1012,7 +1042,12 @@ s3_server_dispatch(
                 s3_request->del.cur      = 0;
                 s3_request->del.quiet    = 0;
             } else if (qmark == s3_request->path) {
-                if (s3_request->has_tagging) {
+                if (s3_request->has_acl) {
+                    /* Bucket-level ?acl: no object key, the ACL handlers
+                     * operate on the bucket directory itself. */
+                    s3_request->path     = "";
+                    s3_request->path_len = 0;
+                } else if (s3_request->has_tagging) {
                     /* Bucket-level ?tagging: no object key, route to the
                      * tagging handlers (which operate on the bucket dir). */
                     s3_request->path     = "";
@@ -1027,8 +1062,9 @@ s3_server_dispatch(
                      * "?subresource" key visible to every protocol. vfs_state
                      * COMPLETE short-circuits the routing below.
                      *
-                     * NOTE: this means security-relevant configs (bucket policy,
-                     * encryption, ACL) are silently NOT enforced. */
+                     * NOTE: this means security-relevant configs (bucket
+                     * policy, encryption) are silently NOT enforced.  ?acl is
+                     * handled above and no longer falls in here. */
                     s3_request->status           = CHIMERA_S3_STATUS_OK;
                     s3_request->file_length      = 0;
                     s3_request->file_real_length = 0;
@@ -1158,7 +1194,7 @@ s3_server_dispatch(
         chimera_s3_request_get(s3_request);
 
         chimera_vfs_lookup(thread->vfs,
-                           &thread->shared->cred,
+                           &s3_request->cred,
                            shared->root_fh,
                            shared->root_fh_len,
                            bucket->path,
@@ -1272,14 +1308,37 @@ chimera_s3_bucket_get_path(const struct s3_bucket *bucket)
 
 SYMBOL_EXPORT int
 chimera_s3_add_cred(
-    void       *s3_shared,
-    const char *access_key,
-    const char *secret_key,
-    int         pinned)
+    void           *s3_shared,
+    const char     *access_key,
+    const char     *secret_key,
+    int             has_identity,
+    uint32_t        uid,
+    uint32_t        gid,
+    uint32_t        ngids,
+    const uint32_t *gids,
+    const char     *canon_id,
+    const char     *display_name,
+    int             pinned)
 {
     struct chimera_server_s3_shared *shared = s3_shared;
 
-    return chimera_s3_cred_cache_add(shared->cred_cache, access_key, secret_key, pinned);
+    /* A key bound to no user acts as the anonymous identity rather than root:
+     * omitting the binding must not hand out privilege. */
+    if (!has_identity) {
+        chimera_s3_error(
+            "S3 access key %s is not bound to a user; it will act as uid=%u gid=%u "
+            "and can only reach objects those ids may reach. Set \"username\" on "
+            "the key to bind it to a configured user.",
+            access_key, shared->config->anon_uid, shared->config->anon_gid);
+        uid   = shared->config->anon_uid;
+        gid   = shared->config->anon_gid;
+        ngids = 0;
+        gids  = NULL;
+    }
+
+    return chimera_s3_cred_cache_add(shared->cred_cache, access_key, secret_key,
+                                     uid, gid, ngids, gids,
+                                     canon_id, display_name, pinned);
 } /* chimera_s3_add_cred */
 
 SYMBOL_EXPORT int
@@ -1322,8 +1381,10 @@ s3_server_init(
     shared->tcp_flavor   = chimera_server_config_get_tcp_flavor(config);
     shared->tcp_protocol = chimera_tcp_flavor_to_protocol(shared->tcp_flavor);
 
-    shared->config->port    = chimera_server_config_get_s3_port(config);
-    shared->config->io_size = 128 * 1024;
+    shared->config->port     = chimera_server_config_get_s3_port(config);
+    shared->config->io_size  = 128 * 1024;
+    shared->config->anon_uid = chimera_server_config_get_s3_anon_uid(config);
+    shared->config->anon_gid = chimera_server_config_get_s3_anon_gid(config);
 
     /* Built from the same flavor tcp_protocol came from: a protocol and an
      * endpoint that disagree about whether they are a socket is a listen
@@ -1339,9 +1400,6 @@ s3_server_init(
     shared->cred_cache = chimera_s3_cred_cache_create(64, 3600);
 
     shared->multipart_table = chimera_s3_multipart_table_create(256);
-
-    /* Initialize root credentials for now - TODO: proper credential mapping */
-    chimera_vfs_cred_init_unix(&shared->cred, 0, 0, 0, NULL);
 
     /* Initialize the root file handle for VFS lookups */
     chimera_vfs_get_root_fh(shared->root_fh, &shared->root_fh_len);

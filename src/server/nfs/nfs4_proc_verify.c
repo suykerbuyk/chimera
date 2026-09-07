@@ -105,7 +105,8 @@ chimera_nfs4_verify_complete(
                                 req->thread->shared->nfs_lease_time_s,
                                 req->export_id,
                                 req->thread->shared->fh_key,
-                                req->thread->shared->fh_sign);
+                                req->thread->shared->fh_sign,
+                                0);
 
     bool match = (num_out_mask == args->num_attrmask) &&
         (memcmp(out_mask, args->attrmask,
@@ -168,15 +169,18 @@ verify_validate_mask(
         (1 << FATTR4_CASE_PRESERVING) | (1 << FATTR4_CHOWN_RESTRICTED) |
         (1 << FATTR4_FILEHANDLE)      | (1 << FATTR4_FILEID) |
         (1 << FATTR4_FILES_AVAIL)     | (1 << FATTR4_FILES_FREE) |
-        (1 << FATTR4_FILES_TOTAL)     | (1 << FATTR4_MAXNAME) |
-        (1 << FATTR4_MAXREAD)         | (1U << FATTR4_MAXWRITE);
+        (1 << FATTR4_FILES_TOTAL)     | (1 << FATTR4_HOMOGENEOUS) |
+        (1 << FATTR4_MAXFILESIZE)     | (1 << FATTR4_MAXLINK) |
+        (1 << FATTR4_MAXNAME)         | (1 << FATTR4_MAXREAD) |
+        (1U << FATTR4_MAXWRITE);
     static const uint32_t supported_word1 =
         (1U << (FATTR4_MODE - 32))         | (1U << (FATTR4_NUMLINKS - 32)) |
         (1U << (FATTR4_OWNER - 32))        | (1U << (FATTR4_OWNER_GROUP - 32)) |
         (1U << (FATTR4_SPACE_AVAIL - 32))  | (1U << (FATTR4_SPACE_FREE - 32)) |
         (1U << (FATTR4_SPACE_TOTAL - 32))  | (1U << (FATTR4_SPACE_USED - 32)) |
         (1U << (FATTR4_TIME_ACCESS - 32))  | (1U << (FATTR4_TIME_METADATA - 32)) |
-        (1U << (FATTR4_TIME_MODIFY - 32));
+        (1U << (FATTR4_TIME_MODIFY - 32))  |
+        (1U << (FATTR4_MOUNTED_ON_FILEID - 32));
     static const uint32_t writeonly_word1 =
         (1U << (FATTR4_TIME_ACCESS_SET - 32)) |
         (1U << (FATTR4_TIME_MODIFY_SET - 32));

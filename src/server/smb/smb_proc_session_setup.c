@@ -4,8 +4,8 @@
 
 #include "smb_internal.h"
 #include "smb_procs.h"
-#include "smb_signing.h"
-#include "smb_encrypt.h"
+#include "smb_common/smb_signing.h"
+#include "smb_common/smb_encrypt.h"
 #include "smb_auth.h"
 #include "smb_wbclient.h"
 #include "vfs/vfs.h"
@@ -609,6 +609,7 @@ chimera_smb_session_setup(struct chimera_smb_request *request)
             size_t klen = 0;
 
             if (chimera_smb_derive_encryption_keys(
+                    0 /* server */,
                     conn->dialect, conn->negotiated.cipher_id,
                     session_key_saved, session_key_saved_len,
                     conn->dialect == SMB2_DIALECT_3_1_1 ? conn->preauth_hash : NULL,
@@ -619,6 +620,34 @@ chimera_smb_session_setup(struct chimera_smb_request *request)
                     session->flags |= CHIMERA_SMB_SESSION_ENCRYPT_DATA;
                 }
             }
+        }
+
+        /* smb_encryption == 2 REQUIRES encryption (1 merely enables it).  Every
+         * other read of the knob treats it as a boolean, which left "required"
+         * indistinguishable from "enabled": a client that never advertised an
+         * encryption capability negotiates cipher_id 0, so the block above
+         * derives no keys, the session is never marked encrypt-all, and the
+         * enforcement points keyed off that flag never fire -- the server then
+         * served the whole session in cleartext while configured to require
+         * encryption.
+         *
+         * MS-SMB2 3.3.5.5.3: when Server.EncryptData is TRUE and the client did
+         * not negotiate encryption, the server MUST fail the session setup with
+         * ACCESS_DENIED.  Anonymous is exempt: a null session has no secret to
+         * protect and is never encrypt-all (as above), so requiring encryption
+         * of it would reject the guest probe every SMB client opens with.
+         *
+         * The per-share requirement already enforces exactly this shape at the
+         * request gate (smb.c: share->encrypt_data && !received_encrypted ->
+         * ACCESS_DENIED); this is the global-mode half that was missing. */
+        if (shared->config.encryption >= 2 && !is_anonymous && !is_binding &&
+            !(session->flags & CHIMERA_SMB_SESSION_ENCRYPT_DATA)) {
+            chimera_smb_error("Session setup refused: encryption is required "
+                              "but the client negotiated none (dialect 0x%04x, "
+                              "cipher 0x%04x)",
+                              conn->dialect, conn->negotiated.cipher_id);
+            chimera_smb_complete_request(request, SMB2_STATUS_ACCESS_DENIED);
+            return;
         }
 
         /* Track whether the established/current security context is anonymous.

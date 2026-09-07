@@ -32,11 +32,21 @@ chimera_nfs4_setclientid_confirm(
     struct chimera_server_nfs_shared *shared          = thread->shared;
     struct nfs_client                *destroy_unified = NULL;
     struct nfs4_session              *session;
+    struct nfs4_client_principal      principal;
     nfsstat4                          status;
+
+    /* RFC 7530 §16.34.5 binds the confirm to the principal that issued the
+     * SETCLIENTID, so it travels into the record match. */
+    principal.flavor          = req->principal_flavor;
+    principal.uid             = req->principal_uid;
+    principal.gid             = req->principal_gid;
+    principal.machinename     = req->principal_machinename;
+    principal.machinename_len = req->principal_machinename_len;
 
     status = nfs4_client_setclientid_confirm(&shared->nfs4_shared_clients,
                                              args->clientid,
                                              args->setclientid_confirm,
+                                             &principal,
                                              &destroy_unified);
 
     /* A superseded (rebooted) client's state hierarchy is torn down outside
@@ -53,6 +63,12 @@ chimera_nfs4_setclientid_confirm(
         chimera_nfs4_compound_complete(req, status);
         return;
     }
+
+    /* RFC 7530 §16.34.5: this is the step that modifies the recorded and
+     * confirmed callback information, so apply the path the matching
+     * SETCLIENTID staged.  One-shot -- a retransmitted confirm finds nothing
+     * staged and leaves the path (and any channel built on it) alone. */
+    nfs4_client_commit_cb_path(&shared->nfs4_shared_clients, args->clientid);
 
     /* The clientid is now confirmed and usable.  Ensure it has an implicit
      * (NFS4.0) session and bind it to this connection so subsequent
@@ -77,10 +93,11 @@ chimera_nfs4_setclientid_confirm(
                                  &thread->shared->nfs4_recovery, uc);
 
             /* If the client re-registered a new callback address while holding
-             * delegations (RFC 7530 §16.33), its stale channel was torn down in
-             * nfs4_client_set_cb_path.  Rebuild a channel to the new address now,
-             * on this (the client's) thread, so a subsequent recall reaches the
-             * new callback server rather than being revoked for want of a path. */
+             * delegations (RFC 7530 §16.33), its stale channel was torn down
+             * by nfs4_client_commit_cb_path above.  Rebuild a channel to the
+             * new address now, on this (the client's) thread, so a subsequent
+             * recall reaches the new callback server rather than being revoked
+             * for want of a path. */
             if (uc->delegations) {
                 nfs4_cb_ensure_probe(thread, uc, req);
             }

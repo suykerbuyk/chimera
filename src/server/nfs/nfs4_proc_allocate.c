@@ -86,7 +86,7 @@ chimera_nfs4_allocate_typecheck_complete(
 
     if ((attr->va_set_mask & CHIMERA_VFS_ATTR_MODE) &&
         !S_ISREG(attr->va_mode)) {
-        res->ar_status = chimera_nfs4_data_nonreg_status(attr->va_mode);
+        res->ar_status = chimera_nfs4_sparse_nonreg_status(attr->va_mode);
         chimera_vfs_release(req->thread->vfs_thread, req->handle);
         req->handle = NULL;
         chimera_nfs4_compound_complete(req, res->ar_status);
@@ -158,6 +158,18 @@ chimera_nfs4_allocate(
      * path opens it directly, and the state-table path must name it. */
     if (req->fhlen == 0) {
         res->ar_status = NFS4ERR_NOFILEHANDLE;
+        chimera_nfs4_compound_complete(req, res->ar_status);
+        return;
+    }
+
+    /* RFC 7862 §15.1 describes the reservation as the byte range
+     * [aa_offset, aa_offset + aa_length); a range whose end does not fit in a
+     * uint64 names no such interval.  Reject it here rather than handing a
+     * wrapped end to the backends, where it becomes a tiny (or absurd) block
+     * range in memfs and an out-of-range fallocate() elsewhere. */
+    if (args->aa_length &&
+        args->aa_offset > UINT64_MAX - args->aa_length) {
+        res->ar_status = NFS4ERR_INVAL;
         chimera_nfs4_compound_complete(req, res->ar_status);
         return;
     }

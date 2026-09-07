@@ -40,6 +40,14 @@
 
 #define chimera_linux_abort_if(cond, ...) \
         chimera_abort_if(cond, "linux", __FILE__, __LINE__, __VA_ARGS__)
+
+/* The statx(2) request mask both passthrough backends use for attributes.
+ * STATX_BTIME rides along with the basic set: ext4/xfs/btrfs track a birth
+ * time and the mapper needs it to fill va_btime (SMB CreationTime, NFSv4
+ * time_create).  Asking for it costs nothing on filesystems that do not have
+ * one -- the kernel simply leaves the bit clear in stx_mask. */
+#define CHIMERA_LINUX_STATX_MASK (STATX_BASIC_STATS | STATX_BTIME)
+
 #define TERM_STR(name, str, len, scratch) \
         char *(name) = scratch; \
         scratch     += (len) + 1; \
@@ -153,7 +161,11 @@ chimera_linux_stat_to_attr(
 
     attr->va_set_mask |= CHIMERA_VFS_ATTR_MASK_STAT;
 
-    attr->va_dev   = st->st_dev;
+    /* Compose the device id as major<<32|minor (the same convention as
+     * va_rdev and the statx mapper below) rather than exposing the glibc
+     * dev_t bit layout: the two mappers back the same handles, and object
+     * identity checks compare va_dev across operations. */
+    attr->va_dev   = ((uint64_t) major(st->st_dev) << 32) | minor(st->st_dev);
     attr->va_ino   = st->st_ino;
     attr->va_mode  = st->st_mode;
     attr->va_nlink = st->st_nlink;
@@ -202,6 +214,17 @@ chimera_linux_statx_to_attr(
     attr->va_mtime.tv_nsec = stx->stx_mtime.tv_nsec;
     attr->va_ctime.tv_sec  = stx->stx_ctime.tv_sec;
     attr->va_ctime.tv_nsec = stx->stx_ctime.tv_nsec;
+
+    /* Birth time is optional in the VFS and optional in statx: only claim the
+     * bit when the kernel actually returned one (ext4/xfs/btrfs do, tmpfs and
+     * older kernels do not), so consumers keep their "not tracked" fallback
+     * rather than reporting a zero creation time. */
+    if ((attr->va_req_mask & CHIMERA_VFS_ATTR_BTIME) &&
+        (stx->stx_mask & STATX_BTIME)) {
+        attr->va_set_mask     |= CHIMERA_VFS_ATTR_BTIME;
+        attr->va_btime.tv_sec  = stx->stx_btime.tv_sec;
+        attr->va_btime.tv_nsec = stx->stx_btime.tv_nsec;
+    }
 
     /* See chimera_linux_stat_to_attr: map the device id to a stable
      * per-filesystem fsid (vfs_fsid.h) rather than exposing the raw device
@@ -367,6 +390,49 @@ linux_mount_table_destroy(struct chimera_linux_mount_table *mount_table)
 
 } /* linux_mount_table_destroy */
 
+/* Identity of a chimera mount's backing (root) directory, allocated at MOUNT
+ * and handed back as mount_private, so per-op code can recognize the mount
+ * root without holding an fd.
+ *
+ * UMOUNT frees it, but a process that exits with the mount still up never
+ * issues one: chimera_vfs_destroy tears the delegation threads down before the
+ * mount table, so no request can be dispatched by then, and
+ * chimera_vfs_mount_table_destroy frees the mount without touching the
+ * module-owned mount_private (it cannot -- the shape is the module's).  So
+ * every mount left standing at teardown leaked this.  The other backends do
+ * not: their mount_private points at a filesystem object owned by the module's
+ * own registry, not at an allocation the mount alone owns.
+ *
+ * `next` threads them onto the module's shared list so module destroy can
+ * sweep whatever UMOUNT did not, the same way it already sweeps ranges and
+ * range_files. */
+struct chimera_linux_mount_root {
+    dev_t                            dev;
+    ino_t                            ino;
+    struct chimera_linux_mount_root *next;
+};
+
+/* True when `name` is ".." and `parent_fd` is the mount's root directory:
+ * resolution must not escape the mount.  POSIX resolves the root's ".." to
+ * the root itself; without the clamp a passthrough walks into the backing
+ * store's parent (the scratch directory and its siblings). */
+static inline int
+linux_lookup_escapes_root(
+    const void *mount_private,
+    int         parent_fd,
+    const char *name)
+{
+    const struct chimera_linux_mount_root *root = mount_private;
+    struct stat                            pst;
+
+    if (!root || strcmp(name, "..") != 0) {
+        return 0;
+    }
+
+    return fstat(parent_fd, &pst) == 0 &&
+           pst.st_dev == root->dev && pst.st_ino == root->ino;
+} /* linux_lookup_escapes_root */
+
 static inline int
 linux_open_by_handle(
     struct chimera_linux_mount_table *mount_table,
@@ -471,18 +537,20 @@ chimera_linux_map_attrs(
     int                       fd)
 {
     int            rc;
-    struct stat    st;
+    struct statx   stx;
     struct statvfs stvfs;
 
+    /* statx() rather than fstat(): same stats, one syscall, plus a birth time. */
     if (attr->va_req_mask & (CHIMERA_VFS_ATTR_MASK_STAT | CHIMERA_VFS_ATTR_FSID)) {
 
-        rc = fstat(fd, &st);
+        rc = statx(fd, "", AT_EMPTY_PATH | AT_STATX_SYNC_AS_STAT,
+                   CHIMERA_LINUX_STATX_MASK, &stx);
 
         if (rc) {
             return;
         }
 
-        chimera_linux_stat_to_attr(attr, &st);
+        chimera_linux_statx_to_attr(attr, &stx);
     }
 
     if (attr->va_req_mask & CHIMERA_VFS_ATTR_MASK_STATFS_VALUES) {
@@ -540,7 +608,7 @@ chimera_linux_map_child_attrs(
     const char                 *name)
 {
     int            rc;
-    struct stat    st;
+    struct statx   stx;
     struct statvfs stvfs;
     int            stat_valid = 0;
 
@@ -550,13 +618,16 @@ chimera_linux_map_child_attrs(
 
     if (attr->va_req_mask & (CHIMERA_VFS_ATTR_MASK_STAT | CHIMERA_VFS_ATTR_FSID)) {
 
-        rc = fstatat(dirfd, name, &st, AT_SYMLINK_NOFOLLOW);
+        /* statx() rather than fstatat(): same basic stats in one syscall, plus
+         * the birth time that fstatat(2) cannot report. */
+        rc = statx(dirfd, name, AT_SYMLINK_NOFOLLOW | AT_STATX_SYNC_AS_STAT,
+                   CHIMERA_LINUX_STATX_MASK, &stx);
 
         if (rc) {
             return chimera_linux_errno_to_status(errno);
         }
 
-        chimera_linux_stat_to_attr(attr, &st);
+        chimera_linux_statx_to_attr(attr, &stx);
         stat_valid = 1;
     }
 
@@ -581,7 +652,7 @@ chimera_linux_map_child_attrs(
     }
 
     if ((attr->va_req_mask & CHIMERA_VFS_ATTR_EA_SIZE) && stat_valid &&
-        (S_ISREG(st.st_mode) || S_ISDIR(st.st_mode))) {
+        (S_ISREG(stx.stx_mode) || S_ISDIR(stx.stx_mode))) {
         attr->va_ea_size   = chimera_linux_ea_size_at(dirfd, name);
         attr->va_set_mask |= CHIMERA_VFS_ATTR_EA_SIZE;
     }
@@ -643,3 +714,68 @@ chimera_linux_mtime_to_verifier(const struct stat *st)
     return ((uint64_t) st->st_mtim.tv_sec << 32) |
            ((uint64_t) st->st_mtim.tv_nsec & 0xFFFFFFFF);
 } /* chimera_linux_mtime_to_verifier */
+
+/* True when a setattr is exactly the utimensat(2) pattern Linux handles
+ * differently from POSIX: one timestamp set to "now", the other omitted, and
+ * nothing else in the request.  POSIX 2008 grants that change to any process
+ * with write access (it is equivalent to a NULL times after an I/O), but
+ * Linux treats it as an explicit set and insists on ownership, failing a
+ * mere writer with EPERM (see utimensat(2) BUGS). */
+static inline int
+chimera_linux_times_now_omit(const struct chimera_vfs_attrs *attr)
+{
+    uint64_t tmask = attr->va_set_mask &
+        (CHIMERA_VFS_ATTR_ATIME | CHIMERA_VFS_ATTR_MTIME);
+
+    if (attr->va_set_mask != tmask || tmask == 0) {
+        return 0;
+    }
+
+    if ((attr->va_set_mask & CHIMERA_VFS_ATTR_ATIME) &&
+        (attr->va_set_mask & CHIMERA_VFS_ATTR_MTIME)) {
+        return (attr->va_atime.tv_nsec == CHIMERA_VFS_TIME_NOW &&
+                attr->va_mtime.tv_nsec == CHIMERA_VFS_TIME_OMIT) ||
+               (attr->va_atime.tv_nsec == CHIMERA_VFS_TIME_OMIT &&
+                attr->va_mtime.tv_nsec == CHIMERA_VFS_TIME_NOW);
+    }
+
+    if (attr->va_set_mask & CHIMERA_VFS_ATTR_ATIME) {
+        return attr->va_atime.tv_nsec == CHIMERA_VFS_TIME_NOW;
+    }
+
+    return attr->va_mtime.tv_nsec == CHIMERA_VFS_TIME_NOW;
+} /* chimera_linux_times_now_omit */
+
+/* POSIX-mode write-access check for the credential against the object behind
+* fd.  faccessat(2) checks the real (or effective) uid, never the fsuid the
+* modules impersonate with, so the class check is done here from the stat. */
+static inline int
+chimera_linux_cred_write_ok(
+    int                            fd,
+    const struct chimera_vfs_cred *cred)
+{
+    struct stat st;
+    unsigned    shift;
+    uint32_t    i;
+    int         in_group;
+
+    if (fstat(fd, &st) != 0) {
+        return 0;
+    }
+
+    if (cred->uid == 0) {
+        return 1;
+    }
+
+    if (st.st_uid == cred->uid) {
+        shift = 6;
+    } else {
+        in_group = (st.st_gid == cred->gid);
+        for (i = 0; !in_group && i < cred->ngids; i++) {
+            in_group = (cred->gids[i] == st.st_gid);
+        }
+        shift = in_group ? 3 : 0;
+    }
+
+    return ((st.st_mode >> shift) & S_IWOTH) ? 1 : 0;
+} /* chimera_linux_cred_write_ok */

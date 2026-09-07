@@ -12,6 +12,7 @@
 #include "nfs4_state.h"
 #include "nfs4_callback.h"
 #include "nfs4_drc.h"
+#include "nfs_drc_reply.h"
 #include "nfs_internal.h"
 #include "nfs_nlm_state.h"
 #include "nfs_common.h"
@@ -647,10 +648,11 @@ nfs4_client_setclientid(
 
 nfsstat4
 nfs4_client_setclientid_confirm(
-    struct nfs4_client_table *table,
-    uint64_t                  clientid,
-    const uint8_t            *confirm,
-    struct nfs_client       **destroy_unified)
+    struct nfs4_client_table           *table,
+    uint64_t                            clientid,
+    const uint8_t                      *confirm,
+    const struct nfs4_client_principal *principal,
+    struct nfs_client                 **destroy_unified)
 {
     struct nfs4_client *r, *old;
     nfsstat4            status;
@@ -674,6 +676,17 @@ nfs4_client_setclientid_confirm(
          * specifies NFS4ERR_STALE_CLIENTID here; NFS4ERR_STALE_STATEID is only
          * valid for stateid operations. */
         status = NFS4ERR_STALE_CLIENTID;
+        goto out_unlock;
+    }
+
+    /* RFC 7530 §16.34.5: in every case where the confirm names an existing
+     * record, "if the principals of the records do not match that of the
+     * SETCLIENTID_CONFIRM, the server returns NFS4ERR_CLID_INUSE".  Without
+     * it a principal that learns the {clientid, confirm verifier} pair --
+     * the confirm verifiers being a monotonic counter -- can confirm, and on
+     * a reboot record supersede, a client it did not create. */
+    if (!nfs4_principal_matches(r, principal)) {
+        status = NFS4ERR_CLID_INUSE;
         goto out_unlock;
     }
 
@@ -1514,22 +1527,29 @@ nfs4_replay_capture_reply(
     const struct evpl_iovec *iov,
     int                      niov,
     int                      total_length,
+    uint32_t                 body_offset,
     void                    *private_data)
 {
     struct nfs_request      *req     = private_data;
-    struct nfs4_session     *session = req->session;
+    struct nfs4_session     *session = req->replay_session;
     struct nfs4_replay_slot *slot    = req->replay_slot;
     uint8_t                 *buf;
-    size_t                   offset = 0;
-    size_t                   total  = (size_t) total_length;
+    uint32_t                 rpc_len;
+    size_t                   total;
     size_t                   cur;
-    int                      i;
 
-    if (!slot || !session || total_length <= 0) {
+    if (!slot || !session || total_length <= (int) body_offset) {
         return;
     }
 
-    if ((uint32_t) total_length > session->replay_maxresp_cached) {
+    /* Store the RPC reply, not the whole outgoing message: body_offset bytes of
+     * transport framing are rebuilt for the retransmit anyway, and keeping them
+     * made a reply captured over RDMA unparseable on replay -- which
+     * nfs4_send_cached_reply's caller turns into a fatal abort. */
+    rpc_len = (uint32_t) total_length - body_offset;
+    total   = rpc_len;
+
+    if (rpc_len > session->replay_maxresp_cached) {
         return;
     }
 
@@ -1546,7 +1566,7 @@ nfs4_replay_capture_reply(
                  &session->replay_bytes_in_use, &cur, cur + total,
                  memory_order_relaxed, memory_order_relaxed));
 
-    buf = malloc(total_length);
+    buf = malloc(rpc_len);
     if (!buf) {
         atomic_fetch_sub_explicit(&session->replay_bytes_in_use, total,
                                   memory_order_relaxed);
@@ -1556,17 +1576,19 @@ nfs4_replay_capture_reply(
     /* Concatenate iovecs into a single contiguous buffer.  Loses
      * zerocopy on replay; acceptable since cachethis=true is rare for
      * iovec-heavy ops (READ/READLINK) and replay is rare in general. */
-    for (i = 0; i < niov; i++) {
-        memcpy(buf + offset, iov[i].data, iov[i].length);
-        offset += iov[i].length;
+    if (nfs_drc_copy_rpc_reply(iov, niov, body_offset, buf, rpc_len) != rpc_len) {
+        free(buf);
+        atomic_fetch_sub_explicit(&session->replay_bytes_in_use, total,
+                                  memory_order_relaxed);
+        return;
     }
 
     /* Same thread runs finalize next, which release-publishes these via the
      * state_word store -- a later reader that observes CACHED sees them. */
     slot->cached_buf = buf;
-    slot->cached_len = total_length;
+    slot->cached_len = rpc_len;
 
-    nfs4_replay_bytes_delta(req, total_length);
+    nfs4_replay_bytes_delta(req, rpc_len);
 } /* nfs4_replay_capture_reply */
 
 /*
@@ -1581,6 +1603,58 @@ nfs4_replay_arm_capture(struct nfs_request *req)
         req->encoding->reply_capture_private = req;
     }
 } /* nfs4_replay_arm_capture */
+
+/*
+ * A 64-bit FNV-1a over the identity a request was made under.
+ *
+ * The fields are the ones chimera_nfs4_compound already decodes onto the
+ * request: the auth flavor, the AUTH_SYS uid/gid and machine name, or the
+ * RPCSEC_GSS principal (which arrives in the same machinename slot).  Not the
+ * raw credential bytes -- the AUTH_SYS stamp is free to differ between a call
+ * and its own retransmission, so folding it in would make every retry look
+ * false.
+ */
+static uint64_t
+nfs4_replay_fold(
+    uint64_t    h,
+    const void *data,
+    uint32_t    len)
+{
+    const uint8_t *p = data;
+    uint32_t       i;
+
+    for (i = 0; i < len; i++) {
+        h ^= p[i];
+        h *= 1099511628211ULL;   /* FNV-1a prime */
+    }
+    return h;
+} /* nfs4_replay_fold */
+
+/*
+ * A 64-bit FNV-1a over the identity a request was made under.
+ *
+ * The fields are the ones chimera_nfs4_compound already decodes onto the
+ * request: the auth flavor, the AUTH_SYS uid/gid and machine name, or the
+ * RPCSEC_GSS principal (which arrives in the same machinename slot).  Not the
+ * raw credential bytes -- the AUTH_SYS stamp is free to differ between a call
+ * and its own retransmission, so folding it in would make every retry look
+ * false.
+ */
+uint64_t
+nfs4_replay_principal_digest(const struct nfs_request *req)
+{
+    uint64_t h = 1469598103934665603ULL;   /* FNV-1a offset basis */
+
+    h = nfs4_replay_fold(h, &req->principal_flavor,
+                         sizeof(req->principal_flavor));
+    h = nfs4_replay_fold(h, &req->principal_uid, sizeof(req->principal_uid));
+    h = nfs4_replay_fold(h, &req->principal_gid, sizeof(req->principal_gid));
+    if (req->principal_machinename && req->principal_machinename_len) {
+        h = nfs4_replay_fold(h, req->principal_machinename,
+                             req->principal_machinename_len);
+    }
+    return h;
+} /* nfs4_replay_principal_digest */
 
 nfsstat4
 nfs4_replay_slot_acquire(
@@ -1629,10 +1703,12 @@ nfs4_replay_slot_acquire(
                 continue;  /* lost the race; re-read and re-evaluate */
             }
             req->replay_slot        = slot;
+            req->replay_session     = session;
             req->replay_slot_id     = slotid;
             req->replay_action      = NFS4_REPLAY_ACTION_NEW;
             slot->in_progress_since = nfs4_slot_now();
             slot->last_stuck_report = 0;
+            slot->principal         = nfs4_replay_principal_digest(req);
             if (cachethis) {
                 nfs4_replay_arm_capture(req);
             }
@@ -1666,14 +1742,44 @@ nfs4_replay_slot_acquire(
                     }
                 }
                 req->replay_slot        = slot;
+                req->replay_session     = session;
                 req->replay_slot_id     = slotid;
                 req->replay_action      = NFS4_REPLAY_ACTION_NEW;
                 slot->in_progress_since = nfs4_slot_now();
                 slot->last_stuck_report = 0;
+                slot->principal         = nfs4_replay_principal_digest(req);
                 if (cachethis) {
                     nfs4_replay_arm_capture(req);
                 }
             } else if (seqid == cseq) {
+                /*
+                 * A retry.  Before anything else, is it the same user?
+                 *
+                 * RFC 8881 Section 2.10.6.1.3.1: a retry that "uses a
+                 * different principal in the RPC request's credential field
+                 * that translates to a different user" is a false retry, and
+                 * "if the replier determines the users are different between
+                 * the original request and a retry, then the replier MUST
+                 * return NFS4ERR_SEQ_FALSE_RETRY".  Answering it from the
+                 * cache instead hands one user another user's reply and
+                 * silently drops the operation the second one asked for.
+                 *
+                 * The MUST is conditioned on the replier DETERMINING that the
+                 * users differ, and there is one slot that cannot: one
+                 * reconstructed from the KV store after a restart
+                 * (nfs4_drc_repopulate_slot), whose principal was never
+                 * persisted and reads as zero.  Erroring there would answer
+                 * the rightful owner NFS4ERR_SEQ_FALSE_RETRY on the first
+                 * retransmit after every failover, which is the case the
+                 * persistence exists to serve.  Persisting the digest with
+                 * the reply would close the gap and is a change to the record
+                 * format.
+                 */
+                if (slot->principal &&
+                    slot->principal != nfs4_replay_principal_digest(req)) {
+                    status = NFS4ERR_SEQ_FALSE_RETRY;
+                    break;
+                }
                 /* Retransmit.  A CACHED slot always has a live cached_buf
                  * (finalize promotes to CACHED only when bytes were captured),
                  * so claim it CACHED -> IN_PROGRESS with the *same* CAS the
@@ -1694,6 +1800,7 @@ nfs4_replay_slot_acquire(
                         continue;  /* lost the race; re-read and re-evaluate */
                     }
                     req->replay_slot        = slot;
+                    req->replay_session     = session;
                     req->replay_slot_id     = slotid;
                     req->replay_action      = NFS4_REPLAY_ACTION_FROM_CACHE;
                     *out_is_replay          = true;
@@ -1713,10 +1820,24 @@ nfs4_replay_slot_acquire(
              * (true retry) or not (client jumped ahead), we cannot
              * produce a reply yet.  Both paths return errors. */
             if (seqid == cseq) {
-                status = NFS4ERR_RETRY_UNCACHED_REP;
+                /*
+                 * RFC 8881 Section 2.10.6.2: "A retry might be sent while the
+                 * original request is still in progress on the replier.  The
+                 * replier SHOULD deal with the issue by returning NFS4ERR_DELAY
+                 * as the reply to SEQUENCE or CB_SEQUENCE operation, but
+                 * implementations MAY return NFS4ERR_MISORDERED."
+                 *
+                 * NFS4ERR_RETRY_UNCACHED_REP, which this used to answer, is
+                 * neither -- and Section 2.10.6.1.3 forbids it outright as the
+                 * result of a Sequence operation in the first position, which
+                 * SEQUENCE always is.  It is also what made a wedged slot
+                 * invisible: a client retries RETRY_UNCACHED_REP silently
+                 * forever, where NFS4ERR_DELAY makes it back off and retry the
+                 * way the protocol intends.
+                 */
+                status = NFS4ERR_DELAY;
                 /* A retry landing on a slot that has been IN_PROGRESS for many
-                 * seconds means the original compound is wedged server-side;
-                 * the client will retry RETRY_UNCACHED_REP silently forever
+                 * seconds means the original compound is wedged server-side
                  * (observed as fsstress writeback hanging in CI with 14k
                  * errored WRITE RPCs and nothing in the server log).  Make the
                  * wedge visible, rate-limited per slot. */
@@ -1729,7 +1850,7 @@ nfs4_replay_slot_acquire(
                         slot->last_stuck_report = now;
                         chimera_nfs_error(
                             "nfs4 session slot %u seqid %u stuck IN_PROGRESS "
-                            "for %ld sec; replying RETRY_UNCACHED_REP "
+                            "for %ld sec; replying NFS4ERR_DELAY "
                             "(original compound has not completed)",
                             slotid, seqid,
                             (long) (now - slot->in_progress_since));
@@ -1751,7 +1872,11 @@ nfs4_replay_slot_acquire(
         nfs4_replay_metric_inc(req, replay_field_hit);
     } else if (status == NFS4ERR_SEQ_MISORDERED) {
         nfs4_replay_metric_inc(req, replay_field_seq_misordered);
-    } else if (status == NFS4ERR_RETRY_UNCACHED_REP) {
+    } else if (status == NFS4ERR_RETRY_UNCACHED_REP ||
+               status == NFS4ERR_DELAY ||
+               status == NFS4ERR_SEQ_FALSE_RETRY) {
+        /* One counter for "a retry this slot could not replay", whichever of
+         * the three the reason turned out to be. */
         nfs4_replay_metric_inc(req, replay_field_retry_uncached);
     }
     return status;
@@ -1760,7 +1885,7 @@ nfs4_replay_slot_acquire(
 void
 nfs4_replay_slot_finalize(struct nfs_request *req)
 {
-    struct nfs4_session     *session = req->session;
+    struct nfs4_session     *session = req->replay_session;
     struct nfs4_replay_slot *slot    = req->replay_slot;
     uint64_t                 cur;
 
@@ -1838,44 +1963,26 @@ nfs4_replay_slot_replay_done(struct nfs_request *req)
 } /* nfs4_replay_slot_replay_done */
 
 /*
- * Record the delegation callback path for a client onto its unified state
- * record.  Called from the SETCLIENTID handler (4.0, with a cb_client4) and
- * from CREATE_SESSION (4.1, program only -- the backchannel rides the fore
- * conn).  Re-setting the path (e.g. a fresh SETCLIENTID) resets the probe
- * state so the callback channel is re-validated before any new delegation.
+ * Commit callback addressing onto a client's unified state record.  Re-setting
+ * the path resets the probe state so the callback channel is re-validated
+ * before any new delegation.  The caller holds the client table lock.
  *
  * The actual outbound channel (cb_path.cb_client) is established lazily by
  * the callback subsystem; here we only capture the addressing the client
  * supplied.
  */
-void
-nfs4_client_set_cb_path(
-    struct nfs4_client_table *table,
-    uint64_t                  client_id,
-    uint32_t                  cb_program,
-    uint32_t                  cb_ident,
-    uint8_t                   minorversion,
-    const char               *netid,
-    int                       netid_len,
-    const char               *addr,
-    int                       addr_len)
+static void
+nfs4_cb_path_store(
+    struct nfs_client *u,
+    uint32_t           cb_program,
+    uint32_t           cb_ident,
+    uint8_t            minorversion,
+    const char        *netid,
+    int                netid_len,
+    const char        *addr,
+    int                addr_len)
 {
-    struct nfs4_client  *c;
-    struct nfs_client   *u;
-    struct nfs4_cb_path *cb;
-
-    pthread_mutex_lock(&table->nfs4_ct_lock);
-
-    HASH_FIND(nfs4_client_hh_by_id, table->nfs4_ct_clients_by_id,
-              &client_id, sizeof(client_id), c);
-
-    if (!c || !c->unified) {
-        pthread_mutex_unlock(&table->nfs4_ct_lock);
-        return;
-    }
-
-    u  = c->unified;
-    cb = &u->cb_path;
+    struct nfs4_cb_path *cb = &u->cb_path;
 
     if (addr_len >= (int) sizeof(cb->cb_addr)) {
         addr_len = sizeof(cb->cb_addr) - 1;
@@ -1922,8 +2029,128 @@ nfs4_client_set_cb_path(
     }
 
     pthread_mutex_unlock(&u->lock);
+} /* nfs4_cb_path_store */
+
+/*
+ * Apply a callback path immediately.  Used by CREATE_SESSION (4.1, program
+ * only -- the backchannel rides the fore conn), where the operation that
+ * carries the addressing is itself the one that confirms the client.  The 4.0
+ * SETCLIENTID path stages instead; see nfs4_client_stage_cb_path.
+ */
+void
+nfs4_client_set_cb_path(
+    struct nfs4_client_table *table,
+    uint64_t                  client_id,
+    uint32_t                  cb_program,
+    uint32_t                  cb_ident,
+    uint8_t                   minorversion,
+    const char               *netid,
+    int                       netid_len,
+    const char               *addr,
+    int                       addr_len)
+{
+    struct nfs4_client *c;
+
+    pthread_mutex_lock(&table->nfs4_ct_lock);
+
+    HASH_FIND(nfs4_client_hh_by_id, table->nfs4_ct_clients_by_id,
+              &client_id, sizeof(client_id), c);
+
+    if (c && c->unified) {
+        nfs4_cb_path_store(c->unified, cb_program, cb_ident, minorversion,
+                           netid, netid_len, addr, addr_len);
+    }
+
     pthread_mutex_unlock(&table->nfs4_ct_lock);
 } /* nfs4_client_set_cb_path */
+
+/*
+ * Stage the callback path a 4.0 SETCLIENTID supplied.
+ *
+ * RFC 7530 §16.33.5: a callback/callback_ident update "is only confirmed if
+ * followed up by a SETCLIENTID_CONFIRM", and §16.34.5 makes the confirm the
+ * step that modifies "recorded and confirmed callback and callback_ident
+ * information".  The RFC tolerates a stray SETCLIENTID carrying stale
+ * callback info precisely because of that deferral, so the addressing is
+ * parked on the client record here and only reaches the live unified record
+ * in nfs4_client_commit_cb_path.
+ */
+void
+nfs4_client_stage_cb_path(
+    struct nfs4_client_table *table,
+    uint64_t                  client_id,
+    uint32_t                  cb_program,
+    uint32_t                  cb_ident,
+    const char               *netid,
+    int                       netid_len,
+    const char               *addr,
+    int                       addr_len)
+{
+    struct nfs4_client *c;
+
+    pthread_mutex_lock(&table->nfs4_ct_lock);
+
+    HASH_FIND(nfs4_client_hh_by_id, table->nfs4_ct_clients_by_id,
+              &client_id, sizeof(client_id), c);
+
+    if (c) {
+        if (netid_len < 0) {
+            netid_len = 0;
+        }
+        if (netid_len > (int) sizeof(c->nfs4_client_scid_cb_netid)) {
+            netid_len = sizeof(c->nfs4_client_scid_cb_netid);
+        }
+        if (addr_len < 0) {
+            addr_len = 0;
+        }
+        if (addr_len > (int) sizeof(c->nfs4_client_scid_cb_addr)) {
+            addr_len = sizeof(c->nfs4_client_scid_cb_addr);
+        }
+
+        c->nfs4_client_scid_cb_program   = cb_program;
+        c->nfs4_client_scid_cb_ident     = cb_ident;
+        c->nfs4_client_scid_cb_netid_len = (uint32_t) netid_len;
+        c->nfs4_client_scid_cb_addr_len  = (uint32_t) addr_len;
+        if (netid_len) {
+            memcpy(c->nfs4_client_scid_cb_netid, netid, netid_len);
+        }
+        if (addr_len) {
+            memcpy(c->nfs4_client_scid_cb_addr, addr, addr_len);
+        }
+        c->nfs4_client_scid_cb_valid = 1;
+    }
+
+    pthread_mutex_unlock(&table->nfs4_ct_lock);
+} /* nfs4_client_stage_cb_path */
+
+void
+nfs4_client_commit_cb_path(
+    struct nfs4_client_table *table,
+    uint64_t                  client_id)
+{
+    struct nfs4_client *c;
+
+    pthread_mutex_lock(&table->nfs4_ct_lock);
+
+    HASH_FIND(nfs4_client_hh_by_id, table->nfs4_ct_clients_by_id,
+              &client_id, sizeof(client_id), c);
+
+    if (c && c->unified && c->nfs4_client_scid_cb_valid) {
+        /* One-shot: a retransmitted SETCLIENTID_CONFIRM must not tear the
+         * channel this one just authorised back down. */
+        c->nfs4_client_scid_cb_valid = 0;
+        nfs4_cb_path_store(c->unified,
+                           c->nfs4_client_scid_cb_program,
+                           c->nfs4_client_scid_cb_ident,
+                           0,
+                           c->nfs4_client_scid_cb_netid,
+                           (int) c->nfs4_client_scid_cb_netid_len,
+                           c->nfs4_client_scid_cb_addr,
+                           (int) c->nfs4_client_scid_cb_addr_len);
+    }
+
+    pthread_mutex_unlock(&table->nfs4_ct_lock);
+} /* nfs4_client_commit_cb_path */
 
 /*
  * Record the RPC auth flavor/credentials the client wants the server to use on

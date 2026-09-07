@@ -66,10 +66,20 @@ chimera_nfs4_lockt_probe(
     }
 
     memset(&owner, 0, sizeof(owner));
-    owner.proto      = CHIMERA_CLAIM_PROTO_NFSV4;
-    owner.client_key = args->owner.clientid;
-    owner.owner_lo   = XXH3_64bits(args->owner.owner.data,
-                                   args->owner.owner.len);
+    owner.proto = CHIMERA_CLAIM_PROTO_NFSV4;
+    /* RFC 8881 §2.4: in 4.1+ the client is identified by the session, not by
+     * the clientid embedded in lock_owner4 -- clients routinely leave that
+     * field zero or stale.  LOCK registers its claims under the server-assigned
+     * client id (nfs4_proc_lock.c), so keying the probe on the wire field would
+     * make the caller's own locks look foreign and defeat the SHOULD-exclude-
+     * self rule of RFC 7530 §16.11.5. */
+    if (req->minorversion > 0 && req->session && req->session->client_unified) {
+        owner.client_key = req->session->client_unified->client_id;
+    } else {
+        owner.client_key = args->owner.clientid;
+    }
+    owner.owner_lo = XXH3_64bits(args->owner.owner.data,
+                                 args->owner.owner.len);
     owner.owner_hi = 0;
 
     chimera_vfs_claim_init_range(&probe,
@@ -157,6 +167,22 @@ chimera_nfs4_lockt(
         res->status = NFS4ERR_NOFILEHANDLE;
         chimera_nfs4_compound_complete(req, res->status);
         return;
+    }
+
+    /* RFC 7530 §9.6.2: inside the server-reboot grace window the byte-range
+     * locks held before the restart have not all been reclaimed, so LOCKT
+     * would report a range as available that another client is about to
+     * reclaim.  Refuse it with NFS4ERR_GRACE rather than answer from
+     * half-rebuilt state. */
+    {
+        nfsstat4 g_status = nfs_recovery_io_check(
+            &thread->shared->nfs4_recovery);
+
+        if (g_status != NFS4_OK) {
+            res->status = g_status;
+            chimera_nfs4_compound_complete(req, res->status);
+            return;
+        }
     }
 
     /* RFC 7530 §9.1.4: the lock-owner names a clientid; reject one the server

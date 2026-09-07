@@ -18,8 +18,9 @@
 #include "common/logging.h"
 #include "common/macros.h"
 #include "common/misc.h"
-#include "smb2.h"
-#include "smb_encrypt.h"
+#include "smb_common/smb2.h"
+#include "smb_common/smb_encrypt.h"
+#include "smb_secure_send.h"
 #include "smb1.h"
 #include "smb_attr.h"
 #include "smb_session.h"
@@ -242,6 +243,15 @@ struct chimera_smb_config {
      * SET_SECURITY; see chimera_server_config_set_smb_acl_inherited_canonicalize
      * for semantics.  Default 1 (canonical). */
     int                            acl_inherited_canonicalize;
+    /* Emit POSIX mode as an S-1-5-88-3 modefromsid ACE on QUERY SECURITY so a
+     * POSIX/CIFS-style client reads the exact mode instead of the translated
+     * Windows ACL memfs synthesizes.  Default 0; the POSIX-over-SMB loopback
+     * enables it (chimera_server_config_set_smb_mode_from_sid). */
+    int                            mode_from_sid;
+    /* POSIX rename semantics: skip the contained-open recall and destination-
+     * parent dir-lease probe (a POSIX rename never fails on open handles).
+     * Default 0; the POSIX-over-SMB loopback enables it. */
+    int                            posix_rename;
     /* Answer a replayed durable-v2 CREATE that matches a still-deferred CREATE
      * the Windows way (ACCESS_DENIED, and no replay detection while the original
      * is deferred on a share conflict) rather than the default Samba way
@@ -340,6 +350,15 @@ struct chimera_smb_conn;
  * allocated as a single iovec (max_iovecs == 1); a request larger than one
  * evpl buffer cannot be satisfied with one iovec. */
 #define CHIMERA_SMB_MAX_TRANSACT_SIZE         (1 * 1024 * 1024)
+
+/* MaxReadSize/MaxWriteSize advertised in NEGOTIATE.  Per MS-SMB2 3.2.4.1.5, a
+ * connection without SMB2_GLOBAL_CAP_LARGE_MTU (dialect < 2.1, or multi-credit
+ * disabled) charges exactly one credit per request regardless of size, which
+ * fixes the largest single payload at 64 KiB; only a connection granted
+ * LARGE_MTU may advertise the larger multi-credit size. */
+#define CHIMERA_SMB_MAX_RW_SIZE_LARGE_MTU     (8 * 1024 * 1024)
+#define CHIMERA_SMB_MAX_RW_SIZE_SINGLE_CREDIT 65536
+
 
 /* Maximum supported file size, matching the Windows/Samba value
  * (0xFFFFFFF0000 == 2^44 - 2^16).  A write, SetEndOfFile or SetAllocation whose
@@ -724,6 +743,11 @@ struct chimera_smb_request {
             uint8_t                            r_symlink_error;
             uint8_t                            r_symlink_relative;
             uint16_t                           r_symlink_target_len;
+            /* UnparsedPathLength (bytes, UTF-16) for the SymbolicLinkError
+             * Response: 0 for a final-component symlink, and the "/"+name suffix
+             * for an intermediate (parent-path) symlink so the client resolves
+             * the mid-path link and retries rather than seeing a bare ELOOP. */
+            uint16_t                           r_symlink_unparsed;
             char                               r_symlink_target[CHIMERA_VFS_PATH_MAX];
             struct chimera_vfs_open_handle    *r_symlink_handle;
         } create;
@@ -1425,6 +1449,25 @@ struct chimera_smb_conn {
     char                               local_addr[128];
     char                               remote_addr[128];
 };
+
+/* The MaxReadSize/MaxWriteSize this connection actually advertised, for the
+ * READ/WRITE handlers to bound against.
+ *
+ * MS-SMB2 3.3.5.12 and 3.3.5.13 require INVALID_PARAMETER when Length exceeds
+ * MaxReadSize / MaxWriteSize, and that means the value sent in THIS
+ * connection's NEGOTIATE response -- not the largest the server is willing to
+ * advertise to anyone.  READ compared against the LARGE_MTU constant directly,
+ * which is 128x too permissive on a connection that negotiated the
+ * single-credit size, and WRITE did not check at all.  Derived from the same
+ * capability NEGOTIATE branches on, so it cannot drift from what was sent. */
+static inline uint32_t
+chimera_smb_max_rw_size(const struct chimera_smb_conn *conn)
+{
+    return (conn->capabilities & SMB2_GLOBAL_CAP_LARGE_MTU)
+           ? CHIMERA_SMB_MAX_RW_SIZE_LARGE_MTU
+           : CHIMERA_SMB_MAX_RW_SIZE_SINGLE_CREDIT;
+} /* chimera_smb_max_rw_size */
+
 
 /*
  * Compute the SMB2 CreditResponse for one response and update the connection's

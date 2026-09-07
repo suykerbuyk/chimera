@@ -24,10 +24,17 @@ chimera_vfs_lookup_at_complete(struct chimera_vfs_request *request)
 
     if (request->status == CHIMERA_VFS_OK) {
         /* A path-only backend resolves the whole path in one shot and returns no
-         * stable child fh (va_fh_len == 0).  Skip the child name/attr cache: a
-         * zero-length fh is the name cache's NEGATIVE (ENOENT) marker, so caching
-         * a success-without-fh here would poison subsequent lookups. */
-        if (request->lookup_at.r_attr.va_fh_len > 0) {
+         * stable child fh.  Skip the child name/attr cache: a zero-length fh is
+         * the name cache's NEGATIVE (ENOENT) marker, so caching a
+         * success-without-fh here would poison subsequent lookups.
+         *
+         * The authority for "a handle came back" is the ATTR_FH set bit, not
+         * va_fh_len: requests are recycled through a free list, so a backend
+         * that simply does not fill the handle in leaves the previous request's
+         * length behind -- and that stale length would otherwise reach a
+         * memcpy as a size. */
+        if ((request->lookup_at.r_attr.va_set_mask & CHIMERA_VFS_ATTR_FH) &&
+            request->lookup_at.r_attr.va_fh_len > 0) {
             chimera_vfs_name_cache_insert(thread, name_cache,
                                           request->lookup_at.handle->fh_hash,
                                           request->lookup_at.handle->fh,
@@ -85,8 +92,17 @@ chimera_vfs_lookup_at_dispatch(
 
     name_hash = chimera_vfs_hash(name, namelen);
 
+    /* A path-only backend cannot cache positive name->child entries (its
+     * creates return no stable child fh), so the name cache holds only the
+     * negative (tombstone) entries a remove leaves -- and those go stale the
+     * moment the name is recreated through a different key (a fd-relative
+     * create clears "(parent_handle,name)" while a path lookup checks
+     * "(mount_root,whole/path)").  Serving such a tombstone hides a live
+     * object (the end-of-trace audit's lstat then wrongly ENOENTs).  Skip the
+     * name-cache fast path for path-only parents and always dispatch. */
     if (!(attr_mask & ~(CHIMERA_VFS_ATTR_FH | CHIMERA_VFS_ATTR_MASK_CACHEABLE)) &&
-        !(dir_attr_mask & ~(CHIMERA_VFS_ATTR_MASK_CACHEABLE))) {
+        !(dir_attr_mask & ~(CHIMERA_VFS_ATTR_MASK_CACHEABLE)) &&
+        !chimera_vfs_module_is_path_only(handle->vfs_module)) {
 
         cached_attr.va_req_mask = 0;
         cached_attr.va_set_mask = 0;
@@ -233,8 +249,10 @@ chimera_vfs_lookup_at(
      * DELEGATES_DAC (passthrough) backends when the caller is a POSIX (AUTH_UNIX)
      * client: they resolve each component by file handle (open_by_handle_at),
      * which bypasses the kernel's directory-search DAC, so the prefix would
-     * otherwise never be checked.  SMB keeps its own model (see gate_needed_dac). */
-    if (chimera_vfs_gate_needed_dac(handle->vfs_module->capabilities, cred)) {
+     * otherwise never be checked.  SMB keeps its own model (see gate_needed_dac),
+     * and a remote-DAC proxy joins for the same cache-served-resolution reason
+     * (see chimera_vfs_gate_needed_prefix). */
+    if (chimera_vfs_gate_needed_prefix(handle->vfs_module->capabilities, cred)) {
         gate                = chimera_vfs_gate_scratch_alloc(thread);
         gate->thread        = thread;
         gate->cred          = cred;
@@ -246,10 +264,10 @@ chimera_vfs_lookup_at(
         gate->callback      = callback;
         gate->private_data  = private_data;
 
-        chimera_vfs_gate_fh_dac(&gate->gate_ctx, thread, cred,
-                                handle->fh, handle->fh_len,
-                                CHIMERA_ACE_EXECUTE,
-                                chimera_vfs_lookup_at_gate_complete, gate);
+        chimera_vfs_gate_handle_prefix(&gate->gate_ctx, thread, cred,
+                                       handle,
+                                       CHIMERA_ACE_EXECUTE,
+                                       chimera_vfs_lookup_at_gate_complete, gate);
         return;
     }
 

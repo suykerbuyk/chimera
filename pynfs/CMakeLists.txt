@@ -90,6 +90,17 @@ set(PYNFS_SKIP_BACKENDS_SATT15 linux io_uring)
 # already excluded from the combined suite; this drops the per-code entries.)
 set(PYNFS_SKIP_BACKENDS_EID50  ${PYNFS_BACKENDS})
 
+# SEC7 (st_secinfo.testRPCSEC_GSS) requires SECINFO to list an RPCSEC_GSS
+# triple.  Chimera advertises krb5 only when the Kerberos acceptor is actually
+# installed (server.nfs_kerberos_enabled, off by default and off in this
+# harness): RFC 7530 3.2.1.1 / 16.31 require SECINFO to report flavors the
+# server will accept, and an RPCSEC_GSS client would otherwise be refused at the
+# RPC layer.  The test asserts the advertisement unconditionally, so it cannot
+# pass against a server with GSS disabled -- the same shape as EID50 above, a
+# test of a feature this configuration does not offer.  Scoped to 4.0, which is
+# where it runs; an unknown no<CODE> token aborts the 4.1/4.2 testserver.
+set(PYNFS_SKIP_BACKENDS_SEC7   ${PYNFS_BACKENDS})
+
 # Per-code NFSv4 lease-time override (seconds).  Delegation recall-handshake
 # tests open a file as one client, then drive a *second* client's conflicting
 # OPEN to force a CB_RECALL.  Establishing that second client (SETCLIENTID /
@@ -309,6 +320,9 @@ function(pynfs_add_combined_suite backend minor)
         if("${backend}" IN_LIST PYNFS_SKIP_BACKENDS_SATT15)
             list(APPEND excludes noSATT15)
         endif()
+        if("${backend}" IN_LIST PYNFS_SKIP_BACKENDS_SEC7)
+            list(APPEND excludes noSEC7)
+        endif()
     endif()
 
     set(name chimera/pynfs/combined_${backend}_nfs4.${minor})
@@ -397,3 +411,24 @@ set_tests_properties(chimera/pynfs/kerberos/sec_krb5only_deny_sys_memfs_nfs4.1 P
     LABELS "pynfs;pynfs_kerberos;rpcsec_gss;memfs;nfs4.1"
     SKIP_RETURN_CODE 77
     ENVIRONMENT "PYTHONUNBUFFERED=1;NFS_EXPORT_SEC=krb5;NFS_KRB_SEC=sys;NFS_EXPECT_WRONGSEC=1")
+
+# Privacy service (krb5p) end-to-end smoke.  Same path as the krb5 smoke but
+# drives pynfs with sec=krb5p, so every call's arguments are GSS-wrapped as
+# rpc_gss_priv_data (gss_wrap, conf=1) and every reply's results are wrapped
+# symmetrically -- exercising the encrypt/decrypt framing on both directions
+# (including a multi-block WRITE/READ via OPEN1/OPEN2).
+add_test(NAME chimera/pynfs/kerberos/krb5p_smoke_memfs_nfs4.1
+    COMMAND bash ${NFS_KRB_WRAPPER} ${CHIMERA_BINARY} memfs ${PYNFS_DIR} ${NFS_KRB_CODES})
+set_tests_properties(chimera/pynfs/kerberos/krb5p_smoke_memfs_nfs4.1 PROPERTIES
+    LABELS "pynfs;pynfs_kerberos;rpcsec_gss;memfs;nfs4.1"
+    SKIP_RETURN_CODE 77
+    ENVIRONMENT "PYTHONUNBUFFERED=1;NFS_KRB_SEC=krb5p")
+
+# Per-export sec=krb5p policy: restrict the export to privacy only and verify an
+# allowed flavor (krb5p) works through the enforcement path.
+add_test(NAME chimera/pynfs/kerberos/sec_krb5p_only_allow_memfs_nfs4.1
+    COMMAND bash ${NFS_KRB_WRAPPER} ${CHIMERA_BINARY} memfs ${PYNFS_DIR} ${NFS_KRB_CODES})
+set_tests_properties(chimera/pynfs/kerberos/sec_krb5p_only_allow_memfs_nfs4.1 PROPERTIES
+    LABELS "pynfs;pynfs_kerberos;rpcsec_gss;memfs;nfs4.1"
+    SKIP_RETURN_CODE 77
+    ENVIRONMENT "PYTHONUNBUFFERED=1;NFS_EXPORT_SEC=krb5p;NFS_KRB_SEC=krb5p")
