@@ -290,7 +290,11 @@ chimera_nfs4_encode_ff_layout(
      * §5.1).  ffds_group is constant across iomodes. */
     const char   *ffds_user = (iomode == LAYOUTIOMODE4_RW) ? "0" : "1";
 
-    pnfs_put_u64(&p, NFS4_PNFS_STRIPE_UNIT);          /* ffl_stripe_unit       */
+    /* One mirror holding the whole segment on one data server is a stripe
+     * count of one, and RFC 8435 §5.1 requires ffl_stripe_unit to default to
+     * zero in that case; a non-zero unit would let a strict client compute a
+     * data-server index the layout does not have. */
+    pnfs_put_u64(&p, 0);                              /* ffl_stripe_unit       */
 
     pnfs_put_u32(&p, 1);                              /* ffl_mirrors<> count   */
     pnfs_put_u32(&p, 1);                              /* ffm_data_servers<>    */
@@ -538,6 +542,20 @@ ff_lg_fail(
     chimera_nfs4_compound_complete(req, status);
 } /* ff_lg_fail */
 
+/*
+ * XDR size of one layout4 carrying a loc_body of body_len bytes: lo_offset (8)
+ * + lo_length (8) + lo_iomode (4) + loc_type (4) + the loc_body opaque length
+ * prefix (4) plus the body padded to a 4-byte boundary.  loga_maxcount bounds
+ * this (RFC 8881 18.43.3: "the maximum layout size (in bytes) that the client
+ * can handle"); the array's own count word is left out so a client that sized
+ * its buffer for the layouts alone is not refused.
+ */
+static inline uint32_t
+lg_layout4_xdr_len(uint32_t body_len)
+{
+    return 28 + ((body_len + 3) & ~3u);
+} /* lg_layout4_xdr_len */
+
 static void
 ff_lg_emit(struct ff_layoutget_ctx *ctx)
 {
@@ -596,6 +614,19 @@ ff_lg_emit(struct ff_layoutget_ctx *ctx)
         native_fh_len = backing_fh_len - FF_BLOB_FH_SKIP;
     }
 
+    body = xdr_dbuf_alloc_space(256, req->encoding->dbuf);
+    chimera_nfs_abort_if(body == NULL, "Failed to allocate space");
+    body_len = chimera_nfs4_encode_ff_layout(body, deviceid, native_fh, native_fh_len,
+                                             args->loga_iomode);
+
+    /* Enforce loga_maxcount before taking any layout state: a LAYOUTGET that
+     * fails must leave nothing registered, or the server would hold a layout
+     * whose stateid the client never saw. */
+    if (lg_layout4_xdr_len(body_len) > args->loga_maxcount) {
+        ff_lg_fail(ctx, NFS4ERR_TOOSMALL);
+        return;
+    }
+
     client_short_id = (uint32_t) client->client_id;
 
     layout = nfs_layout_state_find(client, req->fh, req->fhlen);
@@ -609,20 +640,18 @@ ff_lg_emit(struct ff_layoutget_ctx *ctx)
         }
         nfs_layout_state_bump(layout, client_short_id, &res->logr_resok4.logr_stateid);
     } else {
-        nfs_layout_state_create(client, req->fh, req->fhlen, req->export_id, args->loga_iomode,
-                                client_short_id, table,
-                                &req->thread->shared->nfs4_layout_table,
-                                &res->logr_resok4.logr_stateid);
+        layout = nfs_layout_state_create(client, req->fh, req->fhlen, req->export_id, args->loga_iomode,
+                                         client_short_id, table,
+                                         &req->thread->shared->nfs4_layout_table,
+                                         &res->logr_resok4.logr_stateid);
     }
+
+    /* Remember what we handed out so CB_LAYOUTRECALL can name the same type. */
+    layout->layout_type = LAYOUT4_FLEX_FILES;
 
     /* Open the client's callback channel so a later conflicting op can recall
      * this layout; CB_LAYOUTRECALL rides the shared delegation channel. */
     nfs4_cb_ensure_probe(req->thread, client, req);
-
-    body = xdr_dbuf_alloc_space(256, req->encoding->dbuf);
-    chimera_nfs_abort_if(body == NULL, "Failed to allocate space");
-    body_len = chimera_nfs4_encode_ff_layout(body, deviceid, native_fh, native_fh_len,
-                                             args->loga_iomode);
 
     lo = xdr_dbuf_alloc_space(sizeof(*lo), req->encoding->dbuf);
     chimera_nfs_abort_if(lo == NULL, "Failed to allocate space");
@@ -804,6 +833,7 @@ lg_sourced_cb(
     struct nfs_client       *client = req->session ? req->session->client_unified : NULL;
     struct nfs_layout_state *layout;
     uint32_t                 client_short_id, i, loc_type;
+    uint32_t                 layouts_len = 0;
 
     if (error_code != CHIMERA_VFS_OK) {
         ff_lg_fail(ctx, chimera_nfs4_errno_to_nfsstat4(error_code));
@@ -836,25 +866,6 @@ lg_sourced_cb(
         nfs_pnfs_devcache_put(&req->thread->shared->nfs4_pnfs_devcache, &devices[i]);
     }
 
-    client_short_id = (uint32_t) client->client_id;
-    layout          = nfs_layout_state_find(client, req->fh, req->fhlen);
-    if (layout) {
-        /* See ff_lg_emit(): widen an existing READ layout to RW. */
-        if (args->loga_iomode == LAYOUTIOMODE4_RW) {
-            layout->iomode = LAYOUTIOMODE4_RW;
-        }
-        nfs_layout_state_bump(layout, client_short_id, &res->logr_resok4.logr_stateid);
-    } else {
-        nfs_layout_state_create(client, req->fh, req->fhlen, req->export_id, args->loga_iomode,
-                                client_short_id, table,
-                                &req->thread->shared->nfs4_layout_table,
-                                &res->logr_resok4.logr_stateid);
-    }
-
-    /* Open the client's callback channel so a later conflicting op can recall
-     * this layout; CB_LAYOUTRECALL rides the shared delegation channel. */
-    nfs4_cb_ensure_probe(req->thread, client, req);
-
     if (loc_type == LAYOUT4_BLOCK_VOLUME || loc_type == LAYOUT4_SCSI) {
         uint8_t        *body = xdr_dbuf_alloc_space(1024, req->encoding->dbuf);
         struct layout4 *lo   = xdr_dbuf_alloc_space(sizeof(*lo), req->encoding->dbuf);
@@ -884,6 +895,7 @@ lg_sourced_cb(
                                                        body_len, req->encoding->dbuf);
         chimera_nfs_abort_if(rc, "Failed to copy layout body");
 
+        layouts_len                      = lg_layout4_xdr_len(body_len);
         res->logr_resok4.num_logr_layout = 1;
         res->logr_resok4.logr_layout     = lo;
     } else {
@@ -909,11 +921,43 @@ lg_sourced_cb(
             rc                         = xdr_dbuf_opaque_copy(&los[i].lo_content.loc_body, body,
                                                               body_len, req->encoding->dbuf);
             chimera_nfs_abort_if(rc, "Failed to copy layout body");
+
+            layouts_len += lg_layout4_xdr_len(body_len);
         }
 
         res->logr_resok4.num_logr_layout = num_segments;
         res->logr_resok4.logr_layout     = los;
     }
+
+    /* Enforce loga_maxcount before taking any layout state, so a rejected
+     * LAYOUTGET leaves nothing registered (see ff_lg_emit). */
+    if (layouts_len > args->loga_maxcount) {
+        ff_lg_fail(ctx, NFS4ERR_TOOSMALL);
+        return;
+    }
+
+    client_short_id = (uint32_t) client->client_id;
+    layout          = nfs_layout_state_find(client, req->fh, req->fhlen);
+    if (layout) {
+        /* See ff_lg_emit(): widen an existing READ layout to RW. */
+        if (args->loga_iomode == LAYOUTIOMODE4_RW) {
+            layout->iomode = LAYOUTIOMODE4_RW;
+        }
+        nfs_layout_state_bump(layout, client_short_id, &res->logr_resok4.logr_stateid);
+    } else {
+        layout = nfs_layout_state_create(client, req->fh, req->fhlen, req->export_id, args->loga_iomode,
+                                         client_short_id, table,
+                                         &req->thread->shared->nfs4_layout_table,
+                                         &res->logr_resok4.logr_stateid);
+    }
+
+    /* Remember the backend-sourced type: a block/SCSI holder must be recalled
+     * as block/SCSI or the client finds no matching layout to return. */
+    layout->layout_type = loc_type;
+
+    /* Open the client's callback channel so a later conflicting op can recall
+     * this layout; CB_LAYOUTRECALL rides the shared delegation channel. */
+    nfs4_cb_ensure_probe(req->thread, client, req);
 
     res->logr_resok4.logr_return_on_close = 0;
 
@@ -998,6 +1042,7 @@ chimera_nfs4_layoutget(
     struct LAYOUTGET4args   *args = &argop->oplayoutget;
     struct LAYOUTGET4res    *res  = &resop->oplayoutget;
     struct ff_layoutget_ctx *ctx;
+    struct nfs_client       *client;
 
     req->handle = NULL;
 
@@ -1018,8 +1063,82 @@ chimera_nfs4_layoutget(
         return;
     }
 
+    /* LAYOUTIOMODE4_ANY is legal only for LAYOUTRETURN and CB_LAYOUTRECALL
+     * (RFC 8881 §3.3.20), and the returned lo_iomode MUST be READ or RW
+     * (§18.43.3).  Reject anything else here rather than echo an illegal
+     * iomode back -- it would also mis-derive the per-iomode ff_layout
+     * principal, handing a write layout the read principal. */
+    if (args->loga_iomode != LAYOUTIOMODE4_READ &&
+        args->loga_iomode != LAYOUTIOMODE4_RW) {
+        res->logr_status = NFS4ERR_BADIOMODE;
+        chimera_nfs4_compound_complete(req, res->logr_status);
+        return;
+    }
+
     if (req->fhlen == 0) {
         res->logr_status = NFS4ERR_NOFILEHANDLE;
+        chimera_nfs4_compound_complete(req, res->logr_status);
+        return;
+    }
+
+    /* RFC 8881 §18.43.3: once the client holds a layout on this file,
+     * loga_stateid MUST be that layout's stateid, so one naming no layout this
+     * client holds is NFS4ERR_BAD_STATEID, as is a seqid the server never
+     * issued.  A zero seqid means "the current stateid" (§8.2.2).  Only a
+     * layout-typed stateid is judged here: before the first layout is granted
+     * the client legitimately presents an open, lock, or delegation stateid,
+     * about which the layout state has nothing to say -- and the all-ones
+     * READ-bypass stateid decodes as the layout type without being one.
+     *
+     * A *lagging* seqid is accepted, unlike LAYOUTRETURN below.  The server
+     * advances the seqid on every LAYOUTGET (§12.5.3), so a client with more
+     * than one LAYOUTGET in flight cannot know the current value -- it can only
+     * echo the last one it was given, and the second of two pipelined
+     * LAYOUTGETs therefore arrives carrying a seqid the server has already
+     * superseded.  Rejecting that breaks a legitimate client, which is what
+     * pynfs FFLOOS (st_flex.testFlexLayoutOldSeqid) checks.  A stale seqid is
+     * still a value this server issued for this layout, so honoring it forges
+     * nothing; NFS4ERR_OLD_STATEID is merely listed as permitted for the op
+     * (§18.43.4), not required for this case.  LAYOUTRETURN is a single ordered
+     * operation with no such ambiguity and keeps the strict check. */
+    client = req->session ? req->session->client_unified : NULL;
+
+    if (client && !nfs4_stateid_is_special(&args->loga_stateid)) {
+        struct nfs4_stateid_view view;
+
+        nfs4_stateid_decode(&view, &args->loga_stateid);
+
+        if (view.type == NFS4_STATEID_TYPE_LAYOUT) {
+            struct nfs_layout_state *layout =
+                nfs_layout_state_find(client, req->fh, req->fhlen);
+            uint32_t                 in_seqid = args->loga_stateid.seqid;
+
+            if (!layout) {
+                res->logr_status = NFS4ERR_BAD_STATEID;
+            } else if (in_seqid > layout->seqid) {
+                res->logr_status = NFS4ERR_BAD_STATEID;
+            } else {
+                res->logr_status = NFS4_OK;
+            }
+
+            if (res->logr_status != NFS4_OK) {
+                chimera_nfs4_compound_complete(req, res->logr_status);
+                return;
+            }
+        }
+    }
+
+    /* RFC 8881 §18.43.3 / §12.5.5.2: a LAYOUTGET that overlaps a recall in
+     * progress MUST be rejected with NFS4ERR_RECALLCONFLICT.  The recall
+     * snapshots the holders it will call back at recall_prepare time, so a
+     * layout granted after that point would never be recalled: the client
+     * would keep writing through a range the deferred operation (e.g. a
+     * SETATTR truncate) is about to change, and that operation would stall
+     * until the new layout's lease lapsed.  The client retries once the
+     * recall completes. */
+    if (nfs_layout_table_recall_active(&thread->shared->nfs4_layout_table,
+                                       req->fh, (uint16_t) req->fhlen)) {
+        res->logr_status = NFS4ERR_RECALLCONFLICT;
         chimera_nfs4_compound_complete(req, res->logr_status);
         return;
     }
@@ -1061,8 +1180,24 @@ chimera_nfs4_layoutreturn(
 
     client = req->session ? req->session->client_unified : NULL;
 
+    /* RFC 8881 §18.44.3: a LAYOUTRETURN4_ALL makes the client believe every
+     * layout it held is gone, so the server has to forget them all.  Keeping
+     * them registered left the server-wide recall barrier standing for files
+     * the client had already given up, and a later conflicting op then parked
+     * behind a CB_LAYOUTRECALL to a client that was usually on its way out
+     * (RETURN ALL is what an unmount sends) until the recall deadline or the
+     * lease expired.  FSID stays a no-op: the fsid is a backend attribute the
+     * layout record does not carry, so selecting by it needs a getattr per
+     * record that this synchronous path cannot make. */
+    if (client &&
+        args->lora_layoutreturn.lr_returntype == LAYOUTRETURN4_ALL) {
+        nfs_layout_state_destroy_all(client,
+                                     &thread->shared->nfs4_state_table,
+                                     thread->vfs_thread);
+    }
+
     /* v1 tracks a single whole-file layout per file, so a FILE return drops
-     * the record entirely.  FSID/ALL returns are accepted as no-ops. */
+     * the record entirely. */
     if (client &&
         args->lora_layoutreturn.lr_returntype == LAYOUTRETURN4_FILE) {
         struct nfs_layout_state *layout =
@@ -1084,9 +1219,8 @@ chimera_nfs4_layoutreturn(
 
             /* RFC 8881 §12.5.3: the layout stateid carried by LAYOUTRETURN must
              * match the server's current seqid for this layout.  A stale seqid
-             * is OLD_STATEID, a future one BAD_STATEID.  (LAYOUTGET, by
-             * contrast, tolerates an old seqid -- the client may race two
-             * LAYOUTGETs.) */
+             * is OLD_STATEID, a future one BAD_STATEID.  (LAYOUTGET applies the
+             * same rule, except that it also accepts a zero seqid.) */
             if (in_seqid < layout->seqid) {
                 res->lorr_status = NFS4ERR_OLD_STATEID;
                 chimera_nfs4_compound_complete(req, res->lorr_status);

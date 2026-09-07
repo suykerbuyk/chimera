@@ -7,6 +7,58 @@
 #include "nfs4_state.h"
 #include "nfs4_drc.h"
 
+/*
+ * The SEQUENCE result of a successful slot acquisition.
+ *
+ * RFC 8881 Section 2.10.6.1.1 requires this reply to be cached, and permits a
+ * replier to recompute the slot-usage fields rather than store them; that is
+ * what this does, which is also why the uncached-retry path can be answered
+ * from it: the reply the client should have received is reconstructible from
+ * the session and the args alone.
+ */
+static void
+nfs4_sequence_fill_resok(
+    struct SEQUENCE4res  *res,
+    struct nfs4_session  *session,
+    struct SEQUENCE4args *args)
+{
+    res->sr_status = NFS4_OK;
+    memcpy(res->sr_resok4.sr_sessionid, session->nfs4_session_id,
+           NFS4_SESSIONID_SIZE);
+    res->sr_resok4.sr_sequenceid = args->sa_sequenceid;
+    res->sr_resok4.sr_slotid     = args->sa_slotid;
+    /* RFC 5661 18.46.3: sr_highest_slotid is the *maximum slot id*, not
+     * the count.  Linux nfsd returns max_slots - 1. */
+    res->sr_resok4.sr_highest_slotid =
+        session->replay_max_slots ? session->replay_max_slots - 1 : 0;
+    res->sr_resok4.sr_target_highest_slotid = res->sr_resok4.sr_highest_slotid;
+    res->sr_resok4.sr_status_flags          = 0;
+
+    /* RFC 8881 §2.10.6.3 / §18.46.3: signal the client that one or more of its
+     * recallable objects (delegations) have been revoked, so it issues
+     * TEST_STATEID / FREE_STATEID to recover.  Cleared once the client has
+     * freed every revoked delegation. */
+    if (session->client_unified &&
+        atomic_load_explicit(&session->client_unified->revoked_deleg_count,
+                             memory_order_acquire) > 0) {
+        res->sr_resok4.sr_status_flags |= SEQ4_STATUS_RECALLABLE_STATE_REVOKED;
+    }
+
+    /* RFC 8881 §18.46.3: SEQ4_STATUS_CB_PATH_DOWN tells the client the server
+     * has no usable callback path to it, so it re-establishes one (in 4.1 via
+     * BIND_CONN_TO_SESSION on a fresh connection).  4.0 signals the same
+     * condition with NFS4ERR_CB_PATH_DOWN from RENEW (nfs4_proc_renew.c); 4.1
+     * has no RENEW, so without this bit a client whose backchannel died was
+     * never told, and delegation recall stayed broken silently.  cb_state
+     * returns to UNINIT when the backchannel is rebound, which clears the bit
+     * on the next SEQUENCE. */
+    if (session->client_unified &&
+        atomic_load_explicit(&session->client_unified->cb_path.cb_state,
+                             memory_order_acquire) == NFS4_CB_DOWN) {
+        res->sr_resok4.sr_status_flags |= SEQ4_STATUS_CB_PATH_DOWN;
+    }
+} /* nfs4_sequence_fill_resok */
+
 void
 chimera_nfs4_sequence(
     struct chimera_server_nfs_thread *thread,
@@ -46,29 +98,18 @@ chimera_nfs4_sequence(
 
     req->session = session;
 
-    status = nfs4_replay_slot_acquire(session,
-                                      args->sa_slotid,
-                                      args->sa_sequenceid,
-                                      args->sa_cachethis,
-                                      req,
-                                      &is_replay);
-
-    if (status != NFS4_OK) {
-        res->sr_status = status;
-        chimera_nfs4_compound_complete(req, status);
-        return;
-    }
-
-    if (is_replay) {
-        /* Phase 2 will short-circuit the compound dispatcher and send
-         * the cached reply bytes verbatim.  Phase 1 has no cache so
-         * this branch is unreachable today; nfs4_replay_slot_acquire
-         * returns NFS4ERR_RETRY_UNCACHED_REP instead. */
-        nfs_client_touch(session->client_unified);
-        chimera_nfs4_compound_complete(req, NFS4_OK);
-        return;
-    }
-
+    /*
+     * The COMPOUND-shape limits are checked before the slot is touched.
+     *
+     * RFC 8881 §2.10.6.1.2 and §18.46.3: when SEQUENCE returns an error "the
+     * sequence ID of the slot MUST NOT change" and the replier "MUST NOT
+     * modify the reply cache entry for the slot".  Checking these after
+     * nfs4_replay_slot_acquire left the slot CAS-advanced to the new seqid and
+     * finalized as COMPLETED with no cached bytes, so the client's retry at the
+     * old seqid was answered NFS4ERR_RETRY_UNCACHED_REP forever -- one
+     * over-large COMPOUND permanently wedged the slot.  None of these limits
+     * depend on slot state, so they can simply be evaluated first.
+     */
     if (session->nfs4_session_fore_attrs.ca_maxrequestsize &&
         marshall_length_COMPOUND4args(req->args_compound) >
         (int) session->nfs4_session_fore_attrs.ca_maxrequestsize) {
@@ -88,27 +129,10 @@ chimera_nfs4_sequence(
         return;
     }
 
-    res->sr_status = NFS4_OK;
-    memcpy(res->sr_resok4.sr_sessionid, session->nfs4_session_id,
-           NFS4_SESSIONID_SIZE);
-    res->sr_resok4.sr_sequenceid = args->sa_sequenceid;
-    res->sr_resok4.sr_slotid     = args->sa_slotid;
-    /* RFC 5661 18.46.3: sr_highest_slotid is the *maximum slot id*, not
-     * the count.  Linux nfsd returns max_slots - 1. */
-    res->sr_resok4.sr_highest_slotid =
-        session->replay_max_slots ? session->replay_max_slots - 1 : 0;
-    res->sr_resok4.sr_target_highest_slotid = res->sr_resok4.sr_highest_slotid;
-    res->sr_resok4.sr_status_flags          = 0;
-
-    /* RFC 8881 §2.10.6.3 / §18.46.3: signal the client that one or more of its
-     * recallable objects (delegations) have been revoked, so it issues
-     * TEST_STATEID / FREE_STATEID to recover.  Cleared once the client has
-     * freed every revoked delegation. */
-    if (session->client_unified &&
-        atomic_load_explicit(&session->client_unified->revoked_deleg_count,
-                             memory_order_acquire) > 0) {
-        res->sr_resok4.sr_status_flags |= SEQ4_STATUS_RECALLABLE_STATE_REVOKED;
-    }
+    /* The reply is reconstructible from the session and the args alone, so it
+     * can be built before the slot is claimed; that is what lets the
+     * cacheability check below also run without disturbing the slot. */
+    nfs4_sequence_fill_resok(res, session, args);
 
     if (args->sa_cachethis &&
         session->nfs4_session_fore_attrs.ca_maxresponsesize_cached &&
@@ -116,6 +140,62 @@ chimera_nfs4_sequence(
         (int) session->nfs4_session_fore_attrs.ca_maxresponsesize_cached) {
         res->sr_status = NFS4ERR_REP_TOO_BIG_TO_CACHE;
         chimera_nfs4_compound_complete(req, NFS4ERR_REP_TOO_BIG_TO_CACHE);
+        return;
+    }
+
+    status = nfs4_replay_slot_acquire(session,
+                                      args->sa_slotid,
+                                      args->sa_sequenceid,
+                                      args->sa_cachethis,
+                                      req,
+                                      &is_replay);
+
+    /*
+     * A retry of a request whose reply was not cached.
+     *
+     * RFC 8881 Section 2.10.6.1.1: "When a SEQUENCE or CB_SEQUENCE operation is
+     * successfully executed, its reply MUST always be cached" -- even when the
+     * client did not ask for the rest of the COMPOUND to be.  So a retry has a
+     * SEQUENCE reply to be answered from, and Section 2.10.6.1.3 says what the
+     * rest of the COMPOUND gets: the replier "enters into its reply cache a
+     * reply consisting of the original results to the SEQUENCE ... operation,
+     * and with the next operation in COMPOUND ... having the error
+     * NFS4ERR_RETRY_UNCACHED_REP", and it "MUST NOT return
+     * NFS4ERR_RETRY_UNCACHED_REP in reply to a Sequence operation if the
+     * Sequence operation is the first operation" -- which it always is, since
+     * a COMPOUND that does not begin with SEQUENCE is refused earlier.
+     *
+     * A lone SEQUENCE has no next operation, and nothing but the SEQUENCE reply
+     * to cache, so the cached success is the whole answer.
+     */
+    if (status == NFS4ERR_RETRY_UNCACHED_REP) {
+        /* res already carries the reconstructed SEQUENCE reply. */
+        if (req->args_compound->num_argarray > 1) {
+            req->index = 1;
+            nfs4_fail_undispatched_op(thread,
+                                      &req->args_compound->argarray[1],
+                                      &req->res_compound.resarray[1],
+                                      NFS4ERR_RETRY_UNCACHED_REP);
+            chimera_nfs4_compound_complete(req, NFS4ERR_RETRY_UNCACHED_REP);
+        } else {
+            chimera_nfs4_compound_complete(req, NFS4_OK);
+        }
+        return;
+    }
+
+    if (status != NFS4_OK) {
+        res->sr_status = status;
+        chimera_nfs4_compound_complete(req, status);
+        return;
+    }
+
+    if (is_replay) {
+        /* Phase 2 will short-circuit the compound dispatcher and send
+         * the cached reply bytes verbatim.  Phase 1 has no cache so
+         * this branch is unreachable today; nfs4_replay_slot_acquire
+         * returns NFS4ERR_RETRY_UNCACHED_REP instead. */
+        nfs_client_touch(session->client_unified);
+        chimera_nfs4_compound_complete(req, NFS4_OK);
         return;
     }
 

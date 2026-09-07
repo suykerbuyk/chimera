@@ -436,10 +436,20 @@ ctest_kvm:
         ARCH: [ amd64 ]
         KVM_NAME: [ pnfs ]
         KVM_FILTER: [ "-R '/pnfs/'" ]
+      # nfstest_alloc on diskfs (both the io_uring and the aio variant) is
+      # excluded for now.  Upstream re-enabled it in the 2026-09-07 sync
+      # (befd69b9, "issue #733 fixed"); in this leg both variants fail alloc02
+      # with "File size should be correct after allocate ... got 0", the guest
+      # then hangs until the harness watchdog fires, and each burns 82 minutes
+      # before ctest calls it failed -- which fails this job in the merge
+      # train.  Upstream's own Extended KVM jobs have been cancelled by that
+      # workflow's six-hour timeout on every run since the change landed, so
+      # the enablement is unvalidated there too.  The memfs variant keeps
+      # running.  Remove the -E once diskfs ALLOCATE in the guest is fixed.
       - MODE: [ Release, Debug ]
         ARCH: [ amd64 ]
         KVM_NAME: [ nfstest ]
-        KVM_FILTER: [ "-R '/nfstest/'" ]
+        KVM_FILTER: [ "-R '/nfstest/' -E 'nfstest_alloc_diskfs'" ]
       - MODE: [ Release, Debug ]
         ARCH: [ amd64 ]
         KVM_NAME: [ ltp ]

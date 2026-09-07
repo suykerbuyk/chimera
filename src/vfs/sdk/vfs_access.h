@@ -73,6 +73,16 @@ int chimera_vfs_gate_needed_dac(
     const struct chimera_vfs_cred *cred);
 
 /*
+ * Like chimera_vfs_gate_needed_dac(), plus remote-DAC proxies
+ * (CHIMERA_VFS_CAP_REMOTE_DAC): cache-served resolution never reaches their
+ * server, so path-prefix search on lookup falls to the engine for them too.
+ * Used only by the lookup gate -- per-op data gates use gate_needed_dac.
+ */
+int chimera_vfs_gate_needed_prefix(
+    uint64_t                       module_capabilities,
+    const struct chimera_vfs_cred *cred);
+
+/*
  * Whether the engine must authorize an OPEN's requested access itself.  Same
  * as chimera_vfs_gate_needed() plus remote-DAC proxy backends
  * (CHIMERA_VFS_CAP_REMOTE_DAC): their server enforces every wire operation
@@ -201,7 +211,78 @@ void chimera_vfs_gate_fh_dac(
     chimera_vfs_gate_callback_t    callback,
     void                          *private_data);
 
+/* As chimera_vfs_gate_fh_dac(), but for the lookup prefix: additionally
+ * enforced for remote-DAC proxies (see chimera_vfs_gate_needed_prefix). */
+void chimera_vfs_gate_fh_prefix(
+    struct chimera_vfs_gate_ctx   *ctx,
+    struct chimera_vfs_thread     *thread,
+    const struct chimera_vfs_cred *cred,
+    const void                    *fh,
+    int                            fhlen,
+    uint32_t                       required,
+    chimera_vfs_gate_callback_t    callback,
+    void                          *private_data);
+
+/* Handle variants of the gate helpers: authorize against an already-open handle
+ * the caller holds instead of re-resolving the object by FH (open_fh+getattr).
+ * Correct for a path-only backend whose FH is a path token that ENOENTs after
+ * an unlink-while-open, and a strict win elsewhere (one fewer open, no TOCTOU).
+ * The caller retains ownership of `handle`. */
+void chimera_vfs_gate_handle(
+    struct chimera_vfs_gate_ctx    *ctx,
+    struct chimera_vfs_thread      *thread,
+    const struct chimera_vfs_cred  *cred,
+    struct chimera_vfs_open_handle *handle,
+    uint32_t                        required,
+    chimera_vfs_gate_callback_t     callback,
+    void                           *private_data);
+
+/* As chimera_vfs_gate_handle(), enforced even for DELEGATES_DAC passthroughs
+ * (see chimera_vfs_gate_needed_dac). */
+void chimera_vfs_gate_handle_dac(
+    struct chimera_vfs_gate_ctx    *ctx,
+    struct chimera_vfs_thread      *thread,
+    const struct chimera_vfs_cred  *cred,
+    struct chimera_vfs_open_handle *handle,
+    uint32_t                        required,
+    chimera_vfs_gate_callback_t     callback,
+    void                           *private_data);
+
+/* As chimera_vfs_gate_handle(), enforced additionally for remote-DAC proxies
+ * (the lookup prefix search).  See chimera_vfs_gate_needed_prefix. */
+void chimera_vfs_gate_handle_prefix(
+    struct chimera_vfs_gate_ctx    *ctx,
+    struct chimera_vfs_thread      *thread,
+    const struct chimera_vfs_cred  *cred,
+    struct chimera_vfs_open_handle *handle,
+    uint32_t                        required,
+    chimera_vfs_gate_callback_t     callback,
+    void                           *private_data);
+
+/* As chimera_vfs_gate_delete(), but the parent directory is an already-open
+ * handle the caller holds (the child is still identified by FH). */
+void chimera_vfs_gate_delete_handle(
+    struct chimera_vfs_gate_ctx    *ctx,
+    struct chimera_vfs_thread      *thread,
+    const struct chimera_vfs_cred  *cred,
+    struct chimera_vfs_open_handle *parent_handle,
+    const void                     *child_fh,
+    int                             child_fhlen,
+    chimera_vfs_gate_callback_t     callback,
+    void                           *private_data);
+
 /* Authorize deleting `child_fh` from directory `parent_fh` (delete_allowed). */
+void chimera_vfs_gate_delete_always(
+    struct chimera_vfs_gate_ctx   *ctx,
+    struct chimera_vfs_thread     *thread,
+    const struct chimera_vfs_cred *cred,
+    const void                    *parent_fh,
+    int                            parent_fhlen,
+    const void                    *child_fh,
+    int                            child_fhlen,
+    chimera_vfs_gate_callback_t    callback,
+    void                          *private_data);
+
 void chimera_vfs_gate_delete(
     struct chimera_vfs_gate_ctx   *ctx,
     struct chimera_vfs_thread     *thread,

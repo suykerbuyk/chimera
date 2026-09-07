@@ -5,7 +5,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
 #if defined(__linux__) || defined(CHIMERA_HAVE_XCRYPT)
 #include <crypt.h>
 #else  /* __linux__ || CHIMERA_HAVE_XCRYPT */
@@ -184,8 +188,33 @@ hmac_sha256(
 /* ========== Secret init ========== */
 
 void
-chimera_rest_auth_init_secret(struct chimera_rest_server *rest)
+chimera_rest_auth_init_secret(
+    struct chimera_rest_server *rest,
+    const char                 *state_dir)
 {
+    char    path[512];
+    ssize_t n;
+    int     fd;
+
+    /* A freshly random per-process secret invalidates every bearer token the
+     * moment the daemon restarts, and no two processes can verify each other's
+     * tokens.  RFC 8725 wants an HS256 signing key that is long-lived and
+     * shared by every verifier, so resolve it the way the NFS file-handle key
+     * already is: reuse the copy persisted under state_dir if there is one,
+     * otherwise mint one and persist it 0600 for the next start. */
+    snprintf(path, sizeof(path), "%s/rest_jwt.key", state_dir);
+
+    fd = open(path, O_RDONLY);
+    if (fd >= 0) {
+        n = read(fd, rest->jwt_secret, CHIMERA_REST_JWT_SECRET_LEN);
+        close(fd);
+        if (n == (ssize_t) CHIMERA_REST_JWT_SECRET_LEN) {
+            chimera_rest_info("Loaded JWT signing secret from %s", path);
+            return;
+        }
+        chimera_rest_error("Short read of JWT secret %s; regenerating", path);
+    }
+
     /* RAND_bytes returns 1 on success; on 0/-1 it may not write the buffer at
      * all (CWE-252).  A zero/unseeded jwt_secret would let anyone forge a valid
      * JWT for any user -- a full control-plane authentication bypass -- so a
@@ -194,6 +223,21 @@ chimera_rest_auth_init_secret(struct chimera_rest_server *rest)
     if (RAND_bytes(rest->jwt_secret, CHIMERA_REST_JWT_SECRET_LEN) != 1) {
         chimera_rest_abort("Failed to seed JWT signing secret from CSPRNG");
     }
+
+    fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd >= 0) {
+        if (write(fd, rest->jwt_secret, CHIMERA_REST_JWT_SECRET_LEN) !=
+            (ssize_t) CHIMERA_REST_JWT_SECRET_LEN) {
+            chimera_rest_error("Failed to persist JWT secret to %s; issued "
+                               "tokens will not survive restart", path);
+        }
+        close(fd);
+    } else {
+        chimera_rest_error("Could not persist JWT secret to %s (%s); issued "
+                           "tokens will not survive restart", path,
+                           strerror(errno));
+    }
+
     chimera_rest_info("JWT authentication secret initialized");
 } /* chimera_rest_auth_init_secret */
 
@@ -344,6 +388,11 @@ chimera_rest_jwt_create(
 
 /* ========== JWT verify ========== */
 
+/* Leeway applied to the time-based claims.  RFC 7519 Section 4.1.5 permits
+ * "some small leeway, normally no more than a few minutes, to account for
+ * clock skew" between the issuer and the verifier. */
+#define CHIMERA_REST_JWT_CLOCK_SKEW 60
+
 int
 chimera_rest_jwt_verify(
     struct chimera_rest_server     *rest,
@@ -356,11 +405,15 @@ chimera_rest_jwt_verify(
     size_t        expected_sig_len = 32;
     unsigned char actual_sig[32];
     int           actual_sig_len;
+    unsigned char header_raw[256];
+    int           header_raw_len;
     unsigned char payload_raw[512];
     int           payload_raw_len;
-    json_t       *root;
+    json_t       *header, *root;
     json_error_t  error;
-    const char   *sub;
+    const char   *alg, *typ, *sub;
+    json_t       *nbf_json;
+    time_t        nbf;
     time_t        now;
 
     /* Find the two dots */
@@ -378,6 +431,38 @@ chimera_rest_jwt_verify(
     if (strchr(second_dot + 1, '.')) {
         return -1;
     }
+
+    /* Validate the JOSE header before verifying the signature (RFC 7519
+     * Section 7.2 step 8, RFC 8725 Section 3.1): the verifier must decide the
+     * algorithm from its own configuration rather than trusting the token, so
+     * an "alg":"none" or algorithm-substituted token is rejected outright
+     * instead of relying on the HMAC comparison to fail.  HS256 is the only
+     * algorithm chimera_rest_jwt_create issues and the only one implemented
+     * here. */
+    header_raw_len = base64url_decode(token, first_dot - token,
+                                      header_raw, sizeof(header_raw) - 1);
+    if (header_raw_len < 0) {
+        return -1;
+    }
+    header_raw[header_raw_len] = '\0';
+
+    header = json_loadb((const char *) header_raw, header_raw_len, 0, &error);
+    if (!header) {
+        return -1;
+    }
+
+    alg = json_string_value(json_object_get(header, "alg"));
+    typ = json_string_value(json_object_get(header, "typ"));
+
+    /* "typ" is optional (RFC 7519 Section 5.1); when present it names a media
+     * type, whose comparison is case-insensitive (RFC 8725 Section 3.11). */
+    if (!alg || strcmp(alg, "HS256") != 0 ||
+        (typ && strcasecmp(typ, "JWT") != 0)) {
+        json_decref(header);
+        return -1;
+    }
+
+    json_decref(header);
 
     /* signing_input = header.payload (everything before second dot) */
     si_len = second_dot - token;
@@ -426,11 +511,28 @@ chimera_rest_jwt_verify(
     claims->iat                          = json_integer_value(json_object_get(root, "iat"));
     claims->exp                          = json_integer_value(json_object_get(root, "exp"));
 
+    /* "nbf" is optional and not issued by chimera_rest_jwt_create, but a token
+     * that carries one must still be honored; read it before the payload is
+     * released. */
+    nbf_json = json_object_get(root, "nbf");
+    nbf      = nbf_json ? (time_t) json_integer_value(nbf_json) : 0;
+
     json_decref(root);
 
     /* Check expiration */
     now = time(NULL);
     if (now >= claims->exp) {
+        return -1;
+    }
+
+    /* RFC 7519 Section 4.1.5: the token must not be accepted before "nbf".
+     * Section 4.1.6's "iat" is the issue time, so a token claiming to have
+     * been issued in the future is not yet usable either. */
+    if (nbf && now + CHIMERA_REST_JWT_CLOCK_SKEW < nbf) {
+        return -1;
+    }
+
+    if (claims->iat && now + CHIMERA_REST_JWT_CLOCK_SKEW < claims->iat) {
         return -1;
     }
 

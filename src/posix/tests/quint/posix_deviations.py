@@ -61,24 +61,6 @@ class Deviation:
 
 KNOWN_DEVIATIONS = [
     Deviation(
-        id="PD1",
-        posix="fcntl() F_SETLK/F_SETLKW/F_GETLK (System Interfaces)",
-        summary="memfs advertises CHIMERA_VFS_CAP_FS_LOCK but implements no "
-                "CHIMERA_VFS_OP_LOCK; every record-lock operation fails "
-                "EOPNOTSUPP (and logs 'unknown operation 27')",
-        root_cause="src/vfs/memfs/memfs.c memfs_dispatch (no OP_LOCK case) "
-                   "vs vfs_memfs.capabilities CHIMERA_VFS_CAP_FS_LOCK",
-        candidate_fix="implement byte-range locks in memfs (or stop "
-                      "advertising CAP_FS_LOCK so the VFS returns a "
-                      "deliberate ENOTSUP)",
-        ops=("RFcntlLock", "RLockf"),
-        expected_status=None,
-        actual_status=EOPNOTSUPP,
-        # Lock state is only observable through lock calls, which this
-        # entry also covers, so replay stays in sync.
-        reconcilable=True,
-    ),
-    Deviation(
         id="PD2",
         posix="fcntl() F_DUPFD/F_GETFL/F_SETFL (System Interfaces)",
         summary="chimera_posix_fcntl implements only the record-lock "
@@ -450,9 +432,17 @@ KNOWN_DEVIATIONS = [
         posix="clone_file_range: source range must lie within the source "
               "file (EINVAL)",
         summary="clone_file_range with a source range beyond EOF returns "
-                "success instead of EINVAL",
-        root_cause="memfs clone path does not validate the source range",
-        candidate_fix="validate offSrc+len <= source size",
+                "success instead of EINVAL, and the destination grows to "
+                "cover the range",
+        root_cause="the diskfs clone path does not validate the source "
+                   "range.  Recorded against memfs originally; memfs has "
+                   "since gained the check and no longer reaches this entry "
+                   "(0 hits across the memfs corpus, 3 across diskfs), so "
+                   "the entry now describes diskfs alone -- and, being "
+                   "reconcilable, is what hides the errno divergence until a "
+                   "later read inside the grown region fails instead",
+        candidate_fix="validate offSrc+len <= source size in diskfs "
+                      "clone_range, as memfs does; then retire this entry",
         ops=("RCloneRange",),
         expected_status=EINVAL,
         actual_status=OK,

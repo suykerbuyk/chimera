@@ -9,6 +9,7 @@
 #include <string.h>
 #include <pthread.h>
 #include <sys/stat.h>
+#include <openssl/evp.h>
 
 #include "vfs/sdk/chimera_vfs_sdk.h"
 #include "common/tcp_flavor.h"
@@ -18,7 +19,10 @@
 #include "evpl/evpl.h"
 #include "common/logging.h"
 #include "common/evpl_iovec_cursor.h"
-#include "server/smb/smb2.h"
+#include "smb_common/smb2.h"
+#include "smb_common/smb_signing.h"
+#include "smb_common/smb_encrypt.h"
+#include "smb_common/smb_compress.h"
 #include "smb_ntlm.h"
 
 #define chimera_smbclient_debug(...) chimera_debug("smbclient", __FILE__, __LINE__, __VA_ARGS__)
@@ -47,17 +51,23 @@
 /* The SMB client is a PATH-ONLY VFS backend (no persistent file handles).  File
  * handles come in exactly two shapes:
  *
- *   mount root:  [ mount_id (16) ][ server_index (1) ]                = 17 bytes
- *   open token:  [ mount_id (16) ][ server_index (1) ][ FileId (16) ] = 33 bytes
+ *   mount root:  [ mount_id (16) ][ server_index (1) ]                  = 17 bytes
+ *   open token:  [ mount_id (16) ][ server_index (1) ][ path_id (8) ]   = 25 bytes
  *
- * The mount root is the ONLY re-openable fh (open_fh on it CREATEs the share
- * root).  An open-token fh is an opaque per-open identity built at open time
- * from the SMB FileId; it is used only for open-cache keying and routing, never
- * to re-derive a path, and open_fh of one returns ESTALE.  All metadata is
- * addressed by full mount-relative paths carried in request->X.name. */
+ * SMB2 FileIds are per-open and cannot be handed to a fresh CREATE, so an
+ * open-token fh instead carries a stable 64-bit id (XXH3 of the object's full
+ * mount-relative path).  The server-side path table (chimera_smb_path_intern /
+ * _resolve) maps that id back to the path, so open_fh of ANY object re-CREATEs
+ * it by path -- the same way the mount root re-CREATEs the empty path.  Because
+ * the id is a pure function of the path, the same object always hashes to the
+ * same fh, which lets the VFS open cache share one backend open per object
+ * (every other backend already does this; the old per-FileId token did not).
+ * All metadata is addressed by full mount-relative paths carried in
+ * request->X.name. */
 #define CHIMERA_SMB_FH_SERVER_OFFSET        CHIMERA_VFS_MOUNT_ID_SIZE
+#define CHIMERA_SMB_FH_PATHID_OFFSET        (CHIMERA_VFS_MOUNT_ID_SIZE + 1)
 #define CHIMERA_SMB_ROOT_FH_LEN             (CHIMERA_VFS_MOUNT_ID_SIZE + 1)
-#define CHIMERA_SMB_OPEN_FH_LEN             (CHIMERA_VFS_MOUNT_ID_SIZE + 1 + 16)
+#define CHIMERA_SMB_OPEN_FH_LEN             (CHIMERA_VFS_MOUNT_ID_SIZE + 1 + 8)
 /* Longest mount-relative path the client will encode in a single SMB request. */
 #define CHIMERA_SMB_PATH_MAX                1024
 
@@ -132,15 +142,55 @@ struct chimera_smb_client_file_id {
 /* Per-server registration (global), holding the shared SMB session established
  * once at MOUNT.  Every per-thread connection to this server reuses session_id /
  * tree_id, so a file opened on one thread's connection is usable from another. */
+/* One entry of a server's path table: a stable 64-bit path id (XXH3 of the
+ * full mount-relative path) mapped back to that path, so open_fh can re-CREATE
+ * any object.  Chained by id into chimera_smb_client_server::path_buckets. */
+struct smb_path_ent {
+    uint64_t             id;
+    int                  path_len;
+    char                *path;
+    struct smb_path_ent *next;
+};
+
+#define CHIMERA_SMB_PATH_BUCKETS 256
+
 struct chimera_smb_client_server {
     int                   index;
     int                   in_use;
+
+    /* Path table: id (XXH3 of a full mount-relative path) -> path, so open_fh
+     * can re-CREATE any previously opened object.  Interned at open_at, freed
+     * with the server; the id is a pure function of the path, so entries stay
+     * valid across the per-trace mount cycles that reuse a slot.  path_lock
+     * guards it. */
+    pthread_mutex_t       path_lock;
+    struct smb_path_ent  *path_buckets[CHIMERA_SMB_PATH_BUCKETS];
     char                  hostname[256];
     char                  share[256];
     char                  user[256];
     char                  domain[256];
     char                  password[256];
     uint16_t              port;
+
+    /* Dialect pinned by the mount's vers= option, or 0 to offer the full
+     * CHIMERA_SMB_CLIENT_DIALECTS set and take whatever the server selects.
+     * Pinning is what makes the sub-3.1.1 paths reachable at all: the server
+     * always picks the highest dialect in common, so an unpinned mount against
+     * a modern server never negotiates anything but 3.1.1. */
+    uint16_t              forced_dialect;
+
+    /* seal= from the mount options: 1 asks for transport encryption, 0 leaves
+     * it to the server to demand.  Offering a cipher costs nothing when the
+     * server does not want one, but a client that never offers cannot be
+     * encrypted at all, which is how this module behaved before seal existed. */
+    int                   seal_requested;
+
+    /* compress= from the mount options.  Advertising LZ77 is only half of it:
+     * this server compresses nothing unless a READ carries
+     * SMB2_READFLAG_REQUEST_COMPRESSED, so the flag below is also what makes
+     * the client ask, read by read. */
+    int                   compress_requested;
+    int                   compress_active;
 
     struct evpl_endpoint *endpoint;
 
@@ -167,6 +217,27 @@ struct chimera_smb_client_server {
     int                   signing_active;
     uint16_t              signing_alg;
     uint8_t               signing_key[16];
+
+    /* SMB3 transport encryption, derived alongside the signing key and shared
+     * by every per-thread connection (the cipher keys are per-SESSION).
+     *
+     *   cipher_id       the cipher the server selected, 0 if none was
+     *                   negotiated -- which is also how "this session is not
+     *                   encrypted" is spelled.
+     *   enc_key         client -> server (SMBC2SCipherKey / "ServerIn ")
+     *   dec_key         server -> client (SMBS2CCipherKey / "ServerOut")
+     *   encrypt_active  the server told us to encrypt this session
+     *                   (SMB2_SESSION_FLAG_ENCRYPT_DATA), or the mount asked
+     *                   for it with seal=yes.
+     *   nonce_counter   strictly monotonic per session and never reused; every
+     *                   sender-side message consumes one.  Atomic because
+     *                   per-thread connections share the session. */
+    uint16_t              cipher_id;
+    int                   encrypt_active;
+    size_t                enc_key_len;
+    uint8_t               enc_key[32];
+    uint8_t               dec_key[32];
+    _Atomic uint64_t      nonce_counter;
 };
 
 struct chimera_smb_client_shared {
@@ -207,6 +278,14 @@ struct smb_create_result {
 * CLOSE chain (ops that open a path transiently: lookup/mkdir/remove/rename). */
 struct chimera_smb_op_state {
     struct chimera_smb_client_file_id file_id;
+    /* Attr-enrich chain (getattr / lookup): the FileId above is queried for
+     * FileAllInformation then the modefromsid security descriptor, merged into
+     * `enrich_attr`, after which `enrich_done` runs (complete, or close+complete
+     * for a transiently-opened path). */
+    struct chimera_vfs_attrs         *enrich_attr;
+    void                              (*enrich_done)(
+        struct chimera_smb_client_conn *conn,
+        struct chimera_vfs_request     *request);
 };
 
 /* The continuation invoked when the reply for a specific message_id arrives.
@@ -256,12 +335,12 @@ struct chimera_smb_client_conn {
     struct chimera_smb_client_server   *server;
 
     enum chimera_smb_client_conn_state  state;
-    int                                 closing;   /* evpl_close already issued  */
+    int                                 closing;    /* evpl_close already issued  */
 
     uint64_t                            next_message_id;
 
-    struct chimera_smb_client_pending  *pending;   /* in-flight, by message_id  */
-    struct chimera_smb_client_deferred *deferred;  /* queued until READY        */
+    struct chimera_smb_client_pending  *pending;    /* in-flight, by message_id  */
+    struct chimera_smb_client_deferred *deferred;    /* queued until READY        */
 
     /* All connections a thread owns are linked here so thread teardown can
      * detach every one (the DISCONNECTED notify that frees a conn is deferred to
@@ -281,6 +360,16 @@ struct chimera_smb_client_conn {
     uint8_t                             preauth_hash[SMB2_PREAUTH_HASH_SIZE];
     uint16_t                            negotiated_dialect;
     uint16_t                            negotiated_signing_alg;
+    uint16_t                            negotiated_cipher_id;
+
+    /* AEAD scratch for this connection's transform wrap/unwrap.  Allocated
+     * lazily the first time the session actually encrypts. */
+    struct chimera_smb_encrypt_ctx     *enc_ctx;
+
+    /* AEAD / codec scratch for this connection's transform wrap and unwrap.
+    * Both are per-connection because their EVP contexts are not thread-safe,
+    * and both are allocated lazily the first time the session needs one. */
+    struct chimera_smb_compress_ctx    *cmp_ctx;
 };
 
 struct chimera_smb_client_thread {
@@ -447,9 +536,14 @@ smb_fill_attrs_from_network_open(
     uint32_t                  file_attributes)
 {
     int is_dir = (file_attributes & SMB2_FILE_ATTRIBUTE_DIRECTORY) != 0;
+    int is_lnk = (file_attributes & SMB2_FILE_ATTRIBUTE_REPARSE_POINT) != 0;
 
-    /* SMB has no POSIX mode; synthesize type + a default permission. */
-    attr->va_mode       = (is_dir ? (S_IFDIR | 0755) : (S_IFREG | 0644));
+    /* SMB has no POSIX mode; synthesize type + a default permission.  A reparse
+     * point is reported as a symlink so the VFS core recognizes it and follows
+     * (or, for lstat/readlink, sees the link) -- without the type the core
+     * cannot resolve a symlink at all and every path through one ELOOPs. */
+    attr->va_mode = is_dir ? (S_IFDIR | 0755) :
+        is_lnk ? (S_IFLNK | 0777) : (S_IFREG | 0644);
     attr->va_nlink      = 1;
     attr->va_size       = end_of_file;
     attr->va_space_used = alloc_size;
@@ -467,11 +561,24 @@ smb_fill_attrs_from_network_open(
 
 /* ---- file-handle helpers ----------------------------------------------- */
 
+/* The high bit of the server-index byte flags a "nofollow" fh -- one that names
+ * the raw directory entry (a symbolic link itself, not its target).  open_fh
+ * must re-open such an fh with OPEN_REPARSE_POINT so the path-CREATE lands on
+ * the link, not whatever it points at (which for a self-referential link loops
+ * to ELOOP).  A followed open's fh (the target) leaves the bit clear. */
+#define CHIMERA_SMB_FH_NOFOLLOW_BIT 0x80
+
 static inline int
 chimera_smb_fh_server_index(const uint8_t *fh)
 {
-    return fh[CHIMERA_SMB_FH_SERVER_OFFSET];
+    return fh[CHIMERA_SMB_FH_SERVER_OFFSET] & ~CHIMERA_SMB_FH_NOFOLLOW_BIT;
 } /* chimera_smb_fh_server_index */
+
+static inline int
+chimera_smb_fh_is_nofollow(const uint8_t *fh)
+{
+    return (fh[CHIMERA_SMB_FH_SERVER_OFFSET] & CHIMERA_SMB_FH_NOFOLLOW_BIT) != 0;
+} /* chimera_smb_fh_is_nofollow */
 
 /* The mount-root fh is the only re-openable one. */
 static inline int
@@ -480,21 +587,37 @@ chimera_smb_fh_is_root(int fh_len)
     return fh_len == CHIMERA_SMB_ROOT_FH_LEN;
 } /* chimera_smb_fh_is_root */
 
-/* Build the opaque open-token fh [mount_id][server_index][FileId] from the
- * (root) fh that carries the mount_id + server_index.  Returns its length. */
+/* Build the open-token fh [mount_id][server_index][path_id] from the (root) fh
+ * that carries the mount_id + server_index.  path_id is the XXH3 of the
+ * object's full mount-relative path (interned via chimera_smb_path_intern).
+ * Returns its length. */
 static inline int
 chimera_smb_encode_open_fh(
-    const uint8_t                           *root_fh,
-    const struct chimera_smb_client_file_id *file_id,
-    uint8_t                                 *out_fh)
+    const uint8_t *root_fh,
+    uint64_t       path_id,
+    int            nofollow,
+    uint8_t       *out_fh)
 {
-    uint8_t fragment[1 + sizeof(*file_id)];
+    uint8_t fragment[1 + sizeof(path_id)];
 
     fragment[0] = (uint8_t) chimera_smb_fh_server_index(root_fh);
-    memcpy(fragment + 1, file_id, sizeof(*file_id));
+    if (nofollow) {
+        fragment[0] |= CHIMERA_SMB_FH_NOFOLLOW_BIT;
+    }
+    memcpy(fragment + 1, &path_id, sizeof(path_id));
 
     return chimera_vfs_encode_fh_parent(root_fh, fragment, sizeof(fragment), out_fh);
 } /* chimera_smb_encode_open_fh */
+
+/* Recover the path id stored in an open-token fh. */
+static inline uint64_t
+chimera_smb_fh_path_id(const uint8_t *fh)
+{
+    uint64_t path_id;
+
+    memcpy(&path_id, fh + CHIMERA_SMB_FH_PATHID_OFFSET, sizeof(path_id));
+    return path_id;
+} /* chimera_smb_fh_path_id */
 
 /* ---- transport (smb.c) ------------------------------------------------- */
 
@@ -575,6 +698,37 @@ void chimera_smb_client_umount(
 void chimera_smb_client_conn_on_connected(
     struct chimera_smb_client_conn *conn);
 
+/* Evict any cached open handle for `path`'s interned id from the open caches, so
+ * the next open of that path re-resolves (see smb_namespace.c).  Called after a
+ * namespace op retargets the path (rename/create over a reused id). */
+struct chimera_smb_client_conn;
+struct chimera_vfs_request;
+void smb_evict_pathid(
+    struct chimera_smb_client_conn *conn,
+    struct chimera_vfs_request     *request,
+    const char                     *path,
+    int                             pathlen);
+
+/* ---- path table (smb_ops.c): id <-> full mount-relative path ----------- */
+
+/* Intern `path` in the server's path table and return its stable 64-bit id
+ * (XXH3 of the path).  Idempotent: the same path always returns the same id. */
+uint64_t chimera_smb_path_intern(
+    struct chimera_smb_client_server *server,
+    const char                       *path,
+    int                               path_len);
+
+/* Resolve a path id back to its path (NULL if unknown).  The returned pointer
+ * is owned by the table and valid until the table is cleared/destroyed. */
+const char * chimera_smb_path_resolve(
+    struct chimera_smb_client_server *server,
+    uint64_t                          id,
+    int                              *out_len);
+
+/* Free every entry in the server's path table (keeps the mutex). */
+void chimera_smb_path_table_clear(
+    struct chimera_smb_client_server *server);
+
 /* ---- file operations (smb_ops.c) --------------------------------------- */
 
 void chimera_smb_client_getattr(
@@ -598,7 +752,19 @@ void chimera_smb_client_mkdir_at(
 void chimera_smb_client_remove_at(
     struct chimera_smb_client_conn *conn,
     struct chimera_vfs_request     *request);
+void chimera_smb_set_child_fh(
+    struct chimera_smb_client_conn *conn,
+    struct chimera_vfs_request     *request,
+    const char                     *name,
+    int                             namelen,
+    int                             nofollow,
+    struct chimera_vfs_attrs       *r_attr);
+
 void chimera_smb_client_setattr(
+    struct chimera_smb_client_conn *conn,
+    struct chimera_vfs_request     *request);
+
+void chimera_smb_client_allocate(
     struct chimera_smb_client_conn *conn,
     struct chimera_vfs_request     *request);
 void chimera_smb_client_commit(
@@ -620,6 +786,9 @@ void chimera_smb_client_readdir(
     struct chimera_smb_client_conn *conn,
     struct chimera_vfs_request     *request);
 void chimera_smb_client_rename_at(
+    struct chimera_smb_client_conn *conn,
+    struct chimera_vfs_request     *request);
+void chimera_smb_client_link_at(
     struct chimera_smb_client_conn *conn,
     struct chimera_vfs_request     *request);
 void chimera_smb_client_symlink_at(
@@ -657,6 +826,16 @@ void smb_apply_attrs(
     const struct smb_open_info       *info,
     uint64_t                          ino);
 
+/* Resolve a dirfd-relative leaf `name` against the parent handle `request->fh`
+ * into a full mount-relative path in `out` ("" parent -> just the name). */
+int smb_at_full_path(
+    struct chimera_smb_client_conn *conn,
+    struct chimera_vfs_request     *request,
+    const char                     *name,
+    int                             namelen,
+    char                           *out,
+    int                             out_max);
+
 /* Send an SMB2 CREATE on `path` (full mount-relative path; "" for the root). */
 void smb_send_create(
     struct chimera_smb_client_conn *conn,
@@ -681,7 +860,8 @@ void smb_send_create_ex(
     uint32_t                        options,
     const uint8_t                  *ctx,
     uint32_t                        ctx_len,
-    chimera_smb_client_reply_cb     reply_cb);
+    chimera_smb_client_reply_cb     reply_cb,
+    void                           *reply_arg);
 
 /* An RqLs (lease request v1) create context is 56 bytes: header(16) + "RqLs"(4)
  * + pad(4) + data(32). */
@@ -699,9 +879,38 @@ void smb_send_close(
     const struct chimera_smb_client_file_id *file_id,
     chimera_smb_client_reply_cb              reply_cb);
 
+/* The POSIX owner/group/mode a freshly created object must carry (creator's
+ * cred + requested mode); returns 1 if there is anything to stamp. */
+int smb_build_create_owner_attrs(
+    const struct chimera_vfs_request *request,
+    const struct chimera_vfs_attrs   *set_attr,
+    struct chimera_vfs_attrs         *out);
+
+/* Send an SMB2 SET_INFO SECURITY on `fid` carrying the modefromsid descriptor
+ * built from `set_attr` (owner/group/mode), then invoke `reply_cb`.  The handle
+ * must have been opened with WRITE_OWNER (owner/group) and/or WRITE_DAC (mode). */
+void smb_send_set_security(
+    struct chimera_smb_client_conn          *conn,
+    struct chimera_vfs_request              *request,
+    const struct chimera_smb_client_file_id *fid,
+    const struct chimera_vfs_attrs          *set_attr,
+    chimera_smb_client_reply_cb              reply_cb);
+
 /* Recover the per-open state (FileId + server) from a VFS open handle. */
 static inline struct chimera_smb_client_open *
 smb_handle_open_state(struct chimera_vfs_open_handle *handle)
 {
     return handle ? (struct chimera_smb_client_open *) handle->vfs_private : NULL;
 } /* smb_handle_open_state */
+
+/* True when an *at op's parent handle is a known non-directory: a dirfd-
+ * relative op through it is ENOTDIR.  The path-only backend would otherwise
+ * resolve the parent's interned path -- stale if its name was unlinked while
+ * the fd stayed open -- and report a misleading ENOENT. */
+static inline int
+smb_parent_is_nondir(struct chimera_vfs_open_handle *handle)
+{
+    struct chimera_smb_client_open *os = smb_handle_open_state(handle);
+
+    return os && !os->is_directory;
+} /* smb_parent_is_nondir */

@@ -140,6 +140,10 @@ struct nfs4_replay_cache {
     uint32_t        op;        /* nfs_opnum4 of the cached op  */
     nfsstat4        status;
     struct stateid4 stateid;   /* for OPEN/CLOSE/LOCK/LOCKU/etc. responses */
+    /* OPEN4_RESULT_* of a cached OPEN reply.  OPEN4_RESULT_CONFIRM is the one
+     * bit a client may act on, so replaying it verbatim matters; zeroed by
+     * nfs4_replay_record and filled in by the OPEN completion path. */
+    uint32_t        rflags;
     uint8_t         valid;
 };
 
@@ -191,6 +195,7 @@ nfs4_replay_record(
     replay->seqid  = seqid;
     replay->op     = op;
     replay->status = status;
+    replay->rflags = 0;
     if (stateid) {
         replay->stateid = *stateid;
     } else {
@@ -331,6 +336,12 @@ struct nfs_open_state {
 
     struct chimera_vfs_open_handle *handle;             /* +1 via chimera_vfs_dup_handle */
 
+    /* The read-only handle a write-share coalesce superseded (see
+     * chimera_nfs4_open_install_state): in-flight I/O may still be borrowing
+     * it, so its reference is parked here and released with the state.  A
+     * state upgrades at most once (RO -> RW), so one slot suffices. */
+    struct chimera_vfs_open_handle *handle_superseded;
+
     struct nfs_lock_state          *locks;              /* utlist via next_in_open */
     UT_hash_handle                  hh;                 /* by fh in owner->states_by_fh */
 
@@ -340,6 +351,12 @@ struct nfs_open_state {
     struct chimera_vfs_claim        share_claim;
     struct chimera_vfs_file_state  *share_file_state;
     bool                            share_claim_held;
+
+    /* For an NFSv4 named-attribute (stream) open: a stream_holder taken on the
+     * BASE file's vfs_state so a cross-protocol base delete-on-close defers while
+     * this stream is open (the NFSv4 analogue of the SMB ADS stream holder).
+     * NULL for an ordinary file open; released in open_state_cleanup. */
+    struct chimera_vfs_file_state  *base_stream_file_state;
 
     /* Lifetime: starts at 1 for the state's slot; each acquire bumps it.
      * destroy() flips `destroyed` and drops the +1.  When refcount reaches
@@ -501,6 +518,12 @@ struct nfs_layout_state {
     uint32_t                 seqid;     /* server-incremented layout stateid seqid */
     uint32_t                 iomode;    /* current LAYOUTIOMODE4 */
 
+    /* layouttype4 granted for this file (RFC 8881 3.3.13): flex-files, block
+     * or SCSI.  CB_LAYOUTRECALL must echo it -- the client matches a recall by
+     * {layout type, fh, iomode, range} and answers NFS4ERR_NOMATCHING_LAYOUT
+     * otherwise.  Set by LAYOUTGET; 0 means "not yet granted". */
+    uint32_t                 layout_type;
+
     uint8_t                  shard;
     uint32_t                 slot_idx;
     uint32_t                 generation;
@@ -651,18 +674,18 @@ nfs_open_state_check_principal(
 } /* nfs_open_state_check_principal */
 
 /*
- * Validate a stateid that authorizes a mutation of the current filehandle.
+ * Validate a stateid that authorizes I/O against a given filehandle.
  *
  * Returns NFS4ERR_BAD_STATEID unless `state` names an open (directly, or the
- * open a lock state is anchored to) of the object that is the current
- * filehandle -- required by RFC 7530 sec 9.1.4.3 / RFC 8881 sec 8.2.4 -- and
- * NFS4ERR_OPENMODE if that open does not carry write access.
+ * open a lock state is anchored to) of the object `fh` names -- required by
+ * RFC 7530 sec 9.1.4.3 / RFC 8881 sec 8.2.4 -- and NFS4ERR_OPENMODE if that
+ * open does not carry `want_access` (an OPEN4_SHARE_ACCESS_* bit).
  *
- * The current-filehandle half matters beyond conformance: any access check the
- * server makes against the current filehandle is only meaningful if the
- * operation actually acts on that filehandle.  An op that instead mutated some
- * other handle carried by its stateid would slip past such a check entirely.
- * The per-export read-only gate (nfs4_rofs_gate) is exactly such a check, and
+ * The filehandle half matters beyond conformance: any access check the server
+ * makes against the current filehandle is only meaningful if the operation
+ * actually acts on that filehandle.  An op that instead mutated some other
+ * handle carried by its stateid would slip past such a check entirely.  The
+ * per-export read-only gate (nfs4_rofs_gate) is exactly such a check, and
  * relies on this one to stay a dispatch-time decision.
  *
  * Delegation and layout stateids are rejected rather than misinterpreted:
@@ -670,11 +693,12 @@ nfs_open_state_check_principal(
  * must handle them before calling this.
  */
 static inline nfsstat4
-nfs_state_check_write_for_fh(
+nfs_state_check_access_for_fh(
     void          *state,
     uint8_t        type,
     const uint8_t *fh,
-    uint32_t       fh_len)
+    uint32_t       fh_len,
+    uint32_t       want_access)
 {
     const struct nfs_open_state *open_state;
 
@@ -695,12 +719,37 @@ nfs_state_check_write_for_fh(
         return NFS4ERR_BAD_STATEID;
     }
 
-    if ((open_state->share_access & OPEN4_SHARE_ACCESS_WRITE) == 0) {
+    if ((open_state->share_access & want_access) == 0) {
         return NFS4ERR_OPENMODE;
     }
 
     return NFS4_OK;
+} /* nfs_state_check_access_for_fh */
+
+/* A stateid that authorizes a mutation of the current filehandle. */
+static inline nfsstat4
+nfs_state_check_write_for_fh(
+    void          *state,
+    uint8_t        type,
+    const uint8_t *fh,
+    uint32_t       fh_len)
+{
+    return nfs_state_check_access_for_fh(state, type, fh, fh_len,
+                                         OPEN4_SHARE_ACCESS_WRITE);
 } /* nfs_state_check_write_for_fh */
+
+/* A stateid that authorizes reading a given filehandle -- COPY's source, which
+ * is the SAVED filehandle rather than the current one. */
+static inline nfsstat4
+nfs_state_check_read_for_fh(
+    void          *state,
+    uint8_t        type,
+    const uint8_t *fh,
+    uint32_t       fh_len)
+{
+    return nfs_state_check_access_for_fh(state, type, fh, fh_len,
+                                         OPEN4_SHARE_ACCESS_READ);
+} /* nfs_state_check_read_for_fh */
 
 /*
  * Public API.
@@ -1120,6 +1169,13 @@ nfs_layout_state_bump(
 SYMBOL_EXPORT void
 nfs_layout_state_destroy(
     struct nfs_layout_state   *state,
+    struct nfs_state_table    *table,
+    struct chimera_vfs_thread *vfs_thread);
+
+/* Tear down every layout_state a client holds (LAYOUTRETURN4_ALL). */
+SYMBOL_EXPORT void
+nfs_layout_state_destroy_all(
+    struct nfs_client         *client,
     struct nfs_state_table    *table,
     struct chimera_vfs_thread *vfs_thread);
 

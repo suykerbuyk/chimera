@@ -6,6 +6,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <pthread.h>
 
 #include "vfs/vfs.h"
@@ -74,7 +75,7 @@ struct chimera_vfs_file_state {
 
     struct chimera_vfs_state           *state;
 
-    /* Backend lease projection (CHIMERA_VFS_CAP_LEASE).  One revocable
+    /* Backend lease projection (CHIMERA_VFS_CAP_CLAIM_AGGREGATE).  One revocable
      * AGGREGATE token per file covering the union of local holders, held
      * lazily with escalate-or-reuse; state guarded by file->lock, the work
      * linkage by state->service_lock.  bl_want_used carries an implicit-I/O
@@ -83,6 +84,8 @@ struct chimera_vfs_file_state {
     uint8_t                             bl_state;      /* NONE/ACQUIRING/... */
     uint8_t                             bl_probed;     /* module resolved     */
     uint8_t                             bl_disabled;   /* module lacks CAP    */
+    uint8_t                             bl_range_probed;   /* ditto, for the  */
+    uint8_t                             bl_range_disabled; /* RANGE capability */
     uint8_t                             bl_held_used;
     uint8_t                             bl_held_deny;
     uint8_t                             bl_want_used;
@@ -130,12 +133,22 @@ struct chimera_vfs_state {
     /* Backend lease projection service: work is posted here from any thread
      * and drained on the service thread (the VFS close thread), which owns
      * every backend lease dispatch for AGGREGATE tokens.  lease_capable is
-     * false when no registered module declares CHIMERA_VFS_CAP_LEASE, making
+     * false when no registered module declares CHIMERA_VFS_CAP_CLAIM_AGGREGATE, making
      * every projection hook a cheap no-op. */
-    uint8_t                        lease_capable;
-    uint8_t                        lease_probed;       /* modules scanned (lazy: the
+    /* Atomic: the probe is resolved lazily on first use and is read from
+     * any thread, including callers outside the VFS threads (posix fcntl
+     * decides on the app's own thread whether an acquire has to marshal
+     * onto a VFS thread at all).  Two racing probes reach the same answer,
+     * so the pair needs release/acquire ordering, not a lock. */
+    _Atomic uint8_t                lease_capable;
+    _Atomic uint8_t                lease_probed;       /* modules scanned (lazy: the
                                                        * close thread attaches
                                                        * before modules register) */
+    /* The same probe for CHIMERA_VFS_CAP_CLAIM_RANGE, kept separate because
+     * a backend commonly arbitrates byte ranges without arbitrating the
+     * cache aggregate (a passthrough backend fronting a real OS lock). */
+    _Atomic uint8_t                range_capable;
+    _Atomic uint8_t                range_probed;
     struct chimera_vfs            *vfs;
     struct chimera_claim_owner     node_owner;       /* this node's wire identity */
     pthread_mutex_t                service_lock;
@@ -212,6 +225,32 @@ void
 chimera_vfs_state_put(
     struct chimera_vfs_state      *state,
     struct chimera_vfs_file_state *file);
+
+/* Visit every SMB open registered on `file`.
+ *
+ * Every SMB open takes an ACCESS claim on the file it opened and stamps its
+ * chimera_smb_open_file into cb_private (smb_proc_create.c), attribute-only
+ * opens included -- those build the INERT construct, which conflicts with
+ * nothing but is still a registration.  So this claim list IS the set of SMB
+ * handles on a file, across every session and tree, and it is the only place
+ * that set exists: the SMB layer hashes its open files per TREE, so nothing
+ * above the VFS can enumerate the holders of one file.
+ *
+ * Used by RENAME, which renames the FILE and must therefore move the cached
+ * path every one of those handles keeps.
+ *
+ * `cb` runs under file->lock, so it must not call back into the VFS or take a
+ * lock of its own; updating fields on the open it is handed is what it is for.
+ */
+typedef void (*chimera_vfs_smb_open_cb_t)(
+    void *smb_open_file,
+    void *private_data);
+
+void
+chimera_vfs_claim_foreach_smb_open(
+    struct chimera_vfs_file_state *file,
+    chimera_vfs_smb_open_cb_t      cb,
+    void                          *private_data);
 
 /* -------------------------------------------------------------------- */
 /* Claim constructors — the admission mask table                        */
@@ -359,6 +398,21 @@ chimera_vfs_claim_shrink(
     uint8_t                        new_used,
     uint8_t                        new_denied);
 
+/* Does `owner` hold a range claim other than `except` overlapping
+ * [offset, offset+length) on this file?  A cheap membership test, not an
+ * arbitration: callers use it to skip work they would otherwise pay for
+ * unconditionally -- a POSIX close has to release the process's locks on
+ * the file, and a re-lock has to replace the owner's older coverage, but
+ * neither should pay for the release machinery when there is nothing to
+ * release. */
+bool
+chimera_vfs_claim_range_owner_holds(
+    struct chimera_vfs_file_state    *file,
+    const struct chimera_claim_owner *owner,
+    const struct chimera_vfs_claim   *except,
+    uint64_t                          offset,
+    uint64_t                          length);
+
 /* Pure probe (LOCKT / NLM TEST / F_GETLK / FAIL_IMMEDIATELY pre-check). */
 enum chimera_vfs_claim_result
 chimera_vfs_claim_test(
@@ -397,12 +451,17 @@ chimera_vfs_claim_cancel(
  * is the caller's subsequent acquire.  The core consumes fresh claim
  * structs from `spare` (caller-provided, up to two) for split remainders
  * and hands released fragments back via the release callback.  Used by the
- * POSIX client (and later NFSv4 LOCKU); SMB stays exact-stack. */
+ * POSIX client (and later NFSv4 LOCKU); SMB stays exact-stack.
+ *
+ * `except`, when non-NULL, is left alone: it is how a re-lock expresses
+ * POSIX's replace rule, having already inserted the new claim, without
+ * carving the very claim it just took. */
 void
 chimera_vfs_claim_range_replace(
     struct chimera_vfs_state         *state,
     struct chimera_vfs_file_state    *file,
     const struct chimera_claim_owner *owner,
+    const struct chimera_vfs_claim   *except,
     uint64_t                          offset,
     uint64_t                          length,
     uint8_t                           new_mask,
@@ -675,8 +734,25 @@ chimera_vfs_state_reap_idle(
     uint64_t                  idle_ms);
 
 /* -------------------------------------------------------------------- */
-/* Backend lease projection (CHIMERA_VFS_CAP_LEASE)                     */
+/* Backend lease projection (CHIMERA_VFS_CAP_CLAIM_AGGREGATE)                     */
 /* -------------------------------------------------------------------- */
+
+/* True when any registered module declares CHIMERA_VFS_CAP_CLAIM_AGGREGATE, i.e. a
+ * claim could have to be confirmed with a backend.  Resolved lazily on
+ * first use (modules register after the service attaches) and safe to call
+ * from any thread.  Callers outside the VFS threads use this to decide
+ * whether an acquire has to marshal onto a VFS thread at all: with no such
+ * module every projection hook is a no-op, so nothing is gained by it. */
+bool
+chimera_vfs_claim_backend_capable(
+    struct chimera_vfs_state *state);
+
+/* The same question for byte ranges: is any registered module a RANGE
+ * arbiter?  Callers outside the VFS threads use this to decide whether a
+ * lock acquire has to marshal onto a VFS thread at all. */
+bool
+chimera_vfs_claim_backend_range_capable(
+    struct chimera_vfs_state *state);
 
 /* Attach the projection service (called once from the close-thread setup):
  * scans the registered modules for CAP_LEASE, mints the node owner, and
@@ -695,6 +771,29 @@ chimera_vfs_claim_backend_attach(
 void
 chimera_vfs_claim_backend_detach(
     struct chimera_vfs_state *state);
+
+/* Queue a fire-and-forget release of a projected RANGE token, ordered
+ * behind every previously queued backend op so a later acquire of the same
+ * range cannot overtake it.  For holders the core does not track as claims
+ * (a SEEK_END grant, whose absolute range only the backend knows). */
+void
+chimera_vfs_claim_backend_release_token(
+    struct chimera_vfs_state      *state,
+    struct chimera_vfs_file_state *file,
+    uint64_t                       token);
+
+/* Dispatch every queued backend release for `file` on `thread` and invoke
+* `cb` once the backend has completed all of them (immediately when there
+* are none).  An unlock path must wait for this before reporting success:
+* ordering alone only settles the node's own view, while another process
+* asking the same shared arbiter has no way to wait for our work queue. */
+void
+chimera_vfs_claim_backend_flush_releases(
+    struct chimera_vfs_thread     *thread,
+    struct chimera_vfs_state      *state,
+    struct chimera_vfs_file_state *file,
+    void (                        *cb )(void *private_data),
+    void                          *private_data);
 
 /* Drain the projection work queue; runs ONLY on the service thread (wired
  * into the close thread's timer and doorbell). */
@@ -716,7 +815,7 @@ chimera_vfs_claim_backend_reeval(
  * recall_arg = the chimera_vfs_state).  Any thread; marshals internally;
  * tolerates an unknown file or stale token as a no-op. */
 void
-chimera_vfs_lease_backend_recall(
+chimera_vfs_claim_backend_recall(
     void          *recall_arg,
     const uint8_t *fh,
     uint8_t        fh_len,

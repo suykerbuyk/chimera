@@ -331,6 +331,11 @@ chimera_nfs4_mount_get_root_fh_callback(
     memcpy(fh_fragment + 1, remote_fh->data, remote_fh->len);
     fh_fragment_len = 1 + remote_fh->len;
 
+    /* Remember the export root's wire handle so lookups can clamp ".." at the
+     * mount root (see chimera_nfs_client_mount). */
+    memcpy(mount->root_fh, remote_fh->data, remote_fh->len);
+    mount->root_fh_len = remote_fh->len;
+
     /* Compute FSID by hashing server hostname + remote root FH */
     hostname_len = strlen(mount->server->hostname);
     memcpy(hash_input, mount->server->hostname, hostname_len);
@@ -413,9 +418,8 @@ chimera_nfs4_mount_get_root_fh(
     argarray[op++].argop = OP_GETFH;
 
     /* GETATTR - request basic attributes */
-    argarray[op].argop                      = OP_GETATTR;
-    attr_request[0]                         = (1 << FATTR4_TYPE) | (1 << FATTR4_SIZE) | (1 << FATTR4_FILEID);
-    attr_request[1]                         = (1 << (FATTR4_MODE - 32)) | (1 << (FATTR4_NUMLINKS - 32));
+    argarray[op].argop = OP_GETATTR;
+    chimera_nfs4_attr_request_stat(attr_request);
     argarray[op].opgetattr.attr_request     = attr_request;
     argarray[op].opgetattr.num_attr_request = 2;
     op++;

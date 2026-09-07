@@ -567,19 +567,45 @@ nfs_recovery_open_check(
      * this leg is unreachable on the default memkv backend. */
     if (in_grace && is_reclaim && load_ready && client) {
         struct nfs_recovery_record *r;
+        bool                        reclaimed;
 
         pthread_mutex_lock(&rec->lock);
         HASH_FIND(hh, rec->to_reclaim, client->owner_string,
                   client->owner_len, r);
+        reclaimed = r && r->reclaimed;
         pthread_mutex_unlock(&rec->lock);
 
         if (!r) {
             return NFS4ERR_RECLAIM_BAD;
         }
+
+        /* RFC 8881 §18.51.3: once this client has declared reclaim complete
+         * the server MUST NOT let it reclaim any more state, even though the
+         * server-wide grace window is still open because some *other* client
+         * has not finished.  Grace is a per-client obligation that this client
+         * has already retired. */
+        if (reclaimed) {
+            return NFS4ERR_NO_GRACE;
+        }
     }
 
     return NFS4_OK;
 } /* nfs_recovery_open_check */
+
+nfsstat4
+nfs_recovery_io_check(struct nfs_recovery *rec)
+{
+    /* RFC 7530 §9.6.2: during the grace period the server must reject READ
+     * and WRITE operations and non-reclaim locking requests with
+     * NFS4ERR_GRACE, and may only service them if it can guarantee that no
+     * conflict with an impending reclaim could arise.  The locks that would
+     * conflict are precisely the ones the window exists to rebuild, so no
+     * such guarantee is available here.  Same window (and same
+     * load-still-in-flight treatment) as the OPEN gate; these operations
+     * carry no reclaim flag, so is_reclaim is always false and the client is
+     * irrelevant. */
+    return nfs_recovery_open_check(rec, NULL, false);
+} /* nfs_recovery_io_check */
 
 void
 nfs_recovery_reclaim_complete(

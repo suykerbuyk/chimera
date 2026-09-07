@@ -370,6 +370,17 @@ tasks:
     commands:
       - cd /build
       - export LC_ALL=C
+      # Ring depth for the io_uring event core.  libevpl's 8192-entry default
+      # costs roughly 1.5 MB of kernel-accounted memory per ring (SQE128/CQE32
+      # double both entry sizes) and SQPOLL adds a kernel thread each; ctest
+      # -j 12 runs many multi-threaded chimera processes at once, enough for
+      # the kernel to refuse a ring with ENOMEM -- fatal to that process, so an
+      # unrelated test dies with it.  Size the ring to a test rather than to a
+      # server, as upstream CI does (6d360ede).  libevpl honours the value or
+      # fails the ring; it never shrinks it silently.  Set on every leg that
+      # runs chimera under ctest or smbtorture in this container, not on the
+      # build or analysis legs, which start no rings.
+      - export EVPL_IO_URING_ENTRIES=1024
       - echo "CTEST_FILTER=${CTEST_FILTER}"
       - echo "quint MBT trace replays disabled - hiding oras so cmake finds no trace corpus (upstream batch replayer hang)"
       - mv /usr/local/bin/oras /usr/local/bin/oras.hidden || true
@@ -401,6 +412,8 @@ tasks:
     commands:
       - cd /build
       - export LC_ALL=C
+      # io_uring ring depth, see ctest_release.
+      - export EVPL_IO_URING_ENTRIES=1024
       - echo "CTEST_FILTER=${CTEST_FILTER}"
       - echo "quint MBT trace replays disabled - hiding oras so cmake finds no trace corpus (upstream batch replayer hang)"
       - mv /usr/local/bin/oras /usr/local/bin/oras.hidden || true
@@ -437,6 +450,8 @@ tasks:
     commands:
       - cd /build
       - export LC_ALL=C
+      # io_uring ring depth, see ctest_release.
+      - export EVPL_IO_URING_ENTRIES=1024
       - echo "CTEST_FILTER=${CTEST_FILTER}"
       - echo "quint MBT trace replays disabled - hiding oras so cmake finds no trace corpus (upstream batch replayer hang)"
       - mv /usr/local/bin/oras /usr/local/bin/oras.hidden || true
@@ -502,6 +517,8 @@ tasks:
     commands:
       - cd /build
       - export LC_ALL=C
+      # io_uring ring depth, see ctest_release.
+      - export EVPL_IO_URING_ENTRIES=1024
       - >
         cmake -G Ninja -DCMAKE_BUILD_TYPE=Release
         -DREQUIRE_NETNS_TESTS=ON
@@ -528,6 +545,8 @@ tasks:
     commands:
       - cd /build
       - export LC_ALL=C
+      # io_uring ring depth, see ctest_release.
+      - export EVPL_IO_URING_ENTRIES=1024
       - >
         cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug
         -DREQUIRE_NETNS_TESTS=ON
@@ -565,6 +584,8 @@ tasks:
     commands:
       - cd /build
       - export LC_ALL=C
+      # io_uring ring depth, see ctest_release.
+      - export EVPL_IO_URING_ENTRIES=1024
       # Ubuntu ships these versioned; the unversioned names are not always on
       # PATH, and coverage-report.sh honours the overrides.
       - export LLVM_PROFDATA="$(command -v llvm-profdata || ls /usr/lib/llvm-*/bin/llvm-profdata | tail -n1)"
@@ -671,6 +692,8 @@ tasks:
     commands:
       - cd /build
       - export LC_ALL=C
+      # io_uring ring depth, see ctest_release.
+      - export EVPL_IO_URING_ENTRIES=1024
       # regen.sh reads these as env fallbacks (SMBTORTURE_BACKENDS /
       # SMBTORTURE_FILTER / SMBTORTURE_PARALLEL), each via ${VAR:-default}, so an
       # empty value means "the documented default": the whole backend list, no

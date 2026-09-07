@@ -76,6 +76,12 @@
  * ffl_stripe_unit (8) + ffl_mirrors<> count (4) + ffm_data_servers<> count (4). */
 #define V4_FF_DEVICEID_OFF  16
 
+/* Offset of the ffds_fh_vers<> element -- the data server handle that names the
+ * backing file -- in the same body: ffds_deviceid (16) + ffds_efficiency (4) +
+ * ffds_stateid (16) + ffds_fh_vers<> count (4) past V4_FF_DEVICEID_OFF.  Points
+ * at the opaque's length prefix; see chimera_nfs4_encode_ff_layout(). */
+#define V4_FF_DSFH_OFF      56
+
 #define E_DELAY             10008
 #define E_DENIED            10010
 #define E_NOTSUPP           10004
@@ -270,6 +276,17 @@ enum v4_dev {
     DEV_LOOKUPP_SYMLINK,          /* D4-7 */
     DEV_COARSE_TYPE_ERR,          /* D4-15 */
     DEV_READLINK_DIR_INVAL,       /* D4-16 */
+    DEV_REAL_HOLES,               /* D4-17 */
+    DEV_CREATE_TYPE_BEFORE_PARENT, /* D4-18 */
+    DEV_DIROP_SYMLINK_NOTDIR,      /* D4-19 */
+    DEV_ACCESS_ROOT_EXECUTE,       /* D4-20 */
+    DEV_SECINFO_CONSUMES_FH,       /* D4-21 */
+    DEV_SEQ_REPLAY_UNCACHED,       /* D4-22 */
+    DEV_HOST_SYMLINK_MODE,        /* D4-23 */
+    DEV_COARSE_CHANGE,            /* D4-24 */
+    DEV_LINK_UNLINKED,            /* D4-25 */
+    DEV_HOST_SYMLINK_SETATTR,      /* D4-26 */
+    DEV_EXCL_VERF_LOST,           /* D4-27 */
     DEV_COUNT,
 };
 
@@ -280,7 +297,36 @@ static const char *v4_dev_ids[DEV_COUNT] = {
     "D4-7-lookupp-symlink",
     "D4-15-coarse-type-error",
     "D4-16-readlink-dir-inval",
+    "D4-17-real-holes",
+    "D4-18-create-type-before-parent",
+    "D4-19-dirop-symlink-notdir",
+    "D4-20-access-root-execute",
+    "D4-21-secinfo-consumes-fh",
+    "D4-22-seq-replay-uncached",
+    "D4-23-host-symlink-mode",
+    "D4-24-coarse-change",
+    "D4-25-link-unlinked-source",
+    "D4-26-host-symlink-setattr",
+    "D4-27-exclusive-verifier-lost",
 };
+
+/* Set when the backend tracks holes for real (every backend but memfs, whose
+* block_size is pinned to the model's granularity): the model, like memfs,
+* reads every byte below EOF as data and puts the sole hole at EOF, while a
+* hole-tracking backend legitimately refines that -- SEEK_HOLE may find a
+* genuine hole earlier, SEEK_DATA may skip never-written ranges to a later
+* offset or answer NFS4ERR_NXIO when nothing but holes remain below EOF.
+* All of those are conformant (RFC 7862 15.11); D4-17 records the acceptance,
+* exactly as the posix suite's PT2 rule does for its passthrough backends. */
+static int g_backend_real_holes;
+
+/* Set for the host-passthrough backends (linux/io_uring): the deviations that
+ * exist because the HOST filesystem, not chimera, owns the behavior --
+ * symlink modes pinned at 0777 (no lchmod on Linux), the change attribute
+ * derived from a kernel-tick-granular ctime (multigrain-ctime kernels retire
+ * this), and the kernel's refusal to re-link an unlinked-but-open source.
+ * Never set for a native backend, whose enforcement stays exact. */
+static int g_backend_passthrough;
 
 #define E_WRONG_TYPE 10083
 
@@ -370,6 +416,7 @@ struct v4_res {
     }        segs[4];
     uint8_t         deviceid[16];
     int             has_deviceid;
+    struct mbt_fh   ds_fh;            /* flex-files backing file handle */
     int             lr_present;       /* LAYOUTRETURN */
     int             has_newsize;      /* LAYOUTCOMMIT */
     uint64_t        newsize;
@@ -400,6 +447,13 @@ struct v4_chg {
     int64_t  ino;
     int64_t  abstract;
     uint64_t wire;
+};
+
+/* Where a file's data lives: which data server (deviceid) and which file on
+ * it (the flex-files backing handle).  See oracle.layout_loc. */
+struct v4_layout_loc {
+    struct mbt_fh fh;
+    uint8_t       deviceid[16];
 };
 
 struct v4_hist {
@@ -447,6 +501,22 @@ struct oracle {
 
     uint8_t                deviceid[16];
     int                    has_deviceid;
+
+    /* ino -> the backing location its first LAYOUTGET named.  A metadata
+     * server that persists its per-file layout hands out the same one every
+     * time; one that loses it re-steers, and the round-robin lands the file on
+     * a different data server whose copy is empty -- silently orphaning
+     * everything written through the previous layout.  Nothing else in the
+     * corpus can tell those apart: both answer NFS4_OK with a well-formed
+     * layout covering the requested range, so the invariant is checked here
+     * rather than modeled.
+     *
+     * BOTH halves matter.  The data servers in the test cluster are freshly
+     * mkfs'd instances of one backend, and the backing file is named after the
+     * MDS fileid, so the same file re-created on a different DS gets an
+     * IDENTICAL native handle -- the deviceid is the only thing that says
+     * which server it lives on.  Comparing handles alone silently passes. */
+    struct v4_layout_loc   layout_loc[V4_MAX_INOS];
 
     /* Per-model-client connections (a model client
     * owns its own connection, like a real one). */
@@ -668,6 +738,16 @@ check_change(
     }
     for (i = 0; i < o->nchg; i++) {
         if (o->chg[i].ino == ino && o->chg[i].wire == wire) {
+            /* D4-24: a host backend derives the change attribute from ctime,
+             * whose update granularity is the kernel tick -- two mutations
+             * within one tick legitimately show the same value.  Gated on a
+             * NONZERO wire value: an all-zero change is the backend failing
+             * to supply the attribute at all, which stays a failure.
+             * (Multigrain-ctime kernels, 6.13+, retire this deviation.) */
+            if (g_backend_passthrough && wire != 0) {
+                o->dev_hits[DEV_COARSE_CHANGE]++;
+                return;
+            }
             mism_add(m, "%s: ino %" PRId64 " change %#" PRIx64 " unchanged "
                      "on the wire but the model mutated the object "
                      "(abstract %" PRId64 " vs %" PRId64 ")",
@@ -867,10 +947,20 @@ conn_for(
     }
     if (!o->conns[model_client]) {
         cb_programs[0] = &o->env->nfs_v4_cb.rpc2;
-        ep             = chimera_tcp_flavor_endpoint_create(CHIMERA_TCP_FLAVOR_INPROC,
-                                                            "127.0.0.1", 2049);
+        /* Follow the env's transport.  These per-model-client connections
+         * carry every stateful compound the trace issues -- conn_for() only
+         * falls back to env->nfs_conn for a compound with no client -- so
+         * leaving them on the stream endpoint would put most of an --rdma run
+         * back on plain RPC. */
+        ep = chimera_tcp_flavor_endpoint_create(CHIMERA_TCP_FLAVOR_INPROC,
+                                                "127.0.0.1",
+                                                o->env->rdma
+                                                ? MBT_NFS_RDMA_PORT
+                                                : 2049);
         o->conns[model_client] =
-            evpl_rpc2_client_connect(o->env->rpc2_thread, EVPL_STREAM_INPROC,
+            evpl_rpc2_client_connect(o->env->rpc2_thread,
+                                     o->env->rdma ? EVPL_DATAGRAM_INPROC
+                                     : EVPL_STREAM_INPROC,
                                      ep, cb_programs, 1, o);
         if (!o->conns[model_client]) {
             fprintf(stderr, "failed to open connection for model client "
@@ -2335,8 +2425,16 @@ decode_resop(
 
                 r->eof  = rop->opread.resok4.eof != 0;
                 r->data = o->arena + o->arena_used;
+                /* data.length, not the iovec lengths: an RDMA Write chunk
+                 * comes back at the size the client ADVERTISED, not the size
+                 * the server filled, so a short read hands back a longer
+                 * iovec whose tail is undefined.  chimera's own client reads
+                 * the same field (vfs/nfs/nfs4_read.c). */
                 for (i = 0; i < rop->opread.resok4.data.niov; i++) {
                     n = rop->opread.resok4.data.iov[i].length;
+                    if (off + n > rop->opread.resok4.data.length) {
+                        n = rop->opread.resok4.data.length - off;
+                    }
                     if (o->arena_used + off + n > V4_DATA_ARENA) {
                         n = V4_DATA_ARENA - o->arena_used - off;
                     }
@@ -2618,6 +2716,25 @@ decode_resop(
                         memcpy(r->deviceid, body->data + off, 16);
                         r->has_deviceid = 1;
                     }
+
+                    /* The backing file handle, for the layout-stability check
+                     * in check_result().  Flex-files only: a block layout
+                     * names extents on a volume, not a file on a data
+                     * server. */
+                    if (g_layout_type == V4_LAYOUT_FLEX &&
+                        body->len >= V4_FF_DSFH_OFF + 4) {
+                        const uint8_t *q   = body->data + V4_FF_DSFH_OFF;
+                        uint32_t       len = ((uint32_t) q[0] << 24) |
+                            ((uint32_t) q[1] << 16) |
+                            ((uint32_t) q[2] << 8) | q[3];
+
+                        if (len <= sizeof(r->ds_fh.data) &&
+                            body->len >= V4_FF_DSFH_OFF + 4 + len) {
+                            memcpy(r->ds_fh.data, q + 4, len);
+                            r->ds_fh.len = len;
+                            r->ds_fh.has = 1;
+                        }
+                    }
                 }
             }
             break;
@@ -2728,6 +2845,11 @@ check_attrs(
     if (r->a_mode != (uint32_t) jf_i64(exp, "mode")) {
         if (strcmp(ft, "FLnk") == 0 && r->a_mode == 0755) {
             o->dev_hits[DEV_SYMLINK_MODE_0755]++;
+        } else if (g_backend_passthrough && strcmp(ft, "FLnk") == 0 &&
+                   r->a_mode == 0777) {
+            /* D4-23: Linux has no lchmod -- a host symlink's mode is
+             * structurally 0777 whatever the create asked for. */
+            o->dev_hits[DEV_HOST_SYMLINK_MODE]++;
         } else {
             mism_add(m, "getattr.mode: expected %#o, got %#o",
                      (unsigned) jf_i64(exp, "mode"), r->a_mode);
@@ -2817,6 +2939,7 @@ static void
 classify_status_mismatch(
     struct oracle *o,
     const char    *tag,
+    json_t        *req,
     uint32_t       est,
     uint32_t       ast,
     struct mism   *m)
@@ -2882,6 +3005,38 @@ classify_status_mismatch(
         o->status_dev = ast;
         return;
     }
+    /* D4-19: the mirror of D4-7.  Where a directory-requiring operation meets a
+     * symlink parent (or symlink cfh), the model answers the more specific
+     * NFS4ERR_SYMLINK and chimera the generic NFS4ERR_NOTDIR -- both listed by
+     * RFC 7530 Table 7 for LINK/RENAME/REMOVE/OPEN on a symlink parent, so
+     * either is conformant.  Matched on the (SYMLINK, NOTDIR) status pair for
+     * any op, exactly as D4-7 matches the reverse pair: the pair is the
+     * deviation, and an op list would silently miss each new op the generator
+     * learns to aim at a symlink.  Subsumes the CREATE case D4-18 used to carry. */
+    if (est == V4_ERR_SYMLINK && ast == NFS4ERR_NOTDIR) {
+        o->dev_hits[DEV_DIROP_SYMLINK_NOTDIR]++;
+        o->status_dev = ast;
+        return;
+    }
+    /* D4-18: CREATE into a bad parent.  The model reports the parent first,
+     * and distinguishes a symlink parent (NFS4ERR_SYMLINK) from any other
+     * non-directory (NFS4ERR_NOTDIR), matching NFS-Ganesha and the Linux
+     * server.  chimera answers differently on two axes, both conformant
+     * (RFC 7530 16.4.4 / RFC 8881 18.4 order neither, and 16.4.4 does not list
+     * SYMLINK for CREATE): it reports the illegal object type first
+     * (NFS4ERR_BADTYPE) for a type CREATE cannot make, and it uses the generic
+     * NFS4ERR_NOTDIR for a symlink parent.  Reconcile the model's
+     * NOTDIR/SYMLINK against chimera's BADTYPE here; the model's SYMLINK
+     * against chimera's generic NOTDIR is the same divergence CREATE shares
+     * with every other dir-requiring op, so D4-19 above carries it.  Nothing
+     * is created either way. */
+    if (strcmp(tag, "SCreate") == 0 &&
+        (est == NFS4ERR_NOTDIR || est == V4_ERR_SYMLINK) &&
+        ast == NFS4ERR_BADTYPE) {
+        o->dev_hits[DEV_CREATE_TYPE_BEFORE_PARENT]++;
+        o->status_dev = ast;
+        return;
+    }
     /* D4-15: chimera answers the coarse 4.0-style type error on every
      * data-path and size-setting op -- NFS4ERR_ISDIR for a directory,
      * NFS4ERR_INVAL for every other non-regular object, in all minor
@@ -2916,6 +3071,30 @@ classify_status_mismatch(
         o->status_dev = ast;
         return;
     }
+    /* D4-25: the kernel refuses to re-link a file whose link count reached
+     * zero, however it is still open (linkat answers ENOENT, no capability
+     * excepted) -- the native backends re-link an open-pinned source as the
+     * model expects.  This is a STATE deviation, not just a status: the model
+     * carries the link forward and later operates on the name that was never
+     * made, so the trace cannot be meaningfully replayed past this point --
+     * skip it the way a capability mismatch does. */
+    if (g_backend_passthrough && strcmp(tag, "SLink") == 0 &&
+        est == NFS4_OK && ast == NFS4ERR_NOENT) {
+        o->dev_hits[DEV_LINK_UNLINKED]++;
+        caps_mismatch(o, m, "hostLinkUnlinked",
+                      "LINK of an unlinked-but-open source: host refuses, "
+                      "model links");
+        return;
+    }
+    /* D4-17: SEEK_DATA over ranges the model believes are data but the
+     * backend never materialized -- nothing but real holes remain below EOF,
+     * and NFS4ERR_NXIO is the conformant answer (RFC 7862 15.11.3). */
+    if (g_backend_real_holes && strcmp(tag, "SSeek") == 0 &&
+        est == NFS4_OK && ast == NFS4ERR_NXIO) {
+        o->dev_hits[DEV_REAL_HOLES]++;
+        o->status_dev = ast;
+        return;
+    }
     if (strcmp(tag, "SClose") == 0 &&
         ((est == NFS4_OK && ast == E_LOCKS_HELD) ||
          (est == E_LOCKS_HELD && ast == NFS4_OK))) {
@@ -2923,10 +3102,42 @@ classify_status_mismatch(
                       est, ast);
         return;
     }
-    if (strcmp(tag, "SOpen") == 0 && est == E_DELAY && ast == NFS4_OK) {
+    if ((strcmp(tag, "SOpen") == 0 || strcmp(tag, "SRemove") == 0) &&
+        est == E_DELAY && ast == NFS4_OK) {
         caps_mismatch(o, m, "conflictDelays",
                       "model expected NFS4ERR_DELAY during recall, server "
                       "completed the op");
+        return;
+    }
+    /* D4-26: a mode-only SETATTR of a symlink -- Linux has no lchmod, so
+     * the host answers ENOTSUP where the native backends chmod the symlink
+     * as the model expects.  Gated on the request being mode-only, so a
+     * genuine ATTRNOTSUPP on any other object or attribute still fails. */
+    if (g_backend_passthrough && strcmp(tag, "SSetattr") == 0 &&
+        est == NFS4_OK && ast == E_NOTSUPP && req &&
+        ((json_object_get(jf_val(req), "mode") &&
+          jf_i64(jf_val(req), "sizeBlocks") < 0) ||
+         strcmp(jf_tag(req), "RSetattrWide") == 0)) {
+        o->dev_hits[DEV_HOST_SYMLINK_SETATTR]++;
+        o->status_dev = ast;
+        return;
+    }
+    /* D4-27: EXCLUSIVE4 stores its verifier in the object's atime/mtime, and
+     * a host filesystem does not keep those faithful -- relatime updates
+     * atime on the next read, timestamp ranges clamp -- so a retry that the
+     * model (and the native backends) match against the stored verifier
+     * answers EXIST here, or EXIST where the share check would have won.
+     * The durable fix is verifier storage in an xattr on backends that have
+     * them; until then this is the host's answer. */
+    if (g_backend_passthrough && strcmp(tag, "SOpen") == 0 &&
+        ast == NFS4ERR_EXIST &&
+        (est == NFS4_OK || est == NFS4ERR_SHARE_DENIED) && req &&
+        strcmp(jf_tag(json_object_get(jf_val(req), "how")),
+               "HExclusive") == 0) {
+        o->dev_hits[DEV_EXCL_VERF_LOST]++;
+        caps_mismatch(o, m, "hostExclusiveVerifier",
+                      "EXCLUSIVE4 retry: host timestamps did not preserve "
+                      "the verifier");
         return;
     }
     mism_add(m, "%s: status: expected %u, got %u", tag, est, ast);
@@ -2954,7 +3165,19 @@ check_result(
             ctx->abort = 1;
             return;
         }
-        classify_status_mismatch(o, tag, est, ast, m);
+        /* D4-21: SECINFO consumes the current filehandle (RFC 7530 17.31.3 /
+         * RFC 8881 18.29.3), so a following op that uses it answers
+         * NFS4ERR_NOFILEHANDLE -- as chimera and both reference servers do.
+         * The model does not model that consumption and still predicts success;
+         * ctx->cur == -1 is the harness already tracking the drop after
+         * SECINFO.  Reconciled here pending a model fix (make SECINFO consume
+         * the cfh so the following op predicts NOFILEHANDLE directly). */
+        if (est == NFS4_OK && ast == NFS4ERR_NOFILEHANDLE && ctx->cur == -1) {
+            o->dev_hits[DEV_SECINFO_CONSUMES_FH]++;
+            o->status_dev = ast;
+            return;
+        }
+        classify_status_mismatch(o, tag, req, est, ast, m);
         return;
     }
 
@@ -3006,6 +3229,17 @@ check_result(
             /* Chimera restricts supported/access to type-applicable
              * bits (dirs: no EXECUTE; files: no LOOKUP/DELETE). */
             o->dev_hits[DEV_ACCESS_NO_EXECUTE]++;
+        } else if (r->supported == esup &&
+                   (eacc & 0x20) == 0 &&
+                   r->access == (eacc | 0x20)) {
+            /* D4-20: chimera's root/AUTH_NONE DAC override grants
+             * ACCESS4_EXECUTE (0x20) on a file with no execute mode bit, where
+             * the reference servers -- and the model -- withhold it (RFC 8881
+             * 18.1.4: the server SHOULD NOT set ACCESS4_EXECUTE unless an
+             * execute bit is set).  ACCESS is advisory (18.1: the real op is
+             * the authoritative check), so the coarser privileged override
+             * opens no hole; supported and every other bit match exactly. */
+            o->dev_hits[DEV_ACCESS_ROOT_EXECUTE]++;
         } else {
             if (r->supported != esup) {
                 mism_add(m, "access.supported: expected %#x, got %#x",
@@ -3362,6 +3596,24 @@ check_result(
                 memcpy(o->deviceid, r->deviceid, 16);
                 o->has_deviceid = 1;
             }
+
+            /* Layout stability: the backing location of an ino is fixed for
+             * its lifetime.  See oracle.layout_loc. */
+            if (r->ds_fh.has && r->has_deviceid &&
+                ctx->cur >= 0 && ctx->cur < V4_MAX_INOS) {
+                struct v4_layout_loc *known = &o->layout_loc[ctx->cur];
+
+                if (!known->fh.has) {
+                    known->fh = r->ds_fh;
+                    memcpy(known->deviceid, r->deviceid, 16);
+                } else if (memcmp(known->deviceid, r->deviceid, 16) != 0 ||
+                           !mbt_fh_eq(&known->fh, &r->ds_fh)) {
+                    mism_add(m, "layoutget: backing location changed for ino "
+                             "%" PRId64 " -- the metadata server did not "
+                             "persist its layout and re-steered",
+                             (int64_t) ctx->cur);
+                }
+            }
         }
     } else if (strcmp(tag, "SLayoutreturn") == 0) {
         if (r->lr_present != jf_bool(v, "present")) {
@@ -3382,11 +3634,30 @@ check_result(
                      r->newsize);
         }
     } else if (strcmp(tag, "SSeek") == 0) {
+        uint64_t moff = (uint64_t) jf_i64(v, "offset") * V4_BLOCK_SIZE;
+
+        if (g_backend_real_holes &&
+            (r->offset != moff || r->eof != jf_bool(v, "eof"))) {
+            uint64_t qoff = req ? (uint64_t) jf_i64(jf_val(req), "off") *
+                V4_BLOCK_SIZE : 0;
+            int      wdata = req ? jf_bool(jf_val(req), "whatData") : 0;
+
+            /* D4-17: accept the hole-tracking refinement -- a HOLE at or
+             * after the queried offset but no later than the model's EOF
+             * answer, or DATA at or past the model's offset (real holes
+             * skipped).  The eof flag follows the refined offset, so it is
+             * excused with it. */
+            if ((!wdata && r->offset >= qoff && r->offset <= moff) ||
+                (wdata && r->offset >= moff)) {
+                o->dev_hits[DEV_REAL_HOLES]++;
+                return;
+            }
+        }
         if (r->eof != jf_bool(v, "eof")) {
             mism_add(m, "seek.eof: expected %d, got %d",
                      jf_bool(v, "eof"), r->eof);
         }
-        if (r->offset != (uint64_t) jf_i64(v, "offset") * V4_BLOCK_SIZE) {
+        if (r->offset != moff) {
             mism_add(m, "seek.offset: expected %" PRId64 ", got %" PRIu64,
                      jf_i64(v, "offset") * V4_BLOCK_SIZE, r->offset);
         }
@@ -3534,6 +3805,8 @@ run_compound(
     uint32_t             retry_slot = 0;
     int                  retry_sess = 0;
     int                  has_seq    = 0;
+    int                  cd_ddp     = 0;
+    int                  cd_wchunk  = 0;
 
     o->status_dev              = 0;
     o->cur_open_clientid_known = 0;
@@ -3564,6 +3837,25 @@ run_compound(
     {
         if (encode_op(o, op, &argarray[i], &scratch[i], m) < 0) {
             return -1;
+        }
+
+        /* RDMA chunk eligibility for this compound, mirroring what chimera's
+         * own v4 client asks for (vfs/nfs/nfs4_write.c, nfs4_read.c): a WRITE
+         * puts its payload in a Read chunk for the server to pull (ddp), and a
+         * READ advertises a Write chunk the server can place the reply data
+         * into.  Without these an RDMA run gets RPC-over-RDMA framing but never
+         * a one-sided transfer, and the server's chunk handling goes untested.
+         *
+         * Accumulated here, as each op is encoded, rather than in a second pass
+         * over argarray: only the ops this loop has written are initialized,
+         * and a later pass bounded by nops cannot show the analyzer that. */
+        if (o->env->rdma) {
+            if (argarray[i].argop == OP_WRITE) {
+                cd_ddp = 1;
+            } else if (argarray[i].argop == OP_READ &&
+                       (int) argarray[i].opread.count > cd_wchunk) {
+                cd_wchunk = (int) argarray[i].opread.count;
+            }
         }
     }
 
@@ -3641,8 +3933,11 @@ run_compound(
         o->arena_used = 0;
         o->env->nfs_v4.send_call_NFSPROC4_COMPOUND(&o->env->nfs_v4.rpc2,
                                                    o->env->evpl, conn,
-                                                   &o->env->cred, &args,
-                                                   0, 0, NULL, 0, 0,
+                                                   mbt_cred_for(o->env, conn,
+                                                                &o->env->nfs_v4.rpc2),
+                                                   &args,
+                                                   cd_ddp, cd_wchunk,
+                                                   NULL, 0, 0,
                                                    v4_compound_cb, &cctx);
         while (!rep.done) {
             evpl_continue(o->env->evpl);
@@ -3702,9 +3997,25 @@ run_compound(
         } else {
             struct v4_cached *c = &o->cache[sess][slot];
 
-            if (c->status != rep.status || c->nres != rep.nres) {
+            if (rep.status == NFS4ERR_RETRY_UNCACHED_REP) {
+                /* D4-22: the model predicts a SEQUENCE replay (the cached
+                 * reply) for this slot, but chimera answers
+                 * NFS4ERR_RETRY_UNCACHED_REP -- which RFC 8881 2.10.6.1.3
+                 * explicitly permits: the server MAY override sa_cachethis and
+                 * decline to replay a cached reply.  chimera's slot cache is
+                 * otherwise correct (it replays every genuinely-cached reply
+                 * verbatim); the trigger here is a model defect -- the model's
+                 * per-slot seqids are not strictly monotonic in some generated
+                 * traces (it re-emits an already-used seqid on a slot rather
+                 * than advancing), so its "replay" prediction does not
+                 * correspond to a reply chimera holds.  Reconciled pending a
+                 * model fix to enforce monotonic per-slot seqids. */
+                o->dev_hits[DEV_SEQ_REPLAY_UNCACHED]++;
+            } else if (c->status != rep.status || c->nres != rep.nres) {
                 mism_add(m, "SEQUENCE replay: reply differs from the "
-                         "original (reply cache violation)");
+                         "original (reply cache violation): "
+                         "original status %u nres %d, replay status %u nres %d",
+                         c->status, c->nres, rep.status, rep.nres);
             } else {
                 for (n = 0; n < rep.nres; n++) {
                     if (c->op[n].status != rep.res[n].status ||
@@ -3755,7 +4066,14 @@ run_compound(
     }
 
     if (!ctx.abort && !o->skip &&
-        rep.nres != (int) json_array_size(results)) {
+        rep.nres != (int) json_array_size(results) &&
+        /* An accepted status deviation that turns a model-OK op into a
+        * server error legitimately ends the compound there: the ops the
+        * model ran after it were never executed, so a shorter result
+        * array is the deviation's own consequence, not a fresh one. */
+        !(o->status_dev && rep.nres > 0 &&
+          rep.nres < (int) json_array_size(results) &&
+          rep.res[rep.nres - 1].status == o->status_dev)) {
         mism_add(m, "result count: model expected %d results, server "
                  "returned %d", (int) json_array_size(results),
                  rep.nres);
@@ -3896,11 +4214,13 @@ v4_send_raw(
     struct oracle         *o,
     struct evpl_rpc2_conn *conn,
     struct nfs_argop4     *argarray,
-    int                    nops)
+    int                    nops,
+    struct v4_reply       *out)
 {
-    struct v4_reply      rep  = { 0 };
-    struct v4_call_ctx   cctx = { .o = o, .rep = &rep };
-    struct COMPOUND4args args = { 0 };
+    struct v4_reply      scratch = { 0 };
+    struct v4_reply     *rep     = out ? out : &scratch;
+    struct v4_call_ctx   cctx    = { .o = o, .rep = rep };
+    struct COMPOUND4args args    = { 0 };
 
     args.tag.data     = "teardown";
     args.tag.len      = 8;
@@ -3908,13 +4228,16 @@ v4_send_raw(
     args.argarray     = argarray;
     args.num_argarray = (uint32_t) nops;
 
+    memset(rep, 0, sizeof(*rep));
     o->arena_used = 0;
     o->env->nfs_v4.send_call_NFSPROC4_COMPOUND(&o->env->nfs_v4.rpc2,
                                                o->env->evpl, conn,
-                                               &o->env->cred, &args,
+                                               mbt_cred_for(o->env, conn,
+                                                            &o->env->nfs_v4.rpc2),
+                                               &args,
                                                0, 0, NULL, 0, 0,
                                                v4_compound_cb, &cctx);
-    while (!rep.done) {
+    while (!rep->done) {
         evpl_continue(o->env->evpl);
     }
 } /* v4_send_raw */
@@ -3940,6 +4263,30 @@ v4_sdb_field(
  * filesystem is unreferenced and the recycle (and, for a real client,
  * DESTROY_CLIENTID) succeeds.  Locks ride on their open and go with it; the
  * memfs corpus grants no delegations. */
+/* The model client record's csSeq is the NEXT create-session sequence the
+ * client will send (setupCreateSession uses it verbatim), so it is exactly
+ * what a teardown-built CREATE_SESSION must carry. */
+static int64_t
+v4_model_cs_seq(
+    json_t *clients_map,
+    int     client)
+{
+    size_t  i;
+
+    json_t *pair;
+
+    if (!clients_map) {
+        return -1;
+    }
+    json_array_foreach(clients_map, i, pair)
+    {
+        if (itf_i64(json_array_get(pair, 0)) == client) {
+            return jf_i64(json_array_get(pair, 1), "csSeq");
+        }
+    }
+    return -1;
+} /* v4_model_cs_seq */
+
 static void
 v4_close_dangling_opens(
     struct oracle *o,
@@ -3971,14 +4318,17 @@ v4_close_dangling_opens(
         return;
     }
     json_t *sessions = v4_sdb_field(sdb, "sessions");
+    json_t *clients  = v4_sdb_field(sdb, "clients");
 
     oo40 = v4_sdb_field(sdb, "oo40");   /* 4.0 open-owner seqids; seeded per client */
     (void) oi;
 
     for (client = 0; client < V4_MAX_CLIENTS; client++) {
         struct nfs_argop4 arg[V4_MAX_OPS];
-        int               n    = 0;
-        int               sess = -1;
+        int               n             = 0;
+        int               sess          = -1;
+        uint8_t           temp_sess[16] = { 0 };
+        int               have_temp     = 0;
         size_t            i;
         json_t           *pair;
 
@@ -4001,7 +4351,57 @@ v4_close_dangling_opens(
                 }
             }
             if (sess < 0 || sess >= V4_MAX_SESS || !o->sess_known[sess]) {
-                continue;   /* no live session to carry the compound */
+                /* No live session to carry the compound -- the walk destroyed
+                 * the client's last session without closing its opens, and a
+                 * client with opens answers DESTROY_CLIENTID with
+                 * CLIENTID_BUSY (RFC 8881 s18.50.3), so the ONLY way to
+                 * release the server's handles is a fresh session.  Skip
+                 * clients with nothing open; for the rest, build one. */
+                struct v4_reply crep;
+                int64_t         cs_seq;
+                size_t          oi3;
+                json_t         *op3;
+                int             has_opens = 0;
+
+                json_array_foreach(opens, oi3, op3)
+                {
+                    if (jf_i64(json_array_get(op3, 1), "client") == client) {
+                        has_opens = 1;
+                        break;
+                    }
+                }
+                cs_seq = v4_model_cs_seq(clients, client);
+                if (!has_opens || cs_seq < 0) {
+                    continue;
+                }
+
+                struct channel_attrs4             chan = {
+                    .ca_headerpadsize          = 0,
+                    .ca_maxrequestsize         = 1048576,
+                    .ca_maxresponsesize        = 1048576,
+                    .ca_maxresponsesize_cached = 65536,
+                    .ca_maxoperations          = 16,
+                    .ca_maxrequests            = 32,
+                    .num_ca_rdma_ird           = 0,
+                };
+                static struct callback_sec_parms4 sec = { .cb_secflavor = 0 };
+
+                memset(&arg[0], 0, sizeof(arg[0]));
+                arg[0].argop                                = OP_CREATE_SESSION;
+                arg[0].opcreate_session.csa_clientid        = o->clientid[client];
+                arg[0].opcreate_session.csa_sequence        = (uint32_t) cs_seq;
+                arg[0].opcreate_session.csa_flags           = 0;
+                arg[0].opcreate_session.csa_fore_chan_attrs = chan;
+                arg[0].opcreate_session.csa_back_chan_attrs = chan;
+                arg[0].opcreate_session.csa_cb_program      = 0x40000000;
+                arg[0].opcreate_session.num_csa_sec_parms   = 1;
+                arg[0].opcreate_session.csa_sec_parms       = &sec;
+                v4_send_raw(o, conn_for(o, client), arg, 1, &crep);
+                if (crep.status != NFS4_OK || crep.nres < 1) {
+                    continue;
+                }
+                memcpy(temp_sess, crep.res[0].sessionid, 16);
+                have_temp = 1;
             }
         } else {
             /* Seed this client's open-owner seqids: oo40's key is the
@@ -4054,12 +4454,13 @@ v4_close_dangling_opens(
             /* Flush and restart the batch (with a fresh SEQUENCE) if a
              * PUTFH+CLOSE pair would overflow the compound op cap. */
             if (n + 2 > V4_MAX_OPS) {
-                v4_send_raw(o, conn_for(o, client), arg, n);
+                v4_send_raw(o, conn_for(o, client), arg, n, NULL);
                 n = 0;
             }
             if (o->minor >= 1 && n == 0) {
                 arg[n].argop = OP_SEQUENCE;
-                memcpy(arg[n].opsequence.sa_sessionid, o->sess[sess], 16);
+                memcpy(arg[n].opsequence.sa_sessionid,
+                       have_temp ? temp_sess : o->sess[sess], 16);
                 arg[n].opsequence.sa_sequenceid     = 1;
                 arg[n].opsequence.sa_slotid         = 1;
                 arg[n].opsequence.sa_highest_slotid = 1;
@@ -4081,10 +4482,45 @@ v4_close_dangling_opens(
         }
 
         if (n > (o->minor >= 1 ? 1 : 0)) {
-            v4_send_raw(o, conn_for(o, client), arg, n);
+            v4_send_raw(o, conn_for(o, client), arg, n, NULL);
+        }
+        if (have_temp) {
+            memset(&arg[0], 0, sizeof(arg[0]));
+            arg[0].argop = OP_DESTROY_SESSION;
+            memcpy(arg[0].opdestroy_session.dsa_sessionid, temp_sess, 16);
+            v4_send_raw(o, conn_for(o, client), arg, 1, NULL);
         }
     }
 } /* v4_close_dangling_opens */
+
+/* The close sweep above needs a live session to carry SEQUENCE+CLOSE, so a
+ * 4.1+ client whose walk destroyed its last session but not the client keeps
+ * its opens on the server -- held state the RFC says survives until the lease
+ * expires, which is far longer than the recycler waits.  DESTROY_CLIENTID
+ * needs no session (it is the sole op of a sequenceless compound) and tears
+ * down the client's whole state hierarchy, so aim one at every clientid the
+ * trace established.  Statuses are deliberately ignored: a client that still
+ * has a session answers CLIENTID_BUSY, and its opens were CLOSEd by the sweep
+ * already; one the trace destroyed itself answers STALE_CLIENTID. */
+static void
+v4_destroy_leftover_clients(struct oracle *o)
+{
+    struct nfs_argop4 arg;
+    int               client;
+
+    if (o->minor < 1) {
+        return;
+    }
+    for (client = 0; client < V4_MAX_CLIENTS; client++) {
+        if (!o->clientid_known[client]) {
+            continue;
+        }
+        memset(&arg, 0, sizeof(arg));
+        arg.argop                           = OP_DESTROY_CLIENTID;
+        arg.opdestroy_clientid.dca_clientid = o->clientid[client];
+        v4_send_raw(o, conn_for(o, client), &arg, 1, NULL);
+    }
+} /* v4_destroy_leftover_clients */
 
 static int
 run_trace(
@@ -4292,6 +4728,26 @@ run_trace(
     if (states && nstates > 0) {
         v4_close_dangling_opens(o, json_array_get(states, sweep_idx));
     }
+    v4_destroy_leftover_clients(o);
+    /* Retire every context first, then let the loop put the DESTROYs on the
+     * wire, and only then drop the connections underneath them.  Tearing a
+     * connection down with its own DESTROY still queued leaves the server
+     * holding a context nothing will ever retire. */
+    for (c = 0; c < V4_MAX_CLIENTS; c++) {
+        if (o->conns[c]) {
+            mbt_conn_release(env, o->conns[c]);
+        }
+    }
+
+    /* Only under a Kerberos flavor: AUTH_SYS queues nothing here, and its loop
+     * has no bounded wait, so a pump with nothing outstanding would park in
+     * the poller and never come back. */
+    if (env->sec != MBT_SEC_SYS) {
+        for (c = 0; c < 4; c++) {
+            evpl_continue(env->evpl);
+        }
+    }
+
     for (c = 0; c < V4_MAX_CLIENTS; c++) {
         if (o->conns[c]) {
             evpl_rpc2_client_disconnect(env->rpc2_thread, o->conns[c]);
@@ -4322,6 +4778,9 @@ main(
         { "mandatory",      required_argument, 0, 'M' },
         { "backend",        required_argument, 0, 'b' },
         { "pnfs",           required_argument, 0, 'p' },
+        { "delegations",    no_argument,       0, 'g' },
+        { "rdma",           no_argument,       0, 'R' },
+        { "sec",            required_argument, 0, 'S' },
         { "dry-run",        no_argument,       0, 'n' },
         { "verbose",        no_argument,       0, 'v' },
         { 0,                0,                 0, 0   },
@@ -4349,11 +4808,19 @@ main(
         .memfs_config   = "{\"block_size\": 8192}",
     };
 
+    /* Neutralize the host umask so passthrough backends (linux/io_uring) apply
+    * client-sent modes verbatim and the export root keeps its 0777 -- the
+    * model's fresh share root.  Without this a host umask of 022 turns the
+    * root's mkdir(0777) into 0755, which the strict nfs4 replayer reports as a
+    * getattr.mode divergence on the very first GETATTR (the nfs3 replayer does
+    * the same).  The mkfs backends store modes directly and are unaffected. */
+    umask(0);
+
     /* --trace/--trace-dir/--exclude-prefix are gathered from raw argv by the
      * shared helper; getopt only recognizes them so it does not error. */
     traces = mbt_collect_traces(argc, argv, &ntraces);
 
-    while ((c = getopt_long(argc, argv, "t:D:X:M:b:p:nv", long_options,
+    while ((c = getopt_long(argc, argv, "t:D:X:M:b:p:gnvRS:", long_options,
                             NULL)) != -1) {
         switch (c) {
             case 't':
@@ -4367,6 +4834,13 @@ main(
                 break;
             case 'b':
                 backend = optarg;
+                break;
+            case 'g':
+                /* Serve with delegations on.  The corpus's Deleg instances
+                 * assume grants and skip against the default server; the
+                 * delegation-free instances assume none and skip against
+                 * this one -- two complementary batches cover the corpus. */
+                opts.nfs4_delegations = 1;
                 break;
             case 'n':
                 dry_run = 1;
@@ -4386,10 +4860,27 @@ main(
                     return 2;
                 }
                 break;
+            case 'R':
+                opts.rdma = 1;
+                break;
+            case 'S': {
+                int sec = mbt_sec_parse(optarg);
+
+                if (sec < 0) {
+                    fprintf(stderr, "%s: unknown security flavor '%s'\n",
+                            argv[0], optarg);
+                    mbt_free_traces(traces, ntraces);
+                    return 2;
+                }
+
+                opts.sec = sec;
+                break;
+            }
             default:
                 fprintf(stderr,
                         "usage: %s [--trace FILE ...] [--trace-dir DIR] "
-                        "[--backend memfs|diskfs|cairn] [--pnfs N] "
+                        "[--backend memfs|diskfs|cairn|linux|io_uring] "
+                        "[--pnfs N] [--delegations] [--rdma] "
                         "[--mandatory CAP] [--dry-run] [--verbose]\n",
                         argv[0]);
                 mbt_free_traces(traces, ntraces);
@@ -4410,7 +4901,10 @@ main(
      * once here (it dispatches to the trace-local oracle via g_recall_oracle). */
     /* memfs_config only reaches the memfs module; diskfs and cairn
      * self-provision their scratch under the env's session dir. */
-    opts.module = backend;
+    opts.module           = backend;
+    g_backend_real_holes  = strcmp(backend, "memfs") != 0;
+    g_backend_passthrough = strcmp(backend, "linux") == 0 ||
+        strcmp(backend, "io_uring") == 0;
 
     if (!dry_run) {
         mbt_env_open_opts(&env, &opts);

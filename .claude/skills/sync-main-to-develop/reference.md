@@ -129,6 +129,38 @@ only the *quick* tier (the quint model-based tests); everything else is
   96 pjd failures).  Expect the qb ctest legs, not the merge, to be the
   step that finds these; diagnose before assuming a downstream cause.
 
+### Attributing an extended-tier failure before fixing it
+
+The qb ctest legs report only the test names without `-v`; the failure
+detail appears in the run's final error block, or in a re-run of the one
+leg with `-v` (`qb -o arenaud-claude-sa --plain -a amd64 -v chimera-dev
+ctest_release`, ~40 min, separate tag so it does not collide with the
+check run).  Then decide whose bug it is:
+
+- **Upstream's own Extended runs**: `gh run list --repo chimera-nas/chimera
+  --workflow extended.yml --branch main`, then `gh run view <id> --json jobs`
+  for the per-category job conclusions and `gh api
+  repos/chimera-nas/chimera/actions/jobs/<job>/logs` for the log (the
+  `gh run view --log` form comes back empty).  Extended has been red since
+  at least 2026-09-02 and hits its 6 h timeout, so a job that is absent or
+  cancelled there proves nothing.
+- **develop before the sync**: `glab ci list -R chimera/chimera`, the failed
+  jobs of a nightly pipeline via `glab api
+  "projects/chimera%2Fchimera/pipelines/<id>/jobs?scope[]=failed"`, and
+  `glab ci trace <job>` grepped for `(Failed)`.
+- **Locally**: the smbtorture and WPTS drivers run one case in a few seconds
+  (`smbtorture_test -b <backend> <subtest>` under
+  `scripts/netns_test_wrapper.sh`, `SMBTORTURE_LOG_LEVEL=debug`;
+  `scripts/wpts_smb_test_wrapper.sh <chimera> memfs <Case>` with
+  `CHIMERA_DEBUG=1`).  A failure at ~0.3 s with
+  `io_uring_queue_init_params() failed: Cannot allocate memory` is this
+  box, not the code: export `EVPL_IO_URING_ENTRIES=1024`.
+
+The 2026-09-07 sync brought four such regressions (WPTS ChangeStreamName,
+smbtorture dup_extents on linux, KVM nfstest_alloc on diskfs, two analyzer
+findings); all but the KVM one were fixed as upstream-bound commits, the
+KVM one gated in `.gitlab-ci.yml` with the reason beside it.
+
 ### Verifying with qb: the builder image is not rebuilt by default
 
 Every `ctest_*`, `syntax` and `static_analysis_*` leg declares
@@ -151,6 +183,23 @@ The `check` alias lists `chimera-dev` first, so a full
 1300 lines since 2026-02-26. Default scope on a sync is **make it compile**;
 porting behavioural changes is its own ticket. It only builds where
 `/usr/cvfs/include` exists, so the `rocky9` qb leg is the real gate.
+
+Two things in it are deliberate copies of `linux.c` rather than drift, and
+have to move when upstream moves them:
+
+- **The byte-range lock projection.** Upstream 5ea192f3 (2026-09-07 sync)
+  removed the `OP_LOCK` wire that `snfs_lock()` mirrored; snfs now carries
+  `linux.c`'s `CHIMERA_VFS_CAP_CLAIM_RANGE` code instead -- the
+  `range_file`/`range` registry on `snfs_shared`, `snfs_claim_acquire()`
+  and `snfs_claim_release()`, OFD locks on one descriptor per (fh, owner)
+  -- renamed `chimera_linux_` -> `snfs_`, `CHIMERA_LINUX_LOCK_` ->
+  `SNFS_LOCK_`, `linux_open_by_handle` -> `snfs_open_by_handle`.
+  `sync-report.sh post` diffs the two blocks modulo whitespace and reports
+  DRIFTED when upstream changes its side; re-port rather than patch.
+- **`.sdk_version = CHIMERA_VFS_SDK_VERSION`** in `vfs_snfs`. Registration
+  aborts a module without it (`vfs.c`), which no build leg sees -- snfs
+  lacked the stamp from the 2026-08-28 SDK commit until the 2026-09-07 sync.
+  Keep it whenever the module struct is touched.
 
 ## Merge commit message
 

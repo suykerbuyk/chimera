@@ -2,6 +2,11 @@
 #
 # SPDX-License-Identifier: Unlicense
 
+# Global scope, ahead of every FROM: an ARG reaches a FROM line only if it is
+# declared before the first FROM.  Below one it belongs to that stage instead
+# and the prefix expands to empty, sending the pull to Docker Hub unmirrored.
+ARG DOCKER_MIRROR
+
 # Current ccache, mirrored into GHCR by .github/workflows/mirror-ccache.yml.
 # CI overrides CCACHE_REGISTRY to the internal pull-through proxy so an image
 # build never reaches out to ghcr.io -- the same public-default/internal-override
@@ -15,20 +20,41 @@ ARG CCACHE_REGISTRY=ghcr.io/chimera-nas/ccache
 ARG CCACHE_VERSION=4.14
 FROM ${CCACHE_REGISTRY}:${CCACHE_VERSION} AS ccache
 
-ARG DOCKER_MIRROR
 FROM ${DOCKER_MIRROR}ubuntu:26.04 AS build
 ARG BUILD_TYPE=Release
 ARG APT_MIRROR
+ARG UBUNTU_MIRROR=""
 ARG ENABLE_XLIO=0
 
 # The mirrored ccache, ahead of anything the distro might provide on PATH.
 COPY --from=ccache /ccache /usr/local/bin/ccache
 
+# Two mirror mechanisms, both off by default, so a plain `docker build` reaches
+# whatever the base image ships and nothing unexpected.
+#
+# APT_MIRROR=<url> replaces the sources list outright.  The public CI has no
+# such mirror, but private forks do, and this is what they set.
+#
+# UBUNTU_MIRROR=azure instead swaps the archive hosts for Azure's, which is
+# what the public CI passes: the GitHub-hosted runners are Azure VMs -- their
+# own host apt is pointed there for the same reason -- and the public mirrors
+# are periodically caught mid-sync, serving an index whose size disagrees with
+# its Release file, which fails the whole image build.  A host swap rather than
+# a rewritten sources list, so the suites, components and Signed-By the base
+# image chose all survive; archive and security are amd64's two hosts, ports is
+# arm64's, and each keeps its path under the Azure name.
+#
+# APT_MIRROR wins if both are set: a fork that has stood one up means it.
 RUN if [ -n "$APT_MIRROR" ]; then \
     echo "deb $APT_MIRROR resolute main universe" > /etc/apt/sources.list.d/local-mirror.list && \
     echo "deb $APT_MIRROR resolute-updates main universe" >> /etc/apt/sources.list.d/local-mirror.list && \
     echo "deb $APT_MIRROR resolute-security main universe" >> /etc/apt/sources.list.d/local-mirror.list && \
     rm -f /etc/apt/sources.list.d/ubuntu.sources; \
+    elif [ "$UBUNTU_MIRROR" = azure ]; then \
+        sed -i -e 's|//archive\.ubuntu\.com|//azure.archive.ubuntu.com|g' \
+               -e 's|//security\.ubuntu\.com|//azure.archive.ubuntu.com|g' \
+               -e 's|//ports\.ubuntu\.com|//azure.ports.ubuntu.com|g' \
+            /etc/apt/sources.list.d/ubuntu.sources; \
     fi
 
 RUN apt-get -y update && \

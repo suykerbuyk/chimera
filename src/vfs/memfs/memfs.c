@@ -255,7 +255,7 @@ struct memfs_shared;
  * carrying it: the VFS resolves the handle's mount and hands the backend the
  * mount_private it returned from MOUNT. */
 /* ------------------------------------------------------------------ */
-/* CHIMERA_VFS_CAP_LEASE arbiter                                      */
+/* CHIMERA_VFS_CAP_CLAIM_AGGREGATE arbiter                                      */
 /* ------------------------------------------------------------------ */
 
 /* memfs is the native lease arbiter: it evaluates the SAME kindless
@@ -265,11 +265,13 @@ struct memfs_shared;
  * exclusive side across owners.  The registry is module-global and keyed by
  * fh (fh bytes are unique across named filesystems), so MKFS/RMFS need no
  * lease bookkeeping.  Test knobs: CHIMERA_MEMFS_LEASE_DENY (letters r/w
- * mask grants) and CHIMERA_MEMFS_LEASE_RECALL (ms; each aggregate grant is
+ * mask grants), CHIMERA_MEMFS_LEASE_RANGE_DENY (refuse every byte-range
+ * grant, so a caller's locks fail iff they are really being projected)
+ * and CHIMERA_MEMFS_LEASE_RECALL (ms; each aggregate grant is
  * recalled that long after it lands, exercising the async
  * backend->core->frontend recall cascade). */
 
-struct memfs_lease_agg {
+struct memfs_claim_agg {
     struct chimera_claim_owner owner;
     uint64_t                   token;
     uint8_t                    rev_used;
@@ -283,29 +285,29 @@ struct memfs_lease_agg {
         uint8_t        retain);
     void                      *recall_arg;
     uint64_t                   recall_due; /* stopwatch ticks; 0 = none */
-    struct memfs_lease_agg    *next;
+    struct memfs_claim_agg    *next;
 };
 
-struct memfs_lease_range {
+struct memfs_claim_range {
     struct chimera_claim_owner owner;
     uint64_t                   token;
     uint8_t                    exclusive;
     uint64_t                   offset;
     uint64_t                   length;
-    struct memfs_lease_range  *next;
+    struct memfs_claim_range  *next;
 };
 
-struct memfs_lease_file {
+struct memfs_claim_file {
     uint8_t                   fh[CHIMERA_VFS_FH_SIZE];
     uint8_t                   fh_len;
     uint64_t                  fh_hash;
-    struct memfs_lease_agg   *aggs;
-    struct memfs_lease_range *ranges;
-    struct memfs_lease_file  *next;
+    struct memfs_claim_agg   *aggs;
+    struct memfs_claim_range *ranges;
+    struct memfs_claim_file  *next;
 };
 
 static void
-memfs_lease_recall_sweep(
+memfs_claim_recall_sweep(
     struct evpl       *evpl,
     struct evpl_timer *timer);
 
@@ -367,9 +369,10 @@ struct memfs_shared {
     uint64_t                 fsid_seed;
     /* CAP_LEASE arbiter registry + test knobs (guarded by lease_lock). */
     pthread_mutex_t          lease_lock;
-    struct memfs_lease_file *lease_files;
+    struct memfs_claim_file *lease_files;
     uint64_t                 lease_next_token;
     uint8_t                  lease_deny_mask;  /* env-masked grant bits */
+    uint8_t                  lease_range_deny; /* env: refuse RANGE grants */
     uint64_t                 lease_recall_us;  /* env recall delay; 0 off */
     pthread_mutex_t          lock;
 };
@@ -1215,7 +1218,11 @@ memfs_init(
         /* Test knobs for the CAP_LEASE arbiter. */
         const char *deny_env   = getenv("CHIMERA_MEMFS_LEASE_DENY");
         const char *recall_env = getenv("CHIMERA_MEMFS_LEASE_RECALL");
+        const char *rdeny_env  = getenv("CHIMERA_MEMFS_LEASE_RANGE_DENY");
 
+        if (rdeny_env && *rdeny_env && *rdeny_env != '0') {
+            shared->lease_range_deny = 1;
+        }
         if (deny_env) {
             for (; *deny_env; deny_env++) {
                 if (*deny_env == 'r') {
@@ -1480,11 +1487,11 @@ memfs_destroy(void *private_data)
     }
 
     {
-        struct memfs_lease_file *lf;
+        struct memfs_claim_file *lf;
 
         while ((lf = shared->lease_files)) {
-            struct memfs_lease_agg   *agg;
-            struct memfs_lease_range *rng;
+            struct memfs_claim_agg   *agg;
+            struct memfs_claim_range *rng;
 
             while ((agg = lf->aggs)) {
                 LL_DELETE(lf->aggs, agg);
@@ -1526,7 +1533,7 @@ memfs_thread_init(
     if (shared->lease_recall_us && thread->thread_id == 0) {
         thread->lease_timer_armed = 1;
         evpl_add_timer(evpl, &thread->lease_timer,
-                       memfs_lease_recall_sweep, 100000 /* 100ms */);
+                       memfs_claim_recall_sweep, 100000 /* 100ms */);
     }
 
     return thread;
@@ -1697,6 +1704,15 @@ memfs_map_attrs(
         attr->va_fsid      = fs->fsid;
     }
 
+    /* Named-stream presence (SMB ADS / NFSv4 named attributes).  memfs owns the
+     * stream list, so it answers accurately and for free: a regular file with at
+     * least one named stream reports true.  A named-stream view overrides this
+     * to false in memfs_map_attrs_fork (a stream has no sub-streams). */
+    if (attr->va_req_mask & CHIMERA_VFS_ATTR_NAMED_ATTR) {
+        attr->va_set_mask  |= CHIMERA_VFS_ATTR_NAMED_ATTR;
+        attr->va_named_attr = (S_ISREG(inode->mode) && inode->streams) ? 1 : 0;
+    }
+
     /* Opaque pNFS layout state, persisted verbatim for the NFS server. */
     if ((attr->va_req_mask & CHIMERA_VFS_ATTR_PNFS_LAYOUT) && inode->remote) {
         attr->va_set_mask |= CHIMERA_VFS_ATTR_PNFS_LAYOUT;
@@ -1747,6 +1763,11 @@ memfs_map_attrs_fork(
         attr->va_fh_len = memfs_encode_stream_fh(base_fh, inode->inum,
                                                  inode->gen, stream->id,
                                                  attr->va_fh);
+    }
+
+    /* A named stream is a leaf data fork; it has no named attributes of its own. */
+    if (attr->va_set_mask & CHIMERA_VFS_ATTR_NAMED_ATTR) {
+        attr->va_named_attr = 0;
     }
 } /* memfs_map_attrs_fork */
 
@@ -1887,7 +1908,8 @@ memfs_apply_attrs(
     if (set_mask & CHIMERA_VFS_ATTR_ACL) {
         memfs_inode_set_acl(inode, attr->va_acl);
         if (inode->acl) {
-            inode->mode = (inode->mode & S_IFMT) | chimera_acl_to_mode(inode->acl);
+            inode->mode = (inode->mode & CHIMERA_MODE_ACL_PRESERVE) |
+                chimera_acl_to_mode(inode->acl);
         }
         attr->va_set_mask |= CHIMERA_VFS_ATTR_ACL;
     } else if ((set_mask & CHIMERA_VFS_ATTR_MODE) && inode->acl) {
@@ -2000,7 +2022,8 @@ memfs_inherit_acl(
 
         if (n > 0) {
             memfs_inode_set_acl(child, tmp);
-            child->mode = (child->mode & S_IFMT) | chimera_acl_to_mode(child->acl);
+            child->mode = (child->mode & CHIMERA_MODE_ACL_PRESERVE) |
+                chimera_acl_to_mode(child->acl);
         }
         free(tmp);
 
@@ -3399,12 +3422,54 @@ memfs_open_fh(
     struct chimera_vfs_request *request,
     void                       *private_data)
 {
-    struct memfs_inode *inode;
+    struct memfs_inode        *inode;
+    struct memfs_named_stream *stream;
+    struct memfs_stream_open  *so;
+    uint64_t                   inum;
+    uint32_t                   gen, stream_id = 0;
 
     inode = memfs_inode_get_fh(fs, request->fh, request->fh_len);
 
     if (!inode) {
         request->status = CHIMERA_VFS_ESTALE;
+        request->complete(request);
+        return;
+    }
+
+    /* A named-stream file handle carries a non-zero stream id appended after the
+     * base inum/gen (memfs_encode_stream_fh).  Resolve it to a pinned per-open
+     * stream descriptor and hand back a tagged vfs_private so subsequent data ops
+     * (read/write/getattr/setattr) act on the stream fork, not the base/default
+     * fork.  This is the path NFSv4 takes when a stream fh arrives via PUTFH;
+     * SMB instead always carries the tagged handle returned by open_stream. */
+    memfs_decode_stream_fh(request->fh, request->fh_len, &inum, &gen, &stream_id);
+
+    if (stream_id) {
+        stream = memfs_stream_find_by_id(inode, stream_id);
+
+        if (!stream) {
+            /* Stale stream fh: the stream was removed.  Ids are never reused, so
+             * this resolves to nothing rather than the wrong fork. */
+            pthread_mutex_unlock(&inode->lock);
+            request->status = CHIMERA_VFS_ENOENT;
+            request->complete(request);
+            return;
+        }
+
+        stream->refcnt++;
+        inode->refcnt++;
+
+        so                  = malloc(sizeof(*so));
+        so->inode           = inode;
+        so->stream          = stream;
+        so->open_next       = inode->stream_opens;
+        inode->stream_opens = so;
+
+        pthread_mutex_unlock(&inode->lock);
+
+        request->open_fh.r_vfs_private = (uint64_t) (uintptr_t) so | 1ULL;
+        request->open_fh.r_stream      = 1;
+        request->status                = CHIMERA_VFS_OK;
         request->complete(request);
         return;
     }
@@ -3837,11 +3902,19 @@ memfs_read(
         return;
     }
 
-    /* read() of a directory is EISDIR (the previous behavior fabricated
-     * zero-filled bytes from the empty data fork). */
-    if (unlikely(!stream && S_ISDIR(inode->mode))) {
+    /* A read of a named stream (stream != NULL) targets the stream's own data
+     * fork and is valid on any base object, including a directory's ADS.  A
+     * plain read only makes sense for a regular file: inode->file shares a
+     * union with the dirent tree and the symlink target, so any other type
+     * would have its union member reinterpreted as fork blocks/num_blocks and
+     * indexed far out of bounds (inodes are recycled, so num_blocks is not
+     * even reliably zero).  A directory is EISDIR (the previous behavior
+     * fabricated zero-filled bytes from the empty data fork); RFC 1813 3.3.6
+     * asks for INVAL on every other non-NF3REG handle. */
+    if (unlikely(!stream && !S_ISREG(inode->mode))) {
         pthread_mutex_unlock(&inode->lock);
-        request->status = CHIMERA_VFS_EISDIR;
+        request->status = S_ISDIR(inode->mode) ?
+            CHIMERA_VFS_EISDIR : CHIMERA_VFS_EINVAL;
         request->complete(request);
         return;
     }
@@ -4135,9 +4208,14 @@ memfs_write(
         left            -= block_len;
     }
 
+    /* Storage is allocated and charged a whole memfs block at a time, so the
+     * reported allocation rounds to the configured block size.  A fixed 4 KiB
+     * rounding understated the charge and disagreed with the truncate path
+     * (num_blocks * block_size), so va_space_used changed across a no-op
+     * truncate. */
     if (*p_size < request->write.offset + request->write.length) {
         *p_size       = request->write.offset + request->write.length;
-        *p_space_used = (*p_size + 4095) & ~4095;
+        *p_space_used = (*p_size + block_mask) & ~(uint64_t) block_mask;
     }
 
     inode->mtime = now;
@@ -4326,6 +4404,15 @@ memfs_allocate(
                                                EVPL_IOVEC_FLAG_SHARED, block->iov);
                 memset(block->iov[0].data, 0, block_size);
                 fork->blocks[bi] = block;
+
+                /* RFC 7862 §15.1.3: ALLOCATE increases space_used by the bytes
+                 * reserved, "unless they were previously reserved or written
+                 * and not shared" -- so charge only the blocks this call
+                 * materialized, which is exactly the ones the skip above let
+                 * through.  Without it a GETATTR after ALLOCATE still reported
+                 * the pre-ALLOCATE value even though the blocks (and the
+                 * filesystem-wide charge) were real. */
+                *p_space_used += block_size;
             }
         }
 
@@ -5547,9 +5634,10 @@ memfs_write_same(
         block_offset = 0;
     }
 
+    /* Round the reported allocation to the block size, as memfs_write does. */
     if (*p_size < offset + total) {
         *p_size       = offset + total;
-        *p_space_used = (*p_size + 4095) & ~4095;
+        *p_space_used = (*p_size + block_mask) & ~(uint64_t) block_mask;
     }
 
     inode->mtime = now;
@@ -6633,11 +6721,14 @@ memfs_list_streams(
 {
     struct memfs_inode             *inode;
     struct memfs_named_stream      *stream;
-    uint8_t                        *buf    = request->list_streams.buffer;
-    uint32_t                        max    = request->list_streams.max_bytes;
-    uint32_t                        offset = 0;
-    uint32_t                        count  = 0;
+    uint8_t                        *buf     = request->list_streams.buffer;
+    uint32_t                        max     = request->list_streams.max_bytes;
+    int                             want_fh = request->list_streams.want_fh;
+    uint32_t                        offset  = 0;
+    uint32_t                        count   = 0;
     struct chimera_vfs_stream_entry entry;
+    uint8_t                         fhbuf[CHIMERA_VFS_FH_SIZE + 16];
+    uint32_t                        fh_len;
     uint32_t                        rec;
 
     inode = memfs_inode_get_fh(fs, request->fh, request->fh_len);
@@ -6651,9 +6742,15 @@ memfs_list_streams(
     /* Default unnamed data fork ("::$DATA"), reported first with an empty name
      * so the SMB layer can format it as the default stream.  Only regular files
      * have a data fork -- a directory reports no streams (smb2.streams.dir
-     * expects an empty stream list on a directory). */
+     * expects an empty stream list on a directory).  When the caller requested
+     * handles (NFSv4 named-attr READDIR), the default fork carries the base fh
+     * and each named stream carries its own stream fh. */
     if (S_ISREG(inode->mode)) {
-        rec = sizeof(entry);
+        fh_len = want_fh ? request->fh_len : 0;
+        if (want_fh) {
+            memcpy(fhbuf, request->fh, request->fh_len);
+        }
+        rec = sizeof(entry) + fh_len;
         if (offset + rec > max) {
             pthread_mutex_unlock(&inode->lock);
             request->status = CHIMERA_VFS_ERANGE;
@@ -6663,14 +6760,22 @@ memfs_list_streams(
         entry.size     = inode->size;
         entry.alloc    = inode->space_used;
         entry.name_len = 0;
+        entry.fh_len   = fh_len;
         memcpy(buf + offset, &entry, sizeof(entry));
+        memcpy(buf + offset + sizeof(entry), fhbuf, fh_len);
         offset += rec;
         offset  = (offset + 7) & ~7u;
         count++;
     }
 
     for (stream = inode->streams; stream; stream = stream->next) {
-        rec = sizeof(entry) + stream->name_len;
+        if (want_fh) {
+            fh_len = memfs_encode_stream_fh(request->fh, inode->inum,
+                                            inode->gen, stream->id, fhbuf);
+        } else {
+            fh_len = 0;
+        }
+        rec = sizeof(entry) + stream->name_len + fh_len;
         if (offset + rec > max) {
             pthread_mutex_unlock(&inode->lock);
             request->status = CHIMERA_VFS_ERANGE;
@@ -6680,8 +6785,10 @@ memfs_list_streams(
         entry.size     = stream->size;
         entry.alloc    = stream->space_used;
         entry.name_len = stream->name_len;
+        entry.fh_len   = fh_len;
         memcpy(buf + offset, &entry, sizeof(entry));
         memcpy(buf + offset + sizeof(entry), stream->name, stream->name_len);
+        memcpy(buf + offset + sizeof(entry) + stream->name_len, fhbuf, fh_len);
         offset += rec;
         offset  = (offset + 7) & ~7u;
         count++;
@@ -6767,15 +6874,15 @@ memfs_remove_stream(
 /* CAP_LEASE arbiter implementation                                   */
 /* ------------------------------------------------------------------ */
 
-static struct memfs_lease_file *
-memfs_lease_file_get(
+static struct memfs_claim_file *
+memfs_claim_file_get(
     struct memfs_shared *shared,
     const uint8_t       *fh,
     uint8_t              fh_len,
     uint64_t             fh_hash,
     int                  create)
 {
-    struct memfs_lease_file *f;
+    struct memfs_claim_file *f;
 
     for (f = shared->lease_files; f; f = f->next) {
         if (f->fh_hash == fh_hash && f->fh_len == fh_len &&
@@ -6792,36 +6899,81 @@ memfs_lease_file_get(
     f->fh_hash = fh_hash;
     LL_PREPEND(shared->lease_files, f);
     return f;
-} /* memfs_lease_file_get */
+} /* memfs_claim_file_get */
 
 static void
-memfs_lease_acquire(
+memfs_claim_acquire(
     struct memfs_thread        *thread,
+    struct memfs_fs            *fs,
     struct memfs_shared        *shared,
     struct chimera_vfs_request *request)
 {
-    struct memfs_lease_file  *f;
-    struct memfs_lease_agg   *agg, *mine;
-    struct memfs_lease_range *rng;
-    uint8_t                   klass = request->lease_acquire.klass;
+    struct memfs_claim_file  *f;
+    struct memfs_claim_agg   *agg, *mine;
+    struct memfs_claim_range *rng;
+    uint8_t                   klass  = request->claim_acquire.klass;
+    uint64_t                  offset = request->claim_acquire.offset;
+    uint64_t                  length = request->claim_acquire.length;
 
     (void) thread;
 
+    /* Resolve a SEEK_END range against the file's current size.  The claim
+     * wire hands EOF-relative geometry to the arbiter precisely so the
+     * resolution happens where the size is authoritative; here that means
+     * before the claim lock is taken, since the inode lookup returns the
+     * inode LOCKED and the two locks must not nest. */
+    if (klass == CHIMERA_VFS_CLAIM_KLASS_RANGE &&
+        request->claim_acquire.whence == SEEK_END) {
+        struct memfs_inode *inode;
+        int64_t             start = (int64_t) offset;
+        int64_t             len   = (int64_t) length;
+        int64_t             size;
+
+        inode = memfs_inode_get_fh(fs, request->fh, request->fh_len);
+
+        if (!inode) {
+            request->status = CHIMERA_VFS_ESTALE;
+            request->complete(request);
+            return;
+        }
+        size = (int64_t) inode->size;
+        pthread_mutex_unlock(&inode->lock);
+
+        start += size;
+
+        /* A negative length means the range extends BACKWARDS from start
+         * (POSIX l_len < 0), and 0 still means to-EOF in this spelling. */
+        if (len < 0) {
+            start += len;
+            len    = -len;
+        }
+
+        if (start < 0) {
+            /* The range would begin before byte 0. */
+            request->status = CHIMERA_VFS_EINVAL;
+            request->complete(request);
+            return;
+        }
+
+        offset = (uint64_t) start;
+        length = (len == 0) ? UINT64_MAX : (uint64_t) len;
+    }
+
     pthread_mutex_lock(&shared->lease_lock);
 
-    f = memfs_lease_file_get(shared, request->fh, request->fh_len,
+    f = memfs_claim_file_get(shared, request->fh, request->fh_len,
                              request->fh_hash, 1);
 
-    if (klass == CHIMERA_VFS_LEASE_AGGREGATE) {
-        uint8_t rev     = request->lease_acquire.rev_used;
-        uint8_t deny    = request->lease_acquire.bind_deny;
+    if (klass == CHIMERA_VFS_CLAIM_KLASS_AGGREGATE) {
+        uint8_t rev     = request->claim_acquire.rev_used;
+        uint8_t deny    = request->claim_acquire.bind_deny;
         uint8_t granted = rev;
         int     deny_ok = 1;
 
         mine = NULL;
         for (agg = f->aggs; agg; agg = agg->next) {
             if (chimera_claim_owner_equal(&agg->owner,
-                                          &request->lease_acquire.owner)) {
+                                          &request->claim_acquire.owner)) {
                 mine = agg;
                 continue;
             }
@@ -6843,84 +6995,179 @@ memfs_lease_acquire(
 
         if (!mine) {
             mine        = calloc(1, sizeof(*mine));
-            mine->owner = request->lease_acquire.owner;
+            mine->owner = request->claim_acquire.owner;
             LL_PREPEND(f->aggs, mine);
         }
         mine->rev_used   = granted;
         mine->bind_deny  = deny;
         mine->token      = ++shared->lease_next_token;
-        mine->recall_cb  = request->lease_acquire.recall_cb;
-        mine->recall_arg = request->lease_acquire.recall_arg;
+        mine->recall_cb  = request->claim_acquire.recall_cb;
+        mine->recall_arg = request->claim_acquire.recall_arg;
         if (shared->lease_recall_us) {
             mine->recall_due = chimera_vfs_now_ticks() +
                 chimera_vfs_ns_to_ticks(shared->lease_recall_us * 1000ULL);
         }
 
-        request->lease_acquire.r_token   = mine->token;
-        request->lease_acquire.r_granted = granted;
+        request->claim_acquire.r_token   = mine->token;
+        request->claim_acquire.r_granted = granted;
         pthread_mutex_unlock(&shared->lease_lock);
         request->status = CHIMERA_VFS_OK;
         request->complete(request);
         return;
     }
 
-    /* RANGE: binding, all-or-nothing, cross-owner overlap+exclusivity. */
-    for (rng = f->ranges; rng; rng = rng->next) {
-        if (chimera_claim_owner_equal(&rng->owner,
-                                      &request->lease_acquire.owner)) {
-            continue;
-        }
-        if (!(rng->exclusive || request->lease_acquire.exclusive)) {
-            continue;
-        }
-        if (!chimera_vfs_claim_range_overlap_i(rng->offset, rng->length,
-                                               request->lease_acquire.offset,
-                                               request->lease_acquire.length)) {
-            continue;
-        }
-        /* Conflict: refuse (r_granted stays 0). */
+    /* RANGE: binding, all-or-nothing, cross-owner overlap+exclusivity.
+     *
+     * CHIMERA_VFS_CLAIM_WAIT is answered as a try: memfs completes inline on
+     * the caller's thread (which is what lets a synchronous acquirer project
+     * at all), so it has nowhere to block, and the claim core queues the
+     * waiter locally either way.  CHIMERA_VFS_CLAIM_TEST reports the
+     * conflict without inserting a record. */
+    if (shared->lease_range_deny) { /* test knob: refuse every range */
         pthread_mutex_unlock(&shared->lease_lock);
-        request->lease_acquire.r_token   = 0;
-        request->lease_acquire.r_granted = 0;
+        request->claim_acquire.r_token   = 0;
+        request->claim_acquire.r_granted = 0;
         request->status                  = CHIMERA_VFS_OK;
         request->complete(request);
         return;
     }
 
+    for (rng = f->ranges; rng; rng = rng->next) {
+        if (chimera_claim_owner_equal(&rng->owner,
+                                      &request->claim_acquire.owner)) {
+            continue;
+        }
+        if (!(rng->exclusive || request->claim_acquire.exclusive)) {
+            continue;
+        }
+        if (!chimera_vfs_claim_range_overlap_i(rng->offset, rng->length,
+                                               offset, length)) {
+            continue;
+        }
+        /* Conflict: refuse (r_granted stays 0), and describe the winner so
+         * a caller answering F_GETLK can name it.  memfs has no pids to
+         * report, so r_conflict_pid stays 0. */
+        pthread_mutex_unlock(&shared->lease_lock);
+        request->claim_acquire.r_token         = 0;
+        request->claim_acquire.r_granted       = 0;
+        request->claim_acquire.r_conflict_type = rng->exclusive
+            ? CHIMERA_VFS_LOCK_WRITE : CHIMERA_VFS_LOCK_READ;
+        request->claim_acquire.r_conflict_offset = rng->offset;
+        request->claim_acquire.r_conflict_length = rng->length;
+        request->status                          = CHIMERA_VFS_OK;
+        request->complete(request);
+        return;
+    }
+
+    if (request->claim_acquire.flags & CHIMERA_VFS_CLAIM_TEST) {
+        /* No conflict found, and a probe records nothing. */
+        pthread_mutex_unlock(&shared->lease_lock);
+        request->claim_acquire.r_token         = 0;
+        request->claim_acquire.r_granted       = 1;
+        request->claim_acquire.r_conflict_type = CHIMERA_VFS_LOCK_UNLOCK;
+        request->status                        = CHIMERA_VFS_OK;
+        request->complete(request);
+        return;
+    }
+
     rng            = calloc(1, sizeof(*rng));
-    rng->owner     = request->lease_acquire.owner;
-    rng->exclusive = request->lease_acquire.exclusive;
-    rng->offset    = request->lease_acquire.offset;
-    rng->length    = request->lease_acquire.length;
+    rng->owner     = request->claim_acquire.owner;
+    rng->exclusive = request->claim_acquire.exclusive;
+    rng->offset    = offset;
+    rng->length    = length;
     rng->token     = ++shared->lease_next_token;
     LL_PREPEND(f->ranges, rng);
 
-    request->lease_acquire.r_token   = rng->token;
-    request->lease_acquire.r_granted = 1;
+    request->claim_acquire.r_token   = rng->token;
+    request->claim_acquire.r_granted = 1;
     pthread_mutex_unlock(&shared->lease_lock);
     request->status = CHIMERA_VFS_OK;
     request->complete(request);
-} /* memfs_lease_acquire */
+} /* memfs_claim_acquire */
 
 static void
-memfs_lease_release(
+memfs_claim_release(
     struct memfs_thread        *thread,
+    struct memfs_fs            *fs,
     struct memfs_shared        *shared,
     struct chimera_vfs_request *request)
 {
-    struct memfs_lease_file  *f;
-    struct memfs_lease_agg   *agg;
-    struct memfs_lease_range *rng;
-    uint64_t                  token = request->lease_release.token;
+    struct memfs_claim_file  *f;
+    struct memfs_claim_agg   *agg;
+    struct memfs_claim_range *rng, *tmp;
+    uint64_t                  token = request->claim_release.token;
 
     (void) thread;
+
+    /* Release by GEOMETRY: the caller never learned the absolute range
+     * (a SEEK_END unlock), so it names the range the way it named the
+     * lock and this side resolves EOF -- atomically with the unlock, for
+     * the same reason the acquire does. */
+    if (token == 0 &&
+        request->claim_release.klass == CHIMERA_VFS_CLAIM_KLASS_RANGE) {
+        uint64_t offset = request->claim_release.offset;
+        uint64_t length = request->claim_release.length;
+
+        if (request->claim_release.whence == SEEK_END) {
+            struct memfs_inode *inode;
+            int64_t             start = (int64_t) offset;
+            int64_t             len   = (int64_t) length;
+            int64_t             size;
+
+            inode = memfs_inode_get_fh(fs, request->fh, request->fh_len);
+
+            if (!inode) {
+                request->status = CHIMERA_VFS_ESTALE;
+                request->complete(request);
+                return;
+            }
+            size = (int64_t) inode->size;
+            pthread_mutex_unlock(&inode->lock);
+
+            start += size;
+            if (len < 0) {
+                start += len;
+                len    = -len;
+            }
+            if (start < 0) {
+                request->status = CHIMERA_VFS_EINVAL;
+                request->complete(request);
+                return;
+            }
+            offset = (uint64_t) start;
+            length = (len == 0) ? UINT64_MAX : (uint64_t) len;
+        }
+
+        pthread_mutex_lock(&shared->lease_lock);
+        f = memfs_claim_file_get(shared, request->fh, request->fh_len,
+                                 request->fh_hash, 0);
+        if (f) {
+            LL_FOREACH_SAFE(f->ranges, rng, tmp)
+            {
+                if (!chimera_claim_owner_equal(&rng->owner,
+                                               &request->claim_release.owner)) {
+                    continue;
+                }
+                if (!chimera_vfs_claim_range_overlap_i(rng->offset, rng->length,
+                                                       offset, length)) {
+                    continue;
+                }
+                LL_DELETE(f->ranges, rng);
+                free(rng);
+            }
+        }
+        pthread_mutex_unlock(&shared->lease_lock);
+        request->status = CHIMERA_VFS_OK;
+        request->complete(request);
+        return;
+    }
 
     pthread_mutex_lock(&shared->lease_lock);
     for (f = shared->lease_files; f; f = f->next) {
         for (agg = f->aggs; agg; agg = agg->next) {
             if (agg->token == token) {
-                if (request->lease_release.retained) {
-                    agg->rev_used  &= request->lease_release.retained;
+                if (request->claim_release.retained) {
+                    agg->rev_used  &= request->claim_release.retained;
                     agg->recall_due = 0;
                 } else {
                     LL_DELETE(f->aggs, agg);
@@ -6941,21 +7188,21 @@ memfs_lease_release(
     pthread_mutex_unlock(&shared->lease_lock);
     request->status = CHIMERA_VFS_OK;
     request->complete(request);
-} /* memfs_lease_release */
+} /* memfs_claim_release */
 
 /* Recall-knob sweep (thread 0 only, 100ms): fire the async recall upcall
  * for due aggregate grants OUTSIDE the registry lock -- the cascade runs
  * core -> trigger engine -> frontend break callbacks and acks by release. */
 static void
-memfs_lease_recall_sweep(
+memfs_claim_recall_sweep(
     struct evpl       *evpl,
     struct evpl_timer *timer)
 {
     struct memfs_thread     *thread =
         container_of(timer, struct memfs_thread, lease_timer);
     struct memfs_shared     *shared = thread->shared;
-    struct memfs_lease_file *f;
-    struct memfs_lease_agg  *agg;
+    struct memfs_claim_file *f;
+    struct memfs_claim_agg  *agg;
     uint64_t                 now = chimera_vfs_now_ticks();
 
     struct {
@@ -6997,7 +7244,7 @@ memfs_lease_recall_sweep(
         due[i].cb(due[i].arg, due[i].fh, due[i].fh_len, due[i].fh_hash,
                   due[i].token, 0 /* full recall */);
     }
-} /* memfs_lease_recall_sweep */
+} /* memfs_claim_recall_sweep */
 
 static void
 memfs_dispatch(
@@ -7138,11 +7385,11 @@ memfs_dispatch(
         case CHIMERA_VFS_OP_REMOVE_STREAM:
             memfs_remove_stream(thread, fs, request, private_data);
             break;
-        case CHIMERA_VFS_OP_LEASE_ACQUIRE:
-            memfs_lease_acquire(thread, shared, request);
+        case CHIMERA_VFS_OP_CLAIM_ACQUIRE:
+            memfs_claim_acquire(thread, fs, shared, request);
             break;
-        case CHIMERA_VFS_OP_LEASE_RELEASE:
-            memfs_lease_release(thread, shared, request);
+        case CHIMERA_VFS_OP_CLAIM_RELEASE:
+            memfs_claim_release(thread, fs, shared, request);
             break;
         default:
             chimera_memfs_error("memfs_dispatch: unknown operation %d",
@@ -7162,9 +7409,9 @@ SYMBOL_EXPORT struct chimera_vfs_module vfs_memfs = {
         CHIMERA_VFS_CAP_COPY_RANGE | CHIMERA_VFS_CAP_CLONE_RANGE | CHIMERA_VFS_CAP_MOVE_RANGE |
         CHIMERA_VFS_CAP_ACL_NATIVE | CHIMERA_VFS_CAP_XATTR | CHIMERA_VFS_CAP_LAYOUT |
         CHIMERA_VFS_CAP_READ_PROVIDES_BUFFERS |
-        CHIMERA_VFS_CAP_NAMED_STREAMS | CHIMERA_VFS_CAP_RPL | CHIMERA_VFS_CAP_FS_LOCK |
+        CHIMERA_VFS_CAP_NAMED_STREAMS | CHIMERA_VFS_CAP_RPL |
         CHIMERA_VFS_CAP_CHANGE | CHIMERA_VFS_CAP_MKFS |
-        CHIMERA_VFS_CAP_LEASE |
+        CHIMERA_VFS_CAP_CLAIM_AGGREGATE | CHIMERA_VFS_CAP_CLAIM_RANGE |
         CHIMERA_VFS_CAP_READ_PLUS | CHIMERA_VFS_CAP_WRITE_SAME,
     .init           = memfs_init,
     .destroy        = memfs_destroy,

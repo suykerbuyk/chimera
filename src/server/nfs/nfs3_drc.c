@@ -18,7 +18,10 @@
 #include "evpl/evpl_rpc2.h"
 #include "evpl/evpl_rpc2_program.h"
 
-#define NFS3_DRC_VALUE_MAGIC 0x33435244u /* "DRC3" */
+/* Bumped from "DRC3" when the cached bytes changed from the whole on-wire
+ * message to the RPC reply alone: an entry written by an older build is not
+ * readable by this one, and a magic mismatch is already treated as a miss. */
+#define NFS3_DRC_VALUE_MAGIC 0x34435244u /* "DRC4" */
 
 /* Most evictions remove a single similarly-sized entry; this caps how many
  * evicted keys one insert reports back for KV cleanup (any beyond it leak in
@@ -102,6 +105,84 @@ nfs3_drc_checksum_iov(
     }
     return h;
 } /* nfs3_drc_checksum_iov */
+
+/*
+ * Fold the caller's identity into a request checksum.
+ *
+ * The iovecs a dispatcher is handed begin after the RPC header, so they do not
+ * cover the credential: two users sending byte-identical procedure arguments
+ * produce the same checksum.  With the address (NFSv3) or the connection
+ * (NFSv4.0) as the only other scope, that is enough for one user's request to
+ * be answered from another's entry -- and the second user is told its
+ * non-idempotent operation succeeded when nothing of the sort ran.  Two users
+ * on one machine, or on one container host behind a NAT, are all it takes.
+ *
+ * RFC 8881 Section 2.10.6.1.3.1 states the rule for the NFSv4.1 reply cache: a
+ * retry "that uses a different principal in the RPC request's credential field
+ * that translates to a different user" is a false retry, and if the replier
+ * determines the users differ it MUST NOT answer from the cache.  Neither
+ * RFC 1813 nor RFC 7530 discusses a reply cache at all, so neither says
+ * anything either way -- but the hazard is the same one, and the fix is to make
+ * the identity part of what the key compares.
+ *
+ * The decoded credential is folded rather than the raw bytes, because the
+ * AUTH_SYS stamp is free to vary between a call and its own retransmission and
+ * folding it would mean nothing ever matched.  Squashing is deliberately not
+ * applied first: it happens later, per export, and two credentials that would
+ * squash together simply miss and re-execute, which costs work but is never
+ * wrong.
+ */
+uint64_t
+nfs3_drc_checksum_cred(
+    uint64_t                     h,
+    const struct evpl_rpc2_cred *cred)
+{
+    uint32_t flavor = cred ? cred->flavor : 0;
+    uint32_t i;
+
+    h = nfs3_drc_fnv_accum(h, (const uint8_t *) &flavor, sizeof(flavor));
+
+    if (!cred) {
+        return h;
+    }
+
+    switch (cred->flavor) {
+        case EVPL_RPC2_AUTH_SYS:
+            h = nfs3_drc_fnv_accum(h, (const uint8_t *) &cred->authsys.uid,
+                                   sizeof(cred->authsys.uid));
+            h = nfs3_drc_fnv_accum(h, (const uint8_t *) &cred->authsys.gid,
+                                   sizeof(cred->authsys.gid));
+            for (i = 0; i < cred->authsys.num_gids && cred->authsys.gids; i++) {
+                h = nfs3_drc_fnv_accum(h,
+                                       (const uint8_t *) &cred->authsys.gids[i],
+                                       sizeof(cred->authsys.gids[i]));
+            }
+            /* The machine name is part of the identity an AUTH_SYS credential
+             * asserts: the same uid on two hosts is two users. */
+            if (cred->authsys.machinename && cred->authsys.machinename_len > 0) {
+                h = nfs3_drc_fnv_accum(h,
+                                       (const uint8_t *) cred->authsys.machinename,
+                                       (uint32_t) cred->authsys.machinename_len);
+            }
+            break;
+
+        case EVPL_RPC2_AUTH_RPCSEC_GSS:
+            h = nfs3_drc_fnv_accum(h, (const uint8_t *) &cred->gss.service,
+                                   sizeof(cred->gss.service));
+            if (cred->gss.principal) {
+                h = nfs3_drc_fnv_accum(h, (const uint8_t *) cred->gss.principal,
+                                       (uint32_t) strlen(cred->gss.principal));
+            }
+            break;
+
+        default:
+            /* AUTH_NONE and anything unrecognised assert no identity beyond
+             * the flavor, which is already folded in. */
+            break;
+    } /* switch */
+
+    return h;
+} /* nfs3_drc_checksum_cred */
 
 /* Source IP with the ephemeral port stripped (stable across the reconnect a
  * retransmit rides in on).  Returns the address length written into out. */
@@ -375,6 +456,7 @@ nfs3_drc_capture_reply(
     const struct evpl_iovec *iov,
     int                      niov,
     int                      total_length,
+    uint32_t                 body_offset,
     void                    *private_data)
 {
     struct nfs3_drc_capture_ctx      *ctx    = private_data;
@@ -382,33 +464,37 @@ nfs3_drc_capture_reply(
     struct nfs3_drc                  *drc    = ctx->drc;
     struct nfs3_drc_keybuf            evicted[NFS3_DRC_EVICT_MAX];
     uint8_t                          *buf;
-    size_t                            offset = 0;
+    uint32_t                          rpc_len;
     uint64_t                          ts;
     int                               i, nev;
 
-    if (total_length <= 0 || (uint32_t) total_length > NFS3_DRC_MAX_REPLY_SIZE) {
+    if (total_length <= (int) body_offset ||
+        (uint32_t) total_length > NFS3_DRC_MAX_REPLY_SIZE) {
         return;
     }
 
-    buf = malloc(total_length);
+    rpc_len = (uint32_t) total_length - body_offset;
+
+    buf = malloc(rpc_len);
     if (!buf) {
         return;  /* OOM: skip caching this reply (degrade to a cache miss) */
     }
-    for (i = 0; i < niov; i++) {
-        memcpy(buf + offset, iov[i].data, iov[i].length);
-        offset += iov[i].length;
+
+    if (nfs_drc_copy_rpc_reply(iov, niov, body_offset, buf, rpc_len) != rpc_len) {
+        free(buf);
+        return;
     }
 
     ts = nfs_lease_now_ns();
 
     pthread_mutex_lock(&drc->lock);
-    nev = nfs3_drc_cache_insert_locked(drc, &ctx->key, buf, total_length, ts,
+    nev = nfs3_drc_cache_insert_locked(drc, &ctx->key, buf, rpc_len, ts,
                                        evicted, NFS3_DRC_EVICT_MAX);
     pthread_mutex_unlock(&drc->lock);
 
     if (!drc->persistence_disabled) {
         nfs3_drc_kv_put(thread->vfs_thread, drc->kv_type, &ctx->key, buf,
-                        total_length, ts);
+                        rpc_len, ts);
         for (i = 0; i < nev; i++) {
             nfs3_drc_kv_delete(thread->vfs_thread, drc->kv_type, &evicted[i]);
         }
@@ -705,9 +791,15 @@ nfs3_drc_dispatch(
     struct nfs3_drc                  *drc    = &thread->shared->nfs3_drc;
     struct nfs3_drc_keybuf            key;
 
-    /* The cached reply is the TCP on-wire form; RDMA framing differs, so leave
-    * RDMA requests (and idempotent procs) to the real dispatcher untouched. */
-    if (conn->rdma || !nfs3_drc_proc_cacheable(proc)) {
+    /* Idempotent procs are safe to re-execute, so they bypass the cache.
+     *
+     * RDMA connections used to bypass it too, because the cached reply was the
+     * TCP on-wire form and RDMA framing differs.  The cache now stores the RPC
+     * reply with the transport framing stripped (nfs3_drc_capture_reply), so a
+     * retransmit over RDMA is served like any other -- which it has to be: a
+     * duplicate-request cache that quietly disables itself on one transport
+     * re-executes non-idempotent operations there. */
+    if (!nfs3_drc_proc_cacheable(proc)) {
         return drc->orig_dispatch(evpl, conn, encoding, proc, program_data,
                                   cred, iov, niov, length, private_data);
     }
@@ -716,7 +808,8 @@ nfs3_drc_dispatch(
     key.addr_len = nfs3_drc_client_addr(conn, key.addr);
     key.proc     = proc;
     key.xid      = encoding->xid;
-    key.cksum    = nfs3_drc_checksum_iov(iov, niov);
+    key.cksum    = nfs3_drc_checksum_cred(nfs3_drc_checksum_iov(iov, niov),
+                                          cred);
 
     return nfs3_drc_serve(drc, &key, evpl, conn, encoding, proc, program_data,
                           cred, iov, niov, length, private_data);
