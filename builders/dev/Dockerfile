@@ -53,10 +53,15 @@ RUN if [ "$ENABLE_CODEX" = "1" ] ; then \
     npm install -g @openai/codex ; \
     fi
 
+# --disable-native: fio's configure otherwise adds -march=native, so the
+# binary is tuned to whichever runner happened to build this image.  The qb
+# cluster is a heterogeneous pool, so an image built on an AVX-512 node ships
+# EVEX instructions that die with SIGILL at startup on a node without them --
+# before fio has parsed a single argument.  Matches upstream's Dockerfiles.
 RUN if [ "$ENABLE_FIO" = "1" ] ; then \
     git clone --depth 1 --branch fio-3.40 https://github.com/axboe/fio.git /fio && \
     cd /fio && \
-    ./configure --disable-libnfs && \
+    ./configure --disable-libnfs --disable-native && \
     make -j8 && \
     make install ; \
     fi
