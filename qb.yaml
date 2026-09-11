@@ -837,7 +837,14 @@ tasks:
       # error).  The ${KVM_FILTER} token here stays UNQUOTED so the flag and regex
       # split into separate args; setting it empty runs every kvm test for the
       # platform, including the ones the pipeline gates out.
-      - ctest -C extended --output-on-failure -L kvm -L "^${PLATFORM}$" ${KVM_FILTER} -j 12
+      # --no-tests=error: every shard names a real guest image, so selecting
+      # nothing is a defect, not an empty slice.  Without it a shard whose label
+      # or path regex stopped matching would exit 0 having run nothing -- the
+      # same silent loss of coverage the KVM_SHARDS check above exists to
+      # prevent, one level down.  (Upstream tolerates empty shards because its
+      # category list includes arch-excluded and complement categories that can
+      # legitimately select nothing; ours cannot.)
+      - ctest -C extended --output-on-failure --no-tests=error -L kvm -L "^${PLATFORM}$" ${KVM_FILTER} -j 12
     dependencies:
       builder:
         project: chimera
