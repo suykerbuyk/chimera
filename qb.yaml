@@ -790,12 +790,19 @@ tasks:
       KVM_FILTER: "-E 'nfstest_alloc_diskfs'"
       MODE: "Debug"
       PLATFORM: "ubuntu2604"
+      # The shard set the KVM legs are expected to cover, as "<image>" and
+      # "<image>-nfstest" names.  This is the one place the list lives; the
+      # ctest_kvm and ctest_kvm_images matrices in .gitlab-ci.yml must agree with
+      # it, and verify_kvm_shards.sh below fails the leg when it stops covering
+      # what the tree is configured to test.  Set it empty to skip the check.
+      KVM_SHARDS: "ubuntu2204_hwe ubuntu2404 ubuntu2404-nfstest ubuntu2404_hwe ubuntu2604 ubuntu2604-nfstest"
     commands:
       - cd /build
       - export LC_ALL=C
       - echo "KVM_FILTER=${KVM_FILTER}"
       - echo "MODE=${MODE}"
       - echo "PLATFORM=${PLATFORM}"
+      - echo "KVM_SHARDS=${KVM_SHARDS}"
       # Fail fast if the runner has no KVM device: the guests cannot boot with
       # acceleration without /dev/kvm, so there is no point building chimera and
       # fetching the (~GB) image first.
@@ -816,6 +823,11 @@ tasks:
         -DKVM_TESTING=ON
         -DKVM_FETCH_IMAGES=OFF
         -S /context -B /build
+      # Before the build and before the ~3.4 GB image pull, so a stale matrix
+      # costs seconds.  There is no catch-all shard: an image with no shard runs
+      # nowhere and fails nothing, which is the one failure mode sharding by
+      # image introduces and the only one ctest cannot report.
+      - '[ -z "${KVM_SHARDS}" ] || /context/qtm_build/verify_kvm_shards.sh /build "${KVM_SHARDS}"'
       - ninja --quiet
       - ninja kvm_${PLATFORM}_image
       # KVM_FILTER carries the full ctest selector for this leg, e.g.
