@@ -437,15 +437,25 @@ ctest_kvm:
         KVM_NAME: [ pnfs ]
         KVM_FILTER: [ "-R '/pnfs/'" ]
       # nfstest_alloc on diskfs (both the io_uring and the aio variant) is
-      # excluded for now.  Upstream re-enabled it in the 2026-09-07 sync
-      # (befd69b9, "issue #733 fixed"); in this leg both variants fail alloc02
-      # with "File size should be correct after allocate ... got 0", the guest
-      # then hangs until the harness watchdog fires, and each burns 82 minutes
-      # before ctest calls it failed -- which fails this job in the merge
-      # train.  Upstream's own Extended KVM jobs have been cancelled by that
-      # workflow's six-hour timeout on every run since the change landed, so
-      # the enablement is unvalidated there too.  The memfs variant keeps
-      # running.  Remove the -E once diskfs ALLOCATE in the guest is fixed.
+      # still excluded, but for much less than it was.  Upstream re-enabled it
+      # in the 2026-09-07 sync (befd69b9, "issue #733 fixed"), and in this leg
+      # both variants then failed alloc02 outright -- "File size should be
+      # correct after allocate ... got 0" -- after which the guest hung until
+      # the harness watchdog fired, 82 minutes per test.
+      #
+      # Re-measured on the 2026-09-11 sync (CHIM-202): every ordinary allocate
+      # case now PASSES and each test fails in ~146 s.  What is left is one
+      # case, "Allocate should succeed when allocating the maximum number of
+      # blocks left on the device", which returns ENOSPC; the trailing "got 0"
+      # file-size assertion is that failure's consequence, not a second bug.
+      # The diskfs space-map and transaction-rollback work in that drop
+      # (fb68de02, 98e7a0a3, 6943d50a, ad2bf282) is what closed the rest, and
+      # 9d242f57 plus the 900 s nfstest timeout are what bounded the cost.
+      #
+      # So this is now a narrow ENOSPC-boundary defect rather than a broken
+      # ALLOCATE, and re-testing it costs minutes instead of hours.  The memfs
+      # variant keeps running.  Remove the -E once diskfs can allocate the last
+      # free blocks on a full device.
       - MODE: [ Release, Debug ]
         ARCH: [ amd64 ]
         KVM_NAME: [ nfstest ]
