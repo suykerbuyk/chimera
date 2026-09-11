@@ -56,6 +56,10 @@ add_executable(vfs_idmap_test vfs_idmap_test.c)
 target_link_libraries(vfs_idmap_test chimera_vfs)
 add_test(chimera/vfs/idmap_test vfs_idmap_test)
 
+add_executable(vfs_sid_test vfs_sid_test.c)
+target_link_libraries(vfs_sid_test chimera_vfs)
+add_test(chimera/vfs/sid_test vfs_sid_test)
+
 add_executable(vfs_identity_test vfs_identity_test.c)
 target_link_libraries(vfs_identity_test chimera_vfs chimera_vfs_memfs evpl)
 add_test(chimera/vfs/identity_test vfs_identity_test)
@@ -97,6 +101,45 @@ endif()
 if(CAIRN_ENABLED)
     target_link_libraries(vfs_zerorange_test chimera_vfs_cairn)
     add_test(NAME chimera/vfs/zerorange_cairn COMMAND vfs_zerorange_test cairn)
+endif()
+
+# xattr DAC regression, parameterized by passthrough backend: the linux and
+# io_uring modules must issue f*xattr(2) under the caller's credential, since
+# the kernel evaluates user.* xattr permission against the calling thread's
+# fsuid and their cached open_by_handle_at descriptor was opened privileged.
+# Root only (setfsuid), and the backend must be able to serve the scratch
+# directory (name_to_handle_at fails on overlayfs); the test exits 77 otherwise.
+add_executable(vfs_xattr_dac_test vfs_xattr_dac_test.c)
+target_link_libraries(vfs_xattr_dac_test chimera_vfs chimera_vfs_memkv evpl)
+if(CHIMERA_LINUX)
+    target_link_libraries(vfs_xattr_dac_test chimera_vfs_linux)
+    add_test(NAME chimera/vfs/xattr_dac_linux COMMAND vfs_xattr_dac_test linux)
+    set_tests_properties(chimera/vfs/xattr_dac_linux PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+if(CHIMERA_VFS_IO_URING)
+    target_link_libraries(vfs_xattr_dac_test chimera_vfs_io_uring)
+    add_test(NAME chimera/vfs/xattr_dac_io_uring COMMAND vfs_xattr_dac_test io_uring)
+    set_tests_properties(chimera/vfs/xattr_dac_io_uring PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+
+# Native Windows SID round trip through the VFS, parameterized by
+# backend: only the engine-managed backends that store the canonical ACL
+# natively (memfs, cairn, diskfs) can persist a SID-bearing principal and the
+# owner/group SID companions.  The passthrough backends are mode-only.
+add_executable(vfs_acl_sid_test vfs_acl_sid_test.c)
+target_link_libraries(vfs_acl_sid_test chimera_vfs chimera_vfs_memfs
+    chimera_vfs_diskfs chimera_vfs_memkv evpl)
+add_test(NAME chimera/vfs/acl_sid_memfs COMMAND vfs_acl_sid_test memfs)
+if(HAVE_LIBAIO)
+    add_test(NAME chimera/vfs/acl_sid_diskfs_aio COMMAND vfs_acl_sid_test diskfs_aio)
+endif()
+if(CHIMERA_VFS_IO_URING)
+    target_link_libraries(vfs_acl_sid_test chimera_vfs_io_uring)
+    add_test(NAME chimera/vfs/acl_sid_diskfs_io_uring COMMAND vfs_acl_sid_test diskfs_io_uring)
+endif()
+if(CAIRN_ENABLED)
+    target_link_libraries(vfs_acl_sid_test chimera_vfs_cairn)
+    add_test(NAME chimera/vfs/acl_sid_cairn COMMAND vfs_acl_sid_test cairn)
 endif()
 
 # Tag every test registered above with the 'vfs' label so the suite can be run

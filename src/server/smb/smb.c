@@ -186,8 +186,10 @@ chimera_smb_server_init(
     snprintf(shared->config.identity, sizeof(shared->config.identity), "chimera");
 
     // Copy SMB auth config from server config
-    shared->config.auth.winbind_enabled  = chimera_server_config_get_smb_winbind_enabled(config);
-    shared->config.auth.kerberos_enabled = chimera_server_config_get_smb_kerberos_enabled(config);
+    shared->config.auth.winbind_enabled             = chimera_server_config_get_smb_winbind_enabled(config);
+    shared->config.auth.kerberos_enabled            = chimera_server_config_get_smb_kerberos_enabled(config);
+    shared->config.auth.kerberos_anonymous_fallback =
+        chimera_server_config_get_smb_kerberos_anonymous_fallback(config);
 
     const char *winbind_domain = chimera_server_config_get_smb_winbind_domain(config);
     if (winbind_domain && winbind_domain[0]) {
@@ -221,6 +223,21 @@ chimera_smb_server_init(
         chimera_smb_info("SMB Auth: Kerberos enabled (realm: %s, keytab: %s)",
                          shared->config.auth.kerberos_realm[0] ? shared->config.auth.kerberos_realm : "(not set)",
                          shared->config.auth.kerberos_keytab[0] ? shared->config.auth.kerberos_keytab : "(default)");
+
+        /* Say once, at startup, what a Kerberos principal turns into when no
+        * winbind is there to map it; the per-logon lines refer back here. */
+        if (!shared->config.auth.winbind_enabled) {
+            if (shared->config.auth.kerberos_anonymous_fallback) {
+                chimera_smb_info("SMB Auth: Kerberos without winbind: every authenticated principal "
+                                 "is served as uid/gid 65534 (kerberos_anonymous_fallback)");
+            } else {
+                chimera_smb_error("SMB Auth: Kerberos without winbind and without "
+                                  "kerberos_anonymous_fallback: every Kerberos logon will be refused");
+            }
+        } else if (shared->config.auth.kerberos_anonymous_fallback) {
+            chimera_smb_info("SMB Auth: kerberos_anonymous_fallback ignored: winbind_enabled is set, "
+                             "winbind maps every Kerberos principal");
+        }
     }
 
     /* Resolve the identity advertised in NTLM CHALLENGE messages once at
@@ -1870,20 +1887,26 @@ chimera_smb_server_handle_smb2(
              * the session encrypt-all (Session.EncryptData) — every
              * post-authentication request must be either signed or encrypted.
              * An unsigned, unencrypted request (e.g. a bare TREE_CONNECT) is a
-             * protocol violation; tear the connection down.  SESSION_SETUP is
-             * exempt (its signing key is only derived while processing it), as
-             * are NEGOTIATE and ECHO; compound related operations inherit the
-             * lead request's protection so only the unrelated lead is checked.
-             * A null (anonymous) session is exempt entirely: it has no key, so
-             * MS-SMB2 3.3.5.5.3 never enforces signing or encryption on it even
-             * when the connection negotiated signing-required (the client drops
-             * the requirement for the IS_NULL session — smb2.session.anon-
-             * signing2's second TREE_CONNECT is deliberately unsigned). */
-            chimera_smb_error("Unsigned, unencrypted request (cmd %u) on a protected connection; disconnecting",
+             * protocol violation, answer STATUS_ACCESS_DENIED rather than
+             * tearing the connection down: the spec makes ACCESS_DENIED
+             * mandatory here and a disconnect only optional (3.3.5.2.4), and
+             * this connection may carry other, unrelated sessions that a
+             * transport teardown would take down collaterally.  SESSION_SETUP
+             * is exempt (its signing key is only derived while processing it),
+             * as are NEGOTIATE and ECHO; compound related operations inherit
+             * the lead request's protection so only the unrelated lead is
+             * checked.  A null (anonymous) session is exempt entirely: it has
+             * no key, so MS-SMB2 3.3.5.5.3 never enforces signing or
+             * encryption on it even when the connection negotiated
+             * signing-required (the client drops the requirement for the
+             * IS_NULL session — smb2.session.anon-signing2's second
+             * TREE_CONNECT is deliberately unsigned). */
+            chimera_smb_error("Unsigned, unencrypted request (cmd %u) on a protected connection",
                               request->smb2_hdr.command);
-            chimera_smb_request_free(thread, request);
-            evpl_close(evpl, conn->bind);
-            return;
+            request->status                              = SMB2_STATUS_ACCESS_DENIED;
+            request->flags                              |= CHIMERA_SMB_REQUEST_FLAG_PARSE_FAILED;
+            compound->requests[compound->num_requests++] = request;
+            goto next_compound_request;
         }
 
         if (unlikely(!request->session_handle &&

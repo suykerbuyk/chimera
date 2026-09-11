@@ -209,6 +209,16 @@ struct diskfs_extent {
 };
 
 
+/* setattr's DISKFS_REC_SID replay step (diskfs_request_private.sid_action):
+ * how the chain tail brings the b+tree in line with the inode's sid_serial
+ * mirror once the SID block has updated it. */
+enum diskfs_sid_action {
+    DISKFS_SID_ACTION_NONE = 0,
+    DISKFS_SID_ACTION_INSERT,
+    DISKFS_SID_ACTION_REMOVE,
+    DISKFS_SID_ACTION_REPLACE,
+};
+
 struct diskfs_request_private {
     int                         opcode;
     int                         status;
@@ -244,6 +254,14 @@ struct diskfs_request_private {
     /* Small integer scratch for ops that need to carry state across
      * async callbacks (mount path walker uses it as a path byte offset). */
     uint32_t                    op_scratch;
+    /* setattr: the caller's va_set_mask, captured before diskfs_apply_attrs
+     * rewrites it to the scalar bits it applied.  The record steps (pNFS,
+     * ACL, SID) key off it, and the shrink path only applies attrs after its
+     * extent walk, so a local in the dispatch cannot carry it. */
+    uint64_t                    setattr_mask;
+    /* setattr: which DISKFS_REC_SID replay the chain tail must perform,
+     * decided when the mirror was updated. */
+    enum diskfs_sid_action      sid_action;
 
     /* readdir iteration cursor + the current dirent copied out of the
      * b+tree (carried across the per-child inode fetch). */
@@ -725,6 +743,12 @@ struct diskfs_inode {
     uint32_t                    acl_serial_len;
     uint8_t                    *pnfs_blob;
     uint32_t                    pnfs_blob_len;
+    /* Native owner / group SID record (DISKFS_REC_SID): the SID
+     * companions to uid / gid, encoded as u8 owner_len, owner bytes, u8
+     * group_len, group bytes.  Kept separate from the ACL record so "no ACL
+     * record" still means "mode-derived DACL".  Same mirror discipline. */
+    uint8_t                    *sid_serial;
+    uint32_t                    sid_serial_len;
 
     /* Directory only: parent for ".." resolution (also persisted in dinode). */
     uint64_t                    parent_inum;
@@ -761,9 +785,30 @@ struct diskfs_inode_cache {
 
 #define DISKFS_BLOCK_SIZE                    SM_BLOCK_SIZE   /* 4096 */
 
-#define DISKFS_BLOCK_CACHE_SHARDS            256
+/*
+ * Shards exist to spread block-cache lock contention, but the pool is divided
+ * evenly between them (shard_cap = total / num_shards) and a block's shard is
+ * fixed by its address -- so the shard count is also the divisor on how much
+ * cache any single address may occupy.  A hot block holds one live CoW
+ * generation per un-pushed record that snapshotted it, a count bounded by the
+ * intent log's depth, and every generation shares its address and therefore its
+ * shard.  Fixing the count at 256 made that ceiling total/256 regardless of how
+ * small the pool was: with a 4 MiB journal the default pool is 2048 blocks, or
+ * 8 per shard, and one block could exhaust its shard while 99% of the cache sat
+ * idle (the synchronous claim then aborts -- it cannot park).
+ *
+ * So treat 256 as a MAXIMUM and scale down to the pool: the largest power of
+ * two no greater than it that still leaves each shard MIN_SHARD_BLOCKS.  Small
+ * caches get fewer, fatter shards (less lock spreading, but they are small
+ * enough that contention is not the binding concern); large caches are
+ * unchanged at 256.
+ */
+#define DISKFS_BLOCK_CACHE_MAX_SHARDS        256
 
-#define DISKFS_BLOCK_CACHE_SHARD_MASK        (DISKFS_BLOCK_CACHE_SHARDS - 1)
+/* Floor on shard_cap.  Must comfortably exceed the live CoW generations one hot
+ * block can accumulate: measured peak on an idle box is ~22, and the abort was
+ * reached in CI at 64. */
+#define DISKFS_BLOCK_CACHE_MIN_SHARD_BLOCKS  256
 
 #define DISKFS_BLOCK_CACHE_BUCKETS_PER_SHARD 1024
 
@@ -886,10 +931,13 @@ struct diskfs_block_shard {
 
 struct diskfs_block_cache {
     uint32_t                  shard_cap;   /* max resident buffers per shard */
+    uint32_t                  num_shards;  /* power of two, <= MAX_SHARDS */
+    uint32_t                  shard_mask;  /* num_shards - 1 */
     uint32_t                  buffer_extra_per_shard;
     int                       buffers_ready;
     pthread_mutex_t           prealloc_lock;
-    struct diskfs_block_shard shards[DISKFS_BLOCK_CACHE_SHARDS];
+    /* Sized for the maximum; only the first num_shards are initialised/used. */
+    struct diskfs_block_shard shards[DISKFS_BLOCK_CACHE_MAX_SHARDS];
 };
 
 
@@ -974,6 +1022,7 @@ enum diskfs_bt_rectype {
     DISKFS_REC_ACL      = 7,  /* single record: serialized NFSv4/Windows ACL (subkey 0) */
     DISKFS_REC_REFCOUNT = 8,  /* refcount inode only: subkey = device offset of a
                                * reflink-shared extent; payload = share count */
+    DISKFS_REC_SID      = 9,  /* single record: native owner/group SIDs (subkey 0) */
 };
 
 
@@ -1080,8 +1129,24 @@ struct diskfs_xattr_rec {
 #define DISKFS_ACL_REC_MAX \
         (DISKFS_BT_ROOT_CAP - sizeof(struct diskfs_bt_node_hdr) - sizeof(struct diskfs_bt_lslot))
 
+/* Upper bound on the ACE count of an ACL that fits one record: every encoded
+ * ACE is at least CHIMERA_ACL_SERIAL_ACE bytes (a native SID makes it larger),
+ * so this bounds the decode buffers.  Whether a given ACL fits is decided by
+ * its serialized size, not its count. */
 #define DISKFS_ACL_REC_MAX_ACES \
         (((DISKFS_ACL_REC_MAX) -CHIMERA_ACL_SERIAL_HDR) / CHIMERA_ACL_SERIAL_ACE)
+
+/* True when the ACL carried by a setattr or create (if any) serializes into
+ * one b+tree record.  Checked before anything is mutated: the txn abort does
+ * not roll the in-memory inode back, so an ACL that cannot be stored has to
+ * be refused while there is nothing to roll back. */
+static inline int
+diskfs_acl_rec_fits(const struct chimera_vfs_attrs *attr)
+{
+    return !attr || !(attr->va_set_mask & CHIMERA_VFS_ATTR_ACL) ||
+           !attr->va_acl || !attr->va_acl->num_aces ||
+           chimera_acl_serialized_size(attr->va_acl) <= DISKFS_ACL_REC_MAX;
+} /* diskfs_acl_rec_fits */
 
 
 /*
@@ -1090,7 +1155,7 @@ struct diskfs_xattr_rec {
  * pairs, padded to a 4 KiB multiple.  Full-block redo: the record carries
  * the entire post-image of every dirty block in the transaction.
  */
-#define DISKFS_REDO_MAGIC 0x4F44455246534944ULL     /* "DISFREDO" */
+#define DISKFS_REDO_MAGIC 0x4F44455246534944ULL         /* "DISFREDO" */
 
 
 /*
@@ -1111,7 +1176,8 @@ struct diskfs_redo_header {
     uint64_t csum_lo;      /* XXH3-128 of the record, csum fields zeroed */
     uint64_t csum_hi;
     uint64_t seq;          /* monotonically increasing record sequence */
-    uint64_t tail;         /* log_tail (oldest un-pushed offset) at write time */
+    uint64_t tail_seq;     /* seq of the oldest un-trimmed record at write time
+                            * (recovery's live-window lower bound; see log_tail_seq) */
     uint32_t num_blocks;
     uint32_t reclen;       /* total record length, including padding */
     uint32_t num_deltas;   /* space-map deltas carried in this record */
@@ -1166,6 +1232,14 @@ struct diskfs_txn_block {
     uint64_t                 snap_csum_lo;
     uint64_t                 snap_csum_hi;
     struct diskfs_txn_block *next;
+    /* Undo image: the block's content as it was when this txn first attached it,
+     * captured before the txn mutated anything in it.  An aborting txn copies it
+     * back (diskfs_txn_unpin_blocks), which is what makes abort a true rollback:
+     * the cache keeps the block, so without this a txn's half-finished b+tree
+     * edits survive its own abort while the space they reference stays free in
+     * the allocator.  Live only while the txn is open -- a committing txn never
+     * reads it -- and last in the struct to keep the hot fields packed. */
+    uint8_t                  undo[DISKFS_BLOCK_SIZE];
 };
 
 
@@ -1467,6 +1541,14 @@ struct diskfs_intent_log {
     uint64_t                         applied_wm;      /* atomic: 1-past-last txn id applied */
     struct evpl_block_queue         *log_queue;       /* redo writes -> intent-log device */
     uint64_t                         log_seq;         /* next redo seq (commit only) */
+    /* Set by crash recovery (diskfs_recover_log) to one past the highest seq it
+     * replayed; the commit thread seeds log_seq from it so post-recovery records
+     * get seqs strictly above every record still in the (un-trimmed) log.  Zero
+     * on a clean mount / mkfs (empty log, so seq starts at 0).  Without this a
+     * post-crash record reuses a recovered record's seq, and a SECOND crash's
+     * seq-ordered (latest-image-wins) replay picks the wrong image -- freeing a
+     * block a live inode occupies. */
+    uint64_t                         recovered_log_seq;
     /* Records placed in the log and not yet trimmed past (atomic; incremented
      * by the commit thread at placement, decremented by the push thread when
      * the trim point passes the record).  Zero means the log is logically
@@ -1538,6 +1620,14 @@ struct diskfs_intent_log {
     uint32_t                         handoff_ring_mask;
     uint64_t                         log_head;        /* atomic: commit-written (next free byte) */
     uint64_t                         log_tail;        /* atomic: push-written (trim point) */
+    /* atomic: seq of the oldest record NOT yet trimmed (push_head->seq), advanced
+     * by the push thread in lockstep with log_tail.  Each redo record stamps this
+     * into hdr->tail_seq at commit; crash recovery reads the highest-seq record's
+     * stamp as the live-window lower bound and skips every physically-surviving
+     * record below it (already trimmed => images home + deltas checkpointed).
+     * Without this bound a ring wrap can leave a stale trimmed record as the
+     * newest survivor of a block and resurrect its superseded image. */
+    uint64_t                         log_tail_seq;
     uint64_t                         intent_log_size; /* active log size (from space_map / superblock) */
     /* atomic: highest redo seq whose record is durably logged (set in-order as
      * records retire in diskfs_redo_write_cb).  Stage B: this no longer implies
@@ -1600,6 +1690,7 @@ struct diskfs_shared {
     int                         orphans_created;   /* orphan-shard inodes exist on disk */
     int                         orphans_scanned;   /* mount-time orphan recovery done */
     int                         unsafe_async;      /* config opt-in: submit block writes without FUA/sync (no crash safety) */
+    int                         test_crash;        /* test-only (diskfs_test_crash): destroy skips the free-map persist + CLEAN stamp so the next mount runs recovery */
     int                         noatime;           /* config opt-in: never update atime on read (default: relatime) */
     uint64_t                    mtime_defer_us;    /* coalesce non-FILE_SYNC in-place mtime updates: flush each dirty inode at most once per this many us (0 = disabled, log every write); default 1s */
     int                         mounted;           /* 1 = remounted existing FS (enables inode read-back) */
@@ -2138,8 +2229,10 @@ struct diskfs_inode_load_ctx {
     /* Record-load chain state (valid once the inode is published). */
     struct diskfs_inode        *inode;
     int                         acl_len;
+    int                         sid_len;
     int                         pnfs_len;
     uint8_t                     acl_rec[DISKFS_ACL_REC_MAX];
+    uint8_t                     sid_rec[CHIMERA_SID_PAIR_MAX];
     uint8_t                     pnfs_rec[CHIMERA_VFS_PNFS_LAYOUT_MAX];
 };
 
@@ -2350,6 +2443,10 @@ struct diskfs_mtime_flush {
 
 static const struct diskfs_bt_key diskfs_acl_key = {
     .type = DISKFS_REC_ACL, .subkey = 0
+};
+
+static const struct diskfs_bt_key diskfs_sid_key = {
+    .type = DISKFS_REC_SID, .subkey = 0
 };
 
 static const struct diskfs_bt_key diskfs_pnfs_key = {
@@ -2995,6 +3092,14 @@ void
 diskfs_destroy(
     void *private_data);
 
+/* Module teardown shared by diskfs_destroy (clean=1) and the test-only crash
+ * path (clean=0 skips the free-map persist + SM_SB_CLEAN stamp).  Declared for
+ * the white-box test SDK (diskfs_test.c). */
+void
+diskfs_teardown(
+    struct diskfs_shared *shared,
+    int                   clean);
+
 void
 diskfs_grant_doorbell_cb(
     struct evpl          *evpl,
@@ -3046,6 +3151,18 @@ diskfs_acl_serial_install(
     struct diskfs_inode *inode,
     const uint8_t       *serial,
     int                  len);
+
+void
+diskfs_sid_serial_install(
+    struct diskfs_inode *inode,
+    const uint8_t       *serial,
+    int                  len);
+
+void
+diskfs_sid_decode_into(
+    struct chimera_vfs_attrs *attr,
+    const uint8_t            *serial,
+    uint32_t                  len);
 
 int
 diskfs_inherit_acl_async(
@@ -4307,7 +4424,7 @@ diskfs_block_shard(
 {
     uint64_t hash = diskfs_block_hash(device_id, device_offset);
 
-    return &cache->shards[hash & DISKFS_BLOCK_CACHE_SHARD_MASK];
+    return &cache->shards[hash & cache->shard_mask];
 } /* diskfs_block_shard */
 
 
@@ -4383,6 +4500,10 @@ diskfs_txn_add_block(
     tb->snap_csum_hi = 0;
     tb->next         = txn->blocks;
     txn->blocks      = tb;
+
+    /* Take the undo image before the caller writes into the block: every attach
+     * site claims (or CoW-forks) the block and only then mutates it. */
+    memcpy(tb->undo, block->iov.data, DISKFS_BLOCK_SIZE);
 
     /* Diag: a normal op dirties a handful of blocks.  If one txn balloons,
      * dump the call path + journal/direct split at growth thresholds so we can
@@ -4705,6 +4826,7 @@ static inline void
 diskfs_inode_struct_free(struct diskfs_inode *inode)
 {
     free(inode->acl_serial);
+    free(inode->sid_serial);
     free(inode->pnfs_blob);
     free(inode);
 } /* diskfs_inode_struct_free */
@@ -5021,10 +5143,12 @@ static inline void
 diskfs_txn_abort(struct diskfs_txn *txn)
 {
     /* Discard pending frees (their journaled FREE deltas never commit, so the
-     * ranges stay allocated).  Drop any blocks the aborted txn pinned (their
-     * contents are discarded) and release the inode locks.  NOTE: the in-memory
-     * allocator alloc deltas applied during the txn are still not rolled back
-     * here -- a pre-existing transaction-atomicity gap, separate from frees. */
+     * ranges stay allocated), roll every block this txn dirtied back to its
+     * pre-txn content, and release the inode locks.  NOTE: the txn's in-memory
+     * *inode* scalars (size, timestamps, change counter) are still not rolled
+     * back here; the failure paths that exist today all bail out before
+     * stamping them, but a future one that does not would need the same
+     * treatment. */
     diskfs_txn_discard_frees(txn);
     /* Reservation allocator: alloc deltas were never applied to the free tree
      * (only retire does that), so there is nothing to roll back there -- but each
@@ -5256,6 +5380,13 @@ diskfs_map_attrs(
         diskfs_acl_decode_into(attr, inode->acl_serial,
                                inode->acl_serial ? (int) inode->acl_serial_len : -1,
                                inode->mode);
+    }
+
+    /* Native owner / group SIDs: reported only when the record exists. */
+    if ((attr->va_req_mask & (CHIMERA_VFS_ATTR_OWNER_SID |
+                              CHIMERA_VFS_ATTR_GROUP_SID)) &&
+        inode->sid_serial) {
+        diskfs_sid_decode_into(attr, inode->sid_serial, inode->sid_serial_len);
     }
 
     if (attr->va_req_mask & CHIMERA_VFS_ATTR_MASK_STATFS_VALUES) {

@@ -1561,6 +1561,14 @@ chimera_linux_copy_range(
             if (errno == EINTR) {
                 continue;
             }
+            /* Named because the SMB dup-extents path lands here as the
+             * fallback after a failed clone and reports whatever this returns
+             * as NOT_SUPPORTED or INVALID_PARAMETER; without the errno the
+             * server log cannot say which call refused, or why. */
+            chimera_linux_error(
+                "linux_copy_range: copy_file_range(src_fd=%d off=%lld -> dst_fd=%d off=%lld len=%llu) failed: %s",
+                src_fd, (long long) src_off, dst_fd, (long long) dst_off,
+                (unsigned long long) remaining, strerror(errno));
             request->status = chimera_linux_errno_to_status(errno);
             request->complete(request);
             return;
@@ -1610,6 +1618,17 @@ chimera_linux_clone_range(
     rc = ioctl(dst_fd, FICLONERANGE, &args);
 
     if (rc < 0) {
+        /* EOPNOTSUPP is the everyday answer on a filesystem without reflink
+         * (ext4, overlayfs) and the caller falls back to a copy, so this is
+         * info, not error -- but it is logged: the SMB layer advertises block
+         * refcounting unconditionally, and when a test then sees
+         * NOT_SUPPORTED the only way to tell "clone refused" from "the copy
+         * fallback refused" from "a pre-check refused" is this line. */
+        chimera_linux_info(
+            "linux_clone_range: FICLONERANGE(src_fd=%d off=%llu -> dst_fd=%d off=%llu len=%llu) failed: %s",
+            src_fd, (unsigned long long) args.src_offset, dst_fd,
+            (unsigned long long) args.dest_offset,
+            (unsigned long long) args.src_length, strerror(errno));
         request->status = chimera_linux_errno_to_status(errno);
         request->complete(request);
         return;
@@ -2578,16 +2597,30 @@ chimera_linux_get_xattr(
     int     fd      = (int) request->get_xattr.handle->vfs_private;
     char   *scratch = (char *) request->plugin_data;
     ssize_t rc;
+    int     err;
 
     (void) private_data;
 
     TERM_STR(name, request->get_xattr.name, request->get_xattr.namelen, scratch);
 
+    /* The descriptor was opened privileged (open_by_handle_at) and the
+     * kernel checks user.* xattr access against this thread's fsuid at call
+     * time, so the xattr syscalls run impersonated like every other op. */
+    err = chimera_setup_credential(request->cred, NULL);
+    if (err != 0) {
+        request->status = chimera_linux_errno_to_status(err);
+        request->complete(request);
+        return;
+    }
+
     rc = fgetxattr(fd, name, request->get_xattr.value,
                    request->get_xattr.value_maxlen);
+    err = errno;
+
+    chimera_restore_privilege(request->cred);
 
     if (rc < 0) {
-        request->status = chimera_linux_errno_to_status(errno);
+        request->status = chimera_linux_errno_to_status(err);
     } else {
         request->get_xattr.r_value_len = rc;
         request->status                = CHIMERA_VFS_OK;
@@ -2605,6 +2638,7 @@ chimera_linux_set_xattr(
     char        *scratch = (char *) request->plugin_data;
     int          flags   = 0;
     int          rc;
+    int          err;
     struct statx stx;
 
     (void) private_data;
@@ -2625,11 +2659,21 @@ chimera_linux_set_xattr(
 
     TERM_STR(name, request->set_xattr.name, request->set_xattr.namelen, scratch);
 
+    err = chimera_setup_credential(request->cred, NULL);
+    if (err != 0) {
+        request->status = chimera_linux_errno_to_status(err);
+        request->complete(request);
+        return;
+    }
+
     rc = fsetxattr(fd, name, request->set_xattr.value,
                    request->set_xattr.value_len, flags);
+    err = errno;
+
+    chimera_restore_privilege(request->cred);
 
     if (rc < 0) {
-        request->status = chimera_linux_errno_to_status(errno);
+        request->status = chimera_linux_errno_to_status(err);
     } else if (statx(fd, "", AT_EMPTY_PATH | AT_STATX_SYNC_AS_STAT,
                      CHIMERA_LINUX_STATX_MASK, &stx) < 0) {
         request->status = chimera_linux_errno_to_status(errno);
@@ -2648,14 +2692,26 @@ chimera_linux_list_xattrs(
 {
     int     fd = (int) request->list_xattrs.handle->vfs_private;
     ssize_t rc;
+    int     err;
     char   *p, *end;
 
     (void) private_data;
 
+    err = chimera_setup_credential(request->cred, NULL);
+    if (err != 0) {
+        request->status = chimera_linux_errno_to_status(err);
+        request->complete(request);
+        return;
+    }
+
     rc = flistxattr(fd, request->list_xattrs.buffer,
                     request->list_xattrs.max_bytes);
+    err = errno;
+
+    chimera_restore_privilege(request->cred);
+
     if (rc < 0) {
-        request->status = chimera_linux_errno_to_status(errno);
+        request->status = chimera_linux_errno_to_status(err);
         request->complete(request);
         return;
     }
@@ -2688,6 +2744,7 @@ chimera_linux_remove_xattr(
     int          fd      = (int) request->remove_xattr.handle->vfs_private;
     char        *scratch = (char *) request->plugin_data;
     int          rc;
+    int          err;
     struct statx stx;
 
     (void) private_data;
@@ -2702,10 +2759,20 @@ chimera_linux_remove_xattr(
 
     TERM_STR(name, request->remove_xattr.name, request->remove_xattr.namelen, scratch);
 
-    rc = fremovexattr(fd, name);
+    err = chimera_setup_credential(request->cred, NULL);
+    if (err != 0) {
+        request->status = chimera_linux_errno_to_status(err);
+        request->complete(request);
+        return;
+    }
+
+    rc  = fremovexattr(fd, name);
+    err = errno;
+
+    chimera_restore_privilege(request->cred);
 
     if (rc < 0) {
-        request->status = chimera_linux_errno_to_status(errno);
+        request->status = chimera_linux_errno_to_status(err);
     } else if (statx(fd, "", AT_EMPTY_PATH | AT_STATX_SYNC_AS_STAT,
                      CHIMERA_LINUX_STATX_MASK, &stx) < 0) {
         request->status = chimera_linux_errno_to_status(errno);
