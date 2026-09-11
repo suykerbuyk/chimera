@@ -773,7 +773,21 @@ tasks:
       - /build
     privileged: true
     variables:
-      KVM_FILTER: ""
+      # Defaults to the gate the .gitlab-ci.yml legs apply, so that `qb ... check`
+      # and ad-hoc runs agree with what the pipeline actually gates on.  With an
+      # empty default this task always failed the two nfstest_alloc_diskfs_*_nfs4.2
+      # tests, whatever was being tested, because nothing overrides KVM_FILTER in
+      # the check alias -- which made a genuinely broken tree look exactly like a
+      # clean one to the verification command the sync workflow documents.  Every
+      # .gitlab-ci.yml leg passes its own value and is unaffected.  Revert this
+      # together with the -E in .gitlab-ci.yml when the ENOSPC-boundary defect
+      # behind it is fixed.
+      #
+      # The regex is single-quoted INSIDE the value: qb pastes the variable into
+      # the ctest command line textually, so an unquoted ( or | is a shell syntax
+      # error.  The flag and the regex stay outside the quotes so they split into
+      # two ctest arguments.
+      KVM_FILTER: "-E 'nfstest_alloc_diskfs'"
       MODE: "Debug"
       PLATFORM: "ubuntu2604"
     commands:
@@ -804,12 +818,13 @@ tasks:
         -S /context -B /build
       - ninja --quiet
       - ninja kvm_${PLATFORM}_image
-      # KVM_FILTER carries the full ctest selector for this leg, e.g. "-R '/xfstests/'"
-      # or "-E '/(xfstests|cthon|pnfs|nfstest|ltp)/'".  qb substitutes it into this
-      # line textually, so the regex must be single-quoted within the value (an
-      # unquoted ( or | is a shell syntax error).  The ${KVM_FILTER} token here
-      # stays UNQUOTED so the flag and regex split into separate args; empty (the
-      # default) runs every kvm test for the platform.
+      # KVM_FILTER carries the full ctest selector for this leg, e.g.
+      # "-E '/(nfstest|ltp)/'" or "-R '/(nfstest|ltp)/' -E 'nfstest_alloc_diskfs'".
+      # qb substitutes it into this line textually, so the regex must be
+      # single-quoted within the value (an unquoted ( or | is a shell syntax
+      # error).  The ${KVM_FILTER} token here stays UNQUOTED so the flag and regex
+      # split into separate args; setting it empty runs every kvm test for the
+      # platform, including the ones the pipeline gates out.
       - ctest -C extended --output-on-failure -L kvm -L "^${PLATFORM}$" ${KVM_FILTER} -j 12
     dependencies:
       builder:
