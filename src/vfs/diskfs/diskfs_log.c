@@ -764,13 +764,18 @@ diskfs_push_checkpoint_ready(
     int                        ready = 1;
 
     /* During shutdown the reclaim workers that service checkpoint CONDENSE jobs
-     * are already gone (diskfs_reclaim_destroy runs before the push-thread
-     * drain), so kicking a checkpoint here would never complete and the drain
-     * would hang forever.  A clean unmount persists the whole space map after
-     * the drain (space_map_persist stamped with the final durable_seq) and marks
-     * the superblock CLEAN, so no record needs its per-AG snapshot frontier --
-     * the log is discarded wholesale and there is nothing to replay.  Trim every
-     * covered record unconditionally. */
+     * are torn down; diskfs_teardown publishes il->shutdown BEFORE
+     * diskfs_reclaim_destroy precisely so this gate stops kicking checkpoints the
+     * instant the reclaim pool becomes unavailable.  A kick past that point would
+     * be silently dropped (diskfs_reclaim_submit_job returns on r->shutdown) yet
+     * leave the AG marked condensing, so the frontier could never advance and the
+     * reclaim workers' own shutdown drains -- which still journal through this log
+     * -- would wedge on a trim that never comes.  A clean unmount persists the
+     * whole space map after the drain (space_map_persist stamped with the final
+     * durable_seq) and marks the superblock CLEAN, so no record needs its per-AG
+     * snapshot frontier -- the log is discarded wholesale and there is nothing to
+     * replay; a crash leaves the log intact to replay.  Trim every covered record
+     * unconditionally. */
     if (__atomic_load_n(&il->shutdown, __ATOMIC_ACQUIRE)) {
         return 1;
     }
@@ -830,13 +835,15 @@ diskfs_push_trim(struct diskfs_intent_log *il)
          * advances it). */
         if (il->push_head) {
             __atomic_store_n(&il->log_tail, il->push_head->offset, __ATOMIC_RELEASE);
+            __atomic_store_n(&il->log_tail_seq, il->push_head->seq, __ATOMIC_RELEASE);
         } else {
             uint32_t hh = il->handoff_head;
             uint32_t ht = __atomic_load_n(&il->handoff_tail, __ATOMIC_ACQUIRE);
             if (hh != ht) {
-                __atomic_store_n(&il->log_tail,
-                                 il->handoff[hh & il->handoff_ring_mask]->offset,
-                                 __ATOMIC_RELEASE);
+                struct diskfs_il_record *oldest =
+                    il->handoff[hh & il->handoff_ring_mask];
+                __atomic_store_n(&il->log_tail, oldest->offset, __ATOMIC_RELEASE);
+                __atomic_store_n(&il->log_tail_seq, oldest->seq, __ATOMIC_RELEASE);
             }
         }
 
@@ -1223,7 +1230,7 @@ diskfs_il_write_redo(
     hdr->seq        = il->log_seq++;
     rec->seq        = hdr->seq;
     ctx->seq        = hdr->seq;     /* Stage B: apply thread advances applied_seq from this */
-    hdr->tail       = __atomic_load_n(&il->log_tail, __ATOMIC_ACQUIRE);
+    hdr->tail_seq   = __atomic_load_n(&il->log_tail_seq, __ATOMIC_ACQUIRE);
     hdr->num_blocks = nblocks;
     hdr->reclen     = (uint32_t) reclen;
     hdr->num_deltas = num_deltas;
@@ -1466,6 +1473,10 @@ diskfs_iq_process_batch(struct diskfs_intent_log *il)
                 break;
             }
             __atomic_store_n(&il->log_tail, il->log_head, __ATOMIC_RELEASE);
+            /* Ring is fully trimmed (every prior record durably home): the next
+             * record written is the oldest live one, so the live-window lower
+             * bound is its own seq (== the current log_seq). */
+            __atomic_store_n(&il->log_tail_seq, il->log_seq, __ATOMIC_RELEASE);
             if (!diskfs_il_fits(il, reclen)) {
                 break;
             }
@@ -2028,14 +2039,17 @@ diskfs_intent_log_thread_init(
     struct diskfs_shared     *shared = container_of(il, struct diskfs_shared, intent_log);
     int                       i;
 
-    il->evpl                        = evpl;
-    il->intent_log_size             = shared->intent_log_size;
-    il->handoff_ring_size           = diskfs_il_pow2((uint32_t) (il->intent_log_size / SM_BLOCK_SIZE) * 2);
-    il->handoff_ring_mask           = il->handoff_ring_size - 1;
-    il->log_head                    = SM_INTENT_LOG_OFFSET;
-    il->log_tail                    = SM_INTENT_LOG_OFFSET;
-    il->live_records                = 0;
-    il->log_seq                     = 0;
+    il->evpl              = evpl;
+    il->intent_log_size   = shared->intent_log_size;
+    il->handoff_ring_size = diskfs_il_pow2((uint32_t) (il->intent_log_size / SM_BLOCK_SIZE) * 2);
+    il->handoff_ring_mask = il->handoff_ring_size - 1;
+    il->log_head          = SM_INTENT_LOG_OFFSET;
+    il->log_tail          = SM_INTENT_LOG_OFFSET;
+    il->log_tail_seq      = il->recovered_log_seq;
+    il->live_records      = 0;
+    /* Resume past the highest seq crash recovery replayed (0 on a clean mount /
+     * mkfs), so post-recovery records never reuse a still-in-log record's seq. */
+    il->log_seq                     = il->recovered_log_seq;
     il->redo_inflight               = 0;
     il->redo_inflight_high_water    = 0;
     il->push_outstanding            = 0;
@@ -2126,7 +2140,10 @@ diskfs_intent_log_thread_shutdown(
     /* Workers are gone, so no new SQ work arrives.  Drain every in-flight redo
      * write and retire (hand off, in order) every record to the push thread --
      * which is still running and will flush them home before it is itself shut
-     * down (the push thread is destroyed after this one). */
+     * down (the push thread is destroyed after this one).  This runs on the
+     * crash path too: it neither writes home nor trims (both happen in the push
+     * thread), so it only makes acknowledged redo durable + frees the records --
+     * the on-disk log region is left intact for recovery to replay. */
     while (il->redo_inflight || il->retire_head != il->retire_tail) {
         evpl_continue(evpl);
     }
@@ -2193,8 +2210,12 @@ diskfs_il_push_thread_shutdown(
     int                       i;
 
     /* The commit thread is already gone, so no new hand-offs arrive.  Drain
-     * every handed-off record home and trim the log fully (clean unmount => no
-     * replay needed). */
+     * every handed-off record home and trim the log.  On the crash path this
+     * trim is in-memory only (it advances il->log_tail and frees the record
+     * structs); the on-disk log region bytes are untouched and log_tail is not
+     * persisted (the crash skips the clean-superblock write), so the next mount
+     * still finds and replays every record.  Draining here frees the records
+     * cleanly -- avoiding a straggler leak the leak checker would abort on. */
     while (il->handoff_head != __atomic_load_n(&il->handoff_tail, __ATOMIC_ACQUIRE) ||
            il->push_head || il->push_outstanding) {
         diskfs_il_push_doorbell_cb(evpl, &il->push_doorbell);
@@ -2244,7 +2265,9 @@ diskfs_il_apply_thread_shutdown(
      * remaining record's deltas and ACK its txns, advancing applied_seq up to
      * the final durable_seq -- so the push thread can finish trimming (its
      * checkpoint frontier reads applied_seq) and the unmount checkpoint persists
-     * a complete free map. */
+     * a complete free map.  Runs on the crash path too, to free the ctxs
+     * cleanly; applied_seq is in-memory and discarded (the crash does not
+     * persist the checkpoint). */
     while (il->apply_head != __atomic_load_n(&il->apply_tail, __ATOMIC_ACQUIRE)) {
         diskfs_il_apply_doorbell_cb(evpl, &il->apply_doorbell);
         evpl_continue(evpl);

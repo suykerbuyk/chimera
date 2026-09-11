@@ -27,6 +27,7 @@
 #include "vfs/vfs.h"
 #include "vfs/vfs_user_cache.h"
 #include "server/smb/smb_wbclient.h"
+#include "server/smb/smb_kerberos_identity.h"
 
 #define TEST_PASS(name) do { fprintf(stderr, "  PASS: %s\n", name); passed++; } while (0)
 #define TEST_FAIL(name) do { fprintf(stderr, "  FAIL: %s\n", name); failed++; } while (0)
@@ -648,6 +649,80 @@ test_wbclient_lm_implied_zeros(void)
     }
 } /* test_wbclient_lm_implied_zeros */
 
+/*
+ * Test the identity policy applied to an accepted Kerberos context.
+ *
+ * A GSSAPI accept proves who the client is; it is not a logon until the
+ * principal maps to a Unix identity.  With winbind_enabled the mapping must come
+ * from winbind, so an unreachable winbindd (or a principal it cannot map)
+ * refuses the logon instead of degrading it to the 65534 identity -- which is
+ * what a deployment whose winbindd had died used to hand every Kerberos client
+ * while its NTLM logons were being refused.  Without winbind the logon is
+ * refused unless the deployment opted into the nobody mapping, and that
+ * opt-in never overrides a configured winbind.  The winbind-down cases are
+ * skipped when a winbindd really answers on this host.
+ */
+static void
+test_kerberos_identity_policy(void)
+{
+    struct smb_kerberos_identity ident;
+    int                          rc;
+
+    fprintf(stderr, "\nTesting Kerberos identity policy...\n");
+
+    /* No principal is never a logon, whatever the configuration. */
+    rc = smb_kerberos_resolve_identity(0, 1, NULL, &ident);
+    if (rc == -1) {
+        TEST_PASS("NULL principal is refused");
+    } else {
+        TEST_FAIL("NULL principal is refused");
+    }
+
+    rc = smb_kerberos_resolve_identity(1, 1, "", &ident);
+    if (rc == -1) {
+        TEST_PASS("Empty principal is refused");
+    } else {
+        TEST_FAIL("Empty principal is refused");
+    }
+
+    if (smb_wbclient_available()) {
+        TEST_SKIP("winbind_enabled without winbindd (a winbindd answers on this host)");
+    } else {
+        rc = smb_kerberos_resolve_identity(1, 0, "testuser1@TEST.LOCAL", &ident);
+        if (rc == -1) {
+            TEST_PASS("winbind_enabled with winbindd unavailable refuses the logon");
+        } else {
+            TEST_FAIL("winbind_enabled with winbindd unavailable refuses the logon");
+        }
+
+        /* The fallback knob never overrides a configured winbind. */
+        rc = smb_kerberos_resolve_identity(1, 1, "testuser1@TEST.LOCAL", &ident);
+        if (rc == -1) {
+            TEST_PASS("anonymous fallback is ignored when winbind_enabled is set");
+        } else {
+            TEST_FAIL("anonymous fallback is ignored when winbind_enabled is set");
+        }
+    }
+
+    /* No identity source at all: refused by default. */
+    rc = smb_kerberos_resolve_identity(0, 0, "testuser1@TEST.LOCAL", &ident);
+    if (rc == -1 && ident.resolved == 0) {
+        TEST_PASS("winbind disabled without the fallback knob refuses the logon");
+    } else {
+        TEST_FAIL("winbind disabled without the fallback knob refuses the logon");
+    }
+
+    /* The explicit opt-in serves the principal as nobody. */
+    rc = smb_kerberos_resolve_identity(0, 1, "testuser1@TEST.LOCAL", &ident);
+    if (rc == 0 && ident.uid == 65534 && ident.gid == 65534 &&
+        ident.ngids == 0 && ident.is_ad_user == 0 && ident.resolved == 1 &&
+        strcmp(ident.sid, "S-1-22-1-65534") == 0) {
+        TEST_PASS("anonymous fallback maps the principal to uid/gid 65534");
+    } else {
+        TEST_FAIL("anonymous fallback maps the principal to uid/gid 65534");
+    }
+} /* test_kerberos_identity_policy */
+
 static void
 usage(const char *prog)
 {
@@ -714,6 +789,7 @@ main(
         test_user_update();
         test_cache_capacity();
         test_wbclient_lm_implied_zeros();
+        test_kerberos_identity_policy();
     }
 
     if (test_mode == TEST_MODE_ALL || test_mode == TEST_MODE_NTLM_WINBIND) {

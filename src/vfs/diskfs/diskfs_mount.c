@@ -471,12 +471,28 @@ diskfs_mount_io_read(
         uint64_t                    want = length - done;
         uint64_t                    xfer;
 
+        /* One whole GLOBAL buffer per read.  A single iovec holds at most
+         * config->buffer_size bytes, so a request larger than that needs more
+         * than one -- and evpl_iovec_alloc(..., max_iovecs=1, ...) answers such
+         * a request by releasing what it placed and returning -1, which the old
+         * code ignored and then released again (a use-after-free on the intent
+         * log read during crash recovery, whose region is many buffers wide).
+         * Cap each transfer to what the buffer holds and to the device's max
+         * request, and iterate. */
+        evpl_iovec_alloc_global(io->evpl, &iov);
+
         if (want > maxreq) {
             want = maxreq;
         }
+        if (want > iov.length) {
+            want = iov.length;
+        }
         xfer = (want + DISKFS_BLOCK_SIZE - 1) & ~((uint64_t) DISKFS_BLOCK_SIZE - 1);
+        if (xfer > iov.length) {
+            xfer = iov.length;
+        }
+        iov.length = xfer;   /* bound the read to this chunk */
 
-        evpl_iovec_alloc(io->evpl, xfer, DISKFS_BLOCK_SIZE, 1, 0, &iov);
         evpl_block_read(io->evpl, io->queue[device_id], &iov, 1, offset + done,
                         diskfs_mount_io_complete, &w);
         while (!w.done) {
@@ -706,7 +722,8 @@ diskfs_recover_log(
     char                      *log;
     uint64_t                   o;
     struct diskfs_recover_rec *recs;
-    uint32_t                   nrec = 0, cap = 4096, i;
+    uint32_t                   nrec = 0, cap = 4096, i, replayed = 0;
+    uint64_t                   min_live_seq;
 
     uint64_t                   intent_log_size = shared->intent_log_size;
 
@@ -779,13 +796,47 @@ diskfs_recover_log(
 
     qsort(recs, nrec, sizeof(*recs), diskfs_recover_rec_cmp);
 
+    /* Resume the redo seq counter past every record we are about to replay.  The
+     * log is NOT trimmed on a crash, so these records remain physically in the
+     * log region; a post-recovery record that reused one of their seqs would be
+     * mis-ordered against it by the next crash's seq-ordered (latest-wins)
+     * replay.  recs is sorted ascending, so the last entry carries the max. */
+    shared->intent_log.recovered_log_seq = nrec ? recs[nrec - 1].seq + 1 : 0;
+
+    /* Live-window lower bound.  The log is a ring and is NOT trimmed on a crash,
+     * so records already trimmed before the crash remain physically present with
+     * a valid magic + checksum.  Replaying them is not merely wasteful: a ring
+     * wrap can overwrite a block's newest owner while an older, superseded owner
+     * survives, so a naive latest-seq-wins replay lands the stale image over the
+     * correct one that was pushed home before the trim -- e.g. resurrecting an
+     * orphan whose home block was already freed, which then double-frees on the
+     * post-recovery re-drain.  The highest-seq record stamped log_tail_seq (the
+     * seq of the oldest un-trimmed record) at its commit; every record below that
+     * was trimmed, hence its images are durably home and its space deltas are
+     * folded into a checkpoint.  Skip them. */
+    min_live_seq = nrec ? ((struct diskfs_redo_header *)
+                           (log + recs[nrec - 1].offset))->tail_seq : 0;
+    /* tail_seq can never exceed the stamping record's own seq; a larger value is
+     * garbage (or a log from a build predating this field's seq semantics).  Fall
+     * back to replaying every survivor rather than skipping valid records. */
+    if (nrec && min_live_seq > recs[nrec - 1].seq) {
+        min_live_seq = 0;
+    }
+
     for (i = 0; i < nrec; i++) {
-        struct diskfs_redo_header *hdr  = (struct diskfs_redo_header *) (log + recs[i].offset);
-        char                      *bhp  = log + recs[i].offset + sizeof(*hdr);
-        char                      *data = log + recs[i].offset +
-            diskfs_il_hdr_len(hdr->num_blocks, hdr->num_deltas);
+        struct diskfs_redo_header *hdr = (struct diskfs_redo_header *) (log + recs[i].offset);
+        char                      *bhp;
+        char                      *data;
         char                      *dp;
         uint32_t                   b;
+
+        if (recs[i].seq < min_live_seq) {
+            continue;     /* already trimmed before the crash -- durably home */
+        }
+
+        bhp  = log + recs[i].offset + sizeof(*hdr);
+        data = log + recs[i].offset +
+            diskfs_il_hdr_len(hdr->num_blocks, hdr->num_deltas);
 
         /* New layout: all per-block headers are grouped after the redo header,
          * the space deltas follow them, and the block images follow the 4 KiB-
@@ -823,6 +874,7 @@ diskfs_recover_log(
                                         rd->length, rd->op);
             }
         }
+        replayed++;
     }
 
     for (i = 0; i < (uint32_t) shared->num_devices; i++) {
@@ -831,7 +883,9 @@ diskfs_recover_log(
 
     free(recs);
     free(log);
-    chimera_diskfs_info("crash recovery: replayed %u intact intent-log records", nrec);
+    chimera_diskfs_info("crash recovery: replayed %u of %u intact intent-log "
+                        "records (live-window seq >= %llu)", replayed, nrec,
+                        (unsigned long long) min_live_seq);
     return 0;
 } /* diskfs_recover_log */
 
@@ -1550,12 +1604,39 @@ diskfs_inode_cache_release(
 } /* diskfs_inode_cache_release */
 
 
+/*
+ * Module teardown, shared by the clean path (diskfs_destroy, clean=1) and the
+ * test-only crash path (diskfs_test_crash -> diskfs_teardown(shared, 0)).
+ *
+ * clean=1 is a normal unmount: after the intent-log threads have drained every
+ * logged block to its home location, the free-space map is persisted and the
+ * superblock stamped SM_SB_CLEAN, so the next mount reloads instead of running
+ * recovery.  clean=0 simulates a crash: the same threads are stopped and the
+ * same structures freed (no leak, no use-after-free), but the persist + CLEAN
+ * stamp are skipped, so the superblock stays !CLEAN and the next mount runs the
+ * intent-log replay recovery path.
+ */
 void
-diskfs_destroy(void *private_data)
+diskfs_teardown(
+    struct diskfs_shared *shared,
+    int                   clean)
 {
-    struct diskfs_shared *shared = private_data;
-    struct diskfs_fs     *fs, *fs_tmp;
-    int                   i;
+    struct diskfs_fs *fs, *fs_tmp;
+    int               i;
+
+    /* Signal intent-log shutdown BEFORE destroying the reclaim pool.  The push
+     * thread trims the log only up to a record whose AGs are checkpointed to its
+     * seq (diskfs_push_trim's frontier gate); when it lags it kicks a background
+     * CONDENSE on a reclaim worker.  Once the reclaim pool is torn down those
+     * kicks are silently dropped (diskfs_reclaim_submit_job returns on
+     * r->shutdown) yet leave the AG marked condensing, so the frontier can never
+     * advance -- and the reclaim workers' OWN shutdown drains still journal
+     * through the intent log, so if the ring is full they wedge waiting for a
+     * trim that will never happen.  il->shutdown makes diskfs_push_checkpoint_ready
+     * trim unconditionally (a clean unmount persists the whole space map after the
+     * drain; a crash leaves the log intact to replay), so set it first and the
+     * push thread keeps the ring draining for the reclaim shutdown. */
+    __atomic_store_n(&shared->intent_log.shutdown, 1, __ATOMIC_RELEASE);
 
     /* Reclaim workers first: their shutdown finishes the queued drains, which
      * need the inode cache and the intent-log threads still alive. */
@@ -1573,8 +1654,7 @@ diskfs_destroy(void *private_data)
      * commit thread first (it drains all redo writes and hands every record to
      * the push thread), then the push thread (it flushes every record home and
      * trims the log).  Only then are the shared rings and device-metric arrays
-     * safe to free. */
-    __atomic_store_n(&shared->intent_log.shutdown, 1, __ATOMIC_RELEASE);
+     * safe to free.  (il->shutdown was already published above.) */
     /* Stop the push thread from ringing the commit thread's wake_doorbell:
      * destroying the commit thread closes that fd, and the push thread (torn
      * down afterwards, to drain what the commit thread handed off) would
@@ -1621,8 +1701,12 @@ diskfs_destroy(void *private_data)
      * reloads instead of re-handing-out in-use space.  Driven through the
      * mount-time evpl pump while the devices are still open -- the IL thread
      * (the only other device user) is already gone.  Only mark clean if a root
-     * actually exists (an untouched mkfs has nothing to preserve). */
-    {
+     * actually exists (an untouched mkfs has nothing to preserve).
+     *
+     * Skipped on the crash path (clean=0): leaving the superblock !CLEAN and
+     * the free map un-persisted is exactly the on-disk state a crash leaves,
+     * and is what makes the next mount run recovery. */
+    if (clean) {
         struct diskfs_mount_io *mio  = diskfs_mount_io_open(shared);
         struct sm_io            smio = diskfs_mount_sm_io(mio);
         /* The apply thread drained at teardown, so applied_seq == the final
@@ -1693,7 +1777,19 @@ diskfs_destroy(void *private_data)
     free(shared->kv_shards);
 
     free(shared);
-} /* diskfs_destroy */ /* diskfs_destroy */
+} /* diskfs_teardown */
+
+
+void
+diskfs_destroy(void *private_data)
+{
+    struct diskfs_shared *shared = private_data;
+
+    /* diskfs_test_crash sets test_crash so this normal teardown -- reached at
+     * the right point, after the VFS has torn down its internal threads -- skips
+     * the clean-unmount finalize, leaving the device in a crash state. */
+    diskfs_teardown(shared, !shared->test_crash);
+} /* diskfs_destroy */
 
 
 void *

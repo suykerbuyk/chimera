@@ -667,10 +667,22 @@ diskfs_block_cache_create(struct diskfs_shared *shared)
         total = min;
     }
 
-    cache->shard_cap = total / DISKFS_BLOCK_CACHE_SHARDS;
+    /* Largest power of two no greater than MAX_SHARDS that still leaves every
+     * shard MIN_SHARD_BLOCKS, and at least one shard however small the pool. */
+    cache->num_shards = 1;
+    while (cache->num_shards * 2 <= DISKFS_BLOCK_CACHE_MAX_SHARDS &&
+           total / (cache->num_shards * 2) >= DISKFS_BLOCK_CACHE_MIN_SHARD_BLOCKS) {
+        cache->num_shards *= 2;
+    }
+    cache->shard_mask = cache->num_shards - 1;
+
+    cache->shard_cap = total / cache->num_shards;
     if (cache->shard_cap == 0) {
         cache->shard_cap = 1;
     }
+
+    chimera_diskfs_info("Block cache: %u blocks in %u shards (%u blocks/shard)",
+                        total, cache->num_shards, cache->shard_cap);
 
     /* No dedicated CoW slush: a fork draws its buffer from the regular LRU
      * (diskfs_block_buf_reclaim_locked) and parks if the shard is fully pinned,
@@ -679,7 +691,7 @@ diskfs_block_cache_create(struct diskfs_shared *shared)
     cache->buffer_extra_per_shard = extra;
     pthread_mutex_init(&cache->prealloc_lock, NULL);
 
-    for (i = 0; i < DISKFS_BLOCK_CACHE_SHARDS; i++) {
+    for (i = 0; i < (int) cache->num_shards; i++) {
         struct diskfs_block_shard *shard = &cache->shards[i];
 
         pthread_mutex_init(&shard->lock, NULL);
@@ -716,7 +728,7 @@ diskfs_block_cache_prealloc(
         return;
     }
 
-    for (i = 0; i < DISKFS_BLOCK_CACHE_SHARDS; i++) {
+    for (i = 0; i < (int) cache->num_shards; i++) {
         struct diskfs_block_shard *shard = &cache->shards[i];
         uint32_t                   total = shard->nblocks + cache->buffer_extra_per_shard;
 
@@ -805,7 +817,7 @@ diskfs_block_cache_destroy(struct diskfs_shared *shared)
         return;
     }
 
-    for (i = 0; i < DISKFS_BLOCK_CACHE_SHARDS; i++) {
+    for (i = 0; i < (int) cache->num_shards; i++) {
         struct diskfs_block_shard *shard = &cache->shards[i];
         uint32_t                   j;
 
@@ -905,7 +917,7 @@ diskfs_block_claim(
 {
     struct diskfs_block_cache *cache  = thread->shared->block_cache;
     uint64_t                   hash   = diskfs_block_hash(device_id, device_offset);
-    uint32_t                   sidx   = hash & DISKFS_BLOCK_CACHE_SHARD_MASK;
+    uint32_t                   sidx   = hash & cache->shard_mask;
     uint32_t                   bucket = (hash >> 8) & DISKFS_BLOCK_CACHE_BUCKET_MASK;
     struct diskfs_block_shard *shard  = &cache->shards[sidx];
     struct diskfs_block       *blk;
@@ -1506,7 +1518,7 @@ diskfs_block_claim_async(
 {
     struct diskfs_block_cache  *cache  = thread->shared->block_cache;
     uint64_t                    hash   = diskfs_block_hash(device_id, device_offset);
-    uint32_t                    sidx   = hash & DISKFS_BLOCK_CACHE_SHARD_MASK;
+    uint32_t                    sidx   = hash & cache->shard_mask;
     uint32_t                    bucket = (hash >> 8) & DISKFS_BLOCK_CACHE_BUCKET_MASK;
     struct diskfs_block_shard  *shard  = &cache->shards[sidx];
     struct diskfs_block        *blk;
@@ -1873,9 +1885,24 @@ diskfs_txn_unpin_blocks(struct diskfs_txn *txn)
     txn->blocks = NULL;
     while (tb) {
         n = tb->next;
-        /* Abort: no record was logged, so no tail-push will ever release this
-         * txn's claim pin -- drop it here.  The block is home (nothing of ours
-         * went un-home), so unpin marks it CLEAN once fully unpinned. */
+        /*
+         * Roll the block back to what it held before this txn touched it.  The
+         * block cache is shared, live state: unpinning alone would leave the
+         * aborted txn's half-finished edits in the cache, published as CLEAN --
+         * indistinguishable from committed content.  For a b+tree that means
+         * the file keeps extent records pointing at blocks whose ALLOC deltas
+         * were just discarded, so the allocator still counts them free: it can
+         * hand the same blocks to another file, and deleting this one frees
+         * ranges that are already free (which aborts in sm_ag_free_locked).
+         *
+         * The list is LIFO, so a block attached more than once is restored
+         * newest-first and its oldest -- i.e. true pre-txn -- image lands last.
+         */
+        memcpy(tb->block->iov.data, tb->undo, DISKFS_BLOCK_SIZE);
+
+        /* No record was logged, so no tail-push will ever release this txn's
+         * claim pin -- drop it here.  The block is home (nothing of ours went
+         * un-home), so unpin marks it CLEAN once fully unpinned. */
         diskfs_block_unpin(thread, tb->block, DISKFS_BLOCK_CLEAN);
         free(tb);
         tb = n;
