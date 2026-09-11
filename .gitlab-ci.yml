@@ -221,12 +221,16 @@ ctest:
       # everything else, so the two run as separate parallel CI jobs.  qb
       # pastes CTEST_FILTER into the ctest command line textually, so any shell
       # metacharacters would need quoting INSIDE the value.
+      #
+      # amd64 only: the arm64 runners are not reliable enough to gate on.  The
+      # qb ctest_* tasks are amd64-only to match, so an arm64 entry here would
+      # just fail to schedule.  Restore both together.
       - MODE: [ release, debug ]
-        ARCH: [ arm64, amd64 ]
+        ARCH: [ amd64 ]
         GROUP: [ pynfs ]
         CTEST_FILTER: [ "-L pynfs -E diskfs_" ]
       - MODE: [ release, debug ]
-        ARCH: [ arm64, amd64 ]
+        ARCH: [ amd64 ]
         GROUP: [ other ]
         CTEST_FILTER: [ "-LE pynfs" ]
   script:
@@ -256,8 +260,9 @@ ctest_quint:
       - stuck_or_timeout_failure
   parallel:
     matrix:
+      # amd64 only, as for the ctest job above.
       - MODE: [ release, debug ]
-        ARCH: [ arm64, amd64 ]
+        ARCH: [ amd64 ]
   script:
     - ${RUN_QB} -a ${ARCH} -v ctest_quint_${MODE} &> ctest_quint_${MODE}_${ARCH}.log
   after_script:

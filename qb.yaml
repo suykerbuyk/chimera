@@ -357,9 +357,17 @@ tasks:
   # would run only the quick tier -- and with oras hidden and no quint in the
   # builder image, that tier is nearly empty and the leg would pass having
   # tested nothing.  -C extended runs the quick tier plus everything else.
+  #
+  # All four ctest_* legs below are amd64 only.  The arm64 runners are not
+  # reliable enough to gate on, and an intermittent failure there costs more
+  # triage than the second architecture was buying.  The matching ARCH lists in
+  # .gitlab-ci.yml (the `ctest` and `ctest_quint` jobs) are amd64 only for the
+  # same reason; restore the two together.  static_analysis_* keeps arm64 --
+  # it builds and analyses rather than running tests, so the flakiness does not
+  # reach it, and it is the only remaining arm64 compile check.
   ctest_release:
     type: run_container
-    architecture: [ amd64, arm64 ]
+    architecture: [ amd64 ]
     image: chimera-dev
     context: .
     empty_dir:
@@ -401,7 +409,7 @@ tasks:
 
   ctest_debug:
     type: run_container
-    architecture: [ amd64, arm64 ]
+    architecture: [ amd64 ]
     image: chimera-dev
     context: .
     empty_dir:
@@ -508,7 +516,7 @@ tasks:
   # coverage job still measures it.
   ctest_quint_release:
     type: run_container
-    architecture: [ amd64, arm64 ]
+    architecture: [ amd64 ]
     image: chimera-dev
     context: .
     empty_dir:
@@ -536,7 +544,7 @@ tasks:
 
   ctest_quint_debug:
     type: run_container
-    architecture: [ amd64, arm64 ]
+    architecture: [ amd64 ]
     image: chimera-dev
     context: .
     empty_dir:
