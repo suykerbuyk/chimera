@@ -338,25 +338,33 @@ tasks:
   # independently because qb tasks run in isolated containers with their own
   # empty /build.
   #
-  # The quint MBT trace replays are disabled in the extended test legs
-  # (ctest_release / ctest_debug / ctest_coverage) until upstream fixes the
-  # batch replayer hang (whenever trace stepFds_128_0x1_2 precedes another
-  # trace, the reset's umount waits forever on a VFS close that never
-  # completes, so chimera/posix/mbt/batch_memfs always burns its 300 s
-  # timeout).  Each of those legs hides the oras binary before cmake runs:
-  # with no oras (and no quint) SpecsBundle.cmake cannot obtain the trace
-  # corpus, so the replay ctests are never registered.  The quick corpus-free
-  # *_probe quint tests still run.  ctest_kvm is unaffected -- it runs in its
-  # own container with its own oras.  Drop the mv lines once upstream fixes
-  # the hang.  The ctest_quint_* legs further down deliberately keep oras --
-  # running the replays is what they exist for.
+  # The extended test legs (ctest_release / ctest_debug / ctest_coverage)
+  # acquire no trace corpus: they configure with -DSPECS_BUNDLE=NONE, which
+  # cmake/SpecsBundle.cmake documents as "neither fetch nor build", so the MBT
+  # replay ctests are never registered there.  The corpus-free *_probe quint
+  # tests still run.  Running the replays is what the ctest_quint_* legs
+  # further down exist for, and they are gated on every MR, so repeating them
+  # here would only pay for them twice.
+  #
+  # This replaces an earlier workaround that moved the oras binary aside
+  # before cmake, which worked only for as long as the image carried no quint:
+  # quint's local provider builds the corpus from ext/specs when no bundle can
+  # be fetched, so installing quint (see builders/dev/Dockerfile) would have
+  # defeated the trick and re-registered the replays.  SPECS_BUNDLE=NONE
+  # suppresses both providers and says what it means.  It is also the only
+  # form that survives ${CTEST_FILTER}: a -LE baked in here would be ANDed
+  # with the -LE the CI legs pass, and ctest ANDs repeated label options, so
+  # the pair would exclude only tests matching BOTH and in practice nothing.
+  #
+  # ctest_kvm is unaffected -- it runs in its own container and needs oras to
+  # pull the guest images.
   #
   # The extended legs pass -C extended: upstream's test tiers (see the
   # add_test override in the top-level CMakeLists.txt) put everything except
   # the quint model-based tests in the extended tier, so a bare `ctest` here
-  # would run only the quick tier -- and with oras hidden and no quint in the
-  # builder image, that tier is nearly empty and the leg would pass having
-  # tested nothing.  -C extended runs the quick tier plus everything else.
+  # would run only the quick tier -- and with SPECS_BUNDLE=NONE that tier is
+  # nearly empty here, so the leg would pass having tested nothing.
+  # -C extended runs the quick tier plus everything else.
   #
   # All four ctest_* legs below are amd64 only.  The arm64 runners are not
   # reliable enough to gate on, and an intermittent failure there costs more
@@ -390,12 +398,11 @@ tasks:
       # build or analysis legs, which start no rings.
       - export EVPL_IO_URING_ENTRIES=1024
       - echo "CTEST_FILTER=${CTEST_FILTER}"
-      - echo "quint MBT trace replays disabled - hiding oras so cmake finds no trace corpus (upstream batch replayer hang)"
-      - mv /usr/local/bin/oras /usr/local/bin/oras.hidden || true
       - >
         cmake -G Ninja -DCMAKE_BUILD_TYPE=Release
         -DREQUIRE_NETNS_TESTS=ON
         -DKVM_TESTING=OFF
+        -DSPECS_BUNDLE=NONE
         -S /context -B /build
       - ninja --quiet
       - >
@@ -423,12 +430,11 @@ tasks:
       # io_uring ring depth, see ctest_release.
       - export EVPL_IO_URING_ENTRIES=1024
       - echo "CTEST_FILTER=${CTEST_FILTER}"
-      - echo "quint MBT trace replays disabled - hiding oras so cmake finds no trace corpus (upstream batch replayer hang)"
-      - mv /usr/local/bin/oras /usr/local/bin/oras.hidden || true
       - >
         cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug
         -DREQUIRE_NETNS_TESTS=ON
         -DKVM_TESTING=OFF
+        -DSPECS_BUNDLE=NONE
         -S /context -B /build
       - ninja --quiet
       - >
@@ -461,14 +467,13 @@ tasks:
       # io_uring ring depth, see ctest_release.
       - export EVPL_IO_URING_ENTRIES=1024
       - echo "CTEST_FILTER=${CTEST_FILTER}"
-      - echo "quint MBT trace replays disabled - hiding oras so cmake finds no trace corpus (upstream batch replayer hang)"
-      - mv /usr/local/bin/oras /usr/local/bin/oras.hidden || true
       - mkdir -p /build/coverage/profraw /dist
       - >
         cmake -G Ninja -DCMAKE_BUILD_TYPE=Coverage
         -DCMAKE_C_COMPILER=clang
         -DREQUIRE_NETNS_TESTS=ON
         -DKVM_TESTING=OFF
+        -DSPECS_BUNDLE=NONE
         -S /context -B /build
       - ninja --quiet
       # Each test process (and any daemon it spawns) writes its own raw
@@ -509,11 +514,16 @@ tasks:
   # fetches the prebuilt trace corpus and the MBT replay ctests register --
   # running those replays is the point.  -L quint plus --no-tests=error make
   # a configuration that quietly loses its corpus fail loudly instead of
-  # passing having tested nothing.  REQUIRE_CTL_MBT is deliberately not set:
-  # the control-plane corpus is generated by the quint binary, which
-  # chimera-dev does not carry (see builders/dev/Dockerfile), so the
-  # control-plane MBT suite is absent from these legs; upstream's quint
-  # coverage job still measures it.
+  # passing having tested nothing.
+  #
+  # REQUIRE_CTL_MBT and REQUIRE_DISKFS_MBT extend that same guarantee one
+  # level down.  Both models are generated by the quint binary rather than
+  # fetched -- the control-plane model from ext/specs, the diskfs stress model
+  # from src/vfs/diskfs/tests/quint, which lives in this repo and so has no
+  # bundle at all.  While chimera-dev carried no quint each suite removed
+  # itself with a cmake STATUS line, which is exactly what these legs exist to
+  # prevent: --no-tests=error cannot catch a test that was never registered.
+  # The image carries quint now, so make the absence a configure error.
   ctest_quint_release:
     type: run_container
     architecture: [ amd64 ]
@@ -531,6 +541,8 @@ tasks:
         cmake -G Ninja -DCMAKE_BUILD_TYPE=Release
         -DREQUIRE_NETNS_TESTS=ON
         -DKVM_TESTING=OFF
+        -DREQUIRE_CTL_MBT=ON
+        -DREQUIRE_DISKFS_MBT=ON
         -S /context -B /build
       - ninja --quiet
       - >
@@ -559,6 +571,8 @@ tasks:
         cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug
         -DREQUIRE_NETNS_TESTS=ON
         -DKVM_TESTING=OFF
+        -DREQUIRE_CTL_MBT=ON
+        -DREQUIRE_DISKFS_MBT=ON
         -S /context -B /build
       - ninja --quiet
       - >
@@ -604,6 +618,8 @@ tasks:
         -DCMAKE_C_COMPILER=clang
         -DREQUIRE_NETNS_TESTS=ON
         -DKVM_TESTING=OFF
+        -DREQUIRE_CTL_MBT=ON
+        -DREQUIRE_DISKFS_MBT=ON
         -S /context -B /build
       - ninja --quiet
       # Each test process (and any daemon it spawns) writes its own raw
