@@ -256,10 +256,11 @@ ctest:
       # parsed as shell syntax.  The flag and regex stay outside the quotes so
       # they split into separate ctest args.
       #
-      # pynfs keeps the -E diskfs_ exclusion from CHIM-125.  Note that those
-      # 448 tests are then in no leg at all -- excluded here by name and from
-      # "rest" by label.  That predates this split and is unchanged by it; see
-      # CHIM-203 item 7 for the measurement and the options.
+      # pynfs keeps the -E diskfs_ exclusion from CHIM-125, which dropped the
+      # diskfs_ variants as ~33% of pynfs runtime "for little protocol-level
+      # coverage".  Those 448 tests now run in ctest_explore below rather than
+      # in no leg at all; the three pynfs selectors partition the label exactly
+      # (928 + 448 = 1376, verified by direct count).
       #
       # amd64 only: the arm64 runners are not reliable enough to gate on.  The
       # qb ctest_* tasks are amd64-only to match, so an arm64 entry here would
@@ -280,6 +281,51 @@ ctest:
         ARCH: [ amd64 ]
         GROUP: [ rest ]
         CTEST_FILTER: [ "-LE '^pynfs$|^smbtorture$|^wpts$|^kvm$'" ]
+  script:
+    - ${RUN_QB} -a ${ARCH} -v ctest_${MODE} -V CTEST_FILTER="${CTEST_FILTER}" &> ctest_${MODE}_${GROUP}_${ARCH}.log
+  after_script:
+    - tail -1000 ctest_${MODE}_${GROUP}_${ARCH}.log || true
+  artifacts:
+    when: always
+    paths:
+      - ctest_${MODE}_${GROUP}_${ARCH}.log
+    expire_in: 1 week
+
+# The ctest groups the merge train does not gate on.  Nightly only, the same
+# treatment the extra guest images get in ctest_kvm_images, and for the same
+# reason: rules: cannot vary per matrix cell, so a nightly-only leg cannot just
+# be another entry in the matrix above.
+#
+# pynfs-on-diskfs is the whole of it today.  CHIM-125 (1b0d8a91) excluded the
+# diskfs_ variants from the pynfs leg as ~33% of its runtime "for little
+# protocol-level coverage", noting that "diskfs stays exercised by the posix and
+# client suites".  That is true of diskfs generally but not of pynfs-on-diskfs:
+# with the exclusion in place no NFSv4 protocol conformance ran against the
+# diskfs backend anywhere in this pipeline.  Two things have changed since --
+# upstream's pynfs shard runs them (its selector carries no -E), and the
+# 2026-09-11 drop was largely diskfs work (space-map, transaction rollback,
+# crash recovery), which is the backend these tests cover.
+#
+# Nightly rather than in the train because that buys the coverage without
+# putting 448 tests in front of a merge, and because they have not run here
+# since CHIM-125 -- they are new signal first and a gate only once their
+# failures are understood.  Promote to the ctest matrix above at that point.
+ctest_explore:
+  stage: check
+  needs: [ chimera-dev ]
+  rules: *rules_explore
+  retry:
+    max: 1
+    when:
+      - script_failure
+      - runner_system_failure
+      - stuck_or_timeout_failure
+  parallel:
+    matrix:
+      - MODE: [ release, debug ]
+        ARCH: [ amd64 ]
+        GROUP: [ pynfs_diskfs ]
+        CTEST_FILTER: [ "-L '^pynfs$' -R diskfs_" ]
   script:
     - ${RUN_QB} -a ${ARCH} -v ctest_${MODE} -V CTEST_FILTER="${CTEST_FILTER}" &> ctest_${MODE}_${GROUP}_${ARCH}.log
   after_script:
