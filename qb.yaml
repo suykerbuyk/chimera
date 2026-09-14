@@ -773,15 +773,36 @@ tasks:
       - /build
     privileged: true
     variables:
-      KVM_FILTER: ""
+      # Defaults to the gate the .gitlab-ci.yml legs apply, so that `qb ... check`
+      # and ad-hoc runs agree with what the pipeline actually gates on.  With an
+      # empty default this task always failed the two nfstest_alloc_diskfs_*_nfs4.2
+      # tests, whatever was being tested, because nothing overrides KVM_FILTER in
+      # the check alias -- which made a genuinely broken tree look exactly like a
+      # clean one to the verification command the sync workflow documents.  Every
+      # .gitlab-ci.yml leg passes its own value and is unaffected.  Revert this
+      # together with the -E in .gitlab-ci.yml when the ENOSPC-boundary defect
+      # behind it is fixed.
+      #
+      # The regex is single-quoted INSIDE the value: qb pastes the variable into
+      # the ctest command line textually, so an unquoted ( or | is a shell syntax
+      # error.  The flag and the regex stay outside the quotes so they split into
+      # two ctest arguments.
+      KVM_FILTER: "-E 'nfstest_alloc_diskfs'"
       MODE: "Debug"
       PLATFORM: "ubuntu2604"
+      # The shard set the KVM legs are expected to cover, as "<image>" and
+      # "<image>-nfstest" names.  This is the one place the list lives; the
+      # ctest_kvm and ctest_kvm_images matrices in .gitlab-ci.yml must agree with
+      # it, and verify_kvm_shards.sh below fails the leg when it stops covering
+      # what the tree is configured to test.  Set it empty to skip the check.
+      KVM_SHARDS: "ubuntu2204_hwe ubuntu2404 ubuntu2404-nfstest ubuntu2404_hwe ubuntu2604 ubuntu2604-nfstest"
     commands:
       - cd /build
       - export LC_ALL=C
       - echo "KVM_FILTER=${KVM_FILTER}"
       - echo "MODE=${MODE}"
       - echo "PLATFORM=${PLATFORM}"
+      - echo "KVM_SHARDS=${KVM_SHARDS}"
       # Fail fast if the runner has no KVM device: the guests cannot boot with
       # acceleration without /dev/kvm, so there is no point building chimera and
       # fetching the (~GB) image first.
@@ -802,15 +823,28 @@ tasks:
         -DKVM_TESTING=ON
         -DKVM_FETCH_IMAGES=OFF
         -S /context -B /build
+      # Before the build and before the ~3.4 GB image pull, so a stale matrix
+      # costs seconds.  There is no catch-all shard: an image with no shard runs
+      # nowhere and fails nothing, which is the one failure mode sharding by
+      # image introduces and the only one ctest cannot report.
+      - '[ -z "${KVM_SHARDS}" ] || /context/qtm_build/verify_kvm_shards.sh /build "${KVM_SHARDS}"'
       - ninja --quiet
       - ninja kvm_${PLATFORM}_image
-      # KVM_FILTER carries the full ctest selector for this leg, e.g. "-R '/xfstests/'"
-      # or "-E '/(xfstests|cthon|pnfs|nfstest|ltp)/'".  qb substitutes it into this
-      # line textually, so the regex must be single-quoted within the value (an
-      # unquoted ( or | is a shell syntax error).  The ${KVM_FILTER} token here
-      # stays UNQUOTED so the flag and regex split into separate args; empty (the
-      # default) runs every kvm test for the platform.
-      - ctest -C extended --output-on-failure -L kvm -L "^${PLATFORM}$" ${KVM_FILTER} -j 12
+      # KVM_FILTER carries the full ctest selector for this leg, e.g.
+      # "-E '/(nfstest|ltp)/'" or "-R '/(nfstest|ltp)/' -E 'nfstest_alloc_diskfs'".
+      # qb substitutes it into this line textually, so the regex must be
+      # single-quoted within the value (an unquoted ( or | is a shell syntax
+      # error).  The ${KVM_FILTER} token here stays UNQUOTED so the flag and regex
+      # split into separate args; setting it empty runs every kvm test for the
+      # platform, including the ones the pipeline gates out.
+      # --no-tests=error: every shard names a real guest image, so selecting
+      # nothing is a defect, not an empty slice.  Without it a shard whose label
+      # or path regex stopped matching would exit 0 having run nothing -- the
+      # same silent loss of coverage the KVM_SHARDS check above exists to
+      # prevent, one level down.  (Upstream tolerates empty shards because its
+      # category list includes arch-excluded and complement categories that can
+      # legitimately select nothing; ours cannot.)
+      - ctest -C extended --output-on-failure --no-tests=error -L kvm -L "^${PLATFORM}$" ${KVM_FILTER} -j 12
     dependencies:
       builder:
         project: chimera
