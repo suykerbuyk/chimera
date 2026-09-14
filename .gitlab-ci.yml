@@ -217,10 +217,49 @@ ctest:
       # Each leg pairs a short GROUP (used for the log file name) with the full
       # ctest selector in CTEST_FILTER.  One matrix entry per leg so the two
       # stay paired (a single dict would cross-product them); MODE and ARCH are
-      # the 2-way axes.  The pynfs label is the bulk of the runtime, "other" is
-      # everything else, so the two run as separate parallel CI jobs.  qb
-      # pastes CTEST_FILTER into the ctest command line textually, so any shell
-      # metacharacters would need quoting INSIDE the value.
+      # the 2-way axes.
+      #
+      # The groups are cut by measured cost, not by tidiness.  From the
+      # 2026-09-11 nightly (release amd64, the whole non-pynfs half in one leg,
+      # 27.9 min of ctest):
+      #
+      #   smbtorture  1753 tests  10070 s*proc   14.0 min at -j 12
+      #   wpts          60 tests   4890 s*proc   14.6 min -- see below
+      #   everything else        ~5070 s*proc    7.0 min
+      #
+      # so smbtorture and wpts are the only two worth their own leg; splitting
+      # the remainder further buys nothing.  wpts is bounded by a single test
+      # (wpts-smb2model/memfs_s14, 874 s) rather than by parallelism, which is
+      # why it costs as much as smbtorture in 3% of the tests, and why 14.6 min
+      # is the floor for this job however finely the rest is cut.
+      #
+      # Upstream splits the same suite nine ways in .github/workflows/
+      # extended.yml; its selectors partition our tree exactly (verified: 8690
+      # tests, none in two shards, none uncovered), so adopting more of them
+      # later is a pure addition.  Measured here first: past these four groups
+      # the critical path does not move, and each extra leg pays its own ~4 min
+      # build.
+      #
+      # Every label selector is ANCHORED.  ctest -L takes a regex and ANDs
+      # repeated -L flags, so an unanchored name silently pulls in every label
+      # that contains it -- upstream measured -L posix also selecting posix_mbt.
+      # No label collides today (-L pynfs and -L ^pynfs$ both select 1376), so
+      # this is purely defensive; the dangerous direction is the "rest" leg's
+      # -LE, where a future colliding label would be dropped from the run
+      # rather than duplicated.  The -LE list must name exactly the groups that
+      # have a leg above, or what it excludes runs nowhere.  ^kvm$ is there
+      # because the ctest_* qb tasks build with KVM_TESTING=OFF; the guest
+      # suites have their own legs (ctest_kvm, ctest_kvm_images).
+      #
+      # The regex is single-quoted INSIDE the value: qb pastes CTEST_FILTER
+      # into the ctest command line textually, so an unquoted $ or | would be
+      # parsed as shell syntax.  The flag and regex stay outside the quotes so
+      # they split into separate ctest args.
+      #
+      # pynfs keeps the -E diskfs_ exclusion from CHIM-125.  Note that those
+      # 448 tests are then in no leg at all -- excluded here by name and from
+      # "rest" by label.  That predates this split and is unchanged by it; see
+      # CHIM-203 item 7 for the measurement and the options.
       #
       # amd64 only: the arm64 runners are not reliable enough to gate on.  The
       # qb ctest_* tasks are amd64-only to match, so an arm64 entry here would
@@ -228,11 +267,19 @@ ctest:
       - MODE: [ release, debug ]
         ARCH: [ amd64 ]
         GROUP: [ pynfs ]
-        CTEST_FILTER: [ "-L pynfs -E diskfs_" ]
+        CTEST_FILTER: [ "-L '^pynfs$' -E diskfs_" ]
       - MODE: [ release, debug ]
         ARCH: [ amd64 ]
-        GROUP: [ other ]
-        CTEST_FILTER: [ "-LE pynfs" ]
+        GROUP: [ smbtorture ]
+        CTEST_FILTER: [ "-L '^smbtorture$'" ]
+      - MODE: [ release, debug ]
+        ARCH: [ amd64 ]
+        GROUP: [ wpts ]
+        CTEST_FILTER: [ "-L '^wpts$'" ]
+      - MODE: [ release, debug ]
+        ARCH: [ amd64 ]
+        GROUP: [ rest ]
+        CTEST_FILTER: [ "-LE '^pynfs$|^smbtorture$|^wpts$|^kvm$'" ]
   script:
     - ${RUN_QB} -a ${ARCH} -v ctest_${MODE} -V CTEST_FILTER="${CTEST_FILTER}" &> ctest_${MODE}_${GROUP}_${ARCH}.log
   after_script:
