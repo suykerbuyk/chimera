@@ -20,6 +20,13 @@ ARG WPTS_VERSION=4.26.3.0
 ARG ELBENCHO_REF=96b1bf29c35e437715c0527194e69e4c96ed9922
 # oras CLI, used by the KVM suites to pull the VM images from the registry.
 ARG ORAS_VERSION=1.2.0
+# Pinned quint release, used to generate the model-based-test trace corpus.
+# Trace generation is seeded and so reproducible for a given release, but
+# different releases may sample the state space differently, which is why
+# ext/specs records the version it generated against and warns on a mismatch.
+# KEEP IN SYNC with ext/specs/.quint-version (.devcontainer/alain/Dockerfile
+# and ext/libevpl/.devcontainer/Dockerfile pin the same release).
+ARG QUINT_VERSION=0.32.0
 
 ENV APT_MIRROR=http://repository.mdh.quantum.com/repository/pkgs/ubuntu
 ENV DEBIAN_FRONTEND=noninteractive
@@ -156,18 +163,43 @@ RUN if [ "$ENABLE_WPTS" = "1" ] ; then \
 # Quantum specific addons
 #
 
-# quint is deliberately NOT installed here, though upstream's
-# .devcontainer/Dockerfile installs it.  This image backs every qb ctest,
-# syntax and static_analysis leg, and qb.yaml suppresses the model-based
-# trace replays by hiding the oras binary before cmake runs, so
-# cmake/SpecsBundle.cmake cannot fetch the prebuilt corpus.  Installing
-# quint would let its "local" provider build that corpus from ext/specs
-# instead, re-registering the very replays the oras trick disables -- and
-# the batch replayer still wedges (trace stepFds_128_0x1_2 preceding
-# another trace leaves the reset's umount waiting on a VFS close that
-# never completes), so every ctest leg would burn its timeout.  Add quint
-# here only once that hang is fixed upstream and the oras lines come out
-# of qb.yaml.
+# quint drives the model-based tests.  Two suites need the binary in this
+# image, for different reasons:
+#
+#   - ext/specs generates the ITF trace corpus from its models, and
+#     cmake/SpecsBundle.cmake falls back to that local build whenever the
+#     prebuilt bundle is not fetched.  The ctest_quint_* legs fetch the
+#     bundle, so quint is their backstop rather than their normal path.
+#   - src/vfs/diskfs/tests/quint holds its model IN THIS REPO rather than in
+#     ext/specs, so no bundle can ever supply its corpus: without quint on
+#     PATH, chimera/vfs/diskfs/mbt/batch is skipped with a STATUS message
+#     and no leg reports anything missing.  The same is true of the
+#     control-plane model under src/server/rest/tests/quint.
+#
+# This was omitted while the upstream batch replayer wedged (trace
+# stepFds_128_0x1_2 preceding another trace left the reset's umount waiting
+# on a VFS close that never completed), because quint's local provider would
+# have re-registered the replays that qb.yaml was suppressing by hiding
+# oras.  That hang is fixed: the ctest_quint_* legs have kept oras on PATH
+# and run the replays since 2026-09-01.  qb.yaml now suppresses the corpus
+# in the extended legs with -DSPECS_BUNDLE=NONE instead, which quint cannot
+# defeat, so the two no longer interact.
+#
+# quint downloads its Rust evaluator on first run, into ~/.quint.  Cluster
+# pods reach the network through internal mirrors only, so that download
+# arrives truncated and every generation fails.  Warm the cache here, where
+# the network is available and the result is baked into the image.  Double
+# quotes, so quint's prime operator (n') needs no escaping: inside single
+# quotes a backslash is literal and would end the string early.  The closing
+# ls is the check -- if the evaluator did not land, fail here where it is
+# fixable rather than in every downstream build job.
+RUN npm install -g @informalsystems/quint@${QUINT_VERSION} && \
+    printf "module warm {\n  var n: int\n  action init = n' = 0\n  action step = n' = n + 1\n}\n" \
+        > /tmp/warm.qnt && \
+    { quint run /tmp/warm.qnt --max-steps=1 --max-samples=1 > /dev/null 2>&1 || true ; } && \
+    rm -f /tmp/warm.qnt && \
+    ls -d /root/.quint/rust-evaluator-*/quint_evaluator && \
+    quint --version
 
 # install install snfs on amd64 arch
 RUN if [ "`dpkg --print-architecture`" = "amd64" ] ; then \
