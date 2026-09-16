@@ -339,31 +339,39 @@ tasks:
   # empty /build.
   #
   # The extended test legs (ctest_release / ctest_debug / ctest_coverage)
-  # acquire no trace corpus: they configure with -DSPECS_BUNDLE=NONE, which
-  # cmake/SpecsBundle.cmake documents as "neither fetch nor build", so the MBT
-  # replay ctests are never registered there.  The corpus-free *_probe quint
-  # tests still run.  Running the replays is what the ctest_quint_* legs
-  # further down exist for, and they are gated on every MR, so repeating them
-  # here would only pay for them twice.
+  # acquire no trace corpus: they configure with -DCHIMERA_MBT_CORPUS=OFF,
+  # which cmake/Specs.cmake documents as "no corpus: the harnesses still
+  # build, but no traces are generated and the replay ctests are not
+  # registered".  The corpus-free *_probe quint tests still run.  Running the
+  # replays is what the ctest_quint_* legs further down exist for, and they
+  # are gated on every MR, so repeating them here would only pay for them
+  # twice -- and since upstream adb54a5c the corpus is GENERATED from
+  # ext/specs' models plus this repo's configs on every build (there is no
+  # prebuilt bundle to fetch any more), so that price is quint elaborating
+  # every model family, not a download.
   #
-  # This replaces an earlier workaround that moved the oras binary aside
-  # before cmake, which worked only for as long as the image carried no quint:
-  # quint's local provider builds the corpus from ext/specs when no bundle can
-  # be fetched, so installing quint (see builders/dev/Dockerfile) would have
-  # defeated the trick and re-registered the replays.  SPECS_BUNDLE=NONE
-  # suppresses both providers and says what it means.  It is also the only
-  # form that survives ${CTEST_FILTER}: a -LE baked in here would be ANDed
-  # with the -LE the CI legs pass, and ctest ANDs repeated label options, so
-  # the pair would exclude only tests matching BOTH and in practice nothing.
+  # The option replaced -DSPECS_BUNDLE=NONE, which cmake/SpecsBundle.cmake
+  # honoured until upstream deleted that file along with the bundle -- and
+  # nothing conflicted, because qb.yaml is downstream-only and cmake treats an
+  # unknown -D as an unused variable, so the legs kept passing while the knob
+  # did nothing.  An earlier workaround moved the oras binary aside before
+  # cmake, which worked only for as long as the image carried no quint.  A
+  # cmake option is also the only form that survives ${CTEST_FILTER}: a -LE
+  # baked in here would be ANDed with the -LE the CI legs pass, and ctest
+  # ANDs repeated label options, so the pair would exclude only tests
+  # matching BOTH and in practice nothing.
   #
-  # ctest_kvm is unaffected -- it runs in its own container and needs oras to
-  # pull the guest images.
+  # The same option goes on every other leg that configures the tree but
+  # never runs a replay: static_analysis_* (upstream's own scan-build jobs
+  # pass it, for the same reason), smbtorture_explore and ctest_kvm.  Without
+  # it each of them would elaborate every quint model at configure and build
+  # time only to throw the traces away.
   #
   # The extended legs pass -C extended: upstream's test tiers (see the
   # add_test override in the top-level CMakeLists.txt) put everything except
   # the quint model-based tests in the extended tier, so a bare `ctest` here
-  # would run only the quick tier -- and with SPECS_BUNDLE=NONE that tier is
-  # nearly empty here, so the leg would pass having tested nothing.
+  # would run only the quick tier -- and with CHIMERA_MBT_CORPUS=OFF that
+  # tier is nearly empty here, so the leg would pass having tested nothing.
   # -C extended runs the quick tier plus everything else.
   #
   # All four ctest_* legs below are amd64 only.  The arm64 runners are not
@@ -402,7 +410,7 @@ tasks:
         cmake -G Ninja -DCMAKE_BUILD_TYPE=Release
         -DREQUIRE_NETNS_TESTS=ON
         -DKVM_TESTING=OFF
-        -DSPECS_BUNDLE=NONE
+        -DCHIMERA_MBT_CORPUS=OFF
         -S /context -B /build
       - ninja --quiet
       - >
@@ -434,7 +442,7 @@ tasks:
         cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug
         -DREQUIRE_NETNS_TESTS=ON
         -DKVM_TESTING=OFF
-        -DSPECS_BUNDLE=NONE
+        -DCHIMERA_MBT_CORPUS=OFF
         -S /context -B /build
       - ninja --quiet
       - >
@@ -473,7 +481,7 @@ tasks:
         -DCMAKE_C_COMPILER=clang
         -DREQUIRE_NETNS_TESTS=ON
         -DKVM_TESTING=OFF
-        -DSPECS_BUNDLE=NONE
+        -DCHIMERA_MBT_CORPUS=OFF
         -S /context -B /build
       - ninja --quiet
       # Each test process (and any daemon it spawns) writes its own raw
@@ -510,20 +518,23 @@ tasks:
   # The quint quick tier as its own pair of MR gates.  Upstream's test tiers
   # put the quint model-based tests -- and only them -- in the default ctest
   # configuration, so this is the cheap pre-flight that gates upstream merges.
-  # Unlike the extended legs above, oras stays on PATH: SpecsBundle.cmake
-  # fetches the prebuilt trace corpus and the MBT replay ctests register --
-  # running those replays is the point.  -L quint plus --no-tests=error make
-  # a configuration that quietly loses its corpus fail loudly instead of
+  # Unlike the extended legs above, these leave CHIMERA_MBT_CORPUS at its ON
+  # default: cmake/Specs.cmake generates the trace corpus from ext/specs'
+  # models plus this repo's configs (quint and node come from
+  # builders/dev/Dockerfile) and the MBT replay ctests register -- running
+  # those replays is the point.  -L quint plus --no-tests=error make a
+  # configuration that quietly loses its corpus fail loudly instead of
   # passing having tested nothing.
   #
   # REQUIRE_CTL_MBT and REQUIRE_DISKFS_MBT extend that same guarantee one
-  # level down.  Both models are generated by the quint binary rather than
-  # fetched -- the control-plane model from ext/specs, the diskfs stress model
-  # from src/vfs/diskfs/tests/quint, which lives in this repo and so has no
-  # bundle at all.  While chimera-dev carried no quint each suite removed
-  # itself with a cmake STATUS line, which is exactly what these legs exist to
-  # prevent: --no-tests=error cannot catch a test that was never registered.
-  # The image carries quint now, so make the absence a configure error.
+  # level down, to the two models that were quint-generated even while the
+  # rest of the corpus still arrived as a prebuilt bundle: the control-plane
+  # model from ext/specs and the diskfs stress model from
+  # src/vfs/diskfs/tests/quint, which lives in this repo.  While chimera-dev
+  # carried no quint each suite removed itself with a cmake STATUS line, which
+  # is exactly what these legs exist to prevent: --no-tests=error cannot catch
+  # a test that was never registered.  The image carries quint now, so make
+  # the absence a configure error.
   ctest_quint_release:
     type: run_container
     architecture: [ amd64 ]
@@ -736,6 +747,7 @@ tasks:
         cmake -G Ninja -DCMAKE_BUILD_TYPE=Release
         -DREQUIRE_NETNS_TESTS=ON
         -DKVM_TESTING=OFF
+        -DCHIMERA_MBT_CORPUS=OFF
         -S /context -B /build
       # regen.sh drives the smbtorture_test binary directly rather than ctest, so
       # the driver is the only target the matrix needs.
@@ -838,6 +850,7 @@ tasks:
         -DKVM_IMAGE_REGISTRY=repository.mdh.quantum.com:5009/chimera-nas/kvm-test-base
         -DKVM_TESTING=ON
         -DKVM_FETCH_IMAGES=OFF
+        -DCHIMERA_MBT_CORPUS=OFF
         -S /context -B /build
       # Before the build and before the ~3.4 GB image pull, so a stale matrix
       # costs seconds.  There is no catch-all shard: an image with no shard runs
@@ -879,7 +892,7 @@ tasks:
       - export LC_ALL=C
       - >
         scan-build --status-bugs
-        cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -D IO_URING_NVME_ENABLED=OFF -S . -B /build
+        cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -D IO_URING_NVME_ENABLED=OFF -D CHIMERA_MBT_CORPUS=OFF -S . -B /build
       - scan-build --status-bugs ninja -C /build
     dependencies:
       builder:
@@ -900,7 +913,7 @@ tasks:
       - export LC_ALL=C
       - >
         scan-build -o /scan-report
-        cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -D IO_URING_NVME_ENABLED=OFF -S . -B /build
+        cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -D IO_URING_NVME_ENABLED=OFF -D CHIMERA_MBT_CORPUS=OFF -S . -B /build
       - >
         scan-build --keep-empty -o /scan-report ninja -C /build 2>&1 |
         tee /dist/scan-build-output.txt
@@ -929,7 +942,7 @@ tasks:
       - export LC_ALL=C
       - >
         scan-build --status-bugs
-        cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug -D IO_URING_NVME_ENABLED=OFF -S . -B /build
+        cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug -D IO_URING_NVME_ENABLED=OFF -D CHIMERA_MBT_CORPUS=OFF -S . -B /build
       - scan-build --status-bugs ninja -C /build
     dependencies:
       builder:
@@ -950,7 +963,7 @@ tasks:
       - export LC_ALL=C
       - >
         scan-build -o /scan-report
-        cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug -D IO_URING_NVME_ENABLED=OFF -S . -B /build
+        cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug -D IO_URING_NVME_ENABLED=OFF -D CHIMERA_MBT_CORPUS=OFF -S . -B /build
       - >
         scan-build --keep-empty -o /scan-report ninja -C /build 2>&1 |
         tee /dist/scan-build-output.txt
