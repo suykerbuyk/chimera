@@ -119,6 +119,27 @@ post() {
         rc=1
     fi
 
+    hr "qb.yaml cmake -D options are still named by a CMake file"
+    # Upstream renamed SPECS_BUNDLE -> CHIMERA_MBT_CORPUS (2026-09-16 sync) and
+    # nothing conflicted: qb.yaml is downstream-only, and cmake treats an
+    # unknown -D as an unused variable rather than an error, so the legs kept
+    # passing while the option they relied on did nothing.  -w so an option
+    # that survives only as a longer name (SPECS_BUNDLE_DIR) does not vouch
+    # for the short one.  CMAKE_* are cmake's own and never defined in-tree.
+    # Comment lines are dropped first: they are where a retired option is
+    # legitimately still mentioned, as history.
+    grep -vE '^[[:space:]]*#' qb.yaml | grep -ohE -- '-D ?[A-Za-z_]+=' |
+        sed -E 's/^-D ?//; s/=$//' | sort -u | while read -r opt; do
+            case "$opt" in CMAKE_*) continue ;; esac
+            if grep -rqw --include=CMakeLists.txt --include='*.cmake' \
+                    --exclude-dir=.git -- "$opt" .; then
+                printf '  ok      %s\n' "$opt"
+            else
+                printf '  MISSING %s -- qb.yaml passes it, no CMake file names it\n' "$opt"
+                rc=1
+            fi
+        done
+
     hr "packaged include layout (needs a staged install first)"
     echo "sudo env DESTDIR=/tmp/chimera-stage ninja -C /build/Release install"
     echo "then: find /tmp/chimera-stage/opt/quantum/chimera/include -type f"

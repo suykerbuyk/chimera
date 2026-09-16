@@ -89,8 +89,9 @@ find /tmp/chimera-stage/opt/quantum/chimera/include -type f | sort
 head -5 /tmp/chimera-stage/opt/quantum/chimera/include/chimera/oteltracing.h
 ```
 
-Expect 18 SDK headers plus the three external ones, and `#define
-OTEL_TRACING 0`. Then compile a probe that includes only
+Expect 19 SDK headers (18 plus `vfs_access.h`, which joined in the
+2026-09-16 sync -- recount when upstream adds one) plus the three external
+ones, and `#define OTEL_TRACING 0`. Then compile a probe that includes only
 `"vfs/sdk/chimera_vfs_sdk.h"` with `-I<stage>/include/chimera -I<stage>/include`.
 
 Restore `-DCMAKE_INSTALL_PREFIX=/usr/local` afterwards — it is baked into
@@ -100,19 +101,34 @@ Out-of-tree consumers (myriad) must track layout changes here; the module ABI
 is unversioned, so a stale module against a new server fails at runtime, not
 at build.
 
-### quint, oras, and the MBT replay hang
+### quint and the MBT corpus
 
-Upstream's devcontainer installs quint. `.devcontainer/quantum/Dockerfile`
-takes it as part of the verbatim prefix. **`builders/dev/Dockerfile` must
-not**, while the batch-replayer hang is unfixed.
+Upstream generates the whole model-based-test corpus at build time
+(`cmake/Specs.cmake`, since adb54a5c / the 2026-09-16 sync): each quint
+suite's configs go to ext/specs' generator, and there is no prebuilt bundle,
+no `cmake/SpecsBundle.cmake`, no `oras` fetch. What that means downstream:
 
-`qb.yaml`'s ctest legs hide the `oras` binary before cmake runs so
-`cmake/SpecsBundle.cmake` cannot fetch the prebuilt trace corpus, which
-leaves the model-based replays unregistered. quint would let SpecsBundle's
-`local` provider build that corpus from `ext/specs` instead, re-registering
-the replays — and they still wedge (trace `stepFds_128_0x1_2` before another
-trace leaves the reset's umount waiting on a VFS close that never completes).
-Every ctest leg would burn its timeout instead of reporting.
+- A builder that should *run* the replays needs quint and node on PATH.
+  `builders/dev/Dockerfile` installs quint from npm, pinned to
+  `ext/specs/.quint-version`. The OS builders (`builders/<os>/`) do not and
+  need not: they only build and package, and Specs.cmake disables the
+  replays with a STATUS line when quint is absent. Upstream's
+  `Dockerfile.rocky9` / `Dockerfile.ubuntu22.04` gained quint for their CI
+  cells; that is deliberately not mirrored.
+- Legs that configure the tree but never run a replay pass
+  `-DCHIMERA_MBT_CORPUS=OFF` (the extended ctest legs, static analysis,
+  smbtorture, kvm). It replaced `-DSPECS_BUNDLE=NONE`, which became an
+  unused variable the moment upstream deleted SpecsBundle.cmake -- and the
+  merge said nothing, because qb.yaml is downstream-only and cmake does not
+  fail on an unknown `-D`. `sync-report.sh post` now checks that every `-D`
+  option qb.yaml passes is still named by a CMake file in the tree.
+- The `ctest_quint_*` legs keep the corpus on and pass `REQUIRE_CTL_MBT` /
+  `REQUIRE_DISKFS_MBT`, so a quint missing from chimera-dev fails configure
+  instead of shrinking the suite.
+
+The batch-replayer hang that once justified hiding oras (trace
+`stepFds_128_0x1_2` wedging the reset's umount) is fixed; it is history, not
+a constraint.
 
 ### Upstream merges are gated on the quick tier only
 
