@@ -22,6 +22,7 @@
 #include <time.h>
 
 #include "vfs_attrs.h"
+#include <sys/stat.h>
 #include "vfs_error.h"
 #include "vfs_cred.h"
 #include "vfs_claim_types.h"
@@ -158,6 +159,28 @@ struct chimera_vfs_mount_options {
  * watchers and directory-lease holders regardless of arrival protocol. */
 #define CHIMERA_VFS_OPEN_NO_NOTIFY              (1U << 11)
 
+/* The object this open yields must be a REGULAR file: if it is not, the module
+ * refuses instead of opening it, and says what was in the way --
+ * CHIMERA_VFS_EISDIR for a directory, CHIMERA_VFS_ESYMLINK for a symlink,
+ * CHIMERA_VFS_EINVAL for anything else non-regular.  (Those three are what the
+ * protocols' own type errors map from, so a caller needs no second question to
+ * answer for the type.)
+ *
+ * Set it on an open that is about to carry data.  Without it a caller has to
+ * establish the type for itself before opening -- and a stat holds no state, so
+ * what it established can be untrue by the time the open happens, and on some
+ * backends the refused open has already had an effect.  The module can answer
+ * atomically because it is resolving the object anyway: native backends from
+ * the inode metadata they already hold, passthrough from the leaf it already
+ * walked or an fstat of what it opened.
+ *
+ * CHIMERA_VFS_OPEN_CREATE_REGULAR is the same idea for a create that collides,
+ * and differs only in what it reports: a create says EEXIST of a non-regular
+ * name, because what matters there is that the name is taken, while this says
+ * what the object is, because what matters here is that the operation does not
+ * apply to it. */
+#define CHIMERA_VFS_OPEN_REGULAR_ONLY           (1U << 12)
+
 /* remove_at flags: an optional assertion about the target's type, letting the
  * single VFS remove op express the rmdir(2)/RMDIR vs unlink(2)/REMOVE
  * distinction the callers know but the op otherwise loses.  Enforcing backends
@@ -218,6 +241,23 @@ struct chimera_vfs_mount_options {
 
 #define CHIMERA_VFS_ACCESS_MODE_RW              0
 #define CHIMERA_VFS_ACCESS_MODE_RO              1
+
+/* The error CHIMERA_VFS_OPEN_REGULAR_ONLY refuses a non-regular object with.
+ * Shared so every module answers the same way; a caller that maps these onto
+ * its own type errors can rely on the mapping. */
+static inline enum chimera_vfs_error
+chimera_vfs_nonreg_error(uint32_t mode)
+{
+    if (S_ISDIR(mode)) {
+        return CHIMERA_VFS_EISDIR;
+    }
+
+    if (S_ISLNK(mode)) {
+        return CHIMERA_VFS_ESYMLINK;
+    }
+
+    return CHIMERA_VFS_EINVAL;
+} /* chimera_vfs_nonreg_error */
 
 struct chimera_vfs_open_handle {
     /* Identity: the owning module plus the handle's place in the open cache. */
@@ -430,7 +470,7 @@ struct chimera_vfs_request_handle {
  * resume struct against this; raise it if one legitimately outgrows it.  It is
  * a union member, so it costs nothing until it is the largest arm -- and the
  * request union is already an order of magnitude bigger than this. */
-#define CHIMERA_VFS_GATE_SCRATCH_SIZE   384
+#define CHIMERA_VFS_GATE_SCRATCH_SIZE   400
 
 /* One enumerated named stream, packed back-to-back in the list_streams reply
  * buffer.  `name_len` bytes of (un-terminated) stream name follow this header,

@@ -1415,50 +1415,6 @@ memfs_fs_free_contents(struct memfs_fs *fs)
                         free(inode->file.blocks);
                     }
 
-                    /* Named-stream forks are freed the same way as the main
-                     * fork (direct release, not via the per-thread freelist,
-                     * which is gone by destroy time).  Both the live streams and
-                     * any unlinked-but-still-open ones parked on dead_streams are
-                     * reclaimed -- the latter belong to protocol-layer opens that
-                     * were never closed and would otherwise leak their node, fork
-                     * blocks and iovec references. */
-                    for (int slist = 0; slist < 2; slist++) {
-                        struct memfs_named_stream **head =
-                            slist == 0 ? &inode->streams : &inode->dead_streams;
-
-                        while (*head) {
-                            struct memfs_named_stream *stream = *head;
-                            unsigned int               sbi;
-
-                            *head = stream->next;
-
-                            for (sbi = 0; sbi < stream->fork.num_blocks; sbi++) {
-                                if (stream->fork.blocks[sbi]) {
-                                    for (iovi = 0;
-                                         iovi < stream->fork.blocks[sbi]->niov;
-                                         iovi++) {
-                                        evpl_iovec_release(NULL,
-                                                           &stream->fork.blocks[sbi]->iov[iovi]);
-                                    }
-                                    free(stream->fork.blocks[sbi]);
-                                }
-                            }
-                            if (stream->fork.blocks) {
-                                free(stream->fork.blocks);
-                            }
-                            free(stream->name);
-                            free(stream);
-                        }
-                    }
-
-                    /* Per-open descriptors of abandoned (never-closed) stream
-                     * opens whose stream nodes were just freed above. */
-                    while (inode->stream_opens) {
-                        struct memfs_stream_open *so = inode->stream_opens;
-                        inode->stream_opens = so->open_next;
-                        free(so);
-                    }
-
                     /* Stubs are always regular files; free the remote
                      * descriptor here so we never touch the uninitialized
                      * fields of never-allocated free-list inodes. */
@@ -1466,6 +1422,64 @@ memfs_fs_free_contents(struct memfs_fs *fs)
                         free(inode->remote);
                     }
                 }
+
+                /* Named streams hang off ANY inode type, not just regular
+                 * files: SMB opens the unnamed data stream through the same
+                 * path for a directory, and a stream on a directory removed
+                 * while still open leaves its node on dead_streams with a
+                 * live descriptor on stream_opens.  This cleanup used to sit
+                 * inside the S_ISREG arm above, so those were never freed --
+                 * leaking the stream node, its fork blocks, and the iovec
+                 * references those blocks hold.  One leaked iovec is fatal:
+                 * evpl_allocator_destroy aborts the process on a non-zero
+                 * refcount, which is the SIGABRT smbtorture reports as a
+                 * failed cell after the test itself passed.
+                 * memfs_inode_free already handles every inode type; only
+                 * this teardown path was narrower. */
+                /* Named-stream forks are freed the same way as the main
+                 * fork (direct release, not via the per-thread freelist,
+                 * which is gone by destroy time).  Both the live streams and
+                 * any unlinked-but-still-open ones parked on dead_streams are
+                 * reclaimed -- the latter belong to protocol-layer opens that
+                 * were never closed and would otherwise leak their node, fork
+                 * blocks and iovec references. */
+                for (int slist = 0; slist < 2; slist++) {
+                    struct memfs_named_stream **head =
+                        slist == 0 ? &inode->streams : &inode->dead_streams;
+
+                    while (*head) {
+                        struct memfs_named_stream *stream = *head;
+                        unsigned int               sbi;
+
+                        *head = stream->next;
+
+                        for (sbi = 0; sbi < stream->fork.num_blocks; sbi++) {
+                            if (stream->fork.blocks[sbi]) {
+                                for (iovi = 0;
+                                     iovi < stream->fork.blocks[sbi]->niov;
+                                     iovi++) {
+                                    evpl_iovec_release(NULL,
+                                                       &stream->fork.blocks[sbi]->iov[iovi]);
+                                }
+                                free(stream->fork.blocks[sbi]);
+                            }
+                        }
+                        if (stream->fork.blocks) {
+                            free(stream->fork.blocks);
+                        }
+                        free(stream->name);
+                        free(stream);
+                    }
+                }
+
+                /* Per-open descriptors of abandoned (never-closed) stream
+                 * opens whose stream nodes were just freed above. */
+                while (inode->stream_opens) {
+                    struct memfs_stream_open *so = inode->stream_opens;
+                    inode->stream_opens = so->open_next;
+                    free(so);
+                }
+
             }
             free(fs->inode_list[i].inode[j]);
         }
@@ -1867,7 +1881,12 @@ memfs_apply_attrs(
 
     attr->va_set_mask = CHIMERA_VFS_ATTR_ATOMIC;
 
-    if (set_mask & CHIMERA_VFS_ATTR_MODE) {
+    /* A symbolic link's permission bits are fixed at 0777 and cannot be
+     * changed: Linux has no lchmod(), so a server over a real filesystem
+     * cannot honour this either, and honouring it here would make an ACCESS
+     * or GETATTR of the same link answer differently per backend.  The mask
+     * is not echoed back, so the caller sees that nothing was applied. */
+    if ((set_mask & CHIMERA_VFS_ATTR_MODE) && !S_ISLNK(inode->mode)) {
         attr->va_set_mask |= CHIMERA_VFS_ATTR_MODE;
         inode->mode        = (inode->mode & S_IFMT) | (attr->va_mode & ~S_IFMT);
     }
@@ -2007,7 +2026,7 @@ memfs_apply_attrs(
     if (set_mask & CHIMERA_VFS_ATTR_CTIME) {
         attr->va_set_mask |= CHIMERA_VFS_ATTR_CTIME;
         chimera_vfs_resolve_set_time(&attr->va_ctime, &now, &inode->ctime);
-    } else if (!layout_only) {
+    } else if (!layout_only && set_mask != 0) {
         inode->ctime = now;
     }
 
@@ -2018,10 +2037,16 @@ memfs_apply_attrs(
      * client-visible attribute, and the LAYOUTGET that stores it does not
      * modify the file (RFC 8881 18.43) -- bumping change (and ctime, above)
      * made the first LAYOUTGET on a file invalidate every client's cached
-     * attributes for a write nobody asked for.  The test is for the layout
-     * bit ALONE: memfs_setattr() masks SIZE off before calling here, so an
-     * empty mask still means a real metadata change. */
-    if (!layout_only) {
+     * attributes for a write nobody asked for.
+     *
+     * An EMPTY mask is the other exception: a setattr that sets nothing
+     * changes nothing, ctime included.  utimensat(UTIME_OMIT, UTIME_OMIT) is
+     * exactly that -- POSIX updates no timestamp for it and does not even
+     * require write access -- and it reaches a backend as a setattr with no
+     * bits set.  memfs_setattr() masks SIZE off before calling here, so a
+     * size-only change also arrives empty; it stamps ctime and change itself
+     * rather than relying on this path. */
+    if (!layout_only && set_mask != 0) {
         inode->change++;
     }
 
@@ -2307,7 +2332,22 @@ memfs_setattr(
          * like the write path does. */
         inode->mode        = chimera_vfs_killpriv_mode(request->cred, inode->mode);
         attr->va_set_mask &= ~CHIMERA_VFS_ATTR_SIZE;
-        memfs_apply_attrs(inode, attr);
+
+        {
+            uint64_t rest = attr->va_set_mask;
+
+            memfs_apply_attrs(inode, attr);
+
+            /* SIZE was masked off above, so a size-only setattr reaches
+             * memfs_apply_attrs with an empty mask and is treated as the
+             * no-op it looks like.  The truncate is a real metadata change:
+             * stamp ctime and the change counter here. */
+            if (rest == 0) {
+                chimera_vfs_realtime(&inode->ctime);
+                inode->change++;
+            }
+        }
+
         attr->va_set_mask |= CHIMERA_VFS_ATTR_SIZE;
     } else {
         memfs_apply_attrs(inode, attr);
@@ -3527,6 +3567,18 @@ memfs_open_fh(
         return;
     }
 
+    /* CHIMERA_VFS_OPEN_REGULAR_ONLY: see memfs_open_at.  Checked before the
+     * refcount, so a refused open takes nothing. */
+    if ((request->open_fh.flags & CHIMERA_VFS_OPEN_REGULAR_ONLY) &&
+        !S_ISREG(inode->mode)) {
+        enum chimera_vfs_error e = chimera_vfs_nonreg_error(inode->mode);
+
+        pthread_mutex_unlock(&inode->lock);
+        request->status = e;
+        request->complete(request);
+        return;
+    }
+
     inode->refcnt++;
     pthread_mutex_unlock(&inode->lock);
 
@@ -3582,6 +3634,25 @@ memfs_open_at(
         return;
     }
 
+    /* POSIX path resolution (XBD 4.13): search (EXECUTE) permission on the
+     * parent is what allows a name to be RESOLVED at all, so it is owed before
+     * the directory is examined -- otherwise an existing entry's presence and
+     * type leak to a caller who may not search the directory (EISDIR over a
+     * directory, EEXIST over another object, or the file's handle for an
+     * unchecked create; chimera #1771).  The create branch below adds
+     * WRITE_DATA on top for a fresh name.  AUTH_ATTR (SMB/Windows) is exempt:
+     * traverse checking is bypassed by default there
+     * (SeChangeNotifyPrivilege), which is why the existing create gate asks
+     * for EXECUTE only on the AUTH_UNIX arm. */
+    if (request->cred->flavor == CHIMERA_VFS_AUTH_UNIX &&
+        request->cred->uid != 0 &&
+        !memfs_inode_access(parent_inode, request->cred, CHIMERA_ACE_EXECUTE)) {
+        pthread_mutex_unlock(&parent_inode->lock);
+        request->status = CHIMERA_VFS_EACCES;
+        request->complete(request);
+        return;
+    }
+
     memfs_map_pre_attr(fs, &request->open_at.r_dir_pre_attr, parent_inode, request->fh);
 
     rb_tree_query_exact(&parent_inode->dir.dirents, hash, hash, dirent);
@@ -3618,7 +3689,9 @@ memfs_open_at(
 
         if (request->cred->flavor == CHIMERA_VFS_AUTH_UNIX &&
             request->cred->uid != 0) {
-            create_access = CHIMERA_ACE_WRITE_DATA | CHIMERA_ACE_EXECUTE;
+            /* EXECUTE was already required above, for every caller that gets
+             * this far; WRITE_DATA is what a fresh name adds. */
+            create_access = CHIMERA_ACE_WRITE_DATA;
         } else if (request->cred->flavor == CHIMERA_VFS_AUTH_ATTR) {
             create_access = CHIMERA_ACE_WRITE_DATA;
         }
@@ -3717,6 +3790,18 @@ memfs_open_at(
             return;
         }
 
+        /* CHIMERA_VFS_OPEN_REGULAR_ONLY: this open is about to carry data, so
+         * refuse a type it does not apply to and say which.  From the inode we
+         * are already holding. */
+        if ((flags & CHIMERA_VFS_OPEN_REGULAR_ONLY) && !S_ISREG(inode->mode)) {
+            enum chimera_vfs_error e = chimera_vfs_nonreg_error(inode->mode);
+            pthread_mutex_unlock(&inode->lock);
+            pthread_mutex_unlock(&parent_inode->lock);
+            request->status = e;
+            request->complete(request);
+            return;
+        }
+
         /* A symlink as the final component under O_NOFOLLOW: a *data* open
          * (POSIX open(O_NOFOLLOW)) must fail with ELOOP, but an O_PATH-style
          * open (SMB FILE_OPEN_REPARSE_POINT, i.e. O_PATH|O_NOFOLLOW) wants a
@@ -3769,11 +3854,10 @@ memfs_open_at(
     * re-check here -- a coarse read/write test would mis-handle SMB opens that
     * carry only control rights (e.g. WRITE_DAC) and not data access. */
 
-    if (flags & CHIMERA_VFS_OPEN_INFERRED) {
-        /* If this is an inferred open (ie an NFS3 create)
-         * then we aren't returning a handle so we don't need
-         * to increment the refcnt */
-
+    if (!chimera_vfs_open_handle_retained(flags,
+                                          request->module->capabilities)) {
+        /* The VFS will not keep this handle, so there is nothing for a
+         * refcount to hold open and nothing that will ever be closed. */
         request->open_at.r_vfs_private = 0xdeadbeefUL;
 
     } else {
@@ -5737,10 +5821,17 @@ memfs_symlink_at(
     inode->uid        = request->cred->uid;
     inode->gid        = request->cred->gid;
     inode->nlink      = 1;
-    inode->mode       = S_IFLNK | 0755;
-    inode->atime      = now;
-    inode->mtime      = now;
-    inode->ctime      = now;
+    /* A symbolic link's permission bits are not a portable observable.  POSIX
+    * leaves them unspecified, and Linux fixes every symlink at 0777 and
+    * silently discards whatever mode a creator asks for -- so a passthrough
+    * backend CANNOT honour one.  Honouring it here only split the in-engine
+    * backends from the passthrough ones and made the model describe half of
+    * them (an NFSv4 ACCESS then granted EXECUTE on one backend and not the
+    * other for the same link).  Match Linux: always 0777, request ignored. */
+    inode->mode  = S_IFLNK | 0777;
+    inode->atime = now;
+    inode->mtime = now;
+    inode->ctime = now;
     inode->change++;
     inode->btime = now;
 

@@ -363,6 +363,12 @@ struct sm_extent {
     struct sm_extent *size_prev, *size_next;   /* free_by_size[class] list links */
 };
 
+/* A claim's bump state is one atomic word: the cursor in the high half, the
+ * limit in the low half, both offsets relative to claim->base. */
+#define SM_CLAIM_CUR(w)         ((uint32_t) ((w) >> 32))
+#define SM_CLAIM_END(w)         ((uint32_t) ((w) & 0xffffffffu))
+#define SM_CLAIM_PACK(cur, end) (((uint64_t) (uint32_t) (cur) << 32) | (uint32_t) (end))
+
 /* A reservation claim: a contiguous region of an AG handed to one worker thread
  * as a bump arena.  It is NOT removed from the AG free tree (the tree stays
  * == committed state, so condense never leaks the uncommitted tail); the claim
@@ -373,10 +379,33 @@ struct sm_extent {
  * region.  Protected by the owning AG's lock. */
 struct sm_claim {
     uint64_t         base;          /* absolute device offset of the claimed region */
-    uint64_t         len;
+    uint64_t         len;           /* == end - base; ag->lock-protected mirror of `end` */
     uint32_t         refcount;      /* in-flight txns that allocated from this claim */
     int              retiring;      /* owner released it; GC when refcount==0 */
     struct sm_claim *next;
+
+    /*
+     * Recall rendezvous.  `cursor` and `end` are the bump state, kept here
+     * rather than in the owner's struct sm_reservation so a thread that cannot
+     * find space can see how much of someone else's claim is actually spoken
+     * for and hand the rest back (sm_ag_recall_claims_locked).
+     *
+     * Both live in ONE atomic word, as a pair of AG-relative 32-bit offsets
+     * (an AG is SM_AG_SIZE = 2 GiB, so each fits).  That is the whole point:
+     * the owner advancing the cursor and a recaller lowering the end are then
+     * compare-and-swaps on the same word, so exactly one of them wins and the
+     * loser simply re-reads.
+     *
+     * The first version of this kept them in two words -- owner stores cursor
+     * then loads end, recaller stores end then loads cursor -- which is
+     * Dekker's algorithm and needs sequential consistency to be correct.
+     * Written with release/acquire it permits the store-load reordering that
+     * x86 allows, both sides read stale, both believe they won, and the same
+     * region is handed out twice; the second file to release it then trips the
+     * "double-free or overlap" abort in sm_ag_free_locked.  One word removes
+     * the question rather than answering it.
+     */
+    uint64_t bump;                  /* atomic: SM_CLAIM_PACK(cursor, end) */
 };
 
 /* Per-thread bump reservation (one for metadata, one for data).  Hands out
@@ -386,9 +415,9 @@ struct sm_reservation {
     uint32_t         device_id;
     uint32_t         ag_index;
     uint64_t         base;
-    uint64_t         len;
-    uint64_t         cursor;        /* next free offset within [base, base+len) */
-    struct sm_claim *claim;         /* the AG claim backing this reservation */
+    uint64_t         len;           /* grant size at claim time; diagnostics only */
+    struct sm_claim *claim;         /* the AG claim backing this reservation;
+                                     * carries the live cursor/end (see above) */
     int              valid;
 };
 
@@ -637,7 +666,33 @@ space_map_reservation_alloc(
 /* Default per-thread reservation chunk (configurable later via diskfs).  Small
  * enough for small test filesystems, large enough that the shared allocator is
  * touched only ~once per chunk consumed. */
-#define SM_RESERVATION_CHUNK (4ULL << 20)       /* 4 MiB */
+#define SM_RESERVATION_CHUNK        (4ULL << 20) /* 4 MiB */
+
+/*
+ * Bounding a grant by a share of the AG's remaining free space -- so
+ * reservation size follows the AG down instead of staying a constant 4 MiB --
+ * was part of the first cut of this and has been REMOVED, deliberately.
+ *
+ * It is a good idea and it is not what fixes anything here: recall is what
+ * makes the pool reachable to its last extents, and the cap measured no
+ * improvement on its own.  What it does do is change where allocations land,
+ * and that is enough to trip a double-free in the space map that has nothing
+ * to do with reservations:
+ *
+ *   double-free or overlap at offset=42168320 length=4096 (prev=41889792+25219072)
+ *
+ * A full CI matrix on the cap ALONE, with no recall, reproduces that abort;
+ * the same matrix on recall alone is green on all 24 jobs.  Since the cap
+ * changes no allocator invariant -- it only makes grants smaller, hence more
+ * numerous -- it is surfacing a latent bug rather than introducing one, and
+ * that deserves its own investigation rather than being smuggled in here.
+ */
+
+/* How many times space_map_reservation_alloc will re-grab after losing its
+ * claim to a recall before reporting ENOSPC.  Each attempt is a full grab
+ * (which itself recalls before failing), so this only has to outlast a burst of
+ * concurrent recalls, not a sustained shortage. */
+#define SM_RESERVATION_GRAB_RETRIES 8
 
 /* Apply a COMMITTED allocation to the in-memory free tree at retire/durability
  * (mirrors space_map_free_apply). */

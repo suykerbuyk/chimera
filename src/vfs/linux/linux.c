@@ -804,6 +804,45 @@ chimera_linux_open_fh(
 
     flags = chimera_linux_set_open_flags(request->open_fh.flags);
 
+    /* CHIMERA_VFS_OPEN_REGULAR_ONLY: establish the type BEFORE opening for
+     * data, not after.  Opening a FIFO for data blocks until a peer appears,
+     * and a device can have side effects of its own, so the open that would
+     * tell us what this is must not be the open we are trying to gate.  O_PATH
+     * resolves without any of that.
+     *
+     * Two opens on this backend, then -- the same two the caller used to make
+     * for itself.  What changes is that they are one VFS operation and the
+     * answer is the module's, rather than a stat the caller took separately and
+     * then acted on. */
+    if (request->open_fh.flags & CHIMERA_VFS_OPEN_REGULAR_ONLY) {
+        int probe_fd = linux_open_by_handle(&thread->mount_table,
+                                            request->fh,
+                                            request->fh_len,
+                                            O_PATH | O_NOFOLLOW);
+
+        if (probe_fd < 0) {
+            request->status = chimera_linux_handle_open_status(errno);
+            request->complete(request);
+            return;
+        }
+
+        if (fstat(probe_fd, &st) != 0) {
+            request->status = chimera_linux_errno_to_status(errno);
+            close(probe_fd);
+            request->complete(request);
+            return;
+        }
+
+        close(probe_fd);
+
+        if (!S_ISREG(st.st_mode)) {
+            request->status = chimera_vfs_nonreg_error(st.st_mode);
+            request->complete(request);
+            return;
+        }
+    }
+
+
     fd = linux_open_by_handle(&thread->mount_table,
                               request->fh,
                               request->fh_len,
@@ -953,6 +992,22 @@ chimera_linux_open_at(
                            errno == EROFS)) {
                 fd = openat(parent_fd, fullname, O_PATH | O_NOFOLLOW, 0);
             }
+            reopened = 1;
+        } else if (errno == EEXIST && chimera_linux_leaf_is_symlink(
+                       parent_fd, fullname, request->open_at.flags)) {
+            /* The name is a symbolic link and this open follows it.  Do NOT
+             * let the host kernel do that: the link body is a path in the
+             * EXPORT's namespace, and an absolute one ("/d") resolves from
+             * the HOST's root instead -- which answers for a file outside the
+             * export, or ENOENT where resolution inside it would have found
+             * the target (or looped).  Hand the link itself back, O_PATH so
+             * no data access is taken on it, and the engine resolves the
+             * target within the export exactly as it does for memfs.
+             *
+             * Caught by the posix model: open("/a", O_CREAT) on a chain
+             * /a -> /d -> /d owes ELOOP and the passthrough answered ENOENT,
+             * which is the host root talking. */
+            fd       = openat(parent_fd, fullname, O_PATH | O_NOFOLLOW, 0);
             reopened = 1;
         } else if (errno == EEXIST) {
             /* The object exists: re-open WITHOUT O_CREAT.  Semantically
@@ -2893,7 +2948,7 @@ SYMBOL_EXPORT struct chimera_vfs_module vfs_linux = {
     .sdk_version  = CHIMERA_VFS_SDK_VERSION,
     .name         = "linux",
     .fh_magic     = CHIMERA_VFS_FH_MAGIC_LINUX,
-    .capabilities = CHIMERA_VFS_CAP_BLOCKING | CHIMERA_VFS_CAP_OPEN_PATH_REQUIRED | CHIMERA_VFS_CAP_OPEN_FILE_REQUIRED |
+    .capabilities = CHIMERA_VFS_CAP_BLOCKING | CHIMERA_VFS_CAP_OPEN_PATH_REQUIRED |
         CHIMERA_VFS_CAP_FS | CHIMERA_VFS_CAP_FS_RELATIVE_OP | CHIMERA_VFS_CAP_FS_PATH_OP |
         CHIMERA_VFS_CAP_CLAIM_RANGE | CHIMERA_VFS_CAP_RPL |
         CHIMERA_VFS_CAP_COPY_RANGE | CHIMERA_VFS_CAP_CLONE_RANGE |
