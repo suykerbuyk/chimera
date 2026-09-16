@@ -681,6 +681,44 @@ snfs_open_fh(
 
     flags = snfs_set_open_flags(request->open_fh.flags);
 
+    /* CHIMERA_VFS_OPEN_REGULAR_ONLY: establish the type BEFORE opening for
+     * data, not after.  Opening a FIFO for data blocks until a peer appears,
+     * and a device can have side effects of its own, so the open that would
+     * tell us what this is must not be the open we are trying to gate.  O_PATH
+     * resolves without any of that.
+     *
+     * Two opens on this backend, then -- the same two the caller used to make
+     * for itself.  What changes is that they are one VFS operation and the
+     * answer is the module's, rather than a stat the caller took separately and
+     * then acted on. */
+    if (request->open_fh.flags & CHIMERA_VFS_OPEN_REGULAR_ONLY) {
+        probe_fd = snfs_open_by_handle(&thread->mount_table,
+                                       request->fh,
+                                       request->fh_len,
+                                       O_PATH | O_NOFOLLOW);
+
+        if (probe_fd < 0) {
+            request->status = snfs_errno_to_status(errno);
+            request->complete(request);
+            return;
+        }
+
+        if (fstat(probe_fd, &st) != 0) {
+            request->status = snfs_errno_to_status(errno);
+            close(probe_fd);
+            request->complete(request);
+            return;
+        }
+
+        close(probe_fd);
+
+        if (!S_ISREG(st.st_mode)) {
+            request->status = chimera_vfs_nonreg_error(st.st_mode);
+            request->complete(request);
+            return;
+        }
+    }
+
     fd = snfs_open_by_handle(&thread->mount_table,
                              request->fh,
                              request->fh_len,
@@ -2290,7 +2328,7 @@ SYMBOL_EXPORT struct chimera_vfs_module vfs_snfs = {
     .sdk_version  = CHIMERA_VFS_SDK_VERSION,
     .name         = "snfs",
     .fh_magic     = CHIMERA_VFS_FH_MAGIC_SNFS,
-    .capabilities = CHIMERA_VFS_CAP_BLOCKING | CHIMERA_VFS_CAP_OPEN_PATH_REQUIRED | CHIMERA_VFS_CAP_OPEN_FILE_REQUIRED |
+    .capabilities = CHIMERA_VFS_CAP_BLOCKING | CHIMERA_VFS_CAP_OPEN_PATH_REQUIRED |
         CHIMERA_VFS_CAP_FS | CHIMERA_VFS_CAP_FS_RELATIVE_OP | CHIMERA_VFS_CAP_FS_PATH_OP |
         CHIMERA_VFS_CAP_CLAIM_RANGE |
         CHIMERA_VFS_CAP_COPY_RANGE | CHIMERA_VFS_CAP_CLONE_RANGE
