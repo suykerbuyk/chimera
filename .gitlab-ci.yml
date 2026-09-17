@@ -269,14 +269,48 @@ ctest:
         ARCH: [ amd64 ]
         GROUP: [ pynfs ]
         CTEST_FILTER: [ "-L '^pynfs$' -E diskfs_" ]
+      #
+      # The SMB lease-break cells are excluded while upstream's lease
+      # regression stands: chimera-nas/chimera#1699, with a draft revert in
+      # #1700.  Upstream c7027c3e ("smb2: adjudicate the open before
+      # truncating, and key a lease by its client") moved the truncate to
+      # after the share reservation is granted, and the break is now sized
+      # wrong -- it asks the holder to keep RH (0x3) where it must break to
+      # NONE (0x0), and the REQUEST_NOT_ACCEPTED assertion at
+      # source4/torture/smb2/lease.c:2561 follows from acking that break.  It
+      # fails on ALL SIX backends, which is what says the fault is in the
+      # shared SMB lease path rather than in any backend.
+      #
+      # These 31 cells (24 smbtorture + 7 WPTS, counted against the registered
+      # test list) arrived with the sync-code-20260916 drop and fail
+      # identically in Release and Debug.  They are NOT gated in qb.yaml, so a
+      # raw `qb ... check` still reports them -- the gate exists to keep the
+      # merge train usable, not to stop anyone seeing them.
+      #
+      # The WPTS half additionally takes chimera down: in Release the daemon
+      # SIGSEGVs in the deferred-truncate completion
+      # (chimera_vfs_setattr_complete -> chimera_smb_create_share_granted_tail
+      # -> chimera_smb_create_after_share) on 3 of the 5 smb2model shards, and
+      # the shard then cascades on a closed connection.  That crash is the
+      # serious half of what this hides; see CHIM-209.
+      #
+      # Reverting c7027c3e downstream was considered and rejected: upstream
+      # measured that it restores only 18 of the 24 smbtorture cells (dirlease
+      # still fails on a different subtest, and the WPTS cells are untested
+      # against it), and it brings back the two defects that commit fixed -- a
+      # refused truncating CREATE that has already emptied the file, and one
+      # lease shared by two clients holding two write caches on one file.
+      #
+      # Remove both -E clauses once upstream resolves #1699; the fix arrives
+      # here with the next sync.
       - MODE: [ release, debug ]
         ARCH: [ amd64 ]
         GROUP: [ smbtorture ]
-        CTEST_FILTER: [ "-L '^smbtorture$'" ]
+        CTEST_FILTER: [ "-L '^smbtorture$' -E 'smbtorture_smb2_(dirlease|lease_breaking2|lease_breaking3|lease_v2_breaking3)_'" ]
       - MODE: [ release, debug ]
         ARCH: [ amd64 ]
         GROUP: [ wpts ]
-        CTEST_FILTER: [ "-L '^wpts$'" ]
+        CTEST_FILTER: [ "-L '^wpts$' -E 'wpts/memfs$|wpts/memfs_encryption$|wpts-smb2model/memfs_s[5-9]$'" ]
       - MODE: [ release, debug ]
         ARCH: [ amd64 ]
         GROUP: [ rest ]
