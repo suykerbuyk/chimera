@@ -2130,7 +2130,12 @@ cairn_apply_attrs(
 
     attr->va_set_mask = CHIMERA_VFS_ATTR_ATOMIC;
 
-    if (set_mask & CHIMERA_VFS_ATTR_MODE) {
+    /* A symbolic link's permission bits are fixed at 0777 and cannot be
+     * changed: Linux has no lchmod(), so a server over a real filesystem
+     * cannot honour this either, and honouring it here would make an ACCESS
+     * or GETATTR of the same link answer differently per backend.  The mask
+     * is not echoed back, so the caller sees that nothing was applied. */
+    if ((set_mask & CHIMERA_VFS_ATTR_MODE) && !S_ISLNK(inode->mode)) {
         attr->va_set_mask |= CHIMERA_VFS_ATTR_MODE;
         inode->mode        = (inode->mode & S_IFMT) | (attr->va_mode & ~S_IFMT);
     }
@@ -3764,6 +3769,18 @@ cairn_open_fh(
         return;
     }
 
+    /* CHIMERA_VFS_OPEN_REGULAR_ONLY: this open is about to carry data.  Checked
+     * before the refcount, so a refused open takes nothing. */
+    if ((request->open_fh.flags & CHIMERA_VFS_OPEN_REGULAR_ONLY) &&
+        !S_ISREG(inode->mode)) {
+        enum chimera_vfs_error e = chimera_vfs_nonreg_error(inode->mode);
+
+        cairn_inode_handle_release(&ih);
+        request->status = e;
+        request->complete(request);
+        return;
+    }
+
     inode->refcnt++;
 
     request->open_fh.r_vfs_private = (uint64_t) inode->inum;
@@ -3855,6 +3872,23 @@ cairn_open_at(
         return;
     }
 
+    /* POSIX path resolution (XBD 4.13): search (EXECUTE) permission on the
+     * parent is what allows a name to be RESOLVED at all, so it is owed before
+     * the directory is examined -- otherwise an existing entry's presence and
+     * type leak to a caller who may not search the directory (chimera #1771).
+     * The create branch below adds WRITE_DATA on top for a fresh name.
+     * AUTH_ATTR (SMB/Windows) callers are authorized by the engine and bypass
+     * traverse checking by default. */
+    if (request->cred->flavor == CHIMERA_VFS_AUTH_UNIX &&
+        request->cred->uid != 0 &&
+        !cairn_inode_access(thread, parent_inode, request->cred,
+                            CHIMERA_ACE_EXECUTE)) {
+        cairn_inode_handle_release(&parent_ih);
+        request->status = CHIMERA_VFS_EACCES;
+        request->complete(request);
+        return;
+    }
+
     cairn_map_attrs(fs, &request->open_at.r_dir_pre_attr, parent_inode);
 
     dirent_key.keytype = CAIRN_KEY_DIRENT;
@@ -3871,17 +3905,17 @@ cairn_open_at(
             return;
         }
 
-        /* Creating a new file requires add-file (WRITE_DATA) + search (EXECUTE)
-         * permission on the parent directory.  On the NFSv4/Windows ACL model
-         * WRITE_DATA == ADD_FILE and APPEND_DATA == ADD_SUBDIRECTORY, so a plain
-         * file create is gated by WRITE_DATA (mkdir is gated by APPEND_DATA in
-         * the VFS-core mkdir_at path).  Enforce POSIX semantics for AUTH_UNIX
-         * callers (root is exempt); SMB/ACL (AUTH_ATTR) callers are authorized
-         * by the engine. */
+        /* Creating a new file requires add-file (WRITE_DATA) permission on the
+        * parent directory, on top of the search permission already required
+        * above.  On the NFSv4/Windows ACL model WRITE_DATA == ADD_FILE and
+        * APPEND_DATA == ADD_SUBDIRECTORY, so a plain file create is gated by
+        * WRITE_DATA (mkdir is gated by APPEND_DATA in the VFS-core mkdir_at
+        * path).  Enforce POSIX semantics for AUTH_UNIX callers (root is
+        * exempt); SMB/ACL (AUTH_ATTR) callers are authorized by the engine. */
         if (request->cred->flavor == CHIMERA_VFS_AUTH_UNIX &&
             request->cred->uid != 0 &&
             !cairn_inode_access(thread, parent_inode, request->cred,
-                                CHIMERA_ACE_WRITE_DATA | CHIMERA_ACE_EXECUTE)) {
+                                CHIMERA_ACE_WRITE_DATA)) {
             cairn_inode_handle_release(&parent_ih);
             request->status = CHIMERA_VFS_EACCES;
             request->complete(request);
@@ -3981,9 +4015,15 @@ cairn_open_at(
          * must yield a regular file, so an existing non-regular object is not
          * opened -- a directory gives EISDIR, any other type EEXIST.  Answered
          * from the inode metadata, no data open. */
-        if ((flags & CHIMERA_VFS_OPEN_CREATE_REGULAR) && !S_ISREG(inode->mode)) {
-            enum chimera_vfs_error e = S_ISDIR(inode->mode) ?
-                CHIMERA_VFS_EISDIR : CHIMERA_VFS_EEXIST;
+        if (((flags & CHIMERA_VFS_OPEN_CREATE_REGULAR) ||
+             (flags & CHIMERA_VFS_OPEN_REGULAR_ONLY)) && !S_ISREG(inode->mode)) {
+            /* CHIMERA_VFS_OPEN_REGULAR_ONLY says what the object is, because
+             * the operation does not apply to it; CREATE_REGULAR says the name
+             * is taken.  Both from inode metadata, no data open. */
+            enum chimera_vfs_error e = (flags & CHIMERA_VFS_OPEN_REGULAR_ONLY) ?
+                chimera_vfs_nonreg_error(inode->mode) :
+                (S_ISDIR(inode->mode) ? CHIMERA_VFS_EISDIR :
+                 CHIMERA_VFS_EEXIST);
             cairn_inode_handle_release(&parent_ih);
             cairn_inode_handle_release(&child_ih);
             request->status = e;
@@ -4027,11 +4067,10 @@ cairn_open_at(
         inode->space_used = 0;
     }
 
-    if (flags & CHIMERA_VFS_OPEN_INFERRED) {
-        /* If this is an inferred open (ie an NFS3 create)
-         * then we aren't returning a handle so we don't need
-         * to increment the refcnt */
-
+    if (!chimera_vfs_open_handle_retained(flags,
+                                          request->module->capabilities)) {
+        /* The VFS will not keep this handle, so there is nothing for a
+         * refcount to hold open and nothing that will ever be closed. */
         request->open_at.r_vfs_private = 0xdeadbeefUL;
 
     } else {
@@ -4865,10 +4904,17 @@ cairn_symlink_at(
     new_inode.refcnt = 1;       /* open reference (see cairn_open_at); without it
                                  * unlink underflows the count and leaks the inode */
     new_inode.rdev   = 0;
-    new_inode.mode   = S_IFLNK | 0755;
-    new_inode.atime  = now;
-    new_inode.mtime  = now;
-    new_inode.ctime  = now;
+    /* A symbolic link's permission bits are not a portable observable.  POSIX
+    * leaves them unspecified, and Linux fixes every symlink at 0777 and
+    * silently discards whatever mode a creator asks for -- so a passthrough
+    * backend CANNOT honour one.  Honouring it here only split the in-engine
+    * backends from the passthrough ones and made the model describe half of
+    * them (an NFSv4 ACCESS then granted EXECUTE on one backend and not the
+    * other for the same link).  Match Linux: always 0777, request ignored. */
+    new_inode.mode  = S_IFLNK | 0777;
+    new_inode.atime = now;
+    new_inode.mtime = now;
+    new_inode.ctime = now;
     new_inode.change++;
     new_inode.btime          = now;
     new_inode.dos_attributes = 0;

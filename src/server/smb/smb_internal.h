@@ -680,6 +680,26 @@ struct chimera_smb_request {
             uint8_t                            gen_held_granted;
             uint8_t                            gen_held_denied;
             uint8_t                            gen_parked;
+            /* Whether this open may PARK on a conflicting batch-oplock break.
+             * Only the regular-file path (open_at_callback) may: the mkdir /
+             * stream / pipe paths resolve a BREAKING conflict straight to
+             * SHARING_VIOLATION.  Separate from gen_finish_cb, which every path
+             * that can defer its tail now sets. */
+            uint8_t                            gen_may_park;
+            /* Deferred content replacement (MS-FSA 2.1.5.1.2: an open is
+             * adjudicated BEFORE the file is modified, so a refused CREATE must
+             * leave it untouched).  A truncating disposition therefore does NOT
+             * carry CHIMERA_VFS_OPEN_TRUNCATE into the VFS open; trunc_deferred
+             * records that the replacement is still owed, and it is issued from
+             * chimera_smb_create_issue_truncate once the share reservation is
+             * granted -- while the transient write grant taken for the conflict
+             * check is still held, and before chimera_smb_create_finish_share_
+             * grant shrinks it away.  gen_truncating marks that setattr in
+             * flight, so the open's caller knows the tail has been deferred
+             * exactly as gen_parked does for a break park. */
+            uint8_t                            trunc_deferred;
+            uint8_t                            gen_truncating;
+            struct chimera_vfs_attrs           trunc_attr;
             /* Set by chimera_smb_create_gen_open_file_normal when the share
              * conflict it could not resolve is against a durable holder that will
              * park+yield shortly: an enum chimera_smb_durable_yield value telling
@@ -1030,7 +1050,7 @@ struct chimera_smb_request {
             struct chimera_smb_open_file   *open_file;
             /* Security descriptor built in the getattr callback and emitted by
              * the reply builder (SMB2_INFO_SECURITY). */
-            uint8_t                         sec_buf[2048];
+            uint8_t                         sec_buf[4096];
             uint32_t                        sec_buf_len;
             /* When the SD references identities not yet in the cache, the
              * getattr'd owner/group/mode + ACL are copied here so the SD can be
@@ -1043,6 +1063,10 @@ struct chimera_smb_request {
             int                             sd_pending;
             uint8_t                         sd_acl_storage[sizeof(struct chimera_acl) +
                                                            64 * sizeof(struct chimera_ace)];
+            /* The stored native owner / group SIDs, copied out with the rest
+             * (len 0 = none stored). */
+            struct chimera_sid              sd_owner_sid;
+            struct chimera_sid              sd_group_sid;
             /* FileStreamInformation: the packed VFS list_streams records are
              * held here from the list_streams callback until the reply builder
              * emits them as MS-FSCC FILE_STREAM_INFORMATION entries.
@@ -1111,7 +1135,7 @@ struct chimera_smb_request {
              * wave (which races the rename and must deny it). */
             uint8_t                            recall_final;
             /* Security descriptor buffer for SMB2_INFO_SECURITY */
-            uint8_t                            sec_buf[2048];
+            uint8_t                            sec_buf[4096];
             uint32_t                           sec_buf_len;
             /* Outstanding async identity resolves before the SD is decoded for
              * the final time (fan-out join guard). */
@@ -1120,6 +1144,11 @@ struct chimera_smb_request {
              * security descriptor; vfs_attrs.va_acl points here. */
             uint8_t                            acl_storage[sizeof(struct chimera_acl) +
                                                            64 * sizeof(struct chimera_ace)];
+            /* Native owner / group SIDs decoded from the descriptor when they
+             * resolved through the identity authority; vfs_attrs.va_owner_sid
+             * / va_group_sid point here so the backend stores them. */
+            struct chimera_sid                 owner_sid;
+            struct chimera_sid                 group_sid;
             /* FILE_FULL_EA_INFORMATION set: the client's EA buffer is captured
              * in parse (malloc'd, freed at completion) and applied one EA at a
              * time in an async set_xattr/remove_xattr loop.  ea_list holds the
@@ -1941,6 +1970,10 @@ struct chimera_smb_lease_break_msg {
     uint8_t                             fh_len;
     uint64_t                            fh_hash;
     uint8_t                             lease_key[16];
+    /* The lease's owning client (the grant owner's client_key).  A LeaseKey
+     * names a lease only within one client (MS-SMB2 3.3.5.9.8), so the
+     * delivery marker below must match on both. */
+    uint64_t                            lease_client_key;
     uint8_t                             current_state;
     uint8_t                             new_state;
     bool                                ack_required;

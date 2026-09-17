@@ -28,7 +28,7 @@ struct chimera_vfs_request;
  * chimera_vfs_register() refuses a module built against a different
  * version, so a stale out-of-tree binary fails loudly at load time
  * instead of corrupting memory. */
-#define CHIMERA_VFS_SDK_VERSION             2
+#define CHIMERA_VFS_SDK_VERSION            2
 
 /* If set, module requires open handles for path operations
  * such as mkdir, remove, open_at, etc.  Equivalent to POSIX open
@@ -37,17 +37,49 @@ struct chimera_vfs_request;
  * If not set, VFS may create synthetic open handles that
  * only contain the file handle w/o an explicit open callout
  * to the module for stateless operation (ie NFS3).
- */
-#define CHIMERA_VFS_CAP_OPEN_PATH_REQUIRED  (1U << 0)
-
-/* If set, module requires open handles for file operations
- * and for setattr on directories.
  *
- * If not set, VFS may create synthetic open handles that
- * only contain the file handle w/o an explicit open callout
- * to the module for stateless operation (ie NFS3).
+ * SET THIS ONLY IF THE HANDLE CARRIES THE ADDRESSING.  The question is not
+ * whether the module has something useful to do at open time -- it is whether
+ * a later operation can still find the object without having opened it.  A
+ * module whose ops work from the file handle can always find it and does not
+ * need this, however much per-open state it would like to keep; state that
+ * only data operations consume is what a data open (always real) is for.
+ * The modules that do need it are the ones where the open produces the only
+ * thing that names the object afterwards: an O_PATH descriptor for the *at()
+ * families (linux, io_uring), or the interning of a path id against the path
+ * it resolved from (smb, which has no fh-relative ops at all).
  */
-#define CHIMERA_VFS_CAP_OPEN_FILE_REQUIRED  (1U << 1)
+#define CHIMERA_VFS_CAP_OPEN_PATH_REQUIRED (1U << 0)
+
+/*
+ * Will the VFS keep the handle this open produces, and close it later?
+ *
+ * A module that holds per-open state -- a refcount on an inode, a descriptor --
+ * has to take it exactly when the answer is yes, or it leaks what is never
+ * closed and poisons what is.  The core asks the same question to decide
+ * whether to cache the handle or synthesize one, so both ask it here rather
+ * than each spelling out a rule the other could drift from.
+ */
+static inline int
+chimera_vfs_open_handle_retained(
+    unsigned int flags,
+    uint64_t     capabilities)
+{
+    /* A data open is a capability and is always real. */
+    if (!(flags & CHIMERA_VFS_OPEN_PATH)) {
+        return 1;
+    }
+
+    if (capabilities & CHIMERA_VFS_CAP_OPEN_PATH_REQUIRED) {
+        return 1;
+    }
+
+    /* An inferred path open is a name, and the file handle is already that. */
+    return !(flags & CHIMERA_VFS_OPEN_INFERRED);
+} /* chimera_vfs_open_handle_retained */
+
+/* (1U << 1) was CHIMERA_VFS_CAP_OPEN_FILE_REQUIRED.  A data open is now always
+ * a real open: see the note on CHIMERA_VFS_CAP_OPEN_PATH_REQUIRED. */
 
 /* If set, dispatch function is synchronous/blocking
  * and chimera will delegate VFS requests to a separate
@@ -292,6 +324,19 @@ struct chimera_vfs_handle_state {
 * Application Data Block -- writing a repeated pattern across a run of blocks --
 * via chimera_vfs_write_same.  Modules that leave this unset surface ENOTSUP. */
 #define CHIMERA_VFS_CAP_WRITE_SAME            (1U << 28)
+
+/* If set, the module cannot derive a new object's POSIX group from its parent
+ * directory, so the engine must name it.  Every create on such a backend
+ * arrives as one authenticated identity (the mount session) and the caller's
+ * owner is stamped on afterwards, which loses the set-group-ID inheritance
+ * POSIX gives a file created in a set-group-ID directory -- the backend never
+ * sees the parent's mode, and the server it talks to sees only the mount
+ * identity.  The create wrappers fetch the parent's attrs for such a module
+ * even when DAC gating would be skipped, and fill the group in (see
+ * chimera_vfs_create_inherit_gid).  An engine backend, a passthrough whose
+ * kernel applies the rule, and a proxy whose server applies it all leave this
+ * unset. */
+#define CHIMERA_VFS_CAP_CREATE_GID_ENGINE     (1U << 30)
 
 struct chimera_vfs_module {
     /* Required

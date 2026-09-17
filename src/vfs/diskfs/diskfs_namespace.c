@@ -1755,6 +1755,15 @@ diskfs_open_fh_inode_cb(
         return;
     }
 
+    /* CHIMERA_VFS_OPEN_REGULAR_ONLY: this open is about to carry data, so
+     * refuse a type it does not apply to and say which.  Before the reference,
+     * so a refused open takes nothing. */
+    if ((request->open_fh.flags & CHIMERA_VFS_OPEN_REGULAR_ONLY) &&
+        !S_ISREG(inode->mode)) {
+        diskfs_op_fail(request, p->txn, chimera_vfs_nonreg_error(inode->mode));
+        return;
+    }
+
     diskfs_inode_ref_get(p->thread, inode);
 
     request->open_fh.r_vfs_private = (uint64_t) inode;
@@ -1794,7 +1803,7 @@ diskfs_open_at_finish(
     struct diskfs_request_private *p      = request->plugin_data;
     struct diskfs_thread          *thread = p->thread;
 
-    /* diskfs is CAP_OPEN_FILE_REQUIRED: every open (inferred or not) yields a
+    /* every open (inferred or not) yields a
      * cached handle matched by a diskfs_close, so always pin the inode and stash
      * the real pointer in vfs_private.  read/write reuse it (and close releases
      * the pin); there is no throwaway/synthetic open_at for this backend. */
@@ -1845,6 +1854,14 @@ diskfs_open_at_existing_cb(
         diskfs_op_fail(request, p->txn,
                        S_ISDIR(inode->mode) ? CHIMERA_VFS_EISDIR
                        : CHIMERA_VFS_EEXIST);
+        return;
+    }
+
+    /* CHIMERA_VFS_OPEN_REGULAR_ONLY: this open is about to carry data, so
+     * refuse a type it does not apply to and say which.  From inode metadata. */
+    if ((request->open_at.flags & CHIMERA_VFS_OPEN_REGULAR_ONLY) &&
+        !S_ISREG(inode->mode)) {
+        diskfs_op_fail(request, p->txn, chimera_vfs_nonreg_error(inode->mode));
         return;
     }
 
@@ -2014,23 +2031,38 @@ diskfs_open_at_check_cb(
 
     diskfs_bt_op_free(thread, op);
 
+    /* POSIX path resolution (XBD 4.13): search (EXECUTE) permission on the
+     * parent is what allows a name to be RESOLVED at all, so it is owed before
+     * anything about the directory's contents is disclosed -- otherwise an
+     * existing entry's presence and type leak to a caller who may not search
+     * the directory (chimera #1771).  The create branch below adds WRITE_DATA
+     * on top for a fresh name.  AUTH_ATTR (SMB/Windows) callers are authorized
+     * by the engine and bypass traverse checking by default. */
+    if (request->cred->flavor == CHIMERA_VFS_AUTH_UNIX &&
+        request->cred->uid != 0 &&
+        !diskfs_inode_access(thread, p->inode_stash[0], request->cred,
+                             CHIMERA_ACE_EXECUTE)) {
+        diskfs_op_fail(request, p->txn, CHIMERA_VFS_EACCES);
+        return;
+    }
+
     if (result < 0) {
         if (!(flags & CHIMERA_VFS_OPEN_CREATE)) {
             diskfs_op_fail(request, p->txn, CHIMERA_VFS_ENOENT);
             return;
         }
 
-        /* Creating a new file requires add-file (WRITE_DATA) + search (EXECUTE)
-         * permission on the parent directory.  On the NFSv4/Windows ACL model
-         * WRITE_DATA == ADD_FILE and APPEND_DATA == ADD_SUBDIRECTORY, so a plain
-         * file create is gated by WRITE_DATA (mkdir is gated by APPEND_DATA in
-         * the VFS-core mkdir_at path).  Enforce POSIX semantics for AUTH_UNIX
-         * callers (root is exempt); SMB/ACL (AUTH_ATTR) callers are authorized
-         * by the engine. */
+        /* Creating a new file requires add-file (WRITE_DATA) permission on the
+        * parent directory, on top of the search permission already required
+        * above.  On the NFSv4/Windows ACL model WRITE_DATA == ADD_FILE and
+        * APPEND_DATA == ADD_SUBDIRECTORY, so a plain file create is gated by
+        * WRITE_DATA (mkdir is gated by APPEND_DATA in the VFS-core mkdir_at
+        * path).  Enforce POSIX semantics for AUTH_UNIX callers (root is
+        * exempt); SMB/ACL (AUTH_ATTR) callers are authorized by the engine. */
         if (request->cred->flavor == CHIMERA_VFS_AUTH_UNIX &&
             request->cred->uid != 0 &&
             !diskfs_inode_access(thread, p->inode_stash[0], request->cred,
-                                 CHIMERA_ACE_WRITE_DATA | CHIMERA_ACE_EXECUTE)) {
+                                 CHIMERA_ACE_WRITE_DATA)) {
             diskfs_op_fail(request, p->txn, CHIMERA_VFS_EACCES);
             return;
         }
@@ -2363,8 +2395,15 @@ diskfs_symlink_at_alloc_cb(
     /* POSIX: a set-group-ID parent directory forces the new node's group. */
     inode->gid = (parent->mode & S_ISGID) ?
         parent->gid : request->cred->gid;
-    inode->nlink      = 1;
-    inode->mode       = S_IFLNK | 0755;
+    inode->nlink = 1;
+    /* A symbolic link's permission bits are not a portable observable.  POSIX
+    * leaves them unspecified, and Linux fixes every symlink at 0777 and
+    * silently discards whatever mode a creator asks for -- so a passthrough
+    * backend CANNOT honour one.  Honouring it here only split the in-engine
+    * backends from the passthrough ones and made the model describe half of
+    * them (an NFSv4 ACCESS then granted EXECUTE on one backend and not the
+    * other for the same link).  Match Linux: always 0777, request ignored. */
+    inode->mode       = S_IFLNK | 0777;
     inode->atime_sec  = now.tv_sec;
     inode->atime_nsec = now.tv_nsec;
     inode->mtime_sec  = now.tv_sec;

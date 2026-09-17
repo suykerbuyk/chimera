@@ -1284,10 +1284,77 @@ sm_ag_add_claim_locked(
     c->len      = len;
     c->refcount = 0;
     c->retiring = 0;
+    c->bump     = SM_CLAIM_PACK(0, len);   /* nothing spoken for yet */
     c->next     = ag->claims;
     ag->claims  = c;
     return c;
 } /* sm_ag_add_claim_locked */
+
+/*
+ * Recall: hand back the part of every claim in this AG that its owner has not
+ * actually allocated from.  Called when a grab found no claim-free window, i.e.
+ * the AG reports free space that is all sitting inside other threads' bump
+ * reservations -- the state in which statfs says megabytes are free and a
+ * request for one block returns ENOSPC.
+ *
+ * A claim's tail was never removed from the free tree (claims only stop a
+ * concurrent grab from re-handing the region), so nothing is returned to the
+ * allocator here; lowering `len` is enough to make [cursor, old_end) visible to
+ * sm_ag_try_claim_locked again.
+ *
+ * Owners run lock-free and are not asked to participate, so the handshake is
+ * one-sided: observe the cursor, lower `end`, then look again in case the owner
+ * bumped in between -- if it did, concede that much back.  Conceding keeps the
+ * rule that a recaller only ever frees from a cursor it has observed, which is
+ * the half of the argument in space_map_bump_alloc that lets the owner's
+ * re-read decide the race.  Being conservative here costs a little unreclaimed
+ * tail, never correctness.
+ *
+ * The caller never owns a claim here: the only route in is
+ * space_map_reservation_ensure, which releases its own reservation before
+ * refilling.  So this only ever trims other threads' claims, and a thread
+ * cannot recall space out from under itself mid-bump.
+ *
+ * Caller holds ag->lock.  Returns the number of bytes made claim-free -- a
+ * "did anything move" signal for the retry, not an accounting change: the tail
+ * was already in the free tree and already counted in ag->free_bytes.
+ */
+static uint64_t
+sm_ag_recall_claims_locked(struct sm_ag *ag)
+{
+    struct sm_claim *c;
+    uint64_t         reclaimed = 0;
+
+    for (c = ag->claims; c; c = c->next) {
+        uint64_t w, nw;
+        uint32_t cur, lim;
+
+        w = __atomic_load_n(&c->bump, __ATOMIC_ACQUIRE);
+
+        for (;;) {
+            cur = SM_CLAIM_CUR(w);
+            lim = SM_CLAIM_END(w);
+
+            if (cur >= lim) {
+                break;      /* fully consumed; nothing to take back */
+            }
+
+            /* Lower the limit to the cursor.  Same word the owner bumps, so
+             * this either wins outright or fails because the owner just
+             * allocated -- in which case we re-read and take back only what is
+             * left above its new cursor. */
+            nw = SM_CLAIM_PACK(cur, cur);
+
+            if (__atomic_compare_exchange_n(&c->bump, &w, nw, 0,
+                                            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+                c->len     = cur;
+                reclaimed += lim - cur;
+                break;
+            }
+        }
+    }
+    return reclaimed;
+} /* sm_ag_recall_claims_locked */
 
 /* Unlink and free a claim from the AG.  Caller holds ag->lock. */
 static void
@@ -1318,6 +1385,15 @@ sm_ag_next_claim_base_locked(
     uint64_t         best = UINT64_MAX;
 
     for (c = ag->claims; c; c = c->next) {
+        /* A claim recalled down to nothing (sm_ag_recall_claims_locked trims to
+         * the owner's cursor, which may be its base) reserves no region, so it
+         * must not act as a barrier here.  It also does not overlap anything,
+         * so the caller's overlap scan skips it -- leaving it in this scan
+         * would cap a grant at the empty claim's base and hand back a
+         * zero-length reservation. */
+        if (c->len == 0) {
+            continue;
+        }
         if (c->base >= from && c->base < best) {
             best = c->base;
         }
@@ -1397,6 +1473,14 @@ sm_ag_try_claim_locked(
                     len = cap - s;
                     if (len > chunk) {
                         len = chunk;
+                    }
+                    if (len < want) {
+                        /* [s, s+want) was claim-free, so the next real claim
+                         * starts at or above s+want and this cannot trip; keep
+                         * it as a guard so a future barrier bug degrades into a
+                         * missed grant rather than a zero-length reservation
+                         * that callers read as success. */
+                        break;
                     }
                     *out_base  = s;
                     *out_len   = len;
@@ -1485,7 +1569,6 @@ space_map_reserve_chunk(
                         r->ag_index  = ai;
                         r->base      = base;
                         r->len       = len;
-                        r->cursor    = base;
                         r->claim     = claim;
                         r->valid     = 1;
                         return 0;
@@ -1527,7 +1610,6 @@ space_map_reserve_chunk(
                 r->ag_index  = ai;
                 r->base      = base;
                 r->len       = len;
-                r->cursor    = base;
                 r->claim     = claim;
                 r->valid     = 1;
                 return 0;
@@ -1535,6 +1617,53 @@ space_map_reserve_chunk(
             pthread_mutex_unlock(&ag->lock);
         }
     }
+
+    /*
+     * Nothing anywhere.  Before reporting ENOSPC, recall: the free space may be
+     * real but parked inside other threads' bump reservations, which is the
+     * difference between a full pool and one that merely looks full from here.
+     * This runs only on the path that was about to fail, so the common grab
+     * never pays for it.
+     *
+     * Retry per AG immediately after recalling it, rather than recalling
+     * everything first: the point is to take back as little as will serve the
+     * request, so a thread that is about to keep allocating does not lose its
+     * whole reservation to a request one block could have satisfied.
+     */
+    for (d = 0; d < sm->num_devices; d++) {
+        uint32_t          dev_id = (start_dev + d) % sm->num_devices;
+        struct sm_device *dev    = &sm->devices[dev_id];
+        uint32_t          a;
+
+        if (dev->role != role) {
+            continue;
+        }
+
+        for (a = 0; a < dev->num_ags; a++) {
+            struct sm_ag    *ag = &dev->ags[a];
+            uint64_t         base, len;
+            struct sm_claim *claim;
+
+            pthread_mutex_lock(&ag->lock);
+            if (sm_ag_recall_claims_locked(ag) == 0) {
+                pthread_mutex_unlock(&ag->lock);
+                continue;       /* nothing was being held here */
+            }
+            if (sm_ag_try_claim_locked(ag, want, chunk, &base, &len,
+                                       &claim) == 0) {
+                pthread_mutex_unlock(&ag->lock);
+                r->device_id = dev_id;
+                r->ag_index  = a;
+                r->base      = base;
+                r->len       = len;
+                r->claim     = claim;
+                r->valid     = 1;
+                return 0;
+            }
+            pthread_mutex_unlock(&ag->lock);
+        }
+    }
+
     return -1;      /* ENOSPC */
 } /* space_map_reserve_chunk */
 
@@ -1553,13 +1682,47 @@ space_map_bump_alloc(
     uint32_t                *r_device_id,
     uint64_t                *r_device_offset)
 {
+    uint64_t w, nw;
+    uint32_t cur, lim;
+
     need = SM_ALIGN_UP(need);
 
-    if (!r->valid || r->cursor + need > r->base + r->len) {
+    if (!r->valid) {
         return 1;       /* exhausted -- caller refills */
     }
+
+    /*
+     * Bump against the claim's shared bump word rather than a thread-local
+     * cursor, so a recaller can take back whatever this claim has not spoken
+     * for.  Cursor and limit share one word (see struct sm_claim), so this and
+     * sm_ag_recall_claims_locked contend on a single compare-and-swap: if a
+     * recall lands between our read and our CAS, the CAS fails, we re-read and
+     * see the lowered limit.  There is no window in which both sides believe
+     * they won, and so no way for the same region to be handed out twice.
+     */
+    w = __atomic_load_n(&r->claim->bump, __ATOMIC_ACQUIRE);
+
+    for (;;) {
+        cur = SM_CLAIM_CUR(w);
+        lim = SM_CLAIM_END(w);
+
+        /* 64-bit math: `need` is caller-supplied and may exceed what is left
+         * (or even the AG), so the sum must not wrap the 32-bit halves. */
+        if ((uint64_t) cur + need > (uint64_t) lim) {
+            return 1;   /* exhausted, or recalled out from under us */
+        }
+
+        nw = SM_CLAIM_PACK((uint64_t) cur + need, lim);
+
+        if (__atomic_compare_exchange_n(&r->claim->bump, &w, nw, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            break;      /* the region [cur, cur+need) is ours alone */
+        }
+        /* CAS reloaded w with the current value; retry against it. */
+    }
+
     *r_device_id     = r->device_id;
-    *r_device_offset = r->cursor;
+    *r_device_offset = r->claim->base + cur;
 
     /* Pin the claim: it must outlive this allocation's retire (when
     * space_map_alloc_apply decrements), so a re-grant of the region can't race
@@ -1572,9 +1735,8 @@ space_map_bump_alloc(
      * tree stays == committed state and condense can't leak the tail. */
     if (jnl && jnl->record_delta) {
         jnl->record_delta(jnl->user, r->device_id, r->ag_index,
-                          r->cursor, need, SM_AG_LOG_OP_ALLOC);
+                          r->claim->base + cur, need, SM_AG_LOG_OP_ALLOC);
     }
-    r->cursor += need;
     return 0;
 } /* space_map_bump_alloc */
 
@@ -1629,8 +1791,15 @@ space_map_reservation_ensure(
 {
     want = SM_ALIGN_UP(want);
 
-    if (r->valid && r->cursor + want <= r->base + r->len) {
-        return 0;
+    /* Consult the claim's live cursor/end, not the grant size: a recall may
+     * have lowered `end` since, in which case this reservation can no longer
+     * cover `want` and has to be re-grabbed. */
+    if (r->valid) {
+        uint64_t w = __atomic_load_n(&r->claim->bump, __ATOMIC_ACQUIRE);
+
+        if ((uint64_t) SM_CLAIM_CUR(w) + want <= (uint64_t) SM_CLAIM_END(w)) {
+            return 0;
+        }
     }
     space_map_release_reservation(sm, r);       /* retire the old claim (if any) */
     return space_map_reserve_chunk(sm, r, role, want, chunk, seed);
@@ -1653,17 +1822,45 @@ space_map_reservation_alloc(
     uint32_t                *r_device_id,
     uint64_t                *r_device_offset)
 {
-    if (space_map_bump_alloc(r, jnl, need, r_device_id, r_device_offset) == 0) {
-        return 0;
+    int attempt;
+
+    /*
+     * Loop rather than "grab once, then it must satisfy".  That used to hold:
+     * a reservation was private to its thread, so a chunk grabbed for `need`
+     * could only be consumed by the caller about to consume it.  Recall breaks
+     * it -- a freshly grabbed claim has its cursor at its base, so every byte
+     * of it reads as unspoken-for, and a recall on another thread can take the
+     * whole thing back in the window between the grab and this thread's first
+     * bump.
+     *
+     * Returning -1 there would be a *spurious* ENOSPC, reported while the pool
+     * has room, and that is far worse than a retry: the caller fails the
+     * operation mid-flight, and an allocation failure part-way through (say a
+     * multi-extent fallocate) has to unwind b+tree state that the abort does
+     * not revert.  diskfs_enospc_test's comment spells out where that ends --
+     * "the file then references space the allocator believes is free, which the
+     * next allocation can hand to somebody else and which double-frees the pool
+     * when the file is deleted".
+     *
+     * So only a grab that genuinely finds no space (ensure != 0, after its own
+     * recall pass) is ENOSPC.  Losing the race is retried.  The bound keeps a
+     * pathological recall storm from spinning here forever; reaching it means
+     * every attempt was beaten, which is indistinguishable from out of space
+     * from the caller's point of view.
+     */
+    for (attempt = 0; attempt < SM_RESERVATION_GRAB_RETRIES; attempt++) {
+        if (space_map_bump_alloc(r, jnl, need, r_device_id, r_device_offset) == 0) {
+            return 0;
+        }
+
+        /* Exhausted, or recalled out from under us: retire the old claim and
+         * grab a fresh chunk. */
+        if (space_map_reservation_ensure(sm, r, role, need, chunk, seed) != 0) {
+            return -1;      /* genuinely out of space */
+        }
     }
-    /* Exhausted: retire the old claim, grab a fresh chunk, retry once. */
-    if (space_map_reservation_ensure(sm, r, role, need, chunk, seed) != 0) {
-        return -1;
-    }
-    if (space_map_bump_alloc(r, jnl, need, r_device_id, r_device_offset) != 0) {
-        return -1;      /* a freshly-grabbed chunk >= need must satisfy */
-    }
-    return 0;
+
+    return -1;
 } /* space_map_reservation_alloc */
 
 /*

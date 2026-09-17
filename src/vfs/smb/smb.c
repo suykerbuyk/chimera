@@ -1335,9 +1335,16 @@ SYMBOL_EXPORT struct chimera_vfs_module vfs_smb = {
     .name        = "smb",
     .fh_magic    = CHIMERA_VFS_FH_MAGIC_SMB,
     /* Path-only backend: full mount-relative paths, opaque per-open handle
-     * tokens, no FH-relative ops (no CAP_FS_RELATIVE_OP). */
+     * tokens, no FH-relative ops (no CAP_FS_RELATIVE_OP).
+     *
+     * OPEN_PATH_REQUIRED is structural here, not an optimization: a file
+     * handle is only a path id, and it is the open that interns the id
+     * against the path it was resolved from.  With no fh-relative addressing
+     * to fall back on, a synthesized path handle names nothing a later
+     * operation can re-derive a path from. */
     .capabilities   = CHIMERA_VFS_CAP_FS | CHIMERA_VFS_CAP_FS_PATH_OP |
-        CHIMERA_VFS_CAP_OPEN_FILE_REQUIRED,
+        CHIMERA_VFS_CAP_OPEN_PATH_REQUIRED |
+        CHIMERA_VFS_CAP_CREATE_GID_ENGINE,
     .init           = chimera_smb_client_init,
     .destroy        = chimera_smb_client_destroy,
     .thread_init    = chimera_smb_client_thread_init,

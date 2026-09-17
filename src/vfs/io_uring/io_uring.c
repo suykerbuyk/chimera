@@ -598,6 +598,20 @@ chimera_io_uring_reap(
                             sqe = chimera_io_uring_get_sqe(thread, request, 3, 0);
                             io_uring_prep_openat(sqe, parent_fd, name,
                                                  O_PATH | O_NOFOLLOW, 0);
+                        } else if (chimera_linux_leaf_is_symlink(
+                                       parent_fd, name,
+                                       request->open_at.flags)) {
+                            /* A symbolic link this open follows: hand the
+                             * link back rather than letting the host kernel
+                             * follow it, which resolves an absolute body from
+                             * the HOST's root and so answers for something
+                             * outside the export.  See
+                             * chimera_linux_leaf_is_symlink(); the statx
+                             * below already reports the link's own attrs, so
+                             * the engine takes it from here. */
+                            sqe = chimera_io_uring_get_sqe(thread, request, 3, 0);
+                            io_uring_prep_openat(sqe, parent_fd, name,
+                                                 O_PATH | O_NOFOLLOW, 0);
                         } else {
                             /* Re-open without O_CREAT|O_EXCL (the base flags
                              * still carry O_TRUNC for OVERWRITE_IF/SUPERSEDE).
@@ -1650,10 +1664,50 @@ chimera_io_uring_open_fh(
     void                       *private_data)
 {
     struct chimera_io_uring_thread *thread = private_data;
-    int                             flags  = 0;
+    struct stat                     st;
+    int                             flags = 0;
     int                             fd;
 
     --thread->inflight;
+
+    /* CHIMERA_VFS_OPEN_REGULAR_ONLY: establish the type BEFORE opening for
+     * data, not after.  Opening a FIFO for data blocks until a peer appears,
+     * and a device can have side effects of its own, so the open that would
+     * tell us what this is must not be the open we are trying to gate.  O_PATH
+     * resolves without any of that.
+     *
+     * Two opens on this backend, then -- the same two the caller used to make
+     * for itself.  What changes is that they are one VFS operation and the
+     * answer is the module's, rather than a stat the caller took separately and
+     * then acted on. */
+    if (request->open_fh.flags & CHIMERA_VFS_OPEN_REGULAR_ONLY) {
+        int probe_fd = linux_open_by_handle(&thread->mount_table,
+                                            request->fh,
+                                            request->fh_len,
+                                            O_PATH | O_NOFOLLOW);
+
+        if (probe_fd < 0) {
+            request->status = chimera_linux_handle_open_status(errno);
+            request->complete(request);
+            return;
+        }
+
+        if (fstat(probe_fd, &st) != 0) {
+            request->status = chimera_linux_errno_to_status(errno);
+            close(probe_fd);
+            request->complete(request);
+            return;
+        }
+
+        close(probe_fd);
+
+        if (!S_ISREG(st.st_mode)) {
+            request->status = chimera_vfs_nonreg_error(st.st_mode);
+            request->complete(request);
+            return;
+        }
+    }
+
 
 
     if (request->open_fh.flags & CHIMERA_VFS_OPEN_PATH) {
@@ -3572,7 +3626,7 @@ SYMBOL_EXPORT struct chimera_vfs_module vfs_io_uring = {
     .sdk_version  = CHIMERA_VFS_SDK_VERSION,
     .name         = "io_uring",
     .fh_magic     = CHIMERA_VFS_FH_MAGIC_IO_URING,
-    .capabilities = CHIMERA_VFS_CAP_OPEN_PATH_REQUIRED | CHIMERA_VFS_CAP_OPEN_FILE_REQUIRED | CHIMERA_VFS_CAP_FS |
+    .capabilities = CHIMERA_VFS_CAP_OPEN_PATH_REQUIRED | CHIMERA_VFS_CAP_FS |
         CHIMERA_VFS_CAP_FS_RELATIVE_OP | CHIMERA_VFS_CAP_FS_PATH_OP | CHIMERA_VFS_CAP_CLAIM_RANGE |
         CHIMERA_VFS_CAP_COPY_RANGE | CHIMERA_VFS_CAP_CLONE_RANGE |
         CHIMERA_VFS_CAP_DELEGATES_DAC | CHIMERA_VFS_CAP_XATTR,

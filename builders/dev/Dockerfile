@@ -163,36 +163,40 @@ RUN if [ "$ENABLE_WPTS" = "1" ] ; then \
 # Quantum specific addons
 #
 
-# quint drives the model-based tests.  Two suites need the binary in this
-# image, for different reasons:
+# quint drives the model-based tests.  Since upstream adb54a5c the whole
+# trace corpus is GENERATED at build time -- cmake/Specs.cmake hands each
+# quint suite's configs to ext/specs' generator, and there is no prebuilt
+# bundle to fetch any more -- so without quint (and the node it ships with)
+# on PATH, cmake disables every MBT replay ctest with a STATUS line and no
+# leg reports anything missing.  The same was always true of the two models
+# no bundle ever covered: src/vfs/diskfs/tests/quint, which lives in this
+# repo, and the control-plane model under src/server/rest/tests/quint.  The
+# ctest_quint_* legs in qb.yaml are what runs the replays; they configure
+# with REQUIRE_CTL_MBT and REQUIRE_DISKFS_MBT so a quint that goes missing
+# from this image is a configure error there rather than a quietly smaller
+# suite.
 #
-#   - ext/specs generates the ITF trace corpus from its models, and
-#     cmake/SpecsBundle.cmake falls back to that local build whenever the
-#     prebuilt bundle is not fetched.  The ctest_quint_* legs fetch the
-#     bundle, so quint is their backstop rather than their normal path.
-#   - src/vfs/diskfs/tests/quint holds its model IN THIS REPO rather than in
-#     ext/specs, so no bundle can ever supply its corpus: without quint on
-#     PATH, chimera/vfs/diskfs/mbt/batch is skipped with a STATUS message
-#     and no leg reports anything missing.  The same is true of the
-#     control-plane model under src/server/rest/tests/quint.
+# quint was omitted from this image while the upstream batch replayer wedged
+# (trace stepFds_128_0x1_2 preceding another trace left the reset's umount
+# waiting on a VFS close that never completed), because it would have
+# re-registered the replays that qb.yaml was suppressing by hiding oras.
+# That hang is fixed and the ctest_quint_* legs have run the replays since
+# 2026-09-01.  The legs that must not pay for the replays twice (the extended
+# ctest legs, static analysis, smbtorture, kvm) turn the corpus off with
+# -DCHIMERA_MBT_CORPUS=OFF instead, which quint cannot defeat, so the two no
+# longer interact.
 #
-# This was omitted while the upstream batch replayer wedged (trace
-# stepFds_128_0x1_2 preceding another trace left the reset's umount waiting
-# on a VFS close that never completed), because quint's local provider would
-# have re-registered the replays that qb.yaml was suppressing by hiding
-# oras.  That hang is fixed: the ctest_quint_* legs have kept oras on PATH
-# and run the replays since 2026-09-01.  qb.yaml now suppresses the corpus
-# in the extended legs with -DSPECS_BUNDLE=NONE instead, which quint cannot
-# defeat, so the two no longer interact.
-#
-# quint downloads its Rust evaluator on first run, into ~/.quint.  Cluster
-# pods reach the network through internal mirrors only, so that download
-# arrives truncated and every generation fails.  Warm the cache here, where
-# the network is available and the result is baked into the image.  Double
-# quotes, so quint's prime operator (n') needs no escaping: inside single
-# quotes a backslash is literal and would end the string early.  The closing
-# ls is the check -- if the evaluator did not land, fail here where it is
-# fixable rather than in every downstream build job.
+# Generation defaults to quint's TypeScript backend (SPECS_QUINT_BACKEND in
+# ext/specs/cmake/SpecsCorpus.cmake), which needs nothing beyond the npm
+# install.  The Rust evaluator is still warmed below for a build that selects
+# SPECS_QUINT_BACKEND=rust: quint downloads it on first run, into ~/.quint,
+# and cluster pods reach the network through internal mirrors only, so that
+# download arrives truncated and every generation fails.  Warm the cache
+# here, where the network is available and the result is baked into the
+# image.  Double quotes, so quint's prime operator (n') needs no escaping:
+# inside single quotes a backslash is literal and would end the string early.
+# The closing ls is the check -- if the evaluator did not land, fail here
+# where it is fixable rather than in every downstream build job.
 RUN npm install -g @informalsystems/quint@${QUINT_VERSION} && \
     printf "module warm {\n  var n: int\n  action init = n' = 0\n  action step = n' = n + 1\n}\n" \
         > /tmp/warm.qnt && \
