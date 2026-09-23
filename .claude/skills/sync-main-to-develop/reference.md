@@ -90,16 +90,29 @@ head -5 /tmp/chimera-stage/opt/quantum/chimera/include/chimera/oteltracing.h
 ```
 
 Expect 19 SDK headers (18 plus `vfs_access.h`, which joined in the
-2026-09-16 sync -- recount when upstream adds one) plus the three external
-ones, and `#define OTEL_TRACING 0`. Then compile a probe that includes only
-`"vfs/sdk/chimera_vfs_sdk.h"` with `-I<stage>/include/chimera -I<stage>/include`.
+2026-09-16 sync; still 19 at the 2026-09-23 sync -- recount when upstream
+adds one) plus the three external ones, and `#define OTEL_TRACING 0`. Then
+compile a probe that includes only `"vfs/sdk/chimera_vfs_sdk.h"` with
+`-I<stage>/include/chimera -I<stage>/include`, and run
+`qtm_build/verify_test_includes.sh <stage>/<prefix>` for the test package's
+caller-side headers.
 
 Restore `-DCMAKE_INSTALL_PREFIX=/usr/local` afterwards — it is baked into
-`CHIMERA_STATE_DIR` and changing it forces a rebuild.
+`CHIMERA_STATE_DIR` and changing it forces a rebuild.  When no install rule
+changed this cycle (`git diff <last-tag>..origin/main -- '*CMakeLists.txt'
+'cmake/*' | grep '^[+-].*install('` is empty), skip the prefix switch and
+stage the tree already built: `sudo env DESTDIR=<stage> cmake --install
+/build/Release`.  The layout under `include/` does not depend on the prefix,
+and both rebuilds are avoided.
 
-Out-of-tree consumers (myriad) must track layout changes here; the module ABI
-is unversioned, so a stale module against a new server fails at runtime, not
-at build.
+Out-of-tree consumers (myriad) must track layout changes here.  The only
+runtime guard is `CHIMERA_VFS_SDK_VERSION`, checked at registration, and
+upstream does not bump it for every layout change: at the 2026-09-23 sync
+`struct chimera_vfs_request` gained pNFS fields mid-struct and
+`CHIMERA_VFS_GATE_SCRATCH_SIZE` went 400 -> 704 with the version still 2.
+Diff `src/vfs/sdk/vfs_request.h` every sync and say in the merge message
+when modules must be rebuilt; a stale module passes the gate and then reads
+a skewed request.
 
 ### quint and the MBT corpus
 
@@ -129,6 +142,24 @@ no `cmake/SpecsBundle.cmake`, no `oras` fetch. What that means downstream:
 The batch-replayer hang that once justified hiding oras (trace
 `stepFds_128_0x1_2` wedging the reset's umount) is fixed; it is history, not
 a constraint.
+
+### Commits carried ahead of upstream
+
+develop sometimes cherry-picks commits from open upstream PRs (CHIM-209
+carried seven, from #1697 and #1698).  When upstream later merges them, the
+pre-flight lists their files as conflict candidates.  Compare
+`git show <sha> | git patch-id --stable` for each carried commit against its
+upstream counterpart before merging: if every pair matches, the merge takes
+upstream's later work cleanly, and afterwards
+`git diff sync-code-<new> -- <file>` should be empty for each file only
+those commits touched on develop.  A pair that differs means upstream
+reshaped the PR; resolve toward upstream's version.
+
+Carried branches for open Jira work go stale the same way.  At the
+2026-09-23 sync the CHIM-211 fix and probes arrived upstream in a later
+form (691121b1, 227fccdd, 1dd8a5ed, 1048c466), leaving that branch
+nothing to merge.  Check open topic branches against the merged tree the
+same way before anyone merges one into develop on top of the sync.
 
 ### Upstream merges are gated on the quick tier only
 
@@ -177,6 +208,28 @@ smbtorture dup_extents on linux, KVM nfstest_alloc on diskfs, two analyzer
 findings); all but the KVM one were fixed as upstream-bound commits, the
 KVM one gated in `.gitlab-ci.yml` with the reason beside it.
 
+### Static analysis covers chimera, not the submodules
+
+Upstream's analyzer jobs skip `ext/` (`analyze_cached.py --exclude ext/`,
+TUs only) and analyze Release only; the qb `static_analysis_*` legs run
+scan-build in both modes.  Until the 2026-09-23 sync they also analysed
+`ext/`, and the new libevpl pin's first finding (an unchecked `fopen()` in
+`src/core/pread/tests/shutdown_close.c`) failed all four legs while every
+upstream job stayed green.  They now pass `--exclude /context/ext/` on the
+ninja step (qb.yaml has the why).  A leg that fails with a report under
+`src/` is ours; one Debug-only is a thing upstream cannot see, so fix it
+upstream-first rather than suppressing it.
+
+**Reproducing a leg locally: disable ccache.** The top-level CMakeLists
+wraps every compile in ccache when it is installed (the devcontainer has
+it, chimera-dev does not), and ccache wraps `ccc-analyzer` too.  A cache hit
+replays the analyzer's warning on stderr but never writes the HTML report
+scan-build counts, so a warm cache prints the finding *and* reports "No
+bugs found", rc=0.  Run local scan-build as `sudo env LC_ALL=C
+CCACHE_DISABLE=1 scan-build ...`, and treat any local "0 bugs" produced
+without it as unproven.  To re-check one TU cheaply, `touch` it and re-run
+`scan-build ... ninja` in the already-configured tree.
+
 ### Verifying with qb: the builder image is not rebuilt by default
 
 Every `ctest_*`, `syntax` and `static_analysis_*` leg declares
@@ -192,6 +245,15 @@ qb -o arenaud-claude --plain -a amd64 \
 
 The `check` alias lists `chimera-dev` first, so a full
 `qb -o arenaud-claude --plain check` already rebuilds it.
+
+**Keep the tree clean for the whole run, not just the launch.** qb packs
+each task's context when that task *starts*, and the ctest, syntax and
+static-analysis legs only start once chimera-dev is built, minutes in.  An
+edit made after launching lands in those legs, marks their
+`QB_BUILD_GIT_SHA` `-dirty`, and means the legs no longer test one tree.
+Stage follow-up edits outside the repo until every run_container task has
+logged `Executing` (tasks with an identical context reuse one pack, so not
+each logs its own `Packed context` line).
 
 ### snfs lag
 
@@ -216,6 +278,24 @@ have to move when upstream moves them:
   aborts a module without it (`vfs.c`), which no build leg sees -- snfs
   lacked the stamp from the 2026-08-28 SDK commit until the 2026-09-07 sync.
   Keep it whenever the module struct is touched.
+- **The capability word.** Upstream adds opt-in `CHIMERA_VFS_CAP_*` bits,
+  declares them on linux, and derives protocol behaviour from them; snfs
+  keeps the old word and nothing conflicts or fails to build.  At the
+  2026-09-23 sync e417751a made the SMB server derive
+  FileFsAttributeInformation from the capabilities, and the new
+  `CHIMERA_VFS_CAP_SPARSE` would have silently withdrawn
+  FILE_SUPPORTS_SPARSE_FILES from every snfs share.  `sync-report.sh post`
+  now fails on any bit linux declares that snfs does not, except the three
+  it lacks by design (RPL, XATTR, DELEGATES_DAC; reasons in the script).
+  For a new bit, check snfs implements what the bit stands for before
+  declaring it -- declaring DELEGATES_DAC unverified, for one, would turn
+  off the VFS access gate for snfs.
+
+Not every linux.c change is snfs's business on a sync.  At the 2026-09-23
+sync two were left for a behavioural-catch-up ticket: the O_WRONLY mapping
+for write-only opens (a9652f75; snfs_set_open_flags does not even
+distinguish READ_ONLY|WRITE_ONLY yet) and the ATTR_FH echo in getattr
+(0efe7bee).
 
 ## Merge commit message
 

@@ -54,6 +54,22 @@ target_link_libraries(nfs3_mbt_probe
     chimera_server chimera_nfs_common chimera_metrics jansson)
 mbt_add_krb5(nfs3_mbt_probe)
 
+add_executable(nfs_pnfs_io_probe nfs_pnfs_io_probe.c)
+target_include_directories(nfs_pnfs_io_probe PRIVATE ${CMAKE_BINARY_DIR}/src/nfs_common)
+target_link_libraries(nfs_pnfs_io_probe chimera_server chimera_nfs_common chimera_metrics jansson)
+mbt_add_krb5(nfs_pnfs_io_probe)
+foreach(backend memfs diskfs cairn)
+    if(backend STREQUAL "cairn" AND NOT CAIRN_ENABLED)
+        continue()
+    endif()
+    foreach(topology local remote)
+        add_test(NAME chimera/server/nfs/pnfs/io_${backend}_${topology}
+            COMMAND $<TARGET_FILE:nfs_pnfs_io_probe> ${backend} ${topology})
+        set_tests_properties(chimera/server/nfs/pnfs/io_${backend}_${topology} PROPERTIES
+            LABELS "quint;nfs3_mbt;pnfs;${backend}" TIMEOUT 90)
+    endforeach()
+endforeach()
+
 add_executable(nfs4_deleg_probe nfs4_deleg_probe.c)
 target_include_directories(nfs4_deleg_probe PRIVATE
     ${CMAKE_BINARY_DIR}/src/nfs_common)
@@ -67,6 +83,13 @@ target_include_directories(nfs4_named_attr_probe PRIVATE
 target_link_libraries(nfs4_named_attr_probe
     chimera_server chimera_nfs_common chimera_metrics jansson)
 mbt_add_krb5(nfs4_named_attr_probe)
+
+add_executable(nfs4_open_access_probe nfs4_open_access_probe.c)
+target_include_directories(nfs4_open_access_probe PRIVATE
+    ${CMAKE_BINARY_DIR}/src/nfs_common)
+target_link_libraries(nfs4_open_access_probe
+    chimera_server chimera_nfs_common chimera_metrics jansson)
+mbt_add_krb5(nfs4_open_access_probe)
 
 add_executable(nfs_aux_probe nfs_aux_probe.c)
 target_include_directories(nfs_aux_probe PRIVATE
@@ -208,6 +231,21 @@ foreach(dback memfs diskfs cairn linux io_uring)
         LABELS "quint;nfsdrc_mbt;${dback}"
         SKIP_RETURN_CODE 77
         TIMEOUT 120)
+
+    # Same probe, but with the idle close sweep set to retire a cached handle
+    # the instant it goes unreferenced (min_age 0, sweep every 10 ms).  That
+    # is the worst case the merge queue hit under load: a removed-but-held
+    # object's handle-cache pin is reclaimed between the op that cached it and
+    # the next op on its handle.  Running it deterministically here keeps the
+    # removed-but-held answers (STALE-or-model, per check_status_or_stale)
+    # honest in the quick tier instead of only flaking in CI.
+    add_test(NAME chimera/server/nfs/mbtdrc/probe_${dback}_reclaim_race
+        COMMAND $<TARGET_FILE:nfs_drc_probe> ${_drc_probe_args})
+    set_tests_properties(chimera/server/nfs/mbtdrc/probe_${dback}_reclaim_race PROPERTIES
+        ENVIRONMENT "CHIMERA_MBT_ARTIFACTS=nfsdrc_probe_${dback}_reclaim_race;CHIMERA_CLOSE_SWEEP_MIN_AGE_MS=0;CHIMERA_CLOSE_SWEEP_INTERVAL_MS=10"
+        LABELS "quint;nfsdrc_mbt;${dback}"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 120)
 endforeach()
 
 # Delegation policy probe: pins the deterministic grant/recall behavior the
@@ -228,6 +266,19 @@ add_test(NAME chimera/server/nfs/mbt4/named_attr_probe_memfs
     COMMAND $<TARGET_FILE:nfs4_named_attr_probe>)
 set_tests_properties(chimera/server/nfs/mbt4/named_attr_probe_memfs PROPERTIES
     ENVIRONMENT "CHIMERA_MBT_ARTIFACTS=nfs4_named_attr_probe_memfs"
+    LABELS "quint;nfs4_mbt;multiproto;memfs"
+    TIMEOUT 90)
+# OPEN authorization probe: pins the status of the OPEN operation itself for a
+# non-root caller.  A kernel NFS client defers write-open authorization to the
+# server entirely, so that status is the only check in the path -- and nothing
+# else in the tree asserts it.  The pjd ports reach the server through chimera's
+# own POSIX client, which gates the open a second time on the client side, and
+# the trace corpora run every operation as uid 0, which the gate exempts.
+# Needs no corpus.
+add_test(NAME chimera/server/nfs/mbt4/open_access_probe_memfs
+    COMMAND $<TARGET_FILE:nfs4_open_access_probe>)
+set_tests_properties(chimera/server/nfs/mbt4/open_access_probe_memfs PROPERTIES
+    ENVIRONMENT "CHIMERA_MBT_ARTIFACTS=nfs4_open_access_probe_memfs"
     LABELS "quint;nfs4_mbt;multiproto;memfs"
     TIMEOUT 90)
 # ---------------------------------------------------------------------------

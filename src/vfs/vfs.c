@@ -50,21 +50,14 @@ SYMBOL_EXPORT struct chimera_vfs_clock chimera_vfs_clock;
 SYMBOL_EXPORT void
 chimera_vfs_clock_init(void)
 {
-    struct timespec ts;
-
     if (chimera_vfs_clock.initialized) {
         return; /* process-global singleton; first vfs wins */
     }
 
     stopwatch_context_init(&chimera_vfs_clock.ctx);
 
-    clock_gettime(CLOCK_REALTIME, &ts);
-    chimera_vfs_clock.base_wall_ns = (uint64_t) ts.tv_sec * 1000000000ULL + (uint64_t) ts.tv_nsec;
     stopwatch_start(&chimera_vfs_clock.ctx, &chimera_vfs_clock.base_sw);
-    chimera_vfs_clock.delta_ns         = 0;
-    chimera_vfs_clock.last_refresh     = 0;
-    chimera_vfs_clock.refresh_interval = chimera_vfs_ns_to_ticks(1000000000ULL); /* ~1s */
-    chimera_vfs_clock.initialized      = 1;
+    chimera_vfs_clock.initialized = 1;
 } /* chimera_vfs_clock_init */
 
 SYMBOL_EXPORT void
@@ -215,6 +208,10 @@ chimera_vfs_close_thread_sweep(
     return count;
 } /* chimera_vfs_close_thread_sweep */
 
+static uint64_t
+chimera_vfs_close_sweep_min_age_ns(
+    void);
+
 static void
 chimera_vfs_close_thread_wake_shutdown(
     struct evpl          *evpl,
@@ -224,7 +221,7 @@ chimera_vfs_close_thread_wake_shutdown(
     int                              shutdown     = close_thread->shutdown;
     uint64_t                         min_age, count;
 
-    min_age = shutdown ? 0 : 100000000UL;
+    min_age = shutdown ? 0 : chimera_vfs_close_sweep_min_age_ns();
 
     /* Sweep OUTSIDE close_thread->lock.  A close can re-enter this thread's
      * event loop -- diskfs commit drains its submission queue with a nested
@@ -261,6 +258,33 @@ chimera_vfs_close_thread_wake_shutdown(
 
 } /* chimera_vfs_close_thread_wake_shutdown */
 
+/* Idle age a cached-but-unreferenced open handle must reach before the sweep
+ * closes it.  Default 100 ms; overridable via CHIMERA_CLOSE_SWEEP_MIN_AGE_MS
+ * so tests can drive the removed-but-held reclaim deterministically (0 =
+ * reclaim on the very next sweep). */
+static uint64_t
+chimera_vfs_close_sweep_min_age_ns(void)
+{
+    static uint64_t cached_ns = UINT64_MAX;
+
+    if (cached_ns != UINT64_MAX) {
+        return cached_ns;
+    }
+
+    const char     *env = getenv("CHIMERA_CLOSE_SWEEP_MIN_AGE_MS");
+    if (env && *env) {
+        char              *endp = NULL;
+        unsigned long long ms   = strtoull(env, &endp, 10);
+        if (endp && endp != env && *endp == '\0' && ms <= 60000) {
+            cached_ns = (uint64_t) ms * 1000000ULL;
+            return cached_ns;
+        }
+    }
+
+    cached_ns = 100000000UL;
+    return cached_ns;
+} /* chimera_vfs_close_sweep_min_age_ns */
+
 static void
 chimera_vfs_close_thread_wake_timer(
     struct evpl       *evpl,
@@ -269,7 +293,7 @@ chimera_vfs_close_thread_wake_timer(
     struct chimera_vfs_close_thread *close_thread = container_of(timer, struct chimera_vfs_close_thread, timer);
     uint64_t                         min_age;
 
-    min_age = 100000000UL;
+    min_age = chimera_vfs_close_sweep_min_age_ns();
 
     /* No lock: the periodic sweep touches only this thread's state (num_pending)
      * and the open caches (guarded by their own per-shard locks).  Holding
@@ -1387,6 +1411,30 @@ chimera_vfs_remove_user(
     return chimera_vfs_user_cache_remove(vfs->vfs_user_cache, username);
 } /* chimera_vfs_remove_user */
 
+/* Register a group the identity authority is to know natively: the SID it
+ * carries is what gid_to_sid answers with (NULL leaves the group indexed by
+ * gid only, exactly as an NSS-resolved group is).  Mirrors chimera_vfs_add_user
+ * for the group half of a session's identity. */
+SYMBOL_EXPORT int
+chimera_vfs_add_group(
+    struct chimera_vfs *vfs,
+    const char         *groupname,
+    const char         *sid,
+    uint32_t            gid,
+    int                 pinned)
+{
+    return chimera_vfs_group_cache_add(vfs->vfs_user_cache, groupname, sid,
+                                       gid, pinned);
+} /* chimera_vfs_add_group */
+
+SYMBOL_EXPORT int
+chimera_vfs_remove_group(
+    struct chimera_vfs *vfs,
+    const char         *groupname)
+{
+    return chimera_vfs_group_cache_remove(vfs->vfs_user_cache, groupname);
+} /* chimera_vfs_remove_group */
+
 SYMBOL_EXPORT const struct chimera_vfs_user *
 chimera_vfs_lookup_user_by_name(
     struct chimera_vfs *vfs,
@@ -1515,3 +1563,28 @@ chimera_vfs_iterate_builtin_users(
 {
     chimera_vfs_user_cache_iterate_builtin(vfs->vfs_user_cache, callback, data);
 } /* chimera_vfs_iterate_builtin_users */
+
+SYMBOL_EXPORT void
+chimera_vfs_request_evict_cached_fh(
+    struct chimera_vfs_request *request,
+    const void                 *fh,
+    int                         fh_len)
+{
+    struct chimera_vfs_thread *thread = request->thread;
+
+    chimera_vfs_open_cache_evict(thread, thread->vfs->vfs_open_path_cache, fh, fh_len);
+    chimera_vfs_open_cache_evict(thread, thread->vfs->vfs_open_file_cache, fh, fh_len);
+} /* chimera_vfs_request_evict_cached_fh */
+
+SYMBOL_EXPORT void
+chimera_vfs_request_invalidate_attrs(
+    struct chimera_vfs_request *request,
+    const void                 *fh,
+    int                         fh_len)
+{
+    struct chimera_vfs_thread *thread  = request->thread;
+    struct chimera_vfs_attrs   invalid = { 0 };
+
+    chimera_vfs_attr_cache_insert(thread, thread->vfs->vfs_attr_cache,
+                                  chimera_vfs_hash(fh, fh_len), fh, fh_len, &invalid);
+} /* chimera_vfs_request_invalidate_attrs */

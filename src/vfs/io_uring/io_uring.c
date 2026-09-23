@@ -567,6 +567,23 @@ chimera_io_uring_reap(
                                                   &request->getattr.r_attr,
                                                   request->getattr.handle->vfs_private,
                                                   stx);
+
+                    /* A getattr by handle knows its own file handle: echo it
+                     * when asked (map_attrs_statx fills only stat/statfs/EA),
+                     * mirroring the linux backend and the engine backends.
+                     * Without it a caller that requests ATTR_FH on a bare
+                     * getattr -- e.g. the S3 copy ETag -- receives none. */
+                    if ((request->getattr.r_attr.va_req_mask &
+                         CHIMERA_VFS_ATTR_FH) &&
+                        request->getattr.handle->fh_len > 0) {
+                        memcpy(request->getattr.r_attr.va_fh,
+                               request->getattr.handle->fh,
+                               request->getattr.handle->fh_len);
+                        request->getattr.r_attr.va_fh_len =
+                            request->getattr.handle->fh_len;
+                        request->getattr.r_attr.va_set_mask |=
+                            CHIMERA_VFS_ATTR_FH;
+                    }
                 }
                 break;
             case CHIMERA_VFS_OP_OPEN_AT:
@@ -1721,6 +1738,9 @@ chimera_io_uring_open_fh(
         ((request->open_fh.flags & CHIMERA_VFS_OPEN_READ_ONLY) &&
          !(request->open_fh.flags & CHIMERA_VFS_OPEN_WRITE_ONLY))) {
         flags |= O_RDONLY;
+    } else if ((request->open_fh.flags & CHIMERA_VFS_OPEN_WRITE_ONLY) &&
+               !(request->open_fh.flags & CHIMERA_VFS_OPEN_READ_ONLY)) {
+        flags |= O_WRONLY;
     } else {
         flags |= O_RDWR;
     }
@@ -1790,6 +1810,9 @@ chimera_io_uring_open_at_flags(struct chimera_vfs_request *request)
                !(request->open_at.flags & CHIMERA_VFS_OPEN_WRITE_ONLY) &&
                !(request->open_at.set_attr->va_set_mask & CHIMERA_VFS_ATTR_SIZE)) {
         flags |= O_RDONLY;
+    } else if ((request->open_at.flags & CHIMERA_VFS_OPEN_WRITE_ONLY) &&
+               !(request->open_at.flags & CHIMERA_VFS_OPEN_READ_ONLY)) {
+        flags |= O_WRONLY;
     } else {
         flags |= O_RDWR;
     }
@@ -3629,7 +3652,8 @@ SYMBOL_EXPORT struct chimera_vfs_module vfs_io_uring = {
     .capabilities = CHIMERA_VFS_CAP_OPEN_PATH_REQUIRED | CHIMERA_VFS_CAP_FS |
         CHIMERA_VFS_CAP_FS_RELATIVE_OP | CHIMERA_VFS_CAP_FS_PATH_OP | CHIMERA_VFS_CAP_CLAIM_RANGE |
         CHIMERA_VFS_CAP_COPY_RANGE | CHIMERA_VFS_CAP_CLONE_RANGE |
-        CHIMERA_VFS_CAP_DELEGATES_DAC | CHIMERA_VFS_CAP_XATTR,
+        CHIMERA_VFS_CAP_DELEGATES_DAC | CHIMERA_VFS_CAP_XATTR |
+        CHIMERA_VFS_CAP_SPARSE,
     .init           = chimera_io_uring_init,
     .destroy        = chimera_io_uring_destroy,
     .thread_init    = chimera_io_uring_thread_init,

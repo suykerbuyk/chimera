@@ -3218,6 +3218,11 @@ cairn_mkdir_at(
         (request->mkdir_at.set_attr->va_set_mask & CHIMERA_VFS_ATTR_ACL)
         ? request->mkdir_at.set_attr->va_acl : NULL;
 
+    if (chimera_vfs_create_inherits_gid(request->mkdir_at.set_attr,
+                                        parent_inode->mode)) {
+        chimera_vfs_attrs_drop_group_sid(request->mkdir_at.set_attr);
+    }
+
     cairn_apply_attrs(&inode, request->mkdir_at.set_attr);
 
     cairn_inherit_acl(thread, &inode, parent_inode->inum,
@@ -3352,6 +3357,11 @@ cairn_mknod_at(
 
     if (request->mknod_at.set_attr->va_set_mask & CHIMERA_VFS_ATTR_RDEV) {
         inode.rdev = request->mknod_at.set_attr->va_rdev;
+    }
+
+    if (chimera_vfs_create_inherits_gid(request->mknod_at.set_attr,
+                                        parent_inode->mode)) {
+        chimera_vfs_attrs_drop_group_sid(request->mknod_at.set_attr);
     }
 
     cairn_apply_attrs(&inode, request->mknod_at.set_attr);
@@ -3948,6 +3958,11 @@ cairn_open_at(
         const struct chimera_acl *new_acl_open =
             (request->open_at.set_attr->va_set_mask & CHIMERA_VFS_ATTR_ACL)
             ? request->open_at.set_attr->va_acl : NULL;
+
+        if (chimera_vfs_create_inherits_gid(request->open_at.set_attr,
+                                            parent_inode->mode)) {
+            chimera_vfs_attrs_drop_group_sid(request->open_at.set_attr);
+        }
 
         cairn_apply_attrs(&new_inode, request->open_at.set_attr);
 
@@ -4628,6 +4643,11 @@ cairn_allocate(
             inode->size = new_end;
         }
     }
+
+    /* fallocate changes the file, so it sheds the set-id bits on the same
+     * rule a write does -- file_modified() -> file_remove_privs().  Same as
+     * memfs's allocate path. */
+    inode->mode = chimera_vfs_killpriv_mode(request->cred, inode->mode);
 
     inode->mtime = now;
     inode->ctime = now;
@@ -6277,7 +6297,7 @@ SYMBOL_EXPORT struct chimera_vfs_module vfs_cairn = {
         CHIMERA_VFS_CAP_ATOMIC_HANDLE_STATE |
         CHIMERA_VFS_CAP_XATTR | CHIMERA_VFS_CAP_READ_PROVIDES_BUFFERS |
         CHIMERA_VFS_CAP_CHANGE | CHIMERA_VFS_CAP_MKFS |
-        CHIMERA_VFS_CAP_LAYOUT,
+        CHIMERA_VFS_CAP_LAYOUT | CHIMERA_VFS_CAP_SPARSE,
     .init           = cairn_init,
     .destroy        = cairn_destroy,
     .thread_init    = cairn_thread_init,

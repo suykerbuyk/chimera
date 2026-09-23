@@ -54,6 +54,10 @@ Create a todo per step. Do not skip a step because the merge was clean.
    ```
    This is the step that finds what the checks miss. It has found a broken
    `snfs` include the grep-based check did not model.
+   If it stops at `Does not match the generator used previously`, the tree
+   was configured by the IDE with a different generator; do not delete the
+   cache, build it as configured: `sudo cmake -S . -B /build/Release &&
+   sudo cmake --build /build/Release -j 8`.
 
 6. **Merge commit message.** Compose it before committing; `git commit -F`.
    Format and rationale in reference.md.

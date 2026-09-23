@@ -893,7 +893,23 @@ tasks:
       - >
         scan-build --status-bugs
         cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -D IO_URING_NVME_ENABLED=OFF -D CHIMERA_MBT_CORPUS=OFF -S . -B /build
-      - scan-build --status-bugs ninja -C /build
+      # --exclude /context/ext/ on every static_analysis_* build step: the
+      # submodules are analysed in their own repos, and upstream's analyzer
+      # jobs exclude them too (--exclude ext/ to analyze_cached.py in
+      # .github/workflows/build-test.yml), so a finding there can only ever
+      # fail these legs and nothing upstream sees it.  First hit: the
+      # sync-code-20260923 libevpl pin (b0a7f4c3),
+      # src/core/pread/tests/shutdown_close.c.
+      #
+      # scan-build applies it when it collects the reports: ext/ is still
+      # compiled and analysed, and a report whose bug lies under ext/ is
+      # dropped before --status-bugs and "N bugs found" count it -- so it
+      # belongs on the ninja step, the scan-build that owns the reports.
+      # That is a report filter, where upstream's is a translation-unit
+      # filter; scan-build has no per-TU exclusion.  The one difference: a
+      # bug a chimera file reaches inside an ext/ header is dropped here and
+      # reported upstream.
+      - scan-build --status-bugs --exclude /context/ext/ ninja -C /build
     dependencies:
       builder:
         project: chimera
@@ -915,7 +931,7 @@ tasks:
         scan-build -o /scan-report
         cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -D IO_URING_NVME_ENABLED=OFF -D CHIMERA_MBT_CORPUS=OFF -S . -B /build
       - >
-        scan-build --keep-empty -o /scan-report ninja -C /build 2>&1 |
+        scan-build --keep-empty --exclude /context/ext/ -o /scan-report ninja -C /build 2>&1 |
         tee /dist/scan-build-output.txt
       - mv /scan-report/* /tmp/analysis
       - tar -C /tmp -czf /dist/report.tar.gz analysis
@@ -943,7 +959,7 @@ tasks:
       - >
         scan-build --status-bugs
         cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug -D IO_URING_NVME_ENABLED=OFF -D CHIMERA_MBT_CORPUS=OFF -S . -B /build
-      - scan-build --status-bugs ninja -C /build
+      - scan-build --status-bugs --exclude /context/ext/ ninja -C /build
     dependencies:
       builder:
         project: chimera
@@ -965,7 +981,7 @@ tasks:
         scan-build -o /scan-report
         cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug -D IO_URING_NVME_ENABLED=OFF -D CHIMERA_MBT_CORPUS=OFF -S . -B /build
       - >
-        scan-build --keep-empty -o /scan-report ninja -C /build 2>&1 |
+        scan-build --keep-empty --exclude /context/ext/ -o /scan-report ninja -C /build 2>&1 |
         tee /dist/scan-build-output.txt
       - mv /scan-report/* /tmp/analysis
       - tar -C /tmp -czf /dist/report.tar.gz analysis
