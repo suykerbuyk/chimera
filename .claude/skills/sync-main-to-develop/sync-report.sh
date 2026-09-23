@@ -71,14 +71,48 @@ post() {
         rc=1
     fi
 
+    # The per-item loops below read from process substitution, not a pipe: a
+    # `cmd | while` body runs in a subshell, so its rc=1 never reached the
+    # return and a MISSING line came with exit status 0.
+
     hr "snfs include surface vs linux"
     # Every vfs/ header snfs includes must exist.  The SDK move renamed
     # these out from under it once already and the merge said nothing.
-    grep -rho '"vfs/[a-z0-9_/]*\.h"' src/vfs/snfs/ | tr -d '"' | sort -u |
-        while read -r h; do
-            if [ -f "src/$h" ]; then printf '  ok      %s\n' "$h"
-            else printf '  MISSING %s\n' "$h"; rc=1; fi
-        done
+    while read -r h; do
+        if [ -f "src/$h" ]; then printf '  ok      %s\n' "$h"
+        else printf '  MISSING %s\n' "$h"; rc=1; fi
+    done < <(grep -rho '"vfs/[a-z0-9_/]*\.h"' src/vfs/snfs/ | tr -d '"' | sort -u)
+
+    hr "snfs declares every capability linux declares"
+    # Upstream adds opt-in CHIMERA_VFS_CAP_* bits and declares them on linux;
+    # snfs, linux's copy, keeps its old set and nothing conflicts.  The case
+    # that made this a check: CHIMERA_VFS_CAP_SPARSE (2026-09-23 sync), from
+    # which the SMB server now derives FILE_SUPPORTS_SPARSE_FILES -- without
+    # it, snfs shares would have silently stopped advertising sparse files.
+    # Linux's bits that snfs deliberately lacks, each for want of an
+    # implementation rather than a declaration:
+    #   RPL            no CHIMERA_VFS_OP_GETPARENT in snfs
+    #   XATTR          no xattr ops in snfs
+    #   DELEGATES_DAC  unset, the VFS gate enforces DAC for snfs; setting it
+    #                  unverified would fail open
+    # A bit outside this list is new: port what it stands for, or add it
+    # here with the reason.
+    local snfs_caps_absent="RPL XATTR DELEGATES_DAC"
+    module_caps() {
+        sed -n "/^SYMBOL_EXPORT struct chimera_vfs_module $1 = {/,/\.init/p" "$2" |
+            grep -o 'CHIMERA_VFS_CAP_[A-Z0-9_]*' | sort -u
+    }
+    local cap missing=0
+    while read -r cap; do
+        case " $snfs_caps_absent " in *" ${cap#CHIMERA_VFS_CAP_} "*) continue ;; esac
+        printf '  MISSING %s -- linux declares it, snfs does not\n' "$cap"
+        missing=1
+        rc=1
+    done < <(comm -23 <(module_caps vfs_linux src/vfs/linux/linux.c) \
+                      <(module_caps vfs_snfs src/vfs/snfs/snfs.c))
+    if [ "$missing" -eq 0 ]; then
+        echo "IN SYNC (deliberately absent: $snfs_caps_absent)"
+    fi
 
     hr "snfs claim-range projection is still a rename of linux.c's"
     # snfs carries linux.c's CHIMERA_VFS_CAP_CLAIM_RANGE code (registry
@@ -128,17 +162,17 @@ post() {
     # for the short one.  CMAKE_* are cmake's own and never defined in-tree.
     # Comment lines are dropped first: they are where a retired option is
     # legitimately still mentioned, as history.
-    grep -vE '^[[:space:]]*#' qb.yaml | grep -ohE -- '-D ?[A-Za-z_]+=' |
-        sed -E 's/^-D ?//; s/=$//' | sort -u | while read -r opt; do
-            case "$opt" in CMAKE_*) continue ;; esac
-            if grep -rqw --include=CMakeLists.txt --include='*.cmake' \
-                    --exclude-dir=.git -- "$opt" .; then
-                printf '  ok      %s\n' "$opt"
-            else
-                printf '  MISSING %s -- qb.yaml passes it, no CMake file names it\n' "$opt"
-                rc=1
-            fi
-        done
+    while read -r opt; do
+        case "$opt" in CMAKE_*) continue ;; esac
+        if grep -rqw --include=CMakeLists.txt --include='*.cmake' \
+                --exclude-dir=.git -- "$opt" .; then
+            printf '  ok      %s\n' "$opt"
+        else
+            printf '  MISSING %s -- qb.yaml passes it, no CMake file names it\n' "$opt"
+            rc=1
+        fi
+    done < <(grep -vE '^[[:space:]]*#' qb.yaml | grep -ohE -- '-D ?[A-Za-z_]+=' |
+                 sed -E 's/^-D ?//; s/=$//' | sort -u)
 
     hr "packaged include layout (needs a staged install first)"
     echo "sudo env DESTDIR=/tmp/chimera-stage ninja -C /build/Release install"
