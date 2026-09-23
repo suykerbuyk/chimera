@@ -21,35 +21,6 @@
 /* Cascade helpers                                                      */
 /* -------------------------------------------------------------------- */
 
-/* Only an SMB2 RqLs FILE lease cascades one bit per ack; oplocks, dir
-* leases, delegations, and the implicit claim break one-shot (R35). */
-static inline bool
-chimera_vfs_claim_cascades(const struct chimera_vfs_claim *claim)
-{
-    return claim->construct == CHIMERA_CONSTRUCT_RQLS;
-} /* chimera_vfs_claim_cascades */
-
-/* Next single-bit step toward the floor: CW first (flush), then H, then CR
- * (the most shareable, dropped last). */
-static inline uint8_t
-chimera_vfs_claim_break_step(
-    uint8_t used,
-    uint8_t floor)
-{
-    uint8_t excess = used & (uint8_t) ~floor;
-
-    if (excess & CHIMERA_CLAIM_CW) {
-        return used & (uint8_t) ~CHIMERA_CLAIM_CW;
-    }
-    if (excess & CHIMERA_CLAIM_H) {
-        return used & (uint8_t) ~CHIMERA_CLAIM_H;
-    }
-    if (excess & CHIMERA_CLAIM_CR) {
-        return used & (uint8_t) ~CHIMERA_CLAIM_CR;
-    }
-    return used & floor;
-} /* chimera_vfs_claim_break_step */
-
 /* -------------------------------------------------------------------- */
 /* begin_break / ack / revoke / park                                    */
 /* -------------------------------------------------------------------- */
@@ -87,9 +58,16 @@ chimera_vfs_claim_begin_break_ex(
         claim->break_floor &= floor;
         should_invoke       = false;
     } else {
-        step = (chimera_vfs_claim_cascades(claim) && !one_shot)
-            ? chimera_vfs_claim_break_step(claim->used, floor)
-            : (uint8_t) (claim->used & floor);
+        /* Break to the floor the triggering operation computed, in a single
+         * notification (MS-SMB2 3.3.4.7): the NewLeaseState a break carries is
+         * the caching that operation leaves valid, and a client acknowledges
+         * straight down to it.  A plain conflicting open floors at R|H (its
+         * only conflict is the write cache) and a write / truncate floors at
+         * NONE (it invalidates the read cache too); multi-step reductions come
+         * from SUCCESSIVE distinct conflicts, each breaking to its own floor,
+         * not from laddering a single break one cache bit at a time. */
+        (void) one_shot;
+        step          = (uint8_t) (claim->used & floor);
         should_invoke = (step != claim->used) && (claim->break_cb != NULL);
     }
 
@@ -164,9 +142,12 @@ chimera_vfs_claim_ack(
         claim->used       = resulting_used;
         claim->advertised = resulting_used;
 
-        step = chimera_vfs_claim_cascades(claim)
-            ? chimera_vfs_claim_break_step(resulting_used, claim->break_floor)
-            : resulting_used;
+        /* The holder acked down to resulting_used.  It settles there unless a
+         * conflict that arrived mid-break deepened break_floor below what was
+         * kept -- then re-notify to the deepened floor.  This is the same
+         * break-to-floor rule as begin_break, applied to the post-ack state;
+         * it is NOT the old per-ack cache-bit ladder. */
+        step = (uint8_t) (resulting_used & claim->break_floor);
 
         if (step != resulting_used && claim->break_cb) {
             uint32_t deadline_ms = (file && file->state)
@@ -550,7 +531,7 @@ chimera_vfs_claim_trigger_row(
     bool same_owner = actor &&
         chimera_claim_owner_equal(&victim->owner, &actor->owner);
     bool same_key = actor &&
-        chimera_claim_owner_same_lease(&victim->owner, &actor->owner);
+        chimera_claim_owner_same_key(&victim->owner, &actor->owner);
     bool same_handle = actor && actor->op_handle &&
         victim->op_handle == actor->op_handle;
 
@@ -913,7 +894,14 @@ chimera_vfs_claim_trigger_ns_full(
         if (to_break) {
             /* Cascading (not one-shot): a namespace recall fans out across
              * the retain levels its callers need (RENAME's RH->R vs
-             * UNLINK's ->NONE); rename_last depends on the cascade. */
+             * UNLINK's ->NONE); rename_last depends on the cascade.  But a
+             * recall that strips the holder's read cache (a truncating
+             * setattr -- the deferred data replacement of an OVERWRITE
+             * CREATE -- reaches this engine as a full recall to NONE)
+             * collapses to that floor in a SINGLE notification: the
+             * intermediate R|H the step would advertise carries a read cache
+             * the truncate is invalidating (smb2.lease.breaking2 expects one
+             * RWH->NONE break, not RWH->RH). */
             chimera_vfs_claim_begin_break_ex(state, to_break, 0,
                                              CHIMERA_VFS_NFS_DELEG_METAOP_MS,
                                              false);

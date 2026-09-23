@@ -726,6 +726,18 @@ main(
         chimera_server_config_set_nfs_lockmgr_port(server_config, int_value);
     }
 
+    json_value = json_object_get(server_params, "mount_port");
+    if (json_is_integer(json_value)) {
+        int_value = json_integer_value(json_value);
+        chimera_server_config_set_nfs_mount_port(server_config, int_value);
+    }
+
+    json_value = json_object_get(server_params, "portmap_port");
+    if (json_is_integer(json_value)) {
+        int_value = json_integer_value(json_value);
+        chimera_server_config_set_nfs_portmap_port(server_config, int_value);
+    }
+
     json_value = json_object_get(server_params, "nfs_port");
     if (json_is_integer(json_value)) {
         int_value = json_integer_value(json_value);
@@ -1510,10 +1522,12 @@ main(
 
             if (chimera_server_create_export(server, name, path, export_id,
                                              &opts) != 0) {
-                /* Duplicate name or unusable export_id: proceeding would mint
-                 * file handles under a different id than the operator pinned,
-                 * which breaks cluster failover in a way clients only notice
-                 * later.  Fail hard like the mount-path errors above. */
+                /* Unreachable name, duplicate name or unusable export_id.
+                 * Proceeding would serve a namespace the operator did not
+                 * configure -- an export no client can mount, or file handles
+                 * minted under a different id than was pinned, which breaks
+                 * cluster failover in a way clients only notice later.  Fail
+                 * hard like the mount-path errors above. */
                 chimera_server_error("Failed to create export '%s'", name);
                 startup_validation_fail();
             }

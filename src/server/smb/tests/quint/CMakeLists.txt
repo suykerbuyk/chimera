@@ -39,6 +39,32 @@ set_tests_properties(chimera/server/smb/mbt/smoke_probe_memfs PROPERTIES
     LABELS "quint;smb_mbt;memfs"
     TIMEOUT 60)
 
+# Hold a backend rename across TREE_DISCONNECT to exercise a completion after
+# the requesting tree has released its share.
+add_executable(smb2_rename_disconnect_probe smb2_rename_disconnect_probe.c)
+target_include_directories(smb2_rename_disconnect_probe PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(smb2_rename_disconnect_probe chimera_server chimera_metrics
+    chimera_vfs_memfs evpl)
+
+add_test(NAME chimera/server/smb/mbt/rename_disconnect_probe_memfs
+    COMMAND $<TARGET_FILE:smb2_rename_disconnect_probe>)
+set_tests_properties(chimera/server/smb/mbt/rename_disconnect_probe_memfs PROPERTIES
+    ENVIRONMENT "CHIMERA_MBT_ARTIFACTS=smb2_rename_disconnect_probe_memfs"
+    LABELS "quint;smb_mbt;memfs"
+    TIMEOUT 60)
+
+# Same object-store caching key across distinct protocol lease records.
+add_executable(smb2_lease_identity_probe smb2_lease_identity_probe.c)
+target_include_directories(smb2_lease_identity_probe PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(smb2_lease_identity_probe chimera_server chimera_metrics)
+
+add_test(NAME chimera/server/smb/mbt/lease_identity_probe_memfs
+    COMMAND $<TARGET_FILE:smb2_lease_identity_probe>)
+set_tests_properties(chimera/server/smb/mbt/lease_identity_probe_memfs PROPERTIES
+    ENVIRONMENT "CHIMERA_MBT_ARTIFACTS=smb2_lease_identity_probe_memfs"
+    LABELS "quint;smb_mbt;memfs"
+    TIMEOUT 90)
+
 # Oplock/lease ground-truth probe (Increment 1): pins chimera's grant ->
 # break -> acknowledge behavior against MS-SMB2/MS-FSA, two connections
 # (holder + conflicting opener) on one in-process server.  Findings triaged
@@ -171,6 +197,26 @@ add_test(NAME chimera/server/smb/mbt/compress_probe_memfs
     COMMAND $<TARGET_FILE:smb2_compress_probe>)
 set_tests_properties(chimera/server/smb/mbt/compress_probe_memfs PROPERTIES
     ENVIRONMENT "CHIMERA_MBT_ARTIFACTS=smb2_compress_probe_memfs"
+    LABELS "quint;smb_mbt;memfs"
+    TIMEOUT 120)
+
+# Creator-SID seeding probe: whose native owner SID a CREATE stores, and which
+# CREATEs must store none.  Every other security test runs an ANONYMOUS session
+# against a server with no identity authority, so the seeding path is dark: both
+# identity probes miss and nothing is ever stamped.  This probe registers
+# accounts that carry real SIDs, which is the only configuration where the code
+# runs at all -- and then spends most of its assertions on the negative cases (a
+# non-owner's overwrite, a stream create on another user's file, a client-named
+# owner), because a seed that fires on a path that does not create the object
+# rewrites an existing file's owner and trips the setattr chown gate.
+add_executable(smb2_sidseed_probe smb2_sidseed_probe.c)
+target_include_directories(smb2_sidseed_probe PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(smb2_sidseed_probe chimera_server chimera_metrics crypto)
+
+add_test(NAME chimera/server/smb/mbt/sidseed_probe_memfs
+    COMMAND $<TARGET_FILE:smb2_sidseed_probe>)
+set_tests_properties(chimera/server/smb/mbt/sidseed_probe_memfs PROPERTIES
+    ENVIRONMENT "CHIMERA_MBT_ARTIFACTS=smb2_sidseed_probe_memfs"
     LABELS "quint;smb_mbt;memfs"
     TIMEOUT 120)
 

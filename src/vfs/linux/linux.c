@@ -424,6 +424,21 @@ chimera_linux_getattr(
                             &request->getattr.r_attr,
                             fd);
 
+    /* A getattr by handle knows its own file handle: echo it when asked,
+     * as the engine backends do (memfs/diskfs/cairn).  chimera_linux_map_attrs
+     * fills only the stat/statfs/EA groups, so without this a caller that
+     * requests ATTR_FH -- notably the S3 copy finalizer computing an ETag from
+     * (fh, size, mtime) -- receives none, and every op that needs the handle
+     * back from a bare getattr silently loses it. */
+    if ((request->getattr.r_attr.va_req_mask & CHIMERA_VFS_ATTR_FH) &&
+        request->getattr.handle->fh_len > 0) {
+        memcpy(request->getattr.r_attr.va_fh,
+               request->getattr.handle->fh,
+               request->getattr.handle->fh_len);
+        request->getattr.r_attr.va_fh_len    = request->getattr.handle->fh_len;
+        request->getattr.r_attr.va_set_mask |= CHIMERA_VFS_ATTR_FH;
+    }
+
     /* Mode-only backend: synthesise an ACL from the POSIX mode bits when the
      * caller asked for one (lossy, one-way -- see vfs_acl.h).  This makes the
      * SMB security-descriptor path emit a DACL (no S-1-5-88-3 modefromsid ACE),
@@ -772,6 +787,9 @@ chimera_linux_set_open_flags(uint32_t in_flags)
             ((in_flags & CHIMERA_VFS_OPEN_READ_ONLY) &&
              !(in_flags & CHIMERA_VFS_OPEN_WRITE_ONLY))) {
             flags |= O_RDONLY;
+        } else if ((in_flags & CHIMERA_VFS_OPEN_WRITE_ONLY) &&
+                   !(in_flags & CHIMERA_VFS_OPEN_READ_ONLY)) {
+            flags |= O_WRONLY;
         } else {
             flags |= O_RDWR;
         }
@@ -2952,7 +2970,8 @@ SYMBOL_EXPORT struct chimera_vfs_module vfs_linux = {
         CHIMERA_VFS_CAP_FS | CHIMERA_VFS_CAP_FS_RELATIVE_OP | CHIMERA_VFS_CAP_FS_PATH_OP |
         CHIMERA_VFS_CAP_CLAIM_RANGE | CHIMERA_VFS_CAP_RPL |
         CHIMERA_VFS_CAP_COPY_RANGE | CHIMERA_VFS_CAP_CLONE_RANGE |
-        CHIMERA_VFS_CAP_DELEGATES_DAC | CHIMERA_VFS_CAP_XATTR
+        CHIMERA_VFS_CAP_DELEGATES_DAC | CHIMERA_VFS_CAP_XATTR |
+        CHIMERA_VFS_CAP_SPARSE
     ,
     .init           = chimera_linux_init,
     .destroy        = chimera_linux_destroy,

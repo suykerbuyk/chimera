@@ -2980,9 +2980,18 @@ memfs_mkdir_at(
     inode->dir.parent_inum = parent_inode->inum;
     inode->dir.parent_gen  = parent_inode->gen;
 
-    /* POSIX: a set-group-ID parent directory forces the new node's group. */
-    if (parent_inode->mode & S_ISGID) {
-        inode->gid = parent_inode->gid;
+    /* POSIX: a set-group-ID parent directory forces the new node's group --
+     * unless the caller named a group of its own, which memfs_apply_attrs
+     * above has already stored and which stays.  The attrs were applied
+     * before the parent was in hand, so when the parent's group does win, a
+     * group SID companion seeded for the creator's group is already stored:
+     * un-store it, it no longer describes the object's group (the rule
+     * chimera_vfs_attrs_drop_group_sid applies ahead of the store on the
+     * other create paths). */
+    if (chimera_vfs_create_inherits_gid(request->mkdir_at.set_attr,
+                                        parent_inode->mode)) {
+        inode->gid           = parent_inode->gid;
+        inode->group_sid.len = 0;
     }
 
     /* Inherit the parent's inheritable ACEs (or seed a Windows default DACL for
@@ -3136,9 +3145,12 @@ memfs_mknod_at(
         return;
     }
 
-    /* POSIX: a set-group-ID parent directory forces the new node's group. */
-    if (parent_inode->mode & S_ISGID) {
-        inode->gid = parent_inode->gid;
+    /* POSIX: a set-group-ID parent directory forces the new node's group,
+     * unless the caller named one of its own (as in mkdir_at above). */
+    if (chimera_vfs_create_inherits_gid(request->mknod_at.set_attr,
+                                        parent_inode->mode)) {
+        inode->gid           = parent_inode->gid;
+        inode->group_sid.len = 0;   /* as in mkdir: the companion no longer applies */
         memfs_map_attrs(fs, r_attr, inode, request->fh);
     }
 
@@ -3724,6 +3736,11 @@ memfs_open_at(
         inode->file.blocks     = NULL;
         inode->file.max_blocks = 0;
         inode->file.num_blocks = 0;
+
+        if (chimera_vfs_create_inherits_gid(request->open_at.set_attr,
+                                            parent_inode->mode)) {
+            chimera_vfs_attrs_drop_group_sid(request->open_at.set_attr);
+        }
 
         memfs_apply_attrs(inode, request->open_at.set_attr);
 
@@ -4558,6 +4575,12 @@ memfs_allocate(
         }
     }
 
+    /* fallocate CHANGES the file, so it sheds the set-id bits on the same rule
+     * a write does: every ext4_fallocate() path runs file_modified(), which
+     * calls file_remove_privs().  Both arms -- allocate and punch -- clear,
+     * because both write. */
+    inode->mode = chimera_vfs_killpriv_mode(request->cred, inode->mode);
+
     inode->mtime = now;
     inode->ctime = now;
     inode->change++;
@@ -4775,14 +4798,32 @@ memfs_copy_range(
         return;
     }
 
-    /* Same file: reject overlap (POSIX copy_file_range semantics) */
+    /* Same file: reject overlap (copy_file_range semantics).
+     *
+     * On the length SHORTENED TO THE SOURCE'S EOF, not the one asked for.
+     * generic_copy_file_checks() clamps before it tests, so a request whose
+     * source offset is already at or past EOF copies zero bytes and cannot
+     * overlap anything -- naming one file at one offset for both ends is then
+     * a 0-byte success, not EINVAL.  (The POSIX client clamps the same way
+     * before it ever dispatches; this arm is what other callers reach.) */
     if (src_inode == dst_inode) {
-        uint64_t s_end = src_offset + length;
-        uint64_t d_end = dst_offset + length;
-        if (src_offset < d_end && dst_offset < s_end) {
-            request->status = CHIMERA_VFS_EINVAL;
-            request->complete(request);
-            return;
+        uint64_t clamped = 0;
+
+        if (src_offset < src_inode->size) {
+            clamped = src_inode->size - src_offset;
+            if (clamped > length) {
+                clamped = length;
+            }
+        }
+
+        if (clamped) {
+            uint64_t s_end = src_offset + clamped;
+            uint64_t d_end = dst_offset + clamped;
+            if (src_offset < d_end && dst_offset < s_end) {
+                request->status = CHIMERA_VFS_EINVAL;
+                request->complete(request);
+                return;
+            }
         }
     }
 
@@ -7556,7 +7597,8 @@ SYMBOL_EXPORT struct chimera_vfs_module vfs_memfs = {
         CHIMERA_VFS_CAP_NAMED_STREAMS | CHIMERA_VFS_CAP_RPL |
         CHIMERA_VFS_CAP_CHANGE | CHIMERA_VFS_CAP_MKFS |
         CHIMERA_VFS_CAP_CLAIM_AGGREGATE | CHIMERA_VFS_CAP_CLAIM_RANGE |
-        CHIMERA_VFS_CAP_READ_PLUS | CHIMERA_VFS_CAP_WRITE_SAME,
+        CHIMERA_VFS_CAP_READ_PLUS | CHIMERA_VFS_CAP_WRITE_SAME |
+        CHIMERA_VFS_CAP_SPARSE,
     .init           = memfs_init,
     .destroy        = memfs_destroy,
     .thread_init    = memfs_thread_init,
