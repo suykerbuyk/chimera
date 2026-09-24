@@ -51,6 +51,9 @@ workflow:
 # train, nightly) AND the image published on develop, so it also runs on the
 # develop pipeline.
 #
+# The two JIRA jobs (jira_validation, jira_update) carry their own rules too;
+# their comments say why.
+#
 # Tags get NO testing -- just builders + builds + publish -- and only for tags
 # matching X.Y.Z[-suffix]; any other tag creates no pipeline at all.
 #
@@ -75,10 +78,57 @@ workflow:
   - if: '$CI_PIPELINE_SOURCE == "schedule"'
 
 stages:
+  - validate
   - builders
   - build
   - check
   - publish
+
+# The JIRA gate.  Chimera has no GitLab pre-receive hook (myriad does), so this
+# job is the only thing that enforces a JIRA key on a merge: it must pass in the
+# merge train, and it also runs on every MR push, so a missing or unknown key
+# shows up at review time rather than when the MR reaches the train.  It is
+# alone in the first stage, so a failure stops the pipeline before any builder
+# starts.
+#
+# qb takes keys from the merge commit message (the MR title, through the merge
+# commit template) and from the first line of every commit the merge brings in,
+# and fails when it finds none or when any key it finds is not a JIRA issue.
+# A "BypassMerge" line or "NOJIRA" anywhere skips the check.  Only a merge
+# commit into develop, main, master or release/* is checked.  Editing the MR
+# title starts no pipeline: re-run it after fixing a key.
+#
+# Two kinds of MR pipeline are treated differently:
+#   - detached (no merged result, e.g. a conflict): not run.  Such a pipeline
+#     tests the source head, and when that head is itself a merge (a sync of
+#     origin/main into the topic branch) qb would judge it as the MR's own
+#     merge and reject a legitimate MR.
+#   - Draft: run, but allowed to fail.  GitLab keeps the "Draft: " prefix on
+#     the title line of the merge commit message, where qb looks for the key,
+#     so a Draft whose commits carry no key would fail and hold back all
+#     review-time CI.  A Draft cannot enter the train, which checks the ready
+#     title.
+# For both, the merge train is the gate, so merging such an MR with "Merge
+# immediately" (which skips the train) goes unchecked.
+#
+# Credentials come from ~/.jira_user on the shared k8s runner, not from CI/CD
+# variables: protected variables do not reach a merge request pipeline from an
+# unprotected branch, and that file is also what myriad's train job uses.  The
+# job needs full history (the global GIT_DEPTH: 0) for qb's merged-commit walk,
+# but no submodules.
+jira_validation:
+  stage: validate
+  rules:
+    - if: '$CI_MERGE_REQUEST_EVENT_TYPE == "detached"'
+      when: never
+    - if: '$CI_MERGE_REQUEST_DRAFT == "true"'
+      allow_failure: true
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+  variables:
+    GIT_SUBMODULE_STRATEGY: none
+  script:
+    - git log -1
+    - qb jira check --commit ${CI_COMMIT_SHA} --ref-name ${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}
 
 chimera-dev:
   stage: builders
@@ -623,6 +673,31 @@ ctest_kvm_images:
     paths:
       - ctest_kvm_${MODE}_${ARCH}_${KVM_NAME}.log
     expire_in: 1 week
+
+# Post-merge JIRA bookkeeping.  For every key in the merge (found the same way
+# as in jira_validation) qb adds a remote link and a comment pointing at the
+# merge commit, then applies the "Code Merged" transition where the ticket's
+# workflow offers one.  CHIM's workflow has none, so a CHIM ticket gets the
+# link and the comment only.  MD's does (In Review -> In Test, resolution "Code
+# merged"), so an MD key in a chimera merge moves that MD ticket.  A code drop
+# touches every key its commits carry.
+#
+# A real push to develop only: the nightly schedule runs on develop as well and
+# would re-post the last merge three times a week.  needs: [] starts it with the
+# pipeline and keeps it off every other job's path -- the code is already
+# merged, so a JIRA outage must not hold up dev_branch.  No retry: a retried
+# partial run would duplicate the remote link.
+jira_update:
+  stage: publish
+  needs: []
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop" && $CI_PIPELINE_SOURCE == "push"'
+  retry: 0
+  variables:
+    GIT_SUBMODULE_STRATEGY: none
+  script:
+    - git log -1
+    - qb jira update --commit ${CI_COMMIT_SHA} --ref-name refs/heads/${CI_COMMIT_BRANCH}
 
 release:
   stage: publish
