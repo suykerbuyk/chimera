@@ -19,10 +19,12 @@
 
 #include <stdint.h>
 #include <sys/types.h>
+#include "vfs_mode.h"
 #include <time.h>
 
 #include "vfs_attrs.h"
 #include <sys/stat.h>
+#include "vfs_mode.h"
 #include "vfs_error.h"
 #include "vfs_cred.h"
 #include "vfs_claim_types.h"
@@ -500,6 +502,7 @@ struct chimera_vfs_stream_entry {
 #define CHIMERA_VFS_WRITE_FILESYNC 2
 
 struct chimera_vfs_notify_gate;
+struct chimera_vfs_request_memory;
 
 struct chimera_vfs_request {
     struct chimera_vfs_thread         *thread;
@@ -531,6 +534,9 @@ struct chimera_vfs_request {
 
     /* Points to one page of memory that the plugin may use as desired */
     void                              *plugin_data;
+
+    /* Core-owned temporary allocations, released after the final callback. */
+    struct chimera_vfs_request_memory *memory;
 
     /* For use by the plugin if desired, see io_uring for example */
     struct chimera_vfs_request_handle  handle[CHIMERA_VFS_REQUEST_MAX_HANDLES];
@@ -991,10 +997,10 @@ struct chimera_vfs_request {
              * existing one); lets the SMB server report OPENED vs CREATED.
              * Modules that don't set it leave it 0 (treated as "opened"). */
             uint8_t                          r_created;
-            /* pNFS truncates only after open authorization.  The backend sees
+            /* Size changes run only after open authorization. The backend sees
              * a private copy with truncate removed; preserve caller arguments. */
-            struct chimera_vfs_attrs        *pnfs_set_attr;
-            uint32_t                         pnfs_flags;
+            struct chimera_vfs_attrs        *deferred_set_attr;
+            uint32_t                         original_flags;
         } open_at;
 
         struct {
@@ -1481,3 +1487,11 @@ struct chimera_vfs_request {
         } get_layout;
     };
 };
+
+/* Allocate temporary storage that survives deferred/backend completion and
+* delegation to the owning thread. The core frees it when the request is
+* recycled, after the protocol callback returns. Returns NULL on allocation
+* failure. Unlike plugin_data, this storage may also hold large replies. */
+void * chimera_vfs_request_alloc_memory(
+    struct chimera_vfs_request *request,
+    size_t                      size);

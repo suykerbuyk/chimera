@@ -23,12 +23,11 @@ name: PR checks
 #
 # It also carries the pre-merge signal that is cheap enough to be worth having
 # before the queue: clang static analysis on devcontainer and macOS, and the
-# quint model-based test suite (ctest label "quint") on devcontainer.  The MBT
-# suites are the fastest broad-coverage tests in the tree -- the whole label
-# runs in well under a minute -- and they are the ones a spec or harness change
-# breaks, so catching that here rather than in the queue is worth one image
-# build.  macOS runs the quint suite post-merge, in build-test.yml's macOS job,
-# rather than twice.
+# full quick test tier on devcontainer, including model replays, strict twins
+# and supporting probes, plus native Windows x64 Release quick tests.
+# Catching regressions here rather than in the queue
+# is worth one image build. macOS runs quick post-merge in build-test.yml's
+# macOS job, rather than twice.
 #
 # The queue now runs this same pair -- quick-tier ctest and static analysis --
 # across every supported OS, so what this job buys is earliness, not extra
@@ -71,7 +70,7 @@ env:
 jobs:
   ci-complete:
     name: CI complete
-    needs: [analyze-dev, quint-coverage, analyze-macos]
+    needs: [analyze-dev, quint-coverage, analyze-macos, windows]
     if: ${{ always() }}
     runs-on: ubuntu-24.04
     steps:
@@ -193,7 +192,7 @@ jobs:
           retention-days: 30
 
   quint-coverage:
-    name: Quint coverage devcontainer amd64
+    name: Quick-tier coverage devcontainer amd64
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -243,22 +242,30 @@ jobs:
       # there refuses the repository as dubiously owned.  -U0 keeps hunk
       # headers to exactly the changed runs, with no context lines to subtract
       # back out.
+      # Restore only, like the ccache: build-test.yml's push to main is the
+      # sole writer.  See the model corpus cache note at the top of that file.
+      - name: Restore the model corpus cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/specs-corpus-cache
+          key: specs-corpus-v1-devcontainer-amd64-${{ github.sha }}
+          restore-keys: |
+            specs-corpus-v1-devcontainer-amd64-
+
       - name: Capture the pull request diff
         if: ${{ github.event_name == 'pull_request' }}
         run: git diff -U0 HEAD^1 HEAD > pr.diff
 
       # A Coverage build (clang source-based instrumentation, -O0) rather than
       # Debug: the suite still reports pass/fail, and the same run answers the
-      # question this job exists for -- how much of chimera the models actually
-      # reach.  ASan coverage of these suites comes from the merge queue's Debug
-      # jobs, which now have a trace corpus too.
+      # question this job exists for -- how much of chimera quick tests reach.
+      # ASan coverage comes from the merge queue's Debug jobs, which also have
+      # a trace corpus.
       #
-      # --no-tests=error is the point of the label: a configuration that
-      # silently loses its MBT suites (no quint, no node) must fail here
-      # rather than report a vacuous pass.  It only catches losing the label
-      # ENTIRELY, though, so REQUIRE_CTL_MBT=ON covers the narrower case of
-      # the in-tree control-plane corpus alone going missing.
-      - name: Build instrumented and run the quint suite
+      # Run the same default quick tier as the merge queue, without a label
+      # filter: relabeling a supporting probe must not remove its coverage.
+      # REQUIRE_CTL_MBT guards against losing control-plane model registration.
+      - name: Build instrumented and run the quick tier
         env:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           GH_REPO: ${{ github.repository }}
@@ -271,6 +278,8 @@ jobs:
             -e RUN_URL="$RUN_URL" \
             -e GH_REPO="$GH_REPO" \
             -e PR_HEAD_SHA="$PR_HEAD_SHA" \
+            -e SPECS_CORPUS_CACHE_DIR=/specs-corpus-cache \
+            -v "${{ runner.temp }}/specs-corpus-cache:/specs-corpus-cache" \
             -v "${{ github.workspace }}:/workspace" \
             -v /build \
             -w /build \
@@ -285,7 +294,7 @@ jobs:
               ninja
               mkdir -p /build/coverage/profraw
               LLVM_PROFILE_FILE=/build/coverage/profraw/%m-%p.profraw \
-                ctest -L quint --output-on-failure --no-tests=error \
+                ctest --output-on-failure --no-tests=error \
                       --test-output-size-failed 65536 --timeout 600 -j "$(nproc)"
               # Which of the changed files are worth an lcov export; empty
               # (or absent, on a non-PR run) means the export is skipped.
@@ -452,3 +461,13 @@ jobs:
           path: scan-report/
           if-no-files-found: warn
           retention-days: 30
+
+  windows:
+    name: Windows (pre-merge)
+    permissions:
+      contents: read
+      packages: read
+    uses: ./.github/workflows/windows.yml
+    with:
+      test_tier: quick
+      full_matrix: false

@@ -132,7 +132,9 @@ Version history: 1 was the initial SDK; 2 widened
 `struct chimera_principal` with an inline native SID, added
 `CHIMERA_PRINCIPAL_SID`, and added the `va_owner_sid` / `va_group_sid`
 attrs and their `CHIMERA_VFS_ATTR_OWNER_SID` / `GROUP_SID` bits.  A module
-built against version 1 must be rebuilt.
+built against version 1 must be rebuilt. Version 3 adds request-owned temporary
+allocations (`chimera_vfs_request_alloc_memory`) and changes the request
+layout; modules built against earlier SDK versions must be rebuilt.
 
 The `struct chimera_vfs_request` layout is exposed in full and is
 therefore ABI-stable only within an SDK version.  A public-head /
@@ -158,3 +160,10 @@ See `examples/vfs_module/vfs_example.c` for the skeleton.  In short:
    with `"module": "<name>"` and `"module_path": "/path/to/vfs_<name>.so"`.
    The loader dlopens the object, resolves `vfs_<name>`, and validates
    `sdk_version`.
+
+Pointer-valued result attributes must remain valid until the consumer callback
+finishes. For deferred replies or blocking modules, `request->complete()` can
+queue that callback on another thread. Use `chimera_vfs_request_alloc_memory()`
+for result data that would otherwise refer to reusable scratch; the core frees
+these allocations when it recycles the request. Check its return value for
+allocation failure, and do not free the returned storage yourself.

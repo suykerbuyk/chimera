@@ -11,12 +11,14 @@
  * to suppress.  This avoids the need for external suppressions files
  * or LSAN_OPTIONS environment variables.
  */
+#ifndef _WIN32
 __attribute__((visibility("default")))
+#endif /* ifndef _WIN32 */
 const char *
 __lsan_default_suppressions(void)
 {
     return
-        /* OpenSSL one-time global initialization (via pthread_once) */
+        /* OpenSSL one-time global initialization (via evpl_once) */
         "leak:CONF_modules_load\n"
         "leak:ossl_init_config_ossl_\n"
         "leak:CRYPTO_malloc\n"
@@ -30,8 +32,6 @@ __lsan_default_suppressions(void)
         "leak:parse_options\n"
         "leak:log_io_piece\n"
         "leak:options_mem_dupe\n"
-        /* SMB compound/request free lists (per-thread caches) */
-        "leak:chimera_smb_compound_alloc\n"
         /* NFS proxy per-thread server state (connection, NFS4.1 session +
          * slot tables).  Repeated mount/umount cycles accumulate one block
          * per (thread, mount) that only thread destroy releases, and a
@@ -45,7 +45,7 @@ __lsan_default_suppressions(void)
         "leak:chimera_nfs4_session_pool_init\n"
         "leak:chimera_nfs4_slot_table_init\n"
         "leak:chimera_nfs4_ctx_alloc\n"
-        "leak:chimera_nfs4_mount\n"
+        "leak:chimera_vfs_nfs4_mount\n"
         "leak:chimera_nfs4_cb_exchange_id_callback\n"
         /* GSSAPI/Kerberos internal allocations */
         "leak:gss_accept_sec_context\n"

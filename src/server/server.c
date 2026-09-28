@@ -5,13 +5,34 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include "common/platform.h"
+#else  /* ifdef _WIN32 */
 #include <unistd.h>
-#include <pthread.h>
+#endif /* ifdef _WIN32 */
+#include "common/thread.h"
+#ifndef _WIN32
 #include <sys/resource.h>
+#endif /* ifndef _WIN32 */
 #include <sys/stat.h>
+#ifdef _WIN32
+#include "common/platform.h"
+#endif /* ifdef _WIN32 */
+#ifdef _WIN32
+#include "common/platform.h"
+#else  /* ifdef _WIN32 */
 #include <sys/socket.h>
+#endif /* ifdef _WIN32 */
+#ifdef _WIN32
+#include "common/platform.h"
+#else  /* ifdef _WIN32 */
 #include <netdb.h>
+#endif /* ifdef _WIN32 */
+#ifdef _WIN32
+#include "common/platform.h"
+#else  /* ifdef _WIN32 */
 #include <arpa/inet.h>
+#endif /* ifdef _WIN32 */
 #include <errno.h>
 
 #include "evpl/evpl.h"
@@ -104,12 +125,13 @@ struct chimera_server_config {
     int                                   smb_enabled;
     int                                   s3_enabled;
     int                                   fuse_enabled;
+    int                                   fuse_io_uring;
     int                                   nfs_data_server;
     uint64_t                              nfs_server_scope;
     int                                   external_portmap;
     char                                  portmap_hostname[256];
     int                                   soft_fail_bad_req;
-    rlim_t                                max_open_files;
+    uint64_t                              max_open_files;
     int                                   core_threads;
     int                                   sync_delegation;
     int                                   sync_delegation_threads;
@@ -196,8 +218,8 @@ struct chimera_server {
     struct chimera_rest_server         *rest;
     int                                 num_protocols;
     int                                 threads_online;
-    pthread_mutex_t                     lock;
-    pthread_cond_t                      all_threads_online;
+    evpl_mutex_t                        lock;
+    evpl_cond_t                         all_threads_online;
 };
 
 struct chimera_thread {
@@ -370,6 +392,9 @@ chimera_server_config_init(void)
     config->s3_enabled   = 0;
     config->fuse_enabled = 0;
 
+    /* FUSE-over-io_uring whenever the kernel offers it. */
+    config->fuse_io_uring = 1;
+
     /* NFS service port (default 2049); data-server mode binds only the NFSv4
      * service so a pNFS data server can coexist with an MDS on one host. */
     config->nfs_port        = 2049;
@@ -403,14 +428,15 @@ chimera_server_config_init(void)
      * spawns hundreds of threads per server instance, which is wasteful for
      * short-lived or lightly-loaded instances (memory, process-teardown cost)
      * AND is a correctness hazard: liburcu's call_rcu_data_init does NOT retry
-     * pthread_create and abort()s the whole process on a transient EAGAIN
+     * evpl_native_thread_create and abort()s the whole process on a transient EAGAIN
      * ("Unrecoverable error: Resource temporarily unavailable").  Spawning
      * hundreds of RCU threads at once -- as many in-process server instances do
      * in parallel under a -j CI run -- makes that EAGAIN abort likely, which is
      * the root cause of the intermittent lockf/fcntl NFS3 test flakes.  Default
      * to a small cap (matching the chimera client default) so the common case
      * stays well clear of the thread-exhaustion abort; a real server with a
-     * heavy workload can raise it via common.rcu_reclaim_threads. */
+     * heavy workload can raise it via common.rcu_reclaim_threads.  Without
+     * liburcu there is no such pool and the setting is inert. */
     config->rcu_reclaim_threads = 4;
 
     /* Default NFSv4.1 fore-channel session slots (server cap on the number
@@ -781,7 +807,7 @@ chimera_server_config_set_max_open_files(
     struct chimera_server_config *config,
     int                           open_files)
 {
-    config->max_open_files = (rlim_t) open_files;
+    config->max_open_files = (uint64_t) open_files;
 } /* chimera_server_config_set_max_open_files */
 
 SYMBOL_EXPORT void
@@ -1151,6 +1177,20 @@ chimera_server_config_get_fuse_enabled(const struct chimera_server_config *confi
 {
     return config->fuse_enabled;
 } /* chimera_server_config_get_fuse_enabled */
+
+SYMBOL_EXPORT void
+chimera_server_config_set_fuse_io_uring(
+    struct chimera_server_config *config,
+    int                           enabled)
+{
+    config->fuse_io_uring = enabled;
+} /* chimera_server_config_set_fuse_io_uring */
+
+SYMBOL_EXPORT int
+chimera_server_config_get_fuse_io_uring(const struct chimera_server_config *config)
+{
+    return config->fuse_io_uring;
+} /* chimera_server_config_get_fuse_io_uring */
 
 SYMBOL_EXPORT void
 chimera_server_config_set_nfs_data_server(
@@ -1694,11 +1734,11 @@ chimera_server_thread_init(
 
     thread->rest_thread = chimera_rest_thread_init(evpl, server->rest, thread->vfs_thread);
 
-    pthread_mutex_lock(&server->lock);
+    evpl_mutex_lock(&server->lock);
     if (++server->threads_online == server->config->core_threads) {
-        pthread_cond_signal(&server->all_threads_online);
+        evpl_cond_signal(&server->all_threads_online);
     }
-    pthread_mutex_unlock(&server->lock);
+    evpl_mutex_unlock(&server->lock);
 
     return thread;
 } /* chimera_server_thread_init */
@@ -2561,10 +2601,15 @@ chimera_server_pnfs_resolve(struct chimera_server *server)
             bpath++;
         }
 
-        m = chimera_vfs_mount_table_find_by_path(vfs->mount_table,
-                                                 bpath,
-                                                 strlen(bpath));
+        /* Startup callers need not be registered RCU readers.  Hold the
+         * writer mutex until the backing root and mount metadata are copied,
+         * so a concurrent unmount cannot retire the mount under us. */
+        evpl_mutex_lock(&vfs->mount_table->lock);
+        m = chimera_vfs_mount_table_find_by_path_protected(vfs->mount_table,
+                                                           bpath,
+                                                           strlen(bpath));
         if (!m) {
+            evpl_mutex_unlock(&vfs->mount_table->lock);
             chimera_server_error(
                 "pNFS data server %d: backing mount '%s' not found (mount it via the nfs module)",
                 i, ds->backing_path);
@@ -2585,6 +2630,7 @@ chimera_server_pnfs_resolve(struct chimera_server *server)
             i, ds->backing_path,
             m->module ? m->module->name : "?",
             m->path ? m->path : "?", m->root_fh_len, ds->backing_local);
+        evpl_mutex_unlock(&vfs->mount_table->lock);
         resolved++;
     }
 
@@ -2819,7 +2865,10 @@ chimera_server_init(
 {
     struct chimera_server *server;
     int                    i;
+
+#ifndef _WIN32
     struct rlimit          rl;
+#endif /* ifndef _WIN32 */
 
     if (!config) {
         config = chimera_server_config_init();
@@ -2827,6 +2876,7 @@ chimera_server_init(
 
     chimera_log_init();
 
+#ifndef _WIN32
     /* Need to set the filedescriptor limits */
     if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
         if (rl.rlim_cur < config->max_open_files) {
@@ -2847,12 +2897,14 @@ chimera_server_init(
         chimera_server_error("Failed to get file descriptor limit: %s", strerror(errno));
     }
 
+#endif /* ifndef _WIN32 */
+
     server = calloc(1, sizeof(*server));
 
     server->config = config;
 
-    pthread_mutex_init(&server->lock, NULL);
-    pthread_cond_init(&server->all_threads_online, NULL);
+    evpl_mutex_init(&server->lock, NULL);
+    evpl_cond_init(&server->all_threads_online, NULL);
 
     chimera_server_info("Initializing VFS...");
     server->vfs = chimera_vfs_init(config->sync_delegation ? config->sync_delegation_threads : 0,
@@ -2958,11 +3010,11 @@ chimera_server_start(struct chimera_server *server)
 
     chimera_server_info("Waiting for %d threads to start...", server->config->core_threads);
 
-    pthread_mutex_lock(&server->lock);
+    evpl_mutex_lock(&server->lock);
     while (server->threads_online < server->config->core_threads) {
-        pthread_cond_wait(&server->all_threads_online, &server->lock);
+        evpl_cond_wait(&server->all_threads_online, &server->lock);
     }
-    pthread_mutex_unlock(&server->lock);
+    evpl_mutex_unlock(&server->lock);
 
     for (i = 0; i < server->num_protocols; i++) {
         if (!server->protocol_private[i]) {
@@ -3190,24 +3242,13 @@ chimera_server_iterate_buckets(
     chimera_s3_iterate_buckets(server->s3_shared, callback, data);
 } /* chimera_server_iterate_buckets */
 
-struct mount_iterate_ctx {
-    chimera_server_mount_iterate_cb callback;
-    void                           *data;
+struct mount_snapshot {
+    struct mount_snapshot *next;
+    char                  *path;
+    char                  *module;
+    char                  *module_path;
+    char                  *options;
 };
-
-static int
-mount_iterate_wrapper(
-    struct chimera_vfs_mount *mount,
-    void                     *data)
-{
-    struct mount_iterate_ctx *ctx = data;
-
-    return ctx->callback(mount->path,
-                         mount->module ? mount->module->name : "",
-                         mount->module_path ? mount->module_path : "",
-                         mount->options,
-                         ctx->data);
-} /* mount_iterate_wrapper */
 
 SYMBOL_EXPORT void
 chimera_server_iterate_mounts(
@@ -3215,10 +3256,52 @@ chimera_server_iterate_mounts(
     chimera_server_mount_iterate_cb callback,
     void                           *data)
 {
-    struct mount_iterate_ctx ctx = { .callback = callback, .data = data };
+    struct chimera_vfs_mount_table *table = server->vfs->mount_table;
+    struct mount_snapshot          *head = NULL, **tail = &head, *item;
+    uint32_t                        i;
+    int                             stopped = 0;
 
-    chimera_vfs_mount_table_foreach(server->vfs->mount_table,
-                                    mount_iterate_wrapper, &ctx);
+    /* This public API also runs on application threads without an RCU
+     * registration. Snapshot the metadata under the writer lock, then invoke
+     * callbacks unlocked so they can call back into the server safely. */
+    evpl_mutex_lock(&table->lock);
+    for (i = 0; i < table->num_buckets; i++) {
+        struct chimera_vfs_mount_table_entry *entry;
+
+        for (entry = table->buckets[i]; entry; entry = entry->next) {
+            struct chimera_vfs_mount *mount = entry->mount;
+
+            item = calloc(1, sizeof(*item));
+            if (!item) {
+                abort();
+            }
+            item->path        = strdup(mount->path);
+            item->module      = strdup(mount->module ? mount->module->name : "");
+            item->module_path = strdup(mount->module_path ? mount->module_path : "");
+            item->options     = mount->options ? strdup(mount->options) : NULL;
+            if (!item->path || !item->module || !item->module_path ||
+                (mount->options && !item->options)) {
+                abort();
+            }
+            *tail = item;
+            tail  = &item->next;
+        }
+    }
+    evpl_mutex_unlock(&table->lock);
+
+    while (head) {
+        item = head;
+        head = item->next;
+        if (!stopped) {
+            stopped = callback(item->path, item->module, item->module_path,
+                               item->options, data);
+        }
+        free(item->path);
+        free(item->module);
+        free(item->module_path);
+        free(item->options);
+        free(item);
+    }
 } /* chimera_server_iterate_mounts */
 
 struct mount_in_use_ctx {
@@ -3245,17 +3328,20 @@ mount_in_use_check_path(
         path++;
     }
 
-    mount = chimera_vfs_mount_table_find_by_path(ctx->vfs->mount_table,
-                                                 path, strlen(path));
+    /* Like mount enumeration, this public query can originate on a thread
+     * with no VFS context. Consume the mount pointer while holding the lock. */
+    evpl_mutex_lock(&ctx->vfs->mount_table->lock);
+    mount = chimera_vfs_mount_table_find_by_path_protected(ctx->vfs->mount_table,
+                                                           path, strlen(path));
 
     if (mount &&
         mount->pathlen == (uint32_t) ctx->target_len &&
         memcmp(mount->path, ctx->target, ctx->target_len) == 0) {
         ctx->in_use = 1;
-        return 1;
     }
 
-    return 0;
+    evpl_mutex_unlock(&ctx->vfs->mount_table->lock);
+    return ctx->in_use;
 } /* mount_in_use_check_path */
 
 static int

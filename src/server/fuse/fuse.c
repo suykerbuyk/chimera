@@ -2,9 +2,14 @@
 //
 // SPDX-License-Identifier: LGPL-2.1-only
 
+#include "common/thread.h"
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include "common/platform.h"
+#else  /* ifdef _WIN32 */
 #include <unistd.h>
+#endif /* ifdef _WIN32 */
 #include <utlist.h>
 
 #include "fuse.h"
@@ -20,6 +25,9 @@ fuse_server_init(
     struct prometheus_metrics          *metrics)
 {
     struct chimera_fuse_shared *shared;
+    const char                 *env;
+    char                       *end;
+    long                        value;
 
     if (!chimera_server_config_get_fuse_enabled(config)) {
         chimera_fuse_info("FUSE server disabled (not enabled in config)");
@@ -28,12 +36,26 @@ fuse_server_init(
 
     shared = calloc(1, sizeof(*shared));
 
-    shared->vfs     = vfs;
-    shared->metrics = metrics;
+    shared->vfs      = vfs;
+    shared->metrics  = metrics;
+    shared->io_uring = chimera_server_config_get_fuse_io_uring(config);
 
-    pthread_mutex_init(&shared->lock, NULL);
-    pthread_mutex_init(&shared->notifier_lock, NULL);
-    pthread_cond_init(&shared->notifier_cond, NULL);
+    shared->uring_depth = CHIMERA_FUSE_URING_DEPTH;
+    env                 = getenv("CHIMERA_FUSE_URING_DEPTH");
+
+    if (env) {
+        errno = 0;
+        value = strtol(env, &end, 10);
+        chimera_fuse_abort_if(errno || end == env || *end != '\0' ||
+                              value < 0 || value > CHIMERA_FUSE_URING_DEPTH_MAX,
+                              "CHIMERA_FUSE_URING_DEPTH must be an integer from 0 to %d: '%s'",
+                              CHIMERA_FUSE_URING_DEPTH_MAX, env);
+        shared->uring_depth = value;
+    }
+
+    evpl_mutex_init(&shared->lock, NULL);
+    evpl_mutex_init(&shared->notifier_lock, NULL);
+    evpl_cond_init(&shared->notifier_cond, NULL);
 
     return shared;
 } /* fuse_server_init */
@@ -60,14 +82,14 @@ fuse_server_destroy(void *data)
             chimera_fuse_node_table_destroy(mount->node_table);
         }
 
-        pthread_mutex_destroy(&mount->open_lock);
-        pthread_mutex_destroy(&mount->lock_lock);
-        pthread_mutex_destroy(&mount->grant_lock);
+        evpl_mutex_destroy(&mount->open_lock);
+        evpl_mutex_destroy(&mount->lock_lock);
+        evpl_mutex_destroy(&mount->grant_lock);
     }
 
-    pthread_mutex_destroy(&shared->lock);
-    pthread_mutex_destroy(&shared->notifier_lock);
-    pthread_cond_destroy(&shared->notifier_cond);
+    evpl_mutex_destroy(&shared->lock);
+    evpl_mutex_destroy(&shared->notifier_lock);
+    evpl_cond_destroy(&shared->notifier_cond);
 
     free(shared);
 } /* fuse_server_destroy */
@@ -172,6 +194,10 @@ chimera_fuse_attach_channels(
         evpl_fd_event_read_interest(evpl, &channel->event);
 
         channel->armed = 1;
+
+        if (mount->uring) {
+            chimera_fuse_uring_attach(thread, channel);
+        }
     }
 } /* chimera_fuse_attach_channels */
 
@@ -190,7 +216,7 @@ fuse_server_thread_init(
     thread->vfs_thread = vfs_thread;
     thread->shared     = shared;
 
-    pthread_mutex_lock(&shared->lock);
+    evpl_mutex_lock(&shared->lock);
 
     chimera_fuse_abort_if(shared->num_threads >= CHIMERA_FUSE_MAX_THREADS,
                           "too many core threads for FUSE server (max %d)",
@@ -201,9 +227,9 @@ fuse_server_thread_init(
     shared->num_threads++;
     shared->threads_alive++;
 
-    pthread_mutex_unlock(&shared->lock);
+    evpl_mutex_unlock(&shared->lock);
 
-    pthread_mutex_init(&thread->resume_lock, NULL);
+    evpl_mutex_init(&thread->resume_lock, NULL);
 
     evpl_add_doorbell(evpl, &thread->attach_doorbell, chimera_fuse_attach_channels);
     evpl_add_doorbell(evpl, &thread->resume_doorbell, chimera_fuse_resume_doorbell);
@@ -228,10 +254,10 @@ chimera_fuse_sweep_open_files(
     for (m = 0; m < shared->num_mounts; m++) {
         mount = &shared->mounts[m];
 
-        pthread_mutex_lock(&mount->open_lock);
+        evpl_mutex_lock(&mount->open_lock);
         files             = mount->open_files;
         mount->open_files = NULL;
-        pthread_mutex_unlock(&mount->open_lock);
+        evpl_mutex_unlock(&mount->open_lock);
 
         while (files) {
             file = files;
@@ -265,6 +291,8 @@ fuse_server_thread_destroy(void *data)
                           "fuse thread destroyed with %d active requests",
                           thread->active_requests);
 
+    chimera_fuse_uring_thread_destroy(thread);
+
     while (thread->free_requests) {
         req                   = thread->free_requests;
         thread->free_requests = req->next;
@@ -278,11 +306,11 @@ fuse_server_thread_destroy(void *data)
     evpl_remove_doorbell(thread->evpl, &thread->attach_doorbell);
     evpl_remove_doorbell(thread->evpl, &thread->resume_doorbell);
 
-    pthread_mutex_destroy(&thread->resume_lock);
+    evpl_mutex_destroy(&thread->resume_lock);
 
-    pthread_mutex_lock(&shared->lock);
+    evpl_mutex_lock(&shared->lock);
     last = (--shared->threads_alive == 0);
-    pthread_mutex_unlock(&shared->lock);
+    evpl_mutex_unlock(&shared->lock);
 
     if (last) {
         chimera_fuse_sweep_open_files(shared, thread->vfs_thread);
@@ -341,6 +369,7 @@ chimera_fuse_add_mount(
      * into the async model where the timeouts alone bound staleness. */
     mount->coherence_sync      = 1;
     mount->negative_timeout_ms = UINT32_MAX; /* default resolved below */
+    mount->uring_depth         = shared->uring_depth;
 
     if (options && *options) {
         opts = strdup(options);
@@ -367,6 +396,15 @@ chimera_fuse_add_mount(
                 mount->direct_io = 1;
             } else if (strcmp(opt, "parallel_direct_writes") == 0) {
                 mount->parallel_direct_writes = 1;
+            } else if (strncmp(opt, "uring_depth=", 12) == 0) {
+                mount->uring_depth = strtoul(opt + 12, NULL, 10);
+
+                if (mount->uring_depth > CHIMERA_FUSE_URING_DEPTH_MAX) {
+                    chimera_fuse_error("FUSE mount %s: uring_depth above %d",
+                                       mountpoint, CHIMERA_FUSE_URING_DEPTH_MAX);
+                    rc = -1;
+                    break;
+                }
             } else {
                 chimera_fuse_error("FUSE mount %s: unknown option '%s'",
                                    mountpoint, opt);
@@ -391,11 +429,11 @@ chimera_fuse_add_mount(
             mount->coherence_sync ? mount->entry_timeout_ms : 0;
     }
 
-    pthread_mutex_init(&mount->open_lock, NULL);
-    pthread_mutex_init(&mount->dir_notifier_lock, NULL);
-    pthread_cond_init(&mount->dir_notifier_cond, NULL);
-    pthread_mutex_init(&mount->lock_lock, NULL);
-    pthread_mutex_init(&mount->grant_lock, NULL);
+    evpl_mutex_init(&mount->open_lock, NULL);
+    evpl_mutex_init(&mount->dir_notifier_lock, NULL);
+    evpl_cond_init(&mount->dir_notifier_cond, NULL);
+    evpl_mutex_init(&mount->lock_lock, NULL);
+    evpl_mutex_init(&mount->grant_lock, NULL);
 
     shared->num_mounts++;
 

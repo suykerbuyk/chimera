@@ -2,18 +2,25 @@
 //
 // SPDX-License-Identifier: LGPL-2.1-only
 
+#include "common/compiler.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <unistd.h>
+#ifdef _WIN32
 #include "common/platform.h"
-#include <pthread.h>
+#else  /* ifdef _WIN32 */
+#include <unistd.h>
+#endif /* ifdef _WIN32 */
+#include "common/platform.h"
+#include "common/thread.h"
+#ifdef _WIN32
+#include "common/platform.h"
+#else  /* ifdef _WIN32 */
 #include <arpa/inet.h>
-#include <gssapi/gssapi.h>
-#include <gssapi/gssapi_krb5.h>
-#include <openssl/hmac.h>
+#endif /* ifdef _WIN32 */
+
 
 
 #include "smb.h"
@@ -220,6 +227,9 @@ chimera_smb_server_init(
                                               NULL);
     }
     if (shared->config.auth.kerberos_enabled) {
+#ifndef CHIMERA_HAVE_GSSAPI
+        chimera_smb_abort_if(1, "Kerberos requested but this build has no GSSAPI provider");
+#endif /* ifndef CHIMERA_HAVE_GSSAPI */
         chimera_smb_info("SMB Auth: Kerberos enabled (realm: %s, keytab: %s)",
                          shared->config.auth.kerberos_realm[0] ? shared->config.auth.kerberos_realm : "(not set)",
                          shared->config.auth.kerberos_keytab[0] ? shared->config.auth.kerberos_keytab : "(default)");
@@ -300,8 +310,12 @@ chimera_smb_server_init(
      * replaces the former fixed S-1-5-21-1111-2222-3333. */
     {
         char          hostid[256] = { 0 };
-        FILE         *fp          = fopen("/etc/machine-id", "r");
         XXH128_hash_t h;
+#ifdef _WIN32
+        chimera_smb_abort_if(chimera_windows_machine_identity(hostid, sizeof(hostid)),
+                             "Could not determine the Windows machine identity");
+#else  /* ifdef _WIN32 */
+        FILE         *fp = fopen("/etc/machine-id", "r");
 
         if (fp) {
             if (!fgets(hostid, sizeof(hostid), fp)) {
@@ -316,12 +330,14 @@ chimera_smb_server_init(
             snprintf(hostid, sizeof(hostid), "chimera-%lx", (unsigned long) gethostid());
         }
 
+#endif /* ifdef _WIN32 */
         h                             = XXH3_128bits(hostid, strlen(hostid));
         shared->machine_domain_sub[0] = (uint32_t) h.low64 | 1;   /* never zero */
         shared->machine_domain_sub[1] = (uint32_t) (h.low64 >> 32);
         shared->machine_domain_sub[2] = (uint32_t) h.high64;
     }
 
+#ifdef CHIMERA_HAVE_GSSAPI
     shared->svc      = GSS_C_NO_NAME;
     shared->srv_cred = GSS_C_NO_CREDENTIAL;
 
@@ -333,6 +349,7 @@ chimera_smb_server_init(
 
     gss_import_name(&min, &name, GSS_C_NT_HOSTBASED_SERVICE, &shared->svc);
     //gss_acquire_cred(&min, shared->svc, 0, GSS_C_NO_OID_SET, GSS_C_ACCEPT, &shared->srv_cred, NULL, NULL);
+#endif /* ifdef CHIMERA_HAVE_GSSAPI */
 
     shared->endpoint = chimera_tcp_flavor_endpoint_create(shared->tcp_flavor, "0.0.0.0",
                                                           shared->config.port);
@@ -344,10 +361,10 @@ chimera_smb_server_init(
 
     shared->listener = evpl_listener_create();
 
-    pthread_mutex_init(&shared->sessions_lock, NULL);
-    pthread_mutex_init(&shared->shares_lock, NULL);
-    pthread_mutex_init(&shared->trees_lock, NULL);
-    pthread_mutex_init(&shared->threads_lock, NULL);
+    evpl_mutex_init(&shared->sessions_lock, NULL);
+    evpl_mutex_init(&shared->shares_lock, NULL);
+    evpl_mutex_init(&shared->trees_lock, NULL);
+    evpl_mutex_init(&shared->threads_lock, NULL);
 
     /* Seed the persistent-id allocator with a random, nonzero base so ids do
      * not restart from a fixed value across daemon restarts (a courtesy to the
@@ -399,6 +416,7 @@ chimera_smb_server_destroy(void *data)
         free(share);
     }
 
+#ifdef CHIMERA_HAVE_GSSAPI
     uint32_t min;
 
     if (shared->svc != GSS_C_NO_NAME) {
@@ -408,8 +426,9 @@ chimera_smb_server_destroy(void *data)
     if (shared->srv_cred != GSS_C_NO_CREDENTIAL) {
         gss_release_cred(&min, &shared->srv_cred);
     }
+#endif /* ifdef CHIMERA_HAVE_GSSAPI */
 
-    pthread_mutex_destroy(&shared->threads_lock);
+    evpl_mutex_destroy(&shared->threads_lock);
 
     free(shared);
 } /* smb_server_destroy */
@@ -895,7 +914,7 @@ chimera_smb_compound_reply(struct chimera_smb_compound *compound)
 
         if (rc == 0) {
             netbios_hdr       = evpl_iovec_data(&comp_iov);
-            netbios_hdr->word = __builtin_bswap32(comp_total);
+            netbios_hdr->word = chimera_bswap32(comp_total);
 
             evpl_sendv(evpl, conn->bind, &comp_iov, 1, reply_hdr_len + comp_total,
                        EVPL_SEND_FLAG_TAKE_REF);
@@ -994,7 +1013,7 @@ chimera_smb_compound_reply(struct chimera_smb_compound *compound)
 
                 /* The encrypted message length excludes the NetBIOS framing. */
                 netbios_hdr       = evpl_iovec_data(&enc_iov);
-                netbios_hdr->word = __builtin_bswap32(
+                netbios_hdr->word = chimera_bswap32(
                     (int) sizeof(struct smb2_transform_header) + enc_src_len);
 
                 evpl_sendv(evpl, conn->bind, &enc_iov, 1, enc_total, EVPL_SEND_FLAG_TAKE_REF);
@@ -1064,7 +1083,7 @@ chimera_smb_compound_reply(struct chimera_smb_compound *compound)
         }
 
     } else {
-        netbios_hdr->word = __builtin_bswap32(reply_payload_length);
+        netbios_hdr->word = chimera_bswap32(reply_payload_length);
 
         evpl_sendv(evpl, conn->bind, reply_iov, reply_niov, reply_payload_length + reply_hdr_len,
                    EVPL_SEND_FLAG_TAKE_REF);
@@ -1077,14 +1096,14 @@ chimera_smb_compound_reply(struct chimera_smb_compound *compound)
      * defer its break ack correctly (MS-SMB2; smbtorture dirlease rename/unlink).
      * Cross-connection / reaper breaks (queued with no in-flight compound) were
      * sent via the doorbell instead and are unaffected. */
-    pthread_mutex_lock(&thread->lease_break_lock);
+    evpl_mutex_lock(&thread->lease_break_lock);
     if (thread->active_compounds > 0) {
         thread->active_compounds--;
     }
     if (conn->in_compound > 0) {
         conn->in_compound--;
     }
-    pthread_mutex_unlock(&thread->lease_break_lock);
+    evpl_mutex_unlock(&thread->lease_break_lock);
 
     chimera_smb_lease_break_flush(thread);
 
@@ -1523,6 +1542,7 @@ chimera_smb_server_handle_smb2(
         if (unlikely(memcmp(request->smb2_hdr.protocol_id, SMB2_PROTOCOL_ID, 4) != 0)) {
             chimera_smb_error("Received SMB2 message with invalid protocol header");
             chimera_smb_request_free(thread, request);
+            chimera_smb_compound_free(thread, compound);
             evpl_close(evpl, conn->bind);
             return;
         }
@@ -1530,6 +1550,7 @@ chimera_smb_server_handle_smb2(
         if (unlikely(request->smb2_hdr.struct_size != 64)) {
             chimera_smb_error("Received SMB2 message with invalid struct size");
             chimera_smb_request_free(thread, request);
+            chimera_smb_compound_free(thread, compound);
             evpl_close(evpl, conn->bind);
             return;
         }
@@ -1570,6 +1591,7 @@ chimera_smb_server_handle_smb2(
                     request->smb2_hdr.message_id, charge,
                     conn->seq_low, conn->seq_high);
                 chimera_smb_request_free(thread, request);
+                chimera_smb_compound_free(thread, compound);
                 evpl_close(evpl, conn->bind);
                 return;
             }
@@ -1812,6 +1834,7 @@ chimera_smb_server_handle_smb2(
                 if (unlikely(conn->last_session_handle == NULL)) {
                     chimera_smb_error("Message contains RELATED_OPERATIONS flag but no last session handle exists");
                     chimera_smb_request_free(thread, request);
+                    chimera_smb_compound_free(thread, compound);
                     evpl_close(evpl, conn->bind);
                     return;
                 }
@@ -1866,6 +1889,7 @@ chimera_smb_server_handle_smb2(
 
                 chimera_smb_error("Received SMB2 message with invalid signature");
                 chimera_smb_request_free(thread, request);
+                chimera_smb_compound_free(thread, compound);
                 evpl_close(evpl, conn->bind);
                 return;
             }
@@ -2136,10 +2160,10 @@ chimera_smb_server_handle_smb2(
      * reply-before-break.  The per-connection count distinguishes a self-break
      * (holder conn mid-compound -> defer) from a cross-connection break (holder
      * conn idle -> fire now, else a parking conflicting open deadlocks). */
-    pthread_mutex_lock(&thread->lease_break_lock);
+    evpl_mutex_lock(&thread->lease_break_lock);
     thread->active_compounds++;
     compound->conn->in_compound++;
-    pthread_mutex_unlock(&thread->lease_break_lock);
+    evpl_mutex_unlock(&thread->lease_break_lock);
 
     chimera_smb_compound_advance(compound);
 
@@ -2330,10 +2354,10 @@ chimera_smb_server_handle_smb1(
     smb_trace_compound_request(compound);
 
     /* Balance the decrement in chimera_smb_compound_reply (see the SMB2 path). */
-    pthread_mutex_lock(&thread->lease_break_lock);
+    evpl_mutex_lock(&thread->lease_break_lock);
     thread->active_compounds++;
     compound->conn->in_compound++;
-    pthread_mutex_unlock(&thread->lease_break_lock);
+    evpl_mutex_unlock(&thread->lease_break_lock);
 
     chimera_smb_compound_advance(compound);
 
@@ -2386,7 +2410,7 @@ chimera_smb_server_handle_rdma(
 
     *segment_iov = iov[0];
 
-    segment_iov->data += direct_hdr->data_offset;
+    segment_iov->data = (char *) segment_iov->data + direct_hdr->data_offset;
     evpl_iovec_set_length(segment_iov, direct_hdr->data_length);
 
     conn->rdma_length += direct_hdr->data_length;
@@ -2736,7 +2760,7 @@ chimera_smb_server_segment(
         return 0;
     }
 
-    hdr = __builtin_bswap32(hdr);
+    hdr = chimera_bswap32(hdr);
 
     hdr &= 0x00ffffff;
 
@@ -2758,18 +2782,20 @@ chimera_smb_server_accept(
 
     conn = chimera_smb_conn_alloc(thread);
 
-    conn->thread            = thread;
-    conn->bind              = bind;
-    conn->protocol          = evpl_bind_get_protocol(bind);
-    conn->smbvers           = conn->protocol == EVPL_DATAGRAM_RDMACM_RC ? 2 : 0;
+    conn->thread   = thread;
+    conn->bind     = bind;
+    conn->protocol = evpl_bind_get_protocol(bind);
+    conn->smbvers  = conn->protocol == EVPL_DATAGRAM_RDMACM_RC ? 2 : 0;
+#ifdef CHIMERA_HAVE_GSSAPI
     conn->gss_flags         = 0;
     conn->gss_major         = 0;
     conn->gss_minor         = 0;
     conn->gss_output.value  = NULL;
     conn->gss_output.length = 0;
     conn->nascent_ctx       = GSS_C_NO_CONTEXT;
-    conn->ntlm_output       = NULL;
-    conn->ntlm_output_len   = 0;
+#endif /* ifdef CHIMERA_HAVE_GSSAPI */
+    conn->ntlm_output     = NULL;
+    conn->ntlm_output_len = 0;
     smb_ntlm_ctx_init(&conn->ntlm_ctx);
     memset(&conn->gssapi_ctx, 0, sizeof(conn->gssapi_ctx));
     /* SMB 3.1.1 preauth-integrity hash starts at zero for each connection. */
@@ -2854,10 +2880,10 @@ chimera_smb_server_thread_init(
 
     /* Register in the process-global thread list so resume broadcasts reach
      * this thread. */
-    pthread_mutex_lock(&shared->threads_lock);
+    evpl_mutex_lock(&shared->threads_lock);
     thread->next_thread = shared->threads;
     shared->threads     = thread;
-    pthread_mutex_unlock(&shared->threads_lock);
+    evpl_mutex_unlock(&shared->threads_lock);
 
     if (shared->config.persistent_handles) {
         evpl_add_timer(evpl, &thread->durable_sweeper,
@@ -2884,25 +2910,31 @@ chimera_smb_server_thread_destroy(void *data)
     struct chimera_smb_compound       *compound;
     struct chimera_smb_session_handle *session_handle;
     struct chimera_server_smb_thread **tpp;
+    bool                               last_thread;
 
     /* Unregister from the process-global thread list first so a peer thread's
      * resume broadcast can no longer ring this thread's (about-to-be-removed)
      * resume doorbell.  evpl_remove_doorbell below then runs on this thread. */
-    pthread_mutex_lock(&thread->shared->threads_lock);
+    evpl_mutex_lock(&thread->shared->threads_lock);
     for (tpp = &thread->shared->threads; *tpp; tpp = &(*tpp)->next_thread) {
         if (*tpp == thread) {
             *tpp = thread->next_thread;
             break;
         }
     }
-    pthread_mutex_unlock(&thread->shared->threads_lock);
+    last_thread = thread->shared->threads == NULL;
+    evpl_mutex_unlock(&thread->shared->threads_lock);
 
-    /* Release any durable/persistent handles still parked in the shared
-     * registry while this thread's vfs_thread is alive.  Each parked open
-     * pins a VFS open handle; leaving it referenced makes the VFS close
+    /* libevpl closes a worker's binds before calling thread_destroy, but peer
+     * workers may still have live connections.  Only the last SMB worker can
+     * drain the global registry: doing it earlier frees opens still hashed in
+     * a peer's tree, which that peer will walk during connection teardown.
+     *
+     * Release the parked handles while this last worker's vfs_thread is alive.
+     * Each parked open pins a VFS open handle; leaving it referenced makes the VFS close
      * thread spin and chimera_vfs_destroy hang.  Must run before the
      * free_open_files drain below so the released opens are reclaimed. */
-    if (thread->shared->config.persistent_handles) {
+    if (last_thread && thread->shared->config.persistent_handles) {
         chimera_smb_durable_drain_all(thread);
     }
 
@@ -2977,9 +3009,9 @@ chimera_smb_add_share(
      * own (see chimera_smb_share_release). */
     share->refcnt = 1;
 
-    pthread_mutex_lock(&shared->shares_lock);
+    evpl_mutex_lock(&shared->shares_lock);
     LL_PREPEND(shared->shares, share);
-    pthread_mutex_unlock(&shared->shares_lock);
+    evpl_mutex_unlock(&shared->shares_lock);
 
 } /* chimera_smb_add_share */
 
@@ -2992,7 +3024,7 @@ chimera_smb_share_set_access_based_enum(
     struct chimera_smb_share         *cur;
     int                               rc = -1;
 
-    pthread_mutex_lock(&shared->shares_lock);
+    evpl_mutex_lock(&shared->shares_lock);
     LL_FOREACH(shared->shares, cur)
     {
         if (strcasecmp(cur->name, name) == 0) {
@@ -3001,7 +3033,7 @@ chimera_smb_share_set_access_based_enum(
             break;
         }
     }
-    pthread_mutex_unlock(&shared->shares_lock);
+    evpl_mutex_unlock(&shared->shares_lock);
 
     return rc;
 } /* chimera_smb_share_set_access_based_enum */
@@ -3015,7 +3047,7 @@ chimera_smb_share_set_encrypt_data(
     struct chimera_smb_share         *cur;
     int                               rc = -1;
 
-    pthread_mutex_lock(&shared->shares_lock);
+    evpl_mutex_lock(&shared->shares_lock);
     LL_FOREACH(shared->shares, cur)
     {
         if (strcasecmp(cur->name, name) == 0) {
@@ -3025,7 +3057,7 @@ chimera_smb_share_set_encrypt_data(
             break;
         }
     }
-    pthread_mutex_unlock(&shared->shares_lock);
+    evpl_mutex_unlock(&shared->shares_lock);
 
     return rc;
 } /* chimera_smb_share_set_encrypt_data */
@@ -3039,7 +3071,7 @@ chimera_smb_share_set_force_level2_oplock(
     struct chimera_smb_share         *cur;
     int                               rc = -1;
 
-    pthread_mutex_lock(&shared->shares_lock);
+    evpl_mutex_lock(&shared->shares_lock);
     LL_FOREACH(shared->shares, cur)
     {
         if (strcasecmp(cur->name, name) == 0) {
@@ -3048,7 +3080,7 @@ chimera_smb_share_set_force_level2_oplock(
             break;
         }
     }
-    pthread_mutex_unlock(&shared->shares_lock);
+    evpl_mutex_unlock(&shared->shares_lock);
 
     return rc;
 } /* chimera_smb_share_set_force_level2_oplock */
@@ -3063,7 +3095,7 @@ chimera_smb_remove_share(
     struct chimera_smb_share         *share;
     int                               found = 0;
 
-    pthread_mutex_lock(&shared->shares_lock);
+    evpl_mutex_lock(&shared->shares_lock);
     LL_FOREACH(shared->shares, share)
     {
         if (strcmp(share->name, name) == 0) {
@@ -3079,7 +3111,7 @@ chimera_smb_remove_share(
             break;
         }
     }
-    pthread_mutex_unlock(&shared->shares_lock);
+    evpl_mutex_unlock(&shared->shares_lock);
 
     if (found) {
         chimera_smb_share_release(share);
@@ -3096,15 +3128,15 @@ chimera_smb_get_share(
     struct chimera_server_smb_shared *shared = smb_shared;
     struct chimera_smb_share         *share;
 
-    pthread_mutex_lock(&shared->shares_lock);
+    evpl_mutex_lock(&shared->shares_lock);
     LL_FOREACH(shared->shares, share)
     {
         if (strcmp(share->name, name) == 0) {
-            pthread_mutex_unlock(&shared->shares_lock);
+            evpl_mutex_unlock(&shared->shares_lock);
             return share;
         }
     }
-    pthread_mutex_unlock(&shared->shares_lock);
+    evpl_mutex_unlock(&shared->shares_lock);
 
     return NULL;
 } /* chimera_smb_get_share */
@@ -3118,14 +3150,14 @@ chimera_smb_iterate_shares(
     struct chimera_server_smb_shared *shared = smb_shared;
     struct chimera_smb_share         *share;
 
-    pthread_mutex_lock(&shared->shares_lock);
+    evpl_mutex_lock(&shared->shares_lock);
     LL_FOREACH(shared->shares, share)
     {
         if (callback(share, data) != 0) {
             break;
         }
     }
-    pthread_mutex_unlock(&shared->shares_lock);
+    evpl_mutex_unlock(&shared->shares_lock);
 } /* chimera_smb_iterate_shares */
 
 SYMBOL_EXPORT const char *

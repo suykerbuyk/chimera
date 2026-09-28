@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: LGPL-2.1-only
 
+#include "common/thread.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -118,12 +119,7 @@ smb_lock_ranges_overlap(
     uint64_t b_off,
     uint64_t b_len)
 {
-    __uint128_t a_end = (a_len == UINT64_MAX)
-        ? ((__uint128_t) 1 << 64) : (__uint128_t) a_off + a_len;
-    __uint128_t b_end = (b_len == UINT64_MAX)
-        ? ((__uint128_t) 1 << 64) : (__uint128_t) b_off + b_len;
-
-    return a_off < b_end && b_off < a_end;
+    return chimera_vfs_claim_range_overlap_i(a_off, a_len, b_off, b_len);
 } /* smb_lock_ranges_overlap */
 
 /* One held byte-range, owned by the open_file.  Released on UNLOCK or
@@ -140,21 +136,44 @@ struct chimera_smb_lock_entry {
     struct chimera_smb_lock_entry     *next;
 };
 
-SYMBOL_EXPORT void
-chimera_smb_open_file_drain_locks(
+/* pump=false is the shutdown variant (chimera_smb_durable_drain_all): every
+ * claim is still unlinked -- the open is freed right after, and the VFS
+ * close thread walks the claim lists during its own shutdown pass -- but
+ * no waiter is woken, since none has a connection left to answer. */
+static void
+chimera_smb_open_file_drain_claims(
     struct chimera_server_smb_thread *thread,
-    struct chimera_smb_open_file     *open_file)
+    struct chimera_smb_open_file     *open_file,
+    bool                              pump)
 {
     struct chimera_smb_lock_entry *entry, *tmp;
     struct chimera_vfs_state      *vfs_state = thread->vfs_thread->vfs->vfs_state;
 
-    /* Drop the SHARE-mode reservation first.  Release any byte-range
-     * locks after — they may share the same file_state. */
-    if (open_file->share_lease_inserted) {
-        chimera_vfs_claim_release(vfs_state, open_file->share_file_state,
-                                  &open_file->share_lease);
-        open_file->share_lease_inserted = false;
+    /* A pending CREATE can resume as soon as the share reservation is removed.
+     * Drop the cache grant in the same critical section, so that CREATE cannot
+     * cap its oplock against a lease belonging to the closing open. Detach the
+     * protocol member first so a break cannot notify it during teardown. */
+    if (open_file->grant) {
+        chimera_smb_grant_remove_member(open_file->grant, open_file);
     }
+    if (!pump) {
+        if (open_file->share_lease_inserted) {
+            chimera_vfs_claim_release_nopump(vfs_state, open_file->share_file_state,
+                                             &open_file->share_lease);
+            open_file->share_lease_inserted = false;
+        }
+        if (open_file->grant) {
+            chimera_vfs_claim_grant_release(vfs_state, open_file->grant, false /*pump*/);
+        }
+    } else if (open_file->share_lease_inserted) {
+        chimera_vfs_claim_release_open(vfs_state, open_file->share_file_state,
+                                       &open_file->share_lease, open_file->grant);
+        open_file->share_lease_inserted = false;
+    } else if (open_file->grant) {
+        chimera_vfs_claim_grant_release(vfs_state, open_file->grant, true /*pump*/);
+    }
+    open_file->grant                  = NULL;
+    open_file->caching_lease_inserted = false;
     if (open_file->share_file_state) {
         chimera_vfs_state_put(vfs_state, open_file->share_file_state);
         open_file->share_file_state = NULL;
@@ -163,8 +182,13 @@ chimera_smb_open_file_drain_locks(
     /* A named stream's file-level DELETE reservation on the base file's state
      * (smb2.streams.delete). */
     if (open_file->base_share_lease_inserted) {
-        chimera_vfs_claim_release(vfs_state, open_file->base_share_file_state,
-                                  &open_file->base_share_lease);
+        if (pump) {
+            chimera_vfs_claim_release(vfs_state, open_file->base_share_file_state,
+                                      &open_file->base_share_lease);
+        } else {
+            chimera_vfs_claim_release_nopump(vfs_state, open_file->base_share_file_state,
+                                             &open_file->base_share_lease);
+        }
         chimera_vfs_state_stream_holder_dec(open_file->base_share_file_state);
         open_file->base_share_lease_inserted = false;
     }
@@ -173,19 +197,6 @@ chimera_smb_open_file_drain_locks(
         open_file->base_share_file_state = NULL;
     }
 
-    /* Drop this open's reference on the caching grant (oplock / SMB2 lease).
-     * On the grant's last reference the embedded lease is unlinked and the grant
-     * freed; the per-file state reference (caching_file_state) is balanced
-     * separately below. */
-    if (open_file->grant) {
-        /* Unthread this open from the grant's member list before dropping its
-         * reference: once removed, the break callback will not try to notify a
-         * closing open, and on the grant's last reference the lease is freed. */
-        chimera_smb_grant_remove_member(open_file->grant, open_file);
-        chimera_vfs_claim_grant_release(vfs_state, open_file->grant, true /*pump*/);
-        open_file->grant                  = NULL;
-        open_file->caching_lease_inserted = false;
-    }
     if (open_file->caching_file_state) {
         chimera_vfs_state_put(vfs_state, open_file->caching_file_state);
         open_file->caching_file_state = NULL;
@@ -204,8 +215,13 @@ chimera_smb_open_file_drain_locks(
     while (entry) {
         tmp = entry->next;
         if (entry->lease_inserted) {
-            chimera_vfs_claim_release_ranged(thread->vfs_thread, vfs_state,
-                                             entry->file_state, &entry->lease);
+            if (pump) {
+                chimera_vfs_claim_release_ranged(thread->vfs_thread, vfs_state,
+                                                 entry->file_state, &entry->lease);
+            } else {
+                chimera_vfs_claim_release_nopump(vfs_state, entry->file_state,
+                                                 &entry->lease);
+            }
         }
         if (entry->file_state) {
             chimera_vfs_state_put(vfs_state, entry->file_state);
@@ -213,7 +229,23 @@ chimera_smb_open_file_drain_locks(
         free(entry);
         entry = tmp;
     }
+} /* chimera_smb_open_file_drain_claims */
+
+SYMBOL_EXPORT void
+chimera_smb_open_file_drain_locks(
+    struct chimera_server_smb_thread *thread,
+    struct chimera_smb_open_file     *open_file)
+{
+    chimera_smb_open_file_drain_claims(thread, open_file, true);
 } /* chimera_smb_open_file_drain_locks */
+
+SYMBOL_EXPORT void
+chimera_smb_open_file_drain_locks_nopump(
+    struct chimera_server_smb_thread *thread,
+    struct chimera_smb_open_file     *open_file)
+{
+    chimera_smb_open_file_drain_claims(thread, open_file, false);
+} /* chimera_smb_open_file_drain_locks_nopump */
 
 int
 chimera_smb_parse_lock(
@@ -400,7 +432,7 @@ chimera_smb_lock_abort_parked(
     if (entry && !chimera_vfs_claim_cancel(vfs_state, &entry->ticket)) {
         struct chimera_smb_request **pp = &thread->lock_resume_head;
 
-        pthread_mutex_lock(&thread->lease_break_lock);
+        evpl_mutex_lock(&thread->lease_break_lock);
         while (*pp) {
             if (*pp == request) {
                 *pp = request->lock.lock_resume_next;
@@ -409,7 +441,7 @@ chimera_smb_lock_abort_parked(
             }
             pp = &(*pp)->lock.lock_resume_next;
         }
-        pthread_mutex_unlock(&thread->lease_break_lock);
+        evpl_mutex_unlock(&thread->lease_break_lock);
 
         /* The ticket did not dequeue because the grant already landed: the VFS
          * range lease IS inserted in the table even though the SMB-side
@@ -462,10 +494,10 @@ chimera_smb_lock_acquire_cb(
      * doorbell and completes the lock there. */
     request->lock.resume_status = status;
 
-    pthread_mutex_lock(&thread->lease_break_lock);
+    evpl_mutex_lock(&thread->lease_break_lock);
     request->lock.lock_resume_next = thread->lock_resume_head;
     thread->lock_resume_head       = request;
-    pthread_mutex_unlock(&thread->lease_break_lock);
+    evpl_mutex_unlock(&thread->lease_break_lock);
 
     evpl_ring_doorbell(&thread->lease_resume_doorbell);
 } /* chimera_smb_lock_acquire_cb */
@@ -676,7 +708,7 @@ chimera_smb_lock_multi(
             chimera_smb_lock_multi_complete(request, open_file, SMB2_STATUS_INVALID_PARAMETER);
             return;
         }
-        if ((__uint128_t) off + len > ((__uint128_t) 1 << 64)) {
+        if (len && off > UINT64_MAX - (len - 1)) {
             chimera_smb_lock_multi_complete(request, open_file, SMB2_STATUS_INVALID_LOCK_RANGE);
             return;
         }
@@ -829,8 +861,8 @@ chimera_smb_lock(struct chimera_smb_request *request)
      * §3.3.5.14.{1,2}): reject it with INVALID_LOCK_RANGE before touching the
      * lock table.  A range that ends exactly at 2^64 (e.g. offset=2^64-1,
      * length=1, the last byte) is valid; length 0 is a zero-byte range. */
-    if ((__uint128_t) request->lock.l_offset + request->lock.l_length >
-        ((__uint128_t) 1 << 64)) {
+    if (request->lock.l_length && request->lock.l_offset >
+        UINT64_MAX - (request->lock.l_length - 1)) {
         chimera_smb_open_file_release(request, open_file);
         chimera_smb_complete_request(request, SMB2_STATUS_INVALID_LOCK_RANGE);
         return;

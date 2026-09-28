@@ -10,6 +10,26 @@ add_executable(vfs_clock_test vfs_clock_test.c)
 target_link_libraries(vfs_clock_test chimera_vfs)
 add_test(chimera/vfs/clock_test vfs_clock_test)
 
+if(CHIMERA_VFS_IO_URING AND CHIMERA_LIMITS_TESTING)
+    add_executable(vfs_io_uring_sizing_test vfs_io_uring_sizing_test.c)
+    target_link_libraries(vfs_io_uring_sizing_test
+        chimera_vfs_io_uring chimera_vfs evpl uring ${CMAKE_DL_LIBS})
+    # Resource sizing is outside the protocol models. Keep this initialization
+    # probe in the quick tier so an ignored size override is caught early.
+    set(_sizing_saved_tier "${CHIMERA_TEST_TIER}")
+    set(CHIMERA_TEST_TIER quick)
+    add_test(NAME chimera/vfs/io_uring_sizing
+        COMMAND ${CMAKE_SOURCE_DIR}/scripts/test_limits_wrapper.sh
+                $<TARGET_FILE:vfs_io_uring_sizing_test>)
+    add_executable(vfs_io_uring_diagnostics_test vfs_io_uring_diagnostics_test.c)
+    target_link_libraries(vfs_io_uring_diagnostics_test
+        chimera_vfs_io_uring chimera_vfs evpl uring ${CMAKE_DL_LIBS})
+    add_test(NAME chimera/vfs/io_uring_diagnostics
+        COMMAND ${CMAKE_SOURCE_DIR}/scripts/test_limits_wrapper.sh
+                $<TARGET_FILE:vfs_io_uring_diagnostics_test>)
+    set(CHIMERA_TEST_TIER "${_sizing_saved_tier}")
+endif()
+
 add_executable(vfs_kv_test vfs_kv_test.c)
 target_link_libraries(vfs_kv_test chimera_vfs chimera_vfs_memkv evpl)
 if (SQLITE_ENABLED)
@@ -30,6 +50,33 @@ if(CAIRN_ENABLED)
 	add_executable(vfs_sync_delegation_test vfs_sync_delegation_test.c)
 	target_link_libraries(vfs_sync_delegation_test chimera_vfs chimera_vfs_cairn evpl)
 	add_test(chimera/vfs/sync_delegation_test vfs_sync_delegation_test)
+
+    # The sequential protocol models cannot force a stale inode read to race
+    # with a rename. Keep this deterministic backend interleaving in quick CI,
+    # including the non-pinned compatibility path used by older RocksDB.
+    set(_cairn_saved_tier "${CHIMERA_TEST_TIER}")
+    set(CHIMERA_TEST_TIER quick)
+    foreach(variant native compat)
+        add_executable(vfs_cairn_conflict_${variant}_test vfs_cairn_conflict_test.c)
+        target_link_libraries(vfs_cairn_conflict_${variant}_test
+            chimera_vfs evpl jansson rocksdb)
+        target_compile_definitions(vfs_cairn_conflict_${variant}_test PRIVATE
+            $<TARGET_PROPERTY:chimera_vfs_cairn,COMPILE_DEFINITIONS>)
+        if(variant STREQUAL "compat")
+            target_compile_definitions(vfs_cairn_conflict_${variant}_test PRIVATE
+                ROCKSDB_LEGACY_COMPAT=1)
+        endif()
+        add_test(NAME chimera/vfs/cairn_conflict_${variant}
+            COMMAND vfs_cairn_conflict_${variant}_test)
+        set_tests_properties(chimera/vfs/cairn_conflict_${variant} PROPERTIES TIMEOUT 30)
+    endforeach()
+    add_executable(vfs_cairn_reply_attrs_test vfs_cairn_reply_attrs_test.c)
+    target_link_libraries(vfs_cairn_reply_attrs_test chimera_vfs evpl jansson rocksdb)
+    target_compile_definitions(vfs_cairn_reply_attrs_test PRIVATE
+        $<TARGET_PROPERTY:chimera_vfs_cairn,COMPILE_DEFINITIONS>)
+    add_test(NAME chimera/vfs/cairn_reply_attrs COMMAND vfs_cairn_reply_attrs_test)
+    set_tests_properties(chimera/vfs/cairn_reply_attrs PROPERTIES TIMEOUT 30)
+    set(CHIMERA_TEST_TIER "${_cairn_saved_tier}")
 endif()
 
 add_executable(vfs_notify_test vfs_notify_test.c)
@@ -38,7 +85,12 @@ add_test(chimera/vfs/notify_test vfs_notify_test)
 
 add_executable(vfs_claim_test vfs_claim_test.c)
 target_link_libraries(vfs_claim_test chimera_vfs)
+# Claim waiter races are not represented by sequential protocol traces.
+set(_claim_saved_tier "${CHIMERA_TEST_TIER}")
+set(CHIMERA_TEST_TIER quick)
 add_test(chimera/vfs/claim_test vfs_claim_test)
+set_tests_properties(chimera/vfs/claim_test PROPERTIES TIMEOUT 30)
+set(CHIMERA_TEST_TIER "${_claim_saved_tier}")
 
 add_executable(vfs_acl_test vfs_acl_test.c)
 target_link_libraries(vfs_acl_test chimera_vfs)
@@ -113,17 +165,17 @@ endif()
 # fsuid and their cached open_by_handle_at descriptor was opened privileged.
 # Root only (setfsuid), and the backend must be able to serve the scratch
 # directory (name_to_handle_at fails on overlayfs); the test exits 77 otherwise.
-add_executable(vfs_xattr_dac_test vfs_xattr_dac_test.c)
-target_link_libraries(vfs_xattr_dac_test chimera_vfs chimera_vfs_memkv evpl)
 if(CHIMERA_LINUX)
-    target_link_libraries(vfs_xattr_dac_test chimera_vfs_linux)
+    add_executable(vfs_xattr_dac_test vfs_xattr_dac_test.c)
+    target_link_libraries(vfs_xattr_dac_test chimera_vfs chimera_vfs_memkv evpl
+                          chimera_vfs_linux)
     add_test(NAME chimera/vfs/xattr_dac_linux COMMAND vfs_xattr_dac_test linux)
     set_tests_properties(chimera/vfs/xattr_dac_linux PROPERTIES SKIP_RETURN_CODE 77)
-endif()
-if(CHIMERA_VFS_IO_URING)
-    target_link_libraries(vfs_xattr_dac_test chimera_vfs_io_uring)
-    add_test(NAME chimera/vfs/xattr_dac_io_uring COMMAND vfs_xattr_dac_test io_uring)
-    set_tests_properties(chimera/vfs/xattr_dac_io_uring PROPERTIES SKIP_RETURN_CODE 77)
+    if(CHIMERA_VFS_IO_URING)
+        target_link_libraries(vfs_xattr_dac_test chimera_vfs_io_uring)
+        add_test(NAME chimera/vfs/xattr_dac_io_uring COMMAND vfs_xattr_dac_test io_uring)
+        set_tests_properties(chimera/vfs/xattr_dac_io_uring PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
 endif()
 
 # Native Windows SID round trip through the VFS, parameterized by
@@ -144,6 +196,24 @@ endif()
 if(CAIRN_ENABLED)
     target_link_libraries(vfs_acl_sid_test chimera_vfs_cairn)
     add_test(NAME chimera/vfs/acl_sid_cairn COMMAND vfs_acl_sid_test cairn)
+endif()
+
+# The stored ACL, not the mode, decides a non-root open on every open route,
+# parameterized by the backends that store the canonical ACL natively.
+add_executable(vfs_open_acl_test vfs_open_acl_test.c)
+target_link_libraries(vfs_open_acl_test chimera_vfs chimera_vfs_memfs
+    chimera_vfs_diskfs chimera_vfs_memkv evpl)
+add_test(NAME chimera/vfs/open_acl_memfs COMMAND vfs_open_acl_test memfs)
+if(HAVE_LIBAIO)
+    add_test(NAME chimera/vfs/open_acl_diskfs_aio COMMAND vfs_open_acl_test diskfs_aio)
+endif()
+if(CHIMERA_VFS_IO_URING)
+    target_link_libraries(vfs_open_acl_test chimera_vfs_io_uring)
+    add_test(NAME chimera/vfs/open_acl_diskfs_io_uring COMMAND vfs_open_acl_test diskfs_io_uring)
+endif()
+if(CAIRN_ENABLED)
+    target_link_libraries(vfs_open_acl_test chimera_vfs_cairn)
+    add_test(NAME chimera/vfs/open_acl_cairn COMMAND vfs_open_acl_test cairn)
 endif()
 
 # Tag every test registered above with the 'vfs' label so the suite can be run
