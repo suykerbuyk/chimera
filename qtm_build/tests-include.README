@@ -34,6 +34,10 @@ What is installed
     <prefix>/tests/include/vfs/vfs_clock.h        included by vfs.h
     <prefix>/tests/include/common/logging.h       included by vfs_dump.h
     <prefix>/tests/include/common/tcp_flavor.h    included by vfs.h
+    <prefix>/tests/include/common/thread.h        included by vfs.h
+    <prefix>/tests/include/common/platform.h      included by vfs.h
+    <prefix>/tests/include/common/atomic.h        included by vfs_clock.h
+    <prefix>/tests/include/common/compiler.h      included by logging.h
 
 <prefix> is /opt/quantum/chimera in the Quantum packages.
 

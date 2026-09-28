@@ -56,6 +56,10 @@ tests/include/vfs/vfs_pnfs.h
 tests/include/vfs/vfs_clock.h
 tests/include/common/logging.h
 tests/include/common/tcp_flavor.h
+tests/include/common/thread.h
+tests/include/common/platform.h
+tests/include/common/atomic.h
+tests/include/common/compiler.h
 "
 
 missing=0
