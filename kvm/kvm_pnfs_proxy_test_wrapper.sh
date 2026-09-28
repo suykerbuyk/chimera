@@ -341,7 +341,8 @@ echo "=== proxy negotiated pNFS-MDS + established back channel ==="
 NFS_MOUNT_OPTS="vers=4.1,tcp"
 TEST_CMD="mount -t nfs -o ${NFS_MOUNT_OPTS} ${PROXY_IP}:/pshare /mnt && ${TEST_CMD_ARG}"
 
-ip netns exec "${FE_NS}" timeout --foreground --kill-after=10s "${KVM_QEMU_DEADLINE}" "$QEMU_BIN" \
+python3 "$(dirname "${BASH_SOURCE[0]}")/run_guest.py" -- \
+    ip netns exec "${FE_NS}" timeout --foreground --kill-after=10s "${KVM_QEMU_DEADLINE}" "$QEMU_BIN" \
     -enable-kvm -smp 4 -m 1G -cpu host \
     -kernel "$VMLINUZ" \
     $QEMU_INITRD \
@@ -355,6 +356,7 @@ ip netns exec "${FE_NS}" timeout --foreground --kill-after=10s "${KVM_QEMU_DEADL
     -no-reboot \
     -append "root=/dev/vda rw console=${QEMU_CONSOLE} net.ifnames=0 biosdevname=0 quiet mitigations=off tsc=reliable panic=-1 test_cmd=\"${TEST_CMD}\" init=/init.sh" \
     2>/dev/null | tee "$LOG_FILE"
+GUEST_STATUS=${PIPESTATUS[0]}
 
 for pid in "$PROXY_PID" "$MDS_PID" "$DS_PID"; do
     if ! kill -0 "$pid" 2>/dev/null; then
@@ -366,9 +368,8 @@ for pid in "$PROXY_PID" "$MDS_PID" "$DS_PID"; do
     fi
 done
 
-EXIT_CODE=$(grep -oP 'CHIMERA_KVM_EXIT_CODE=\K[0-9]+' "$LOG_FILE" | tail -1)
-if [ "${EXIT_CODE:-1}" != "0" ]; then
-    exit "${EXIT_CODE:-1}"
+if [ "$GUEST_STATUS" != "0" ]; then
+    exit "$GUEST_STATUS"
 fi
 
 # The events asserted below all happened before the guest workload completed

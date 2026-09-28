@@ -3,6 +3,7 @@
  */
 
 #define _GNU_SOURCE
+#include "common/thread.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -104,7 +105,7 @@ struct snfs_range {
 struct snfs_shared {
     int                     readdir_verifier;
 
-    pthread_mutex_t         range_lock;
+    evpl_mutex_t            range_lock;
     struct snfs_range_file *range_files;
     struct snfs_range      *ranges;
     uint64_t                range_next_token;
@@ -127,7 +128,7 @@ snfs_init(
 
     shared = calloc(1, sizeof(*shared));
 
-    pthread_mutex_init(&shared->range_lock, NULL);
+    evpl_mutex_init(&shared->range_lock, NULL);
 
     if (cfgdata && cfgdata[0] != '\0') {
         json_error_t json_error;
@@ -165,7 +166,7 @@ snfs_destroy(void *private_data)
         free(file);
     }
 
-    pthread_mutex_destroy(&shared->range_lock);
+    evpl_mutex_destroy(&shared->range_lock);
 
     free(shared);
 } /* snfs_destroy */ /* snfs_destroy */
@@ -1964,10 +1965,10 @@ snfs_claim_acquire(
         if (!(request->claim_acquire.flags & CHIMERA_VFS_CLAIM_TEST)) {
             range = calloc(1, sizeof(*range));
 
-            pthread_mutex_lock(&shared->range_lock);
+            evpl_mutex_lock(&shared->range_lock);
             range->token = ++shared->range_next_token;
             LL_PREPEND(shared->ranges, range);
-            pthread_mutex_unlock(&shared->range_lock);
+            evpl_mutex_unlock(&shared->range_lock);
 
             request->claim_acquire.r_token   = range->token;
             request->claim_acquire.r_granted = 1;
@@ -1978,7 +1979,7 @@ snfs_claim_acquire(
         return;
     }
 
-    pthread_mutex_lock(&shared->range_lock);
+    evpl_mutex_lock(&shared->range_lock);
 
     file = snfs_range_file_get(thread,
                                request->fh,
@@ -1988,7 +1989,7 @@ snfs_claim_acquire(
 
     rc = file ? 0 : errno;
 
-    pthread_mutex_unlock(&shared->range_lock);
+    evpl_mutex_unlock(&shared->range_lock);
 
     if (!file) {
         request->status = snfs_errno_to_status(rc);
@@ -2028,7 +2029,7 @@ snfs_claim_acquire(
         snfs_range_resolve(&fl, file->fd, &range->offset, &range->length);
     }
 
-    pthread_mutex_lock(&shared->range_lock);
+    evpl_mutex_lock(&shared->range_lock);
 
     if (range) {
         range->token = ++shared->range_next_token;
@@ -2042,7 +2043,7 @@ snfs_claim_acquire(
         snfs_range_file_put(shared, file);
     }
 
-    pthread_mutex_unlock(&shared->range_lock);
+    evpl_mutex_unlock(&shared->range_lock);
 
     request->complete(request);
 } /* snfs_claim_acquire */
@@ -2067,7 +2068,7 @@ snfs_claim_release_ranged(
     uint64_t                length = request->claim_release.length;
     int                     err    = 0;
 
-    pthread_mutex_lock(&shared->range_lock);
+    evpl_mutex_lock(&shared->range_lock);
 
     file = snfs_range_file_find(shared,
                                 request->fh,
@@ -2080,7 +2081,7 @@ snfs_claim_release_ranged(
         file->refcnt++;
     }
 
-    pthread_mutex_unlock(&shared->range_lock);
+    evpl_mutex_unlock(&shared->range_lock);
 
     if (!file) {
         /* This owner locks nothing on this file, so there is nothing of ours
@@ -2120,16 +2121,16 @@ snfs_claim_release_ranged(
     }
 
     if (err) {
-        pthread_mutex_lock(&shared->range_lock);
+        evpl_mutex_lock(&shared->range_lock);
         snfs_range_file_put(shared, file);
-        pthread_mutex_unlock(&shared->range_lock);
+        evpl_mutex_unlock(&shared->range_lock);
 
         request->status = snfs_errno_to_status(err);
         request->complete(request);
         return;
     }
 
-    pthread_mutex_lock(&shared->range_lock);
+    evpl_mutex_lock(&shared->range_lock);
 
     LL_FOREACH_SAFE(shared->ranges, range, tmp)
     {
@@ -2151,7 +2152,7 @@ snfs_claim_release_ranged(
         LL_PREPEND(matched, range);
     }
 
-    pthread_mutex_unlock(&shared->range_lock);
+    evpl_mutex_unlock(&shared->range_lock);
 
     /* Outside the registry lock, as every other lock syscall on this module is.
      * F_UNLCK does not block, but the descriptor put below wants the lock and
@@ -2167,7 +2168,7 @@ snfs_claim_release_ranged(
         fcntl(file->fd, SNFS_LOCK_SET, &fl);
     }
 
-    pthread_mutex_lock(&shared->range_lock);
+    evpl_mutex_lock(&shared->range_lock);
 
     while (matched) {
         range = matched;
@@ -2178,7 +2179,7 @@ snfs_claim_release_ranged(
 
     snfs_range_file_put(shared, file);
 
-    pthread_mutex_unlock(&shared->range_lock);
+    evpl_mutex_unlock(&shared->range_lock);
 
     request->status = CHIMERA_VFS_OK;
     request->complete(request);
@@ -2203,7 +2204,7 @@ snfs_claim_release(
         return;
     }
 
-    pthread_mutex_lock(&shared->range_lock);
+    evpl_mutex_lock(&shared->range_lock);
 
     for (range = shared->ranges; range; range = range->next) {
         if (range->token == request->claim_release.token) {
@@ -2212,7 +2213,7 @@ snfs_claim_release(
         }
     }
 
-    pthread_mutex_unlock(&shared->range_lock);
+    evpl_mutex_unlock(&shared->range_lock);
 
     if (range && range->projected) {
         fl.l_type   = F_UNLCK;
@@ -2223,9 +2224,9 @@ snfs_claim_release(
 
         fcntl(range->file->fd, SNFS_LOCK_SET, &fl);
 
-        pthread_mutex_lock(&shared->range_lock);
+        evpl_mutex_lock(&shared->range_lock);
         snfs_range_file_put(shared, range->file);
-        pthread_mutex_unlock(&shared->range_lock);
+        evpl_mutex_unlock(&shared->range_lock);
     }
 
     free(range);

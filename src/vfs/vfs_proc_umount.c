@@ -3,6 +3,8 @@
 //
 // SPDX-License-Identifier: LGPL-2.1-only
 
+#include "common/atomic.h"
+#include "common/thread.h"
 #include <string.h>
 #include "vfs_procs.h"
 #include "vfs_internal.h"
@@ -34,10 +36,10 @@ chimera_vfs_umount_wake(struct chimera_vfs_thread *thread)
 /*
  * Reclaim a torn-down mount after an RCU grace period.
  *
- * Mount-table readers run chimera_vfs_mount_table_lookup() under
- * urcu_qsbr_read_lock() and dereference entry->mount->root_fh to match the
+ * Mount-table readers run chimera_vfs_mount_table_lookup() under the mount
+ * table's read side and dereference entry->mount->root_fh to match the
  * mount id.  chimera_vfs_mount_table_remove() unlinks the entry and gives the
- * ENTRY a grace period (call_rcu) before freeing it -- but the mount it points
+ * ENTRY a grace period before freeing it -- but the mount it points
  * at used to be freed the instant the backend's UMOUNT completed, with no
  * grace period at all.  A reader that entered the lookup before the unlink
  * still walks that entry and follows the now-dangling entry->mount.
@@ -47,16 +49,19 @@ chimera_vfs_umount_wake(struct chimera_vfs_thread *thread)
  * thread while a per-trace filesystem recycle unmounted it on another.  Give
  * the mount the same grace period its entry gets.
  *
- * struct chimera_vfs_mount cannot carry the rcu_head itself: vfs.h is
- * deliberately urcu-free, so the head lives in this wrapper instead.
+ * struct chimera_vfs_mount cannot carry the rcu head itself: vfs.h is
+ * deliberately free of the RCU shim, so the head lives in this wrapper
+ * instead.  There is no accompanying store to hang the retire off -- the entry
+ * that referenced this mount was unlinked earlier -- so this is a bare
+ * chimera_rcu_retire() rather than a replace.
  */
 struct chimera_vfs_mount_reclaim {
-    struct rcu_head           rcu;
+    chimera_rcu_head          rcu;
     struct chimera_vfs_mount *mount;
 };
 
 static void
-chimera_vfs_mount_reclaim_rcu(struct rcu_head *head)
+chimera_vfs_mount_reclaim_rcu(chimera_rcu_head *head)
 {
     struct chimera_vfs_mount_reclaim *reclaim =
         container_of(head, struct chimera_vfs_mount_reclaim, rcu);
@@ -92,7 +97,8 @@ chimera_vfs_umount_complete(struct chimera_vfs_request *request)
 
     if (likely(reclaim)) {
         reclaim->mount = mount;
-        call_rcu(&reclaim->rcu, chimera_vfs_mount_reclaim_rcu);
+        chimera_rcu_retire(&thread->vfs->mount_table->rcu, &reclaim->rcu,
+                           chimera_vfs_mount_reclaim_rcu);
     }
     /* Out of memory: leak the mount rather than free it early.  It is one
      * small allocation on a path that only runs at umount, and the alternative
@@ -114,6 +120,7 @@ struct chimera_vfs_umount_wait {
     struct evpl_timer           timer;
     struct chimera_vfs_request *request;
     uint64_t                    waited_us;
+    uint64_t                    started_ticks;
 };
 
 static void chimera_vfs_umount_progress(
@@ -162,7 +169,9 @@ chimera_vfs_umount_wait_timer(
     struct chimera_vfs_umount_wait *wait =
         container_of(timer, struct chimera_vfs_umount_wait, timer);
 
-    wait->waited_us += CHIMERA_VFS_UMOUNT_POLL_US;
+    /* Timers may fire late (notably with Windows timer granularity). Bound
+     * the actual wait, rather than counting callbacks as exact intervals. */
+    wait->waited_us = chimera_vfs_elapsed_ns(wait->started_ticks) / 1000;
 
     chimera_vfs_umount_progress(wait->request);
 } /* chimera_vfs_umount_wait_timer */
@@ -266,7 +275,7 @@ chimera_vfs_umount_dump_referenced(
             struct vfs_open_cache_shard    *shard = &cache->shards[i];
             struct chimera_vfs_open_handle *handle;
 
-            pthread_mutex_lock(&shard->lock);
+            evpl_mutex_lock(&shard->lock);
             for (handle = shard->handles; handle;
                  handle = handle->bucket_next) {
                 char fhhex[CHIMERA_VFS_FH_SIZE * 2 + 1];
@@ -284,7 +293,7 @@ chimera_vfs_umount_dump_referenced(
                     handle->access_mode,
                     (unsigned long long) handle->cred_hash);
             }
-            pthread_mutex_unlock(&shard->lock);
+            evpl_mutex_unlock(&shard->lock);
         }
     }
 } /* chimera_vfs_umount_dump_referenced */
@@ -341,11 +350,11 @@ chimera_vfs_umount_progress(struct chimera_vfs_request *request)
          */
         if (!request->umount.close_fence_valid) {
             request->umount.close_fence =
-                __atomic_load_n(&vfs->close_thread.closes_issued, __ATOMIC_ACQUIRE);
+                chimera_atomic_load_n(&vfs->close_thread.closes_issued, CHIMERA_MEMORY_ACQUIRE);
             request->umount.close_fence_valid = 1;
         }
 
-        if (__atomic_load_n(&vfs->close_thread.closes_completed, __ATOMIC_ACQUIRE) >=
+        if (chimera_atomic_load_n(&vfs->close_thread.closes_completed, CHIMERA_MEMORY_ACQUIRE) >=
             request->umount.close_fence) {
             chimera_vfs_umount_wait_stop(request);
             chimera_vfs_umount_dispatch(request);
@@ -373,8 +382,8 @@ chimera_vfs_umount_progress(struct chimera_vfs_request *request)
                 request->umount.mount->path,
                 vfs->umount_timeout_us / 1000,
                 (unsigned long) (request->umount.close_fence -
-                                 __atomic_load_n(&vfs->close_thread.closes_completed,
-                                                 __ATOMIC_ACQUIRE)));
+                                 chimera_atomic_load_n(&vfs->close_thread.closes_completed,
+                                                       CHIMERA_MEMORY_ACQUIRE)));
         } else {
             chimera_vfs_info(
                 "umount %s: %lu handle(s) still open after purging the cache; "
@@ -384,6 +393,7 @@ chimera_vfs_umount_progress(struct chimera_vfs_request *request)
         }
         wait                 = calloc(1, sizeof(*wait));
         wait->request        = request;
+        wait->started_ticks  = chimera_vfs_now_ticks();
         request->umount.wait = wait;
     } else if (wait->waited_us >= vfs->umount_timeout_us) {
         if (fence_wait) {
@@ -396,8 +406,8 @@ chimera_vfs_umount_progress(struct chimera_vfs_request *request)
                 "EBUSY",
                 request->umount.mount->path, wait->waited_us / 1000,
                 (unsigned long) (request->umount.close_fence -
-                                 __atomic_load_n(&vfs->close_thread.closes_completed,
-                                                 __ATOMIC_ACQUIRE)));
+                                 chimera_atomic_load_n(&vfs->close_thread.closes_completed,
+                                                       CHIMERA_MEMORY_ACQUIRE)));
         } else {
             chimera_vfs_error(
                 "umount %s: giving up with %lu handle(s) still open after %lu ms "

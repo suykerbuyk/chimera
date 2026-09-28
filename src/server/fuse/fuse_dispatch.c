@@ -2,12 +2,24 @@
 //
 // SPDX-License-Identifier: LGPL-2.1-only
 
+#include "common/thread.h"
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include "common/platform.h"
+#else  /* ifdef _WIN32 */
 #include <unistd.h>
+#endif /* ifdef _WIN32 */
 #include <errno.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include "common/platform.h"
+#endif /* ifdef _WIN32 */
+#ifdef _WIN32
+#include "common/platform.h"
+#else  /* ifdef _WIN32 */
 #include <sys/uio.h>
+#endif /* ifdef _WIN32 */
 
 #include "fuse_internal.h"
 #include "fuse_attr.h"
@@ -20,9 +32,13 @@
  * Each /dev/fuse read returns exactly one complete request, and each reply
  * is one atomic writev to the channel the request was read from -- the
  * kernel tracks a request on the per-device queue of the fd that read it,
- * so a reply on any other channel would not find it.  Requests are
- * dispatched on the thread that owns the channel and every VFS completion
- * fires on the issuing thread, so a request never changes threads.
+ * so a reply on any other channel would not find it.  On an io_uring mount
+ * most requests instead arrive in ring entries (fuse_uring.c) and are
+ * answered by committing the same entry; the channel fds stay armed for
+ * FORGET and INTERRUPT, which the kernel never routes through the ring.
+ * Requests are dispatched on the thread that owns the channel (or ring
+ * entry) and every VFS completion fires on the issuing thread, so a request
+ * never changes threads.
  */
 
 static struct chimera_fuse_request *
@@ -50,9 +66,11 @@ chimera_fuse_request_alloc(
         req->buf_allocated = 1;
     }
 
-    req->channel = channel;
-    req->handle  = NULL;
-    req->file    = NULL;
+    req->channel  = channel;
+    req->handle   = NULL;
+    req->file     = NULL;
+    req->hdr_off  = CHIMERA_FUSE_REQ_OFF;
+    req->ring_ent = NULL;
 
     thread->active_requests++;
 
@@ -65,6 +83,12 @@ chimera_fuse_request_free(
     struct chimera_fuse_request *req)
 {
     thread->active_requests--;
+
+    if (req->ring_ent) {
+        /* Owned by its ring entry, not the pool. */
+        chimera_fuse_uring_release(req);
+        return;
+    }
 
     if (thread->num_free_requests >= CHIMERA_FUSE_MAX_POOLED_REQS) {
         if (req->buf_allocated) {
@@ -103,6 +127,11 @@ chimera_fuse_send(
 
     if (req->channel->dead) {
         return -1;
+    }
+
+    if (req->ring_ent) {
+        return chimera_fuse_uring_commit(req, error, payload, payload_len,
+                                         data_iov, data_niov, data_len);
     }
 
     hdr.error  = -error;
@@ -375,10 +404,10 @@ chimera_fuse_resume_post(struct chimera_fuse_request *req)
 {
     struct chimera_fuse_thread *thread = req->thread;
 
-    pthread_mutex_lock(&thread->resume_lock);
+    evpl_mutex_lock(&thread->resume_lock);
     req->next            = thread->resume_queue;
     thread->resume_queue = req;
-    pthread_mutex_unlock(&thread->resume_lock);
+    evpl_mutex_unlock(&thread->resume_lock);
 
     evpl_ring_doorbell(&thread->resume_doorbell);
 } /* chimera_fuse_resume_post */
@@ -391,10 +420,10 @@ chimera_fuse_resume_doorbell(
     struct chimera_fuse_thread  *thread = container_of(doorbell, struct chimera_fuse_thread, resume_doorbell);
     struct chimera_fuse_request *queue, *req;
 
-    pthread_mutex_lock(&thread->resume_lock);
+    evpl_mutex_lock(&thread->resume_lock);
     queue                = thread->resume_queue;
     thread->resume_queue = NULL;
-    pthread_mutex_unlock(&thread->resume_lock);
+    evpl_mutex_unlock(&thread->resume_lock);
 
     while (queue) {
         req   = queue;
@@ -480,7 +509,7 @@ const chimera_fuse_handler_t chimera_fuse_handlers[CHIMERA_FUSE_OPCODE_MAX] = {
     [FUSE_DESTROY]         = chimera_fuse_op_destroy,
 };
 
-static void
+void
 chimera_fuse_dispatch(
     struct chimera_fuse_request *req,
     uint32_t                     len)

@@ -15,7 +15,7 @@
  * disk.
  */
 
-#include <dirent.h>
+#include "common/dirent.h"
 
 #include "posix_test_common.h"
 
@@ -41,10 +41,10 @@ evict_sweep(
     struct posix_test_env *env,
     int                    removed_stride)
 {
-    char        path[128];
-    struct stat st;
-    int         i, rc;
-    long        expect_files = 0, found_files = 0;
+    char                 path[128];
+    chimera_posix_stat_t st;
+    int                  i, rc;
+    long                 expect_files = 0, found_files = 0;
 
     for (i = 0; i < EVICT_NFILES; i++) {
         int removed = removed_stride && (i % removed_stride) == 0;
@@ -207,8 +207,9 @@ main(
                                     posix_test_diskfs_device_type(env.backend),
                                     diskfs_cfg, sizeof(diskfs_cfg));
 
-        root      = json_object();
-        config    = json_object();
+        root   = json_object();
+        config = json_object();
+        posix_test_configure_client(config);
         vfs       = json_object();
         vfs_entry = json_object();
         json_object_set_new(vfs_entry, "path", json_string("/build/test/diskfs"));

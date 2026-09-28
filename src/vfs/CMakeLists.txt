@@ -6,14 +6,15 @@
 # rcu_dereference): without _LGPL_SOURCE liburcu links the out-of-line
 # cross-library functions, adding a PLT call + barrier per RCU op on the hot
 # paths.  Applies to this directory and all subdirectories (the VFS core, the
-# RCU caches, and the backend modules under it -- every urcu user lives here or
-# under src/server).  Deliberately NOT set for src/fio (the GPL fio plugin,
-# which does not use urcu directly).  chimera is LGPL-2.1.
-# (URCU_API_MAP, which selects the unprefixed QSBR API, is set project-wide in
-# the top-level CMakeLists.txt.)
+# RCU caches, and the backend modules under it -- every user of the RCU shim
+# lives here or under src/server).  Deliberately NOT set for src/fio (the GPL
+# fio plugin, which does not use the shim).  chimera is LGPL-2.1.  Inert in a
+# build without liburcu.
+# (URCU_API_MAP, which selects the unprefixed QSBR API, is set alongside
+# CHIMERA_HAVE_URCU in the top-level CMakeLists.txt.)
 add_compile_definitions(_LGPL_SOURCE)
 
-add_library(chimera_vfs SHARED vfs.c vfs_lsan.c vfs_cred.c vfs_sdk_utils.c
+add_library(chimera_vfs ${CHIMERA_LIBRARY_TYPE} vfs.c vfs_lsan.c vfs_cred.c vfs_sdk_utils.c
             vfs_acl.c vfs_acl_serialize.c vfs_access.c vfs_idmap.c vfs_identity.c
             vfs_sid.c
             vfs_proc_mount.c vfs_proc_umount.c
@@ -99,6 +100,7 @@ find_path(SQLITE3_INCLUDE_DIR sqlite3.h)
 find_library(SQLITE3_LIBRARY sqlite3)
 if (SQLITE3_INCLUDE_DIR AND SQLITE3_LIBRARY)
     set(SQLITE_ENABLED TRUE)
+    target_compile_definitions(chimera_vfs PRIVATE CHIMERA_HAVE_SQLITE_VFS=1)
     message(STATUS "sqlite3 found (${SQLITE3_LIBRARY}); building chimera_vfs_sqlite")
     add_subdirectory(sqlite)
 else ()
@@ -109,7 +111,7 @@ endif()
 target_link_libraries(chimera_vfs
     chimera_vfs_root chimera_vfs_memfs chimera_vfs_memkv chimera_vfs_diskfs
     chimera_vfs_nfs chimera_vfs_smb
-    chimera_common prometheus-c xxhash ${CHIMERA_DL_LIB} urcu-qsbr)
+    chimera_common prometheus-c xxhash ${CHIMERA_DL_LIB} ${CHIMERA_RCU_LIBS})
 
 if (CHIMERA_LINUX)
     target_link_libraries(chimera_vfs chimera_vfs_linux)

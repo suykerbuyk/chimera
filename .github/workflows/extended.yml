@@ -555,6 +555,16 @@ jobs:
           restore-keys: |
             ccache-v2-${{ matrix.image_name }}-${{ matrix.arch }}-${{ matrix.build_type }}-
 
+      # Restore only, like the ccache: build-test.yml's push to main is the
+      # sole writer.  See the model corpus cache note at the top of that file.
+      - name: Restore the model corpus cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/specs-corpus-cache
+          key: specs-corpus-v1-${{ matrix.image_name }}-${{ matrix.arch }}-${{ github.sha }}
+          restore-keys: |
+            specs-corpus-v1-${{ matrix.image_name }}-${{ matrix.arch }}-
+
       - name: Configure, build, and test inside the container
         run: |
           # EVPL_IO_URING_ENTRIES below sizes the io_uring rings to a test
@@ -562,12 +572,20 @@ jobs:
           # kernel-accounted memory per ring (SQE128/CQE32 double both entry
           # sizes) and SQPOLL adds a kernel thread each; ctest -j nproc stacks
           # enough of them to be refused with ENOMEM, which is fatal to the
-          # process and takes an unrelated test with it.
+          # process and takes an unrelated test with it.  The VFS backend has
+          # separate rings: 256 in-flight requests reserve 1024 entries per
+          # worker, down from 4096; the request limit shrinks with the ring.
+          # FUSE-over-io_uring entries reserve ~1 MiB each per CPU queue, so
+          # a FUSE mount keeps 2 per queue instead of 16.
           docker run --rm --privileged \
             -e CCACHE_DIR=/ccache \
             -e CCACHE_MAXSIZE \
             -e EVPL_IO_URING_ENTRIES=1024 \
+            -e CHIMERA_IO_URING_MAX_INFLIGHT=256 \
+            -e CHIMERA_FUSE_URING_DEPTH=2 \
+            -e SPECS_CORPUS_CACHE_DIR=/specs-corpus-cache \
             -v "${{ runner.temp }}/ccache:/ccache" \
+            -v "${{ runner.temp }}/specs-corpus-cache:/specs-corpus-cache" \
             -v "${{ github.workspace }}:/workspace" \
             -v "${{ github.workspace }}/oras:/usr/local/bin/oras:ro" \
             -v /build \
@@ -651,12 +669,24 @@ jobs:
           restore-keys: |
             ccache-v2-devcontainer-${{ matrix.arch }}-${{ matrix.build_type }}-
 
+      # Restore only, like the ccache: build-test.yml's push to main is the
+      # sole writer.  See the model corpus cache note at the top of that file.
+      - name: Restore the model corpus cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/specs-corpus-cache
+          key: specs-corpus-v1-devcontainer-${{ matrix.arch }}-${{ github.sha }}
+          restore-keys: |
+            specs-corpus-v1-devcontainer-${{ matrix.arch }}-
+
       - name: Configure and build inside the container
         run: |
           docker run --rm --privileged \
             -e CCACHE_DIR=/ccache \
             -e CCACHE_MAXSIZE \
+            -e SPECS_CORPUS_CACHE_DIR=/specs-corpus-cache \
             -v "${{ runner.temp }}/ccache:/ccache" \
+            -v "${{ runner.temp }}/specs-corpus-cache:/specs-corpus-cache" \
             -v "${{ github.workspace }}:/workspace" \
             -v "${{ github.workspace }}/oras:/usr/local/bin/oras:ro" \
             -v /build \
@@ -758,11 +788,17 @@ jobs:
           # kernel-accounted memory per ring (SQE128/CQE32 double both entry
           # sizes) and SQPOLL adds a kernel thread each; ctest -j nproc stacks
           # enough of them to be refused with ENOMEM, which is fatal to the
-          # process and takes an unrelated test with it.
+          # process and takes an unrelated test with it.  The VFS backend has
+          # separate rings: 256 in-flight requests reserve 1024 entries per
+          # worker, down from 4096; the request limit shrinks with the ring.
+          # FUSE-over-io_uring entries reserve ~1 MiB each per CPU queue, so
+          # a FUSE mount keeps 2 per queue instead of 16.
           docker run --rm --privileged \
             -e CATEGORY=${{ matrix.category }} \
             -e KVM_SHARDS="kvm-ubuntu2404 kvm-ubuntu2404-nfstest kvm-ubuntu2604 kvm-ubuntu2604-nfstest kvm-ubuntu2404_hwe kvm-ubuntu2204_hwe" \
             -e EVPL_IO_URING_ENTRIES=1024 \
+            -e CHIMERA_IO_URING_MAX_INFLIGHT=256 \
+            -e CHIMERA_FUSE_URING_DEPTH=2 \
             -v "${{ github.workspace }}:/workspace" \
             -v "${{ github.workspace }}/oras:/usr/local/bin/oras:ro" \
             -v /build \
@@ -958,6 +994,16 @@ jobs:
           restore-keys: |
             ccache-v2-macos-${{ matrix.build_type }}-
 
+      # Restore only, like the ccache: build-test.yml's push to main is the
+      # sole writer.  See the model corpus cache note at the top of that file.
+      - name: Restore the model corpus cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/specs-corpus-cache
+          key: specs-corpus-v1-macos-${{ github.sha }}
+          restore-keys: |
+            specs-corpus-v1-macos-
+
       # quint from the mirrored darwin payload rather than the npm registry and
       # the GitHub releases endpoint.  Only the Rust evaluator is platform
       # specific -- quint itself is JavaScript -- so this is the same tree the
@@ -1002,6 +1048,7 @@ jobs:
         env:
           CCACHE_DIR: ${{ runner.temp }}/ccache
           CCACHE_MAXSIZE: 2G
+          SPECS_CORPUS_CACHE_DIR: ${{ runner.temp }}/specs-corpus-cache
         run: |
           # Counters ride along in the restored cache; zero them so the stats
           # below describe this run alone.
@@ -1227,13 +1274,15 @@ jobs:
           # against 16 before the move, at identical concurrency -- the machine
           # was thrashing, not the tests regressing.
           #
-          # Two per vCPU keeps the overlap these cells actually benefit from --
-          # they spend most of their time waiting on a daemon, which is why
-          # oversubscribing at all is right -- without the 8x that broke them.
-          # regen.sh's own default is 12, for reference.  Derived rather than
-          # hardcoded so a runner change does not silently reintroduce this.
+          # One per vCPU still overlaps the client/server wait time while leaving
+          # enough memory and kernel io_uring capacity for the diskfs cells.
+          # Two per vCPU continued to produce io_uring ENOMEM aborts and made
+          # maxfid take more than twenty minutes on the four-vCPU runner, while
+          # both maxfid backends finish locally in about one minute when they
+          # are not competing with seven other server instances.  Derived rather
+          # than hardcoded so a runner change does not silently reintroduce this.
           if [ -z "${SMBTORTURE_PARALLEL}" ]; then
-            SMBTORTURE_PARALLEL=$(( $(nproc) * 2 ))
+            SMBTORTURE_PARALLEL=$(nproc)
           fi
           export SMBTORTURE_PARALLEL
           echo "smbtorture concurrency: ${SMBTORTURE_PARALLEL} cells ($(nproc) vCPU)"
@@ -1242,10 +1291,16 @@ jobs:
           # kernel-accounted memory per ring (SQE128/CQE32 double both entry
           # sizes) and SQPOLL adds a kernel thread each; ctest -j nproc stacks
           # enough of them to be refused with ENOMEM, which is fatal to the
-          # process and takes an unrelated test with it.
+          # process and takes an unrelated test with it.  The VFS backend has
+          # separate rings: 256 in-flight requests reserve 1024 entries per
+          # worker, down from 4096; the request limit shrinks with the ring.
+          # FUSE-over-io_uring entries reserve ~1 MiB each per CPU queue, so
+          # a FUSE mount keeps 2 per queue instead of 16.
           docker run --rm --privileged \
             -e SMBTORTURE_BACKENDS \
             -e EVPL_IO_URING_ENTRIES=1024 \
+            -e CHIMERA_IO_URING_MAX_INFLIGHT=256 \
+            -e CHIMERA_FUSE_URING_DEPTH=2 \
             -e SMBTORTURE_FILTER \
             -e SMBTORTURE_PARALLEL \
             -v "${{ github.workspace }}:/workspace" \
@@ -1446,6 +1501,16 @@ jobs:
           restore-keys: |
             ccache-v2-analyze-${{ matrix.image_name }}-${{ matrix.arch }}-${{ matrix.build_type }}-
 
+      # Restore only, like the ccache: build-test.yml's push to main is the
+      # sole writer.  See the model corpus cache note at the top of that file.
+      - name: Restore the model corpus cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/specs-corpus-cache
+          key: specs-corpus-v1-${{ matrix.image_name }}-${{ matrix.arch }}-${{ github.sha }}
+          restore-keys: |
+            specs-corpus-v1-${{ matrix.image_name }}-${{ matrix.arch }}-
+
       # Drives the analyzer per TU instead of through scan-build, so the results
       # are cacheable.  See build-test.yml for why scan-build cannot be.
       - name: Run the clang static analyzer
@@ -1456,7 +1521,9 @@ jobs:
           docker run --rm --privileged \
             -e CCACHE_DIR=/ccache \
             -e CCACHE_MAXSIZE \
+            -e SPECS_CORPUS_CACHE_DIR=/specs-corpus-cache \
             -v "${{ runner.temp }}/ccache:/ccache" \
+            -v "${{ runner.temp }}/specs-corpus-cache:/specs-corpus-cache" \
             -v "${{ github.workspace }}:/workspace" \
             -v "${{ github.workspace }}/scan-report:/scan-report" \
             -v /build \
@@ -1487,3 +1554,13 @@ jobs:
           path: scan-report/
           if-no-files-found: warn
           retention-days: 30
+
+  windows:
+    name: Windows
+    permissions:
+      contents: read
+      packages: read
+    uses: ./.github/workflows/windows.yml
+    with:
+      test_tier: extended
+      full_matrix: true

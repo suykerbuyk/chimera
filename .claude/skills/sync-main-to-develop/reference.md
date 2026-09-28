@@ -89,9 +89,9 @@ find /tmp/chimera-stage/opt/quantum/chimera/include -type f | sort
 head -5 /tmp/chimera-stage/opt/quantum/chimera/include/chimera/oteltracing.h
 ```
 
-Expect 19 SDK headers (18 plus `vfs_access.h`, which joined in the
-2026-09-16 sync; still 19 at the 2026-09-23 sync -- recount when upstream
-adds one) plus the three external ones, and `#define OTEL_TRACING 0`. Then
+Expect 20 SDK headers (18 plus `vfs_access.h`, which joined in the
+2026-09-16 sync, plus `vfs_mode.h` from the 2026-09-28 sync -- recount when
+upstream adds one) plus the three external ones, and `#define OTEL_TRACING 0`. Then
 compile a probe that includes only `"vfs/sdk/chimera_vfs_sdk.h"` with
 `-I<stage>/include/chimera -I<stage>/include`, and run
 `qtm_build/verify_test_includes.sh <stage>/<prefix>` for the test package's

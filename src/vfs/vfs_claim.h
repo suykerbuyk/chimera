@@ -7,7 +7,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdatomic.h>
-#include <pthread.h>
+#include "common/thread.h"
 
 #include "vfs/vfs.h"
 #include "vfs/sdk/vfs_fh.h"
@@ -49,7 +49,7 @@ struct chimera_vfs_file_state {
     uint8_t                             fh[CHIMERA_VFS_FH_SIZE];
     uint8_t                             fh_len;
     uint64_t                            fh_hash;
-    pthread_mutex_t                     lock;
+    evpl_mutex_t                        lock;
 
     /* Claim class lists (all guarded by file->lock). */
     struct chimera_vfs_claim           *claims[CHIMERA_CLAIM_CLASS_COUNT];
@@ -119,7 +119,7 @@ struct chimera_vfs_file_state {
 };
 
 struct chimera_vfs_state_shard {
-    pthread_mutex_t                 lock;
+    evpl_mutex_t                    lock;
     uint32_t                        count;
     uint32_t                        nslots;
     struct chimera_vfs_file_state **slots;
@@ -160,7 +160,7 @@ struct chimera_vfs_state {
     _Atomic uint8_t                range_probed;
     struct chimera_vfs            *vfs;
     struct chimera_claim_owner     node_owner;       /* this node's wire identity */
-    pthread_mutex_t                service_lock;
+    evpl_mutex_t                   service_lock;
     /* Serializes SELECTION+DISPATCH of backend RANGE ops.  Without it the
      * service drain and an inline confirm's chimera_vfs_claim_backend_
      * drain_releases race: the drain can only find a release still ON the
@@ -173,7 +173,7 @@ struct chimera_vfs_state {
      * Order: bl_dispatch_lock BEFORE service_lock, and never held across an
      * acquire confirm -- that runs protocol code and must not sit under a
      * core lock. */
-    pthread_mutex_t                bl_dispatch_lock;
+    evpl_mutex_t                   bl_dispatch_lock;
     struct chimera_vfs_file_state *service_head;
     struct chimera_vfs_file_state *service_tail;
     struct chimera_vfs_thread     *service_thread;
@@ -397,6 +397,27 @@ chimera_vfs_claim_release(
     struct chimera_vfs_state      *state,
     struct chimera_vfs_file_state *file,
     struct chimera_vfs_claim      *claim);
+
+/* Release without waking waiters -- the claim counterpart of
+ * chimera_vfs_claim_grant_release(pump=false), for teardown where a woken
+ * waiter would complete against a connection that is already gone.  The
+ * claim is still unlinked, so the embedding struct may be freed after. */
+void
+chimera_vfs_claim_release_nopump(
+    struct chimera_vfs_state      *state,
+    struct chimera_vfs_file_state *file,
+    struct chimera_vfs_claim      *claim);
+
+/* Release an open's ACCESS claim and its reference to a cache grant under
+ * the same file lock, then pump waiters. The optional grant must belong to
+ * file; the caller must detach its protocol member before calling. A shared
+ * grant remains until its final reference is dropped. */
+void
+chimera_vfs_claim_release_open(
+    struct chimera_vfs_state       *state,
+    struct chimera_vfs_file_state  *file,
+    struct chimera_vfs_claim       *claim,
+    struct chimera_vfs_claim_grant *grant);
 
 /* Shrink an inserted ACCESS claim's masks in place (truncating-open W drop,
  * OPEN_DOWNGRADE).  Never conflicts; pumps waiters. */

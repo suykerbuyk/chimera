@@ -2,8 +2,17 @@
 //
 // SPDX-License-Identifier: LGPL-2.1-only
 
+#ifdef _WIN32
+#include "common/thread.h"
+#include "common/platform.h"
+#else  /* ifdef _WIN32 */
 #include <sys/time.h>
+#endif /* ifdef _WIN32 */
+#ifdef _WIN32
+#include "common/platform.h"
+#else  /* ifdef _WIN32 */
 #include <strings.h>
+#endif /* ifdef _WIN32 */
 #include "smb_common/smb2.h"
 #include "server/smb/smb_session.h"
 #include "smb_internal.h"
@@ -141,11 +150,11 @@ chimera_smb_create_pending_register(struct chimera_smb_request *request)
     memcpy(request->create.pending_client_guid,
            request->compound->conn->client_guid, 16);
 
-    pthread_mutex_lock(&tree->pending_creates_lock);
+    evpl_mutex_lock(&tree->pending_creates_lock);
     request->create.pending_link   = tree->pending_creates;
     tree->pending_creates          = request;
     request->create.pending_linked = 1;
-    pthread_mutex_unlock(&tree->pending_creates_lock);
+    evpl_mutex_unlock(&tree->pending_creates_lock);
 } /* chimera_smb_create_pending_register */
 
 void
@@ -158,7 +167,7 @@ chimera_smb_create_pending_unregister(struct chimera_smb_request *request)
         return;
     }
 
-    pthread_mutex_lock(&tree->pending_creates_lock);
+    evpl_mutex_lock(&tree->pending_creates_lock);
     for (pp = &tree->pending_creates; *pp; pp = &(*pp)->create.pending_link) {
         if (*pp == request) {
             *pp = request->create.pending_link;
@@ -167,7 +176,7 @@ chimera_smb_create_pending_unregister(struct chimera_smb_request *request)
     }
     request->create.pending_link   = NULL;
     request->create.pending_linked = 0;
-    pthread_mutex_unlock(&tree->pending_creates_lock);
+    evpl_mutex_unlock(&tree->pending_creates_lock);
 } /* chimera_smb_create_pending_unregister */
 
 /* Non-zero if a create carrying `create_guid` from `client_guid` is deferred on
@@ -182,7 +191,7 @@ chimera_smb_create_pending_match(
     struct chimera_smb_request *req;
     int                         found = 0;
 
-    pthread_mutex_lock(&tree->pending_creates_lock);
+    evpl_mutex_lock(&tree->pending_creates_lock);
     for (req = tree->pending_creates; req; req = req->create.pending_link) {
         if (memcmp(req->create.dh2q.create_guid, create_guid, 16) == 0 &&
             memcmp(req->create.pending_client_guid, client_guid, 16) == 0) {
@@ -190,7 +199,7 @@ chimera_smb_create_pending_match(
             break;
         }
     }
-    pthread_mutex_unlock(&tree->pending_creates_lock);
+    evpl_mutex_unlock(&tree->pending_creates_lock);
     return found;
 } /* chimera_smb_create_pending_match */
 
@@ -430,13 +439,13 @@ chimera_smb_app_instance_force_close(
 
     bucket = open_file->file_id.vid & CHIMERA_SMB_OPEN_FILE_BUCKET_MASK;
 
-    pthread_mutex_lock(&tree->open_files_lock[bucket]);
+    evpl_mutex_lock(&tree->open_files_lock[bucket]);
     if (!(open_file->flags & CHIMERA_SMB_OPEN_FILE_CLOSED)) {
         open_file->flags |= CHIMERA_SMB_OPEN_FILE_CLOSED;
         HASH_DELETE(hh, tree->open_files[bucket], open_file);
         unhashed = true;
     }
-    pthread_mutex_unlock(&tree->open_files_lock[bucket]);
+    evpl_mutex_unlock(&tree->open_files_lock[bucket]);
 
     if (!unhashed) {
         return false;
@@ -459,14 +468,14 @@ chimera_smb_app_instance_force_close(
     /* Consume the remaining handle reference.  The owning connection's CLOSE
      * will no longer find the open in the hash, so it never releases — this is
      * the last reference. */
-    pthread_mutex_lock(&tree->open_files_lock[bucket]);
+    evpl_mutex_lock(&tree->open_files_lock[bucket]);
     chimera_smb_abort_if(open_file->refcnt == 0,
                          "app-instance force-close: refcnt 0");
     open_file->refcnt--;
     if (open_file->refcnt == 0) {
         to_free = open_file;
     }
-    pthread_mutex_unlock(&tree->open_files_lock[bucket]);
+    evpl_mutex_unlock(&tree->open_files_lock[bucket]);
 
     if (to_free) {
         chimera_smb_open_file_free(thread, to_free);
@@ -639,7 +648,7 @@ chimera_smb_create_purge_parked_writers(
         return;
     }
 
-    pthread_mutex_lock(&file_state->lock);
+    evpl_mutex_lock(&file_state->lock);
     for (claim = file_state->claims[CHIMERA_CLAIM_CLASS_CACHE];
          claim && npids < 16; claim = claim->next) {
         if (claim->parked &&
@@ -649,7 +658,7 @@ chimera_smb_create_purge_parked_writers(
                 ((struct chimera_smb_open_file *) claim->grant->members)->file_id.pid;
         }
     }
-    pthread_mutex_unlock(&file_state->lock);
+    evpl_mutex_unlock(&file_state->lock);
 
     /* Classify each parked write holder (registry lock; must NOT be held under
      * file->lock per the bucket -> registry -> vfs_state order).  A durable-only
@@ -672,7 +681,7 @@ chimera_smb_create_purge_parked_writers(
      * unlock. */
     /* CLAIMTODO: direct used/advertised mutation kept per the port spec; this
      * should become a core verb (a locked in-place downgrade). */
-    pthread_mutex_lock(&file_state->lock);
+    evpl_mutex_lock(&file_state->lock);
     for (claim = file_state->claims[CHIMERA_CLAIM_CLASS_CACHE];
          claim; claim = claim->next) {
         if (!claim->parked || !claim->grant || !claim->grant->members) {
@@ -688,7 +697,7 @@ chimera_smb_create_purge_parked_writers(
             }
         }
     }
-    pthread_mutex_unlock(&file_state->lock);
+    evpl_mutex_unlock(&file_state->lock);
 
     chimera_vfs_state_put(vfs_state, file_state);
 
@@ -967,7 +976,7 @@ chimera_smb_create_gen_open_file(
             struct chimera_smb_open_file *match    = NULL;
             int                           decision = 0;
 
-            pthread_mutex_lock(&file_state->lock);
+            evpl_mutex_lock(&file_state->lock);
             for (struct chimera_vfs_claim *l =
                      file_state->claims[CHIMERA_CLAIM_CLASS_ACCESS];
                  l; l = l->next) {
@@ -985,7 +994,7 @@ chimera_smb_create_gen_open_file(
                     break;
                 }
             }
-            pthread_mutex_unlock(&file_state->lock);
+            evpl_mutex_unlock(&file_state->lock);
 
             chimera_vfs_state_put(vfs_state, file_state);
 
@@ -1022,7 +1031,7 @@ chimera_smb_create_gen_open_file(
             uint64_t block_pids[16];
             int      nblock = 0, k;
 
-            pthread_mutex_lock(&file_state->lock);
+            evpl_mutex_lock(&file_state->lock);
             for (struct chimera_vfs_claim *l =
                      file_state->claims[CHIMERA_CLAIM_CLASS_ACCESS];
                  l && nblock < 16; l = l->next) {
@@ -1030,7 +1039,7 @@ chimera_smb_create_gen_open_file(
                     block_pids[nblock++] = l->owner.owner_lo;
                 }
             }
-            pthread_mutex_unlock(&file_state->lock);
+            evpl_mutex_unlock(&file_state->lock);
             chimera_vfs_state_put(vfs_state, file_state);
 
             for (k = 0; k < nblock; k++) {
@@ -1757,9 +1766,9 @@ chimera_smb_create_after_share(
                      * break instead of denying (the batch escape, R8).  Replaces
                      * the old own_lease_key three-arm matching. */
                     if (open_file->share_lease_inserted) {
-                        pthread_mutex_lock(&file_state->lock);
+                        evpl_mutex_lock(&file_state->lock);
                         open_file->share_lease.own_cache = grant;
-                        pthread_mutex_unlock(&file_state->lock);
+                        evpl_mutex_unlock(&file_state->lock);
                     }
                     /* If this open coalesced onto a grant whose lease is currently
                      * mid-break, the client is told its lease state but with
@@ -1887,11 +1896,11 @@ chimera_smb_create_after_share(
 
     open_file_bucket = open_file->file_id.vid & CHIMERA_SMB_OPEN_FILE_BUCKET_MASK;
 
-    pthread_mutex_lock(&tree->open_files_lock[open_file_bucket]);
+    evpl_mutex_lock(&tree->open_files_lock[open_file_bucket]);
 
     HASH_ADD(hh, tree->open_files[open_file_bucket], file_id, sizeof(open_file->file_id), open_file);
 
-    pthread_mutex_unlock(&tree->open_files_lock[open_file_bucket]);
+    evpl_mutex_unlock(&tree->open_files_lock[open_file_bucket]);
 
     /* Register the durable handle in the shared registry so it survives a
      * disconnect and can be reclaimed on reconnect.  Done outside the bucket
@@ -2031,10 +2040,10 @@ chimera_smb_create_share_park_cb(
      * hop); correctness over a fast path. */
     request->create.gen_resume_result = result;
 
-    pthread_mutex_lock(&thread->lease_break_lock);
+    evpl_mutex_lock(&thread->lease_break_lock);
     request->create.gen_resume_next = thread->share_resume_head;
     thread->share_resume_head       = request;
-    pthread_mutex_unlock(&thread->lease_break_lock);
+    evpl_mutex_unlock(&thread->lease_break_lock);
 
     evpl_ring_doorbell(&thread->lease_resume_doorbell);
 
@@ -2152,8 +2161,13 @@ chimera_smb_create_truncate_cb(
     if (error_code != CHIMERA_VFS_OK) {
         /* The open was granted but the replacement it exists to perform did
          * not happen, so the create fails -- and, as above, leaves the file
-         * alone.  Tear the half-built open down exactly as a denied share park
-         * does: it is not hashed yet, so nothing can have found it. */
+         * alone.  Tear the half-built open down as a denied share park does
+         * (it is not hashed yet, so nothing can have found it), except that
+         * this one HOLDS its share claim: the grant linked it into the file
+         * state before share_lease_inserted is set in finish_share_grant.
+         * Unlink it before the open is freed, or the claim list keeps a
+         * pointer into the freed open (and the reservation never lifts). */
+        chimera_vfs_claim_release(vfs_state, file_state, &open_file->share_lease);
         chimera_vfs_state_put(vfs_state, file_state);
         if (open_file->handle) {
             chimera_vfs_release(vfs_thread, open_file->handle);
@@ -2235,14 +2249,26 @@ chimera_smb_create_issue_truncate(struct chimera_smb_request *request)
      * authorized by that open's grant (POSIX rights retention) rather than
      * re-evaluated against the file's current mode -- which is what riding
      * inside the open used to give it for free. */
-    chimera_vfs_fsetattr(vfs_thread,
-                         &request->session_handle->session->cred,
-                         open_file->handle,
-                         &request->create.trunc_attr,
-                         0,
-                         CHIMERA_VFS_ATTR_MASK_STAT | CHIMERA_VFS_ATTR_BTIME,
-                         chimera_smb_create_truncate_cb,
-                         request);
+    struct chimera_claim_actor actor = {
+        .owner          = {
+            .proto      = CHIMERA_CLAIM_PROTO_SMB2,
+            .client_key = request->session_handle->session->client_key,
+            .owner_lo   = open_file->file_id.pid,
+            .owner_hi   = open_file->file_id.vid,
+        },
+        .op_handle      = open_file->handle,
+    };
+    if (request->create.ctx_present_mask & CHIMERA_SMB_CREATE_CTX_RQLS) {
+        memcpy(actor.owner.key, request->create.rqls.key, 16);
+    }
+    chimera_vfs_fsetattr_owned(vfs_thread,
+                               &request->session_handle->session->cred,
+                               open_file->handle,
+                               &request->create.trunc_attr,
+                               0,
+                               CHIMERA_VFS_ATTR_MASK_STAT | CHIMERA_VFS_ATTR_BTIME,
+                               chimera_smb_create_truncate_cb,
+                               request, &actor);
 } /* chimera_smb_create_issue_truncate */
 
 /* Abandon a CREATE that is parked on a share-acquire ticket because its
@@ -2279,6 +2305,9 @@ chimera_smb_create_abandon_share_park(struct chimera_smb_request *request)
         request->create.gen_parked_open = NULL;
     }
     chimera_smb_create_release_parent(request);
+    /* Cancellation succeeded, so no VFS callback owns the request anymore.
+     * Reclaim the compound without executing its remaining commands. */
+    chimera_smb_compound_free(thread, request->compound);
 } /* chimera_smb_create_abandon_share_park */
 
 static inline uint32_t
@@ -3976,12 +4005,12 @@ chimera_smb_create_resume_doorbell_callback(
     for ( ; ;) {
         struct chimera_smb_request *req;
 
-        pthread_mutex_lock(&thread->lease_break_lock);
+        evpl_mutex_lock(&thread->lease_break_lock);
         req = thread->share_resume_head;
         if (req) {
             thread->share_resume_head = req->create.gen_resume_next;
         }
-        pthread_mutex_unlock(&thread->lease_break_lock);
+        evpl_mutex_unlock(&thread->lease_break_lock);
 
         if (!req) {
             break;
@@ -3997,12 +4026,12 @@ chimera_smb_create_resume_doorbell_callback(
     for ( ; ;) {
         struct chimera_smb_request *req;
 
-        pthread_mutex_lock(&thread->lease_break_lock);
+        evpl_mutex_lock(&thread->lease_break_lock);
         req = thread->lock_resume_head;
         if (req) {
             thread->lock_resume_head = req->lock.lock_resume_next;
         }
-        pthread_mutex_unlock(&thread->lease_break_lock);
+        evpl_mutex_unlock(&thread->lease_break_lock);
 
         if (!req) {
             break;
@@ -4013,26 +4042,20 @@ chimera_smb_create_resume_doorbell_callback(
     }
 } /* chimera_smb_create_resume_doorbell_callback */
 
-/* Ring every PEER SMB thread's resume doorbell so each re-scans its own
- * connections for parked CREATEs the just-settled lease break unblocked.
- * `origin` is skipped because the ack handler already swept its own connection
- * inline; the per-CREATE ack_pending() re-check would make a re-sweep of
- * `origin` harmless anyway.  The deferred CREATE responses' iovecs are
- * thread-local, so each thread must complete its own. */
+/* Ring every SMB thread's resume doorbell, including the origin: another
+ * connection on that thread may own a CREATE unblocked by this ACK or CLOSE.
+ * Each thread rechecks ack_pending() and completes its own responses locally. */
 void
 chimera_smb_create_resume_parked_broadcast(struct chimera_server_smb_thread *origin)
 {
     struct chimera_server_smb_shared *shared = origin->shared;
     struct chimera_server_smb_thread *t;
 
-    pthread_mutex_lock(&shared->threads_lock);
+    evpl_mutex_lock(&shared->threads_lock);
     for (t = shared->threads; t; t = t->next_thread) {
-        if (t == origin) {
-            continue;
-        }
         evpl_ring_doorbell(&t->lease_resume_doorbell);
     }
-    pthread_mutex_unlock(&shared->threads_lock);
+    evpl_mutex_unlock(&shared->threads_lock);
 } /* chimera_smb_create_resume_parked_broadcast */
 
 /*
@@ -4695,7 +4718,7 @@ chimera_smb_create_overwrite_check_callback(
 } /* chimera_smb_create_overwrite_check_callback */
 
 static inline void
-chimera_smb_create_open_parent_callback(
+chimera_smb_create_open_parent_checked(
     enum chimera_vfs_error          error_code,
     struct chimera_vfs_open_handle *oh,
     void                           *private_data)
@@ -4755,6 +4778,58 @@ chimera_smb_create_open_parent_callback(
     } else {
         chimera_smb_create_issue_open(request);
     }
+} /* chimera_smb_create_open_parent_checked */
+
+
+/* A bound lease key must be rejected before a new directory entry is
+ * materialized. The post-open check still handles existing objects by FH. */
+static void
+chimera_smb_create_lease_name_callback(
+    enum chimera_vfs_error    error_code,
+    struct chimera_vfs_attrs *attr,
+    struct chimera_vfs_attrs *dir_attr,
+    void                     *private_data)
+{
+    struct chimera_smb_request *request = private_data;
+    (void) attr;
+    (void) dir_attr;
+
+    if (error_code == CHIMERA_VFS_ENOENT &&
+        request->create.create_disposition != SMB2_FILE_OPEN &&
+        request->create.create_disposition != SMB2_FILE_OVERWRITE &&
+        chimera_smb_session_lease_key_conflict(request->session_handle->session,
+                                               request->create.rqls.key, NULL, 0)) {
+        chimera_smb_create_release_parent(request);
+        chimera_smb_complete_request(request, SMB2_STATUS_INVALID_PARAMETER);
+        return;
+    }
+    chimera_smb_create_open_parent_checked(CHIMERA_VFS_OK,
+                                           request->create.parent_handle, request);
+} /* chimera_smb_create_lease_name_callback */
+
+static void
+chimera_smb_create_open_parent_callback(
+    enum chimera_vfs_error          error_code,
+    struct chimera_vfs_open_handle *oh,
+    void                           *private_data)
+{
+    struct chimera_smb_request       *request = private_data;
+    struct chimera_server_smb_thread *thread  = request->compound->thread;
+
+    if (error_code == CHIMERA_VFS_OK && !request->create.has_stream &&
+        thread->shared->config.leases &&
+        (request->create.ctx_present_mask & CHIMERA_SMB_CREATE_CTX_RQLS) &&
+        chimera_smb_session_lease_key_conflict(request->session_handle->session,
+                                               request->create.rqls.key, NULL, 0)) {
+        request->create.parent_handle = oh;
+        chimera_vfs_lookup_at(thread->vfs_thread,
+                              &request->session_handle->session->cred, oh,
+                              request->create.name, request->create.name_len,
+                              CHIMERA_VFS_ATTR_FH, 0,
+                              chimera_smb_create_lease_name_callback, request);
+        return;
+    }
+    chimera_smb_create_open_parent_checked(error_code, oh, request);
 } /* chimera_smb_create_open_parent_callback */
 
 
@@ -4973,9 +5048,9 @@ chimera_smb_durable_rehome(
     open_file->tree = tree;
 
     bucket = open_file->file_id.vid & CHIMERA_SMB_OPEN_FILE_BUCKET_MASK;
-    pthread_mutex_lock(&tree->open_files_lock[bucket]);
+    evpl_mutex_lock(&tree->open_files_lock[bucket]);
     HASH_ADD(hh, tree->open_files[bucket], file_id, sizeof(open_file->file_id), open_file);
-    pthread_mutex_unlock(&tree->open_files_lock[bucket]);
+    evpl_mutex_unlock(&tree->open_files_lock[bucket]);
 
     request->create.r_open_file        = open_file;
     request->create.create_disposition = SMB2_FILE_OPEN; /* reply default OPENED */
@@ -5281,7 +5356,7 @@ chimera_smb_create_guid_replay(struct chimera_smb_request *request)
     struct chimera_smb_open_file     *pending_of = NULL;
 
     for (b = 0; b < CHIMERA_SMB_OPEN_FILE_BUCKETS && !match && !pending_of; b++) {
-        pthread_mutex_lock(&tree->open_files_lock[b]);
+        evpl_mutex_lock(&tree->open_files_lock[b]);
         HASH_ITER(hh, tree->open_files[b], of, tmp)
         {
             /* A replayed durable create whose create_guid matches an open whose
@@ -5302,14 +5377,10 @@ chimera_smb_create_guid_replay(struct chimera_smb_request *request)
             if ((of->ctx_present_mask & CHIMERA_SMB_CREATE_CTX_DH2Q) &&
                 !(of->flags & (CHIMERA_SMB_OPEN_FILE_CLOSED |
                                CHIMERA_SMB_OPEN_FILE_PARKED)) &&
-                /* Only a replayed create returns the existing live open, and only
-                 * while it remains replay-eligible.  A non-replay create with a
-                 * matching create_guid, or a replay after a non-replay op cleared
-                 * eligibility, is NOT returned here (MS-SMB2 3.3.5.9.10): it falls
-                 * to the registry classification below (DUPLICATE_OBJECTID for a
-                 * non-replay collision, or a fresh open for an ineligible replay).
-                 * smb2.replay.replay-twice-durable, replay6. */
-                request->is_replay &&
+                /* Eligible opens reserve their CreateGuid even when they did
+                 * not receive a durable grant. Replay returns that open; a
+                 * non-replay collision is rejected below (MS-SMB2 3.3.5.9.10).
+                 * Ineligible opens fall through to the durable registry. */
                 (of->flags & CHIMERA_SMB_OPEN_FILE_REPLAY_ELIGIBLE) &&
                 memcmp(of->create_guid, request->create.dh2q.create_guid, 16) == 0) {
                 of->refcnt++;   /* held for this request; getattr cb releases it */
@@ -5317,7 +5388,7 @@ chimera_smb_create_guid_replay(struct chimera_smb_request *request)
                 break;
             }
         }
-        pthread_mutex_unlock(&tree->open_files_lock[b]);
+        evpl_mutex_unlock(&tree->open_files_lock[b]);
     }
 
     /* The create this replay matches may be deferred BEFORE it was hashed (parked
@@ -5378,13 +5449,13 @@ chimera_smb_create_guid_replay(struct chimera_smb_request *request)
          * handle ref so the open is torn down + freed exactly once.  Every evictor
          * always drops the scan ref it took above. */
         b = pending_of->file_id.vid & CHIMERA_SMB_OPEN_FILE_BUCKET_MASK;
-        pthread_mutex_lock(&tree->open_files_lock[b]);
+        evpl_mutex_lock(&tree->open_files_lock[b]);
         if (!(pending_of->flags & CHIMERA_SMB_OPEN_FILE_CLOSED)) {
             pending_of->flags |= CHIMERA_SMB_OPEN_FILE_CLOSED;
             HASH_DELETE(hh, tree->open_files[b], pending_of);
             won = true;
         }
-        pthread_mutex_unlock(&tree->open_files_lock[b]);
+        evpl_mutex_unlock(&tree->open_files_lock[b]);
         chimera_smb_open_file_release(request, pending_of);       /* scan ref */
         if (won) {
             chimera_smb_open_file_release(request, pending_of);   /* handle ref */
@@ -5435,6 +5506,15 @@ chimera_smb_create_guid_replay(struct chimera_smb_request *request)
             } /* switch */
         }
         return 0;
+    }
+
+    /* The DH2Q identity also belongs to an eligible open that was refused a
+     * durable grant. Such opens have no durable-registry entry, but a second
+     * non-replay CREATE must still reject their duplicate CreateGuid. */
+    if (!request->is_replay) {
+        chimera_smb_open_file_release(request, match);
+        chimera_smb_complete_request(request, SMB2_STATUS_DUPLICATE_OBJECTID);
+        return 1;
     }
 
     /* A replay that asks for a different handle type (oplock vs lease), or a
@@ -6807,10 +6887,10 @@ chimera_smb_parse_create(
                              request->create.parent_path_len);
         if (colon) {
             *colon = '\0';
-            slash  = rindex(request->create.parent_path, '\\');
+            slash  = strrchr(request->create.parent_path, '\\');
             *colon = ':';
         } else {
-            slash = rindex(request->create.parent_path, '\\');
+            slash = strrchr(request->create.parent_path, '\\');
         }
     }
 

@@ -6,16 +6,10 @@
 
 #include <stdlib.h>
 #include <string.h>
-#include <pthread.h>
-#include <urcu/urcu-qsbr.h>
+#include "common/thread.h"
+#include "common/chimera_rcu.h"
 #include "vfs/vfs.h"
 #include "vfs/sdk/vfs_fh.h"
-
-#ifndef container_of
-#define container_of(ptr, type, member) ({            \
-        typeof(((type *) 0)->member) * __mptr = (ptr); \
-        (type *) ((char *) __mptr - offsetof(type, member)); })
-#endif // ifndef container_of
 
 /*
  * Extract bucket index directly from mount_id.
@@ -32,24 +26,26 @@ chimera_vfs_mount_table_bucket_index(const void *mount_id)
 } /* chimera_vfs_mount_table_bucket_index */
 
 /*
- * URCU-based mount table for fast lock-free lookups by mount ID.
+ * Mount table for fast lookups by mount ID.
  *
  * Writers (insert/remove) are protected by a mutex - these are rare operations.
- * Readers (lookup) use RCU and require no locks - attrs are copied by value
- * for safe access without holding RCU read lock after return.
+ * Readers (lookup) hold the table's RCU domain, which is free under urcu and a
+ * read lock without it - attrs are copied by value for safe access without
+ * holding the read side after return.
  */
 
 struct chimera_vfs_mount_table_entry {
     struct chimera_vfs_mount             *mount;
     struct chimera_vfs_mount_table_entry *next;
-    struct rcu_head                       rcu;
+    chimera_rcu_head                      rcu;
 };
 
 struct chimera_vfs_mount_table {
     struct chimera_vfs_mount_table_entry **buckets;
     uint32_t                               num_buckets;
     uint32_t                               num_buckets_mask;
-    pthread_mutex_t                        lock;
+    struct chimera_rcu_domain              rcu;
+    evpl_mutex_t                           lock;
 };
 
 static inline struct chimera_vfs_mount_table *
@@ -63,13 +59,14 @@ chimera_vfs_mount_table_create(uint32_t num_buckets_bits)
     table->num_buckets_mask = table->num_buckets - 1;
     table->buckets          = calloc(table->num_buckets, sizeof(*table->buckets));
 
-    pthread_mutex_init(&table->lock, NULL);
+    chimera_rcu_domain_init(&table->rcu);
+    evpl_mutex_init(&table->lock, NULL);
 
     return table;
 } /* chimera_vfs_mount_table_create */
 
 static inline void
-chimera_vfs_mount_table_entry_free_rcu(struct rcu_head *head)
+chimera_vfs_mount_table_entry_free_rcu(chimera_rcu_head *head)
 {
     struct chimera_vfs_mount_table_entry *entry;
 
@@ -83,7 +80,7 @@ chimera_vfs_mount_table_destroy(struct chimera_vfs_mount_table *table)
     struct chimera_vfs_mount_table_entry *entry, *next;
     uint32_t                              i;
 
-    rcu_barrier();
+    chimera_rcu_barrier();
 
     for (i = 0; i < table->num_buckets; i++) {
         entry = table->buckets[i];
@@ -99,7 +96,8 @@ chimera_vfs_mount_table_destroy(struct chimera_vfs_mount_table *table)
         }
     }
 
-    pthread_mutex_destroy(&table->lock);
+    evpl_mutex_destroy(&table->lock);
+    chimera_rcu_domain_destroy(&table->rcu);
     free(table->buckets);
     free(table);
 } /* chimera_vfs_mount_table_destroy */
@@ -120,12 +118,12 @@ chimera_vfs_mount_table_insert(
     index  = chimera_vfs_mount_table_bucket_index(mount->root_fh);
     bucket = index & table->num_buckets_mask;
 
-    pthread_mutex_lock(&table->lock);
+    evpl_mutex_lock(&table->lock);
 
     entry->next = table->buckets[bucket];
-    rcu_assign_pointer(table->buckets[bucket], entry);
+    chimera_rcu_assign(table->buckets[bucket], entry);
 
-    pthread_mutex_unlock(&table->lock);
+    evpl_mutex_unlock(&table->lock);
 } /* chimera_vfs_mount_table_insert */
 
 static inline void
@@ -133,14 +131,15 @@ chimera_vfs_mount_table_remove(
     struct chimera_vfs_mount_table *table,
     const uint8_t                  *mount_id)
 {
-    struct chimera_vfs_mount_table_entry *entry, *prev, *removed = NULL;
+    struct chimera_vfs_mount_table_entry *entry, *prev;
     uint64_t                              index;
     uint32_t                              bucket;
 
     index  = chimera_vfs_mount_table_bucket_index(mount_id);
     bucket = index & table->num_buckets_mask;
 
-    pthread_mutex_lock(&table->lock);
+    chimera_rcu_publish_begin(&table->rcu);
+    evpl_mutex_lock(&table->lock);
 
     prev  = NULL;
     entry = table->buckets[bucket];
@@ -148,12 +147,14 @@ chimera_vfs_mount_table_remove(
     while (entry) {
         /* Compare the full 16-byte mount_id (first 16 bytes of root_fh) */
         if (memcmp(entry->mount->root_fh, mount_id, CHIMERA_VFS_MOUNT_ID_SIZE) == 0) {
-            removed = entry;
-
             if (prev) {
-                rcu_assign_pointer(prev->next, entry->next);
+                chimera_rcu_replace(&table->rcu, prev->next, entry->next,
+                                    &entry->rcu,
+                                    chimera_vfs_mount_table_entry_free_rcu);
             } else {
-                rcu_assign_pointer(table->buckets[bucket], entry->next);
+                chimera_rcu_replace(&table->rcu, table->buckets[bucket], entry->next,
+                                    &entry->rcu,
+                                    chimera_vfs_mount_table_entry_free_rcu);
             }
             break;
         }
@@ -161,11 +162,8 @@ chimera_vfs_mount_table_remove(
         entry = entry->next;
     }
 
-    pthread_mutex_unlock(&table->lock);
-
-    if (removed) {
-        call_rcu(&removed->rcu, chimera_vfs_mount_table_entry_free_rcu);
-    }
+    evpl_mutex_unlock(&table->lock);
+    chimera_rcu_publish_end(&table->rcu);
 } /* chimera_vfs_mount_table_remove */
 
 /*
@@ -187,9 +185,9 @@ chimera_vfs_mount_table_lookup_attrs(
     index  = chimera_vfs_mount_table_bucket_index(mount_id);
     bucket = index & table->num_buckets_mask;
 
-    urcu_qsbr_read_lock();
+    chimera_rcu_read_lock(&table->rcu);
 
-    entry = rcu_dereference(table->buckets[bucket]);
+    entry = chimera_rcu_deref(table->buckets[bucket]);
 
     while (entry) {
         /* Compare the full 16-byte mount_id (first 16 bytes of root_fh) */
@@ -199,10 +197,10 @@ chimera_vfs_mount_table_lookup_attrs(
             rc       = 0;
             break;
         }
-        entry = rcu_dereference(entry->next);
+        entry = chimera_rcu_deref(entry->next);
     }
 
-    urcu_qsbr_read_unlock();
+    chimera_rcu_read_unlock(&table->rcu);
 
     return rc;
 } /* chimera_vfs_mount_table_lookup_attrs */
@@ -210,8 +208,9 @@ chimera_vfs_mount_table_lookup_attrs(
 /*
  * Lookup full mount pointer by mount ID.
  * Returns mount pointer or NULL if not found.
- * IMPORTANT: Caller MUST call urcu_qsbr_read_lock() before and
- * urcu_qsbr_read_unlock() after using the returned pointer.
+ * IMPORTANT: Caller MUST bracket this call and every use of the returned
+ * pointer with chimera_rcu_read_lock(&table->rcu) /
+ * chimera_rcu_read_unlock(&table->rcu).
  */
 static inline struct chimera_vfs_mount *
 chimera_vfs_mount_table_lookup(
@@ -226,7 +225,7 @@ chimera_vfs_mount_table_lookup(
     index  = chimera_vfs_mount_table_bucket_index(mount_id);
     bucket = index & table->num_buckets_mask;
 
-    entry = rcu_dereference(table->buckets[bucket]);
+    entry = chimera_rcu_deref(table->buckets[bucket]);
 
     while (entry) {
         /* Compare the full 16-byte mount_id (first 16 bytes of root_fh) */
@@ -234,7 +233,7 @@ chimera_vfs_mount_table_lookup(
             mount = entry->mount;
             break;
         }
-        entry = rcu_dereference(entry->next);
+        entry = chimera_rcu_deref(entry->next);
     }
 
     return mount;
@@ -242,7 +241,7 @@ chimera_vfs_mount_table_lookup(
 
 /*
  * Count the number of mounts in the table.
- * Uses RCU read lock internally.
+ * Takes the table's read side internally.
  */
 static inline int
 chimera_vfs_mount_table_count(struct chimera_vfs_mount_table *table)
@@ -251,17 +250,17 @@ chimera_vfs_mount_table_count(struct chimera_vfs_mount_table *table)
     uint32_t                              i;
     int                                   count = 0;
 
-    urcu_qsbr_read_lock();
+    chimera_rcu_read_lock(&table->rcu);
 
     for (i = 0; i < table->num_buckets; i++) {
-        entry = rcu_dereference(table->buckets[i]);
+        entry = chimera_rcu_deref(table->buckets[i]);
         while (entry) {
             count++;
-            entry = rcu_dereference(entry->next);
+            entry = chimera_rcu_deref(entry->next);
         }
     }
 
-    urcu_qsbr_read_unlock();
+    chimera_rcu_read_unlock(&table->rcu);
 
     return count;
 } /* chimera_vfs_mount_table_count */
@@ -276,7 +275,7 @@ typedef int (*chimera_vfs_mount_table_iter_cb)(
 
 /*
  * Iterate over all mounts in the table.
- * Callback is called with RCU read lock held.
+ * Callback is called with the table's read side held.
  * Returns 0 if all mounts visited, or the non-zero return from callback.
  */
 static inline int
@@ -289,17 +288,17 @@ chimera_vfs_mount_table_foreach(
     uint32_t                              i;
     int                                   rc = 0;
 
-    urcu_qsbr_read_lock();
+    chimera_rcu_read_lock(&table->rcu);
 
     for (i = 0; i < table->num_buckets && rc == 0; i++) {
-        entry = rcu_dereference(table->buckets[i]);
+        entry = chimera_rcu_deref(table->buckets[i]);
         while (entry && rc == 0) {
             rc    = callback(entry->mount, private_data);
-            entry = rcu_dereference(entry->next);
+            entry = chimera_rcu_deref(entry->next);
         }
     }
 
-    urcu_qsbr_read_unlock();
+    chimera_rcu_read_unlock(&table->rcu);
 
     return rc;
 } /* chimera_vfs_mount_table_foreach */
@@ -307,14 +306,16 @@ chimera_vfs_mount_table_foreach(
 /*
  * Find a mount by path prefix match.
  * Returns the mount whose path is a prefix of the given path,
- * or NULL if not found. Uses RCU read lock internally.
+ * or NULL if not found. Takes the table's read side internally.
  *
- * IMPORTANT: The returned mount pointer is only valid while RCU read lock
- * is held. If caller needs to use the mount after this returns, they must
- * copy necessary data or hold their own RCU read lock.
+ * IMPORTANT: The returned mount pointer is only valid while the table's read
+ * side is held. If caller needs to use the mount after this returns, they must
+ * copy necessary data or take the read side themselves.
  */
+/* The protected form also supports callers holding table->lock, including
+ * startup/management threads that are not registered liburcu readers. */
 static inline struct chimera_vfs_mount *
-chimera_vfs_mount_table_find_by_path(
+chimera_vfs_mount_table_find_by_path_protected(
     struct chimera_vfs_mount_table *table,
     const char                     *path,
     int                             pathlen)
@@ -323,10 +324,9 @@ chimera_vfs_mount_table_find_by_path(
     struct chimera_vfs_mount             *found = NULL;
     uint32_t                              i;
 
-    urcu_qsbr_read_lock();
 
     for (i = 0; i < table->num_buckets && !found; i++) {
-        entry = rcu_dereference(table->buckets[i]);
+        entry = chimera_rcu_deref(table->buckets[i]);
         while (entry) {
             if (entry->mount->pathlen <= pathlen &&
                 memcmp(entry->mount->path, path, entry->mount->pathlen) == 0 &&
@@ -335,14 +335,28 @@ chimera_vfs_mount_table_find_by_path(
                 found = entry->mount;
                 break;
             }
-            entry = rcu_dereference(entry->next);
+            entry = chimera_rcu_deref(entry->next);
         }
     }
 
-    urcu_qsbr_read_unlock();
 
     return found;
+} /* chimera_vfs_mount_table_find_by_path_protected */
+
+static inline struct chimera_vfs_mount *
+chimera_vfs_mount_table_find_by_path(
+    struct chimera_vfs_mount_table *table,
+    const char                     *path,
+    int                             pathlen)
+{
+    struct chimera_vfs_mount *found;
+
+    chimera_rcu_read_lock(&table->rcu);
+    found = chimera_vfs_mount_table_find_by_path_protected(table, path, pathlen);
+    chimera_rcu_read_unlock(&table->rcu);
+    return found;
 } /* chimera_vfs_mount_table_find_by_path */
+
 
 /*
  * Find a mount by exact path match, leaving it in the table.
@@ -361,7 +375,7 @@ chimera_vfs_mount_table_find_exact(
     struct chimera_vfs_mount             *found = NULL;
     uint32_t                              i;
 
-    pthread_mutex_lock(&table->lock);
+    evpl_mutex_lock(&table->lock);
 
     for (i = 0; i < table->num_buckets && !found; i++) {
         for (entry = table->buckets[i]; entry; entry = entry->next) {
@@ -373,7 +387,7 @@ chimera_vfs_mount_table_find_exact(
         }
     }
 
-    pthread_mutex_unlock(&table->lock);
+    evpl_mutex_unlock(&table->lock);
 
     return found;
 } /* chimera_vfs_mount_table_find_exact */
@@ -394,7 +408,8 @@ chimera_vfs_mount_table_remove_by_path(
     struct chimera_vfs_mount             *mount = NULL;
     uint32_t                              i;
 
-    pthread_mutex_lock(&table->lock);
+    chimera_rcu_publish_begin(&table->rcu);
+    evpl_mutex_lock(&table->lock);
 
     for (i = 0; i < table->num_buckets && !mount; i++) {
         prev  = NULL;
@@ -405,12 +420,15 @@ chimera_vfs_mount_table_remove_by_path(
                 mount = entry->mount;
 
                 if (prev) {
-                    rcu_assign_pointer(prev->next, entry->next);
+                    chimera_rcu_replace(&table->rcu, prev->next, entry->next,
+                                        &entry->rcu,
+                                        chimera_vfs_mount_table_entry_free_rcu);
                 } else {
-                    rcu_assign_pointer(table->buckets[i], entry->next);
+                    chimera_rcu_replace(&table->rcu, table->buckets[i], entry->next,
+                                        &entry->rcu,
+                                        chimera_vfs_mount_table_entry_free_rcu);
                 }
 
-                call_rcu(&entry->rcu, chimera_vfs_mount_table_entry_free_rcu);
                 break;
             }
             prev  = entry;
@@ -418,7 +436,8 @@ chimera_vfs_mount_table_remove_by_path(
         }
     }
 
-    pthread_mutex_unlock(&table->lock);
+    evpl_mutex_unlock(&table->lock);
+    chimera_rcu_publish_end(&table->rcu);
 
     return mount;
 } /* chimera_vfs_mount_table_remove_by_path */
@@ -427,7 +446,7 @@ chimera_vfs_mount_table_remove_by_path(
  * Lookup a mount by name and copy its root file handle.
  * The name is compared using strncmp against mount paths.
  * Returns 0 on success with root_fh/root_fh_len copied, -1 if not found.
- * This is safe for use without holding RCU read lock after return.
+ * This is safe for use without holding the table's read side after return.
  */
 static inline int
 chimera_vfs_mount_table_lookup_root_fh_by_name(
@@ -441,10 +460,10 @@ chimera_vfs_mount_table_lookup_root_fh_by_name(
     uint32_t                              i;
     int                                   rc = -1;
 
-    urcu_qsbr_read_lock();
+    chimera_rcu_read_lock(&table->rcu);
 
     for (i = 0; i < table->num_buckets && rc != 0; i++) {
-        entry = rcu_dereference(table->buckets[i]);
+        entry = chimera_rcu_deref(table->buckets[i]);
         while (entry) {
             /* The mount path must equal the looked-up component exactly.  A bare
              * strncmp(path, name, namelen) is a prefix test, so it would match
@@ -459,11 +478,11 @@ chimera_vfs_mount_table_lookup_root_fh_by_name(
                 rc             = 0;
                 break;
             }
-            entry = rcu_dereference(entry->next);
+            entry = chimera_rcu_deref(entry->next);
         }
     }
 
-    urcu_qsbr_read_unlock();
+    chimera_rcu_read_unlock(&table->rcu);
 
     return rc;
 } /* chimera_vfs_mount_table_lookup_root_fh_by_name */

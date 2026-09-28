@@ -25,6 +25,13 @@ endif()
 
 # CUDA is enabled later with enable_language(), once the platform gate below
 # has run and the toolkit probe has decided whether there is one to enable.
+# Let CMAKE_MSVC_DEBUG_INFORMATION_FORMAT choose MSVC's debug-information
+# format instead of the /Zi baked into the default flags; the ccache block
+# below depends on it.  The policy is read when project() enables C.
+if(POLICY CMP0141)
+    cmake_policy(SET CMP0141 NEW)
+endif()
+
 project(chimera LANGUAGES C)
 
 # Platform gate.  Chimera is developed on Linux and a good deal of the stack --
@@ -35,6 +42,8 @@ project(chimera LANGUAGES C)
 # off there rather than hard-failing configure.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     set(CHIMERA_LINUX TRUE)
+elseif(WIN32)
+    set(CHIMERA_LINUX FALSE)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     set(CHIMERA_LINUX FALSE)
 
@@ -208,10 +217,18 @@ endif()
 # devcontainer points it at the persistent /build/ccache volume so all worktrees
 # share one cache, and CI additionally sets an HTTP remote (CCACHE_REMOTE_STORAGE
 # -> the Nexus raw repo).  A plain local build with neither set falls back to
-# ccache's default (~/.cache/ccache).
+# ccache's default (~/.cache/ccache).  The Visual Studio generators ignore a
+# compiler launcher, so on Windows this takes effect under Ninja only.
 find_program(CCACHE_PROGRAM ccache)
 if(CCACHE_PROGRAM)
     set(CMAKE_C_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+    # ccache cannot cache /Zi, which writes one PDB shared by every object in
+    # a target.  Embed the debug information in each object (/Z7) instead; the
+    # linker still produces the PDB.
+    if(MSVC)
+        set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT
+            "$<$<CONFIG:Debug,RelWithDebInfo>:Embedded>")
+    endif()
     if(CUDA_ENABLED)
         set(CMAKE_CUDA_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
     endif()
@@ -229,18 +246,86 @@ endif()
 
 set(CHIMERA_VERSION "0.1.0")
 
-execute_process(COMMAND ln -sf ${CMAKE_BINARY_DIR}/compile_commands.json ${CMAKE_SOURCE_DIR}/compile_commands.json)
+if(NOT WIN32)
+    execute_process(COMMAND ln -sf ${CMAKE_BINARY_DIR}/compile_commands.json ${CMAKE_SOURCE_DIR}/compile_commands.json)
+endif()
+
+include(cmake/Platform.cmake)
 
 add_definitions(-DCHIMERA_VERSION="${CHIMERA_VERSION}")
 add_definitions(-DCHIMERA_STATE_DIR="${CMAKE_INSTALL_PREFIX}/share/state")
 
-# chimera uses userspace-RCU in the QSBR flavor process-wide.  <urcu/urcu-qsbr.h>
-# clears the unprefixed RCU API map (rcu_read_lock, call_rcu, rcu_barrier, ...)
-# at the end of the header unless URCU_API_MAP is defined, so we set it globally:
-# any TU that (even transitively) includes a chimera RCU header -- the VFS caches,
-# the mount table, the identity/cred caches -- needs the map kept active.  It is
-# a no-op for TUs that include no urcu headers (e.g. the fio plugin).
-add_definitions(-DURCU_API_MAP)
+# liburcu is optional.  Everything in chimera that used to call urcu directly
+# now goes through the shim in src/common/chimera_rcu.h, which maps a critical
+# section either onto userspace-RCU in the QSBR flavor or, where liburcu is not
+# installed, onto a reader/writer lock on the construct being read.  See that
+# header for what the substitution does and does not preserve.
+#
+# URCU_SUPPORT is tri-state, matching CUDA_SUPPORT above:
+#   AUTO (default) - use liburcu iff it is present, else fall back to rwlocks
+#   ON             - require liburcu; hard fail if it is missing
+#   OFF            - never use liburcu, even where it is installed
+set(URCU_SUPPORT "AUTO" CACHE STRING
+    "userspace-RCU: AUTO (use iff available), ON (require), or OFF")
+set_property(CACHE URCU_SUPPORT PROPERTY STRINGS AUTO ON OFF)
+string(TOUPPER "${URCU_SUPPORT}" URCU_SUPPORT)
+
+if(NOT URCU_SUPPORT MATCHES "^(AUTO|ON|OFF)$")
+    message(FATAL_ERROR "URCU_SUPPORT must be AUTO, ON or OFF (got \"${URCU_SUPPORT}\").")
+endif()
+
+set(URCU_ENABLED FALSE)
+set(CHIMERA_RCU_LIBS "")
+
+if(WIN32 AND URCU_SUPPORT STREQUAL "ON")
+    message(FATAL_ERROR "Native Windows uses the domain-lock fallback; liburcu is unavailable")
+endif()
+
+if(NOT WIN32 AND NOT URCU_SUPPORT STREQUAL "OFF")
+    find_package(PkgConfig QUIET)
+
+    if(PkgConfig_FOUND)
+        pkg_check_modules(URCU_QSBR QUIET liburcu-qsbr)
+        pkg_check_modules(URCU_CDS QUIET liburcu-cds)
+    endif()
+
+    if(URCU_QSBR_FOUND AND URCU_CDS_FOUND)
+        set(URCU_ENABLED TRUE)
+        set(CHIMERA_RCU_LIBS urcu-qsbr urcu-cds urcu-common)
+    else()
+        # liburcu has shipped pkg-config files for a long time, but a
+        # hand-installed copy may have none; probe for the pieces directly
+        # before concluding it is absent.
+        find_path(URCU_INCLUDE_DIR urcu/urcu-qsbr.h)
+        find_library(URCU_QSBR_LIBRARY urcu-qsbr)
+        find_library(URCU_CDS_LIBRARY urcu-cds)
+        find_library(URCU_COMMON_LIBRARY urcu-common)
+
+        if(URCU_INCLUDE_DIR AND URCU_QSBR_LIBRARY AND URCU_CDS_LIBRARY AND URCU_COMMON_LIBRARY)
+            set(URCU_ENABLED TRUE)
+            set(CHIMERA_RCU_LIBS
+                ${URCU_QSBR_LIBRARY} ${URCU_CDS_LIBRARY} ${URCU_COMMON_LIBRARY})
+        endif()
+    endif()
+endif()
+
+if(URCU_ENABLED)
+    # <urcu/urcu-qsbr.h> clears the unprefixed RCU API map (rcu_read_lock,
+    # call_rcu, rcu_barrier, ...) at the end of the header unless URCU_API_MAP
+    # is defined, so we set it globally: any TU that (even transitively)
+    # includes the chimera RCU shim needs the map kept active.  It is a no-op
+    # for TUs that include no urcu headers (e.g. the fio plugin).
+    add_definitions(-DURCU_API_MAP -DCHIMERA_HAVE_URCU)
+    message(STATUS "userspace-RCU enabled (URCU_SUPPORT=${URCU_SUPPORT})")
+elseif(URCU_SUPPORT STREQUAL "ON")
+    message(FATAL_ERROR
+        "URCU_SUPPORT=ON but liburcu was not found (need liburcu-qsbr and "
+        "liburcu-cds, headers and libraries).  Install liburcu-dev or re-run "
+        "with -DURCU_SUPPORT=AUTO/OFF.")
+else()
+    message(STATUS "userspace-RCU not in use (URCU_SUPPORT=${URCU_SUPPORT}); "
+                   "RCU critical sections fall back to per-construct rwlocks")
+endif()
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/ext/libevpl/ext/prometheus-c)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/ext/libevpl/ext/prometheus-c/ext/stopwatch)
@@ -253,10 +338,10 @@ if (NOT DISABLE_TESTS)
 endif()
 
 # Test tiers.  Plain `ctest` runs the *quick* tier: the quint model-based
-# tests.  They are cheap and are meant to be a pre-flight proxy for the full
+# tests (including strict twins) and supporting probes. They proxy the full
 # suite, so they are what you get when you ask for nothing.  `ctest -C
 # extended` runs the quick tier plus everything else; that is the tier the
-# merge queue and the Extended workflow use.
+# Extended workflow uses. The merge queue runs quick.
 #
 # CTest can only withhold a test from the default run through the
 # CONFIGURATIONS keyword of add_test().  The CONFIGURATIONS *test property* is
@@ -282,7 +367,22 @@ function(add_test)
     set(_args "")
     math(EXPR _last "${ARGC} - 1")
     foreach(_i RANGE ${_last})
-        string(REPLACE ";" "\;" _a "${ARGV${_i}}")
+        set(_a "${ARGV${_i}}")
+        if(WIN32 AND _a STREQUAL "${CMAKE_SOURCE_DIR}/scripts/test_limits_wrapper.sh")
+            continue()
+        endif()
+        # Old test helpers pass build-directory paths instead of target names.
+        # Native multi-config generators put executables in bin/<config>.
+        if(WIN32 AND IS_ABSOLUTE "${_a}")
+            get_filename_component(_candidate "${_a}" NAME_WE)
+            if(TARGET "${_candidate}")
+                get_target_property(_kind "${_candidate}" TYPE)
+                if(_kind STREQUAL "EXECUTABLE")
+                    set(_a "$<TARGET_FILE:${_candidate}>")
+                endif()
+            endif()
+        endif()
+        string(REPLACE ";" "\;" _a "${_a}")
         list(APPEND _args "${_a}")
     endforeach()
 
@@ -304,10 +404,38 @@ function(add_test)
         set(_quick TRUE)
     endif()
 
-    if(_quick)
+    # An explicit configuration restriction overrides the directory's tier
+    # (for example, the extended-only Kerberos security-flavor probes).
+    list(FIND _args CONFIGURATIONS _config_index)
+    if(NOT _config_index EQUAL -1)
+        if(CMAKE_CONFIGURATION_TYPES)
+            math(EXPR _config_value "${_config_index} + 1")
+            list(GET _args ${_config_value} _configuration)
+            if(_configuration STREQUAL "extended")
+                list(REMOVE_AT _args ${_config_value})
+                list(INSERT _args ${_config_value} ${CMAKE_CONFIGURATION_TYPES})
+            endif()
+        endif()
+        _add_test(${_args})
+    elseif(_quick)
+        set_property(GLOBAL APPEND PROPERTY CHIMERA_QUICK_TESTS "${_name}")
         _add_test(${_args})
     else()
-        _add_test(${_args} CONFIGURATIONS extended)
+        if(CMAKE_CONFIGURATION_TYPES)
+            _add_test(${_args} CONFIGURATIONS ${CMAKE_CONFIGURATION_TYPES})
+        else()
+            _add_test(${_args} CONFIGURATIONS extended)
+        endif()
+    endif()
+
+    # Each diskfs fixture runs several polling/event-loop threads. On the
+    # four-core Windows runners, four concurrent fixtures starve one another:
+    # the smoke workload passes alone but times out during the full suite.
+    # Account for that CPU demand in CTest's scheduler while preserving the
+    # workloads and their timeouts. Larger -j values can still run multiple
+    # diskfs fixtures concurrently.
+    if(WIN32 AND _name MATCHES "^chimera/.*diskfs")
+        set_tests_properties("${_name}" PROPERTIES PROCESSORS 4)
     endif()
 endfunction()
 
@@ -324,7 +452,7 @@ endif()
 
 include_directories(3rdparty)
 
-if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+if(NOT MSVC AND CMAKE_BUILD_TYPE STREQUAL "Debug")
     message(STATUS "Enabling AddressSanitizer")
     add_definitions(-fsanitize=address -fno-omit-frame-pointer
                     -fno-optimize-sibling-calls -fstack-protector-all -DCHIMERA_SANITIZE=1)
@@ -334,7 +462,7 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     add_definitions(-DEVPL_IOVEC_TRACE=1)
 endif()
 
-if(CMAKE_BUILD_TYPE STREQUAL "Release")
+if(NOT MSVC AND CMAKE_BUILD_TYPE STREQUAL "Release")
     add_definitions(-O3)
 endif()
 
@@ -362,10 +490,9 @@ endif()
 # frame-pointer-based profilers can unwind call stacks (the cost at -O3 is
 # negligible and the unwind reliability is worth it for production profiling).
 # Mirrors the same setting in the bundled libevpl.
-add_definitions(-fno-omit-frame-pointer)
-
-add_definitions(-g -Wall -Werror -Wno-unused-function)
-add_definitions(-fvisibility=hidden)
+if(NOT MSVC)
+    add_definitions(-fno-omit-frame-pointer -g -Wall -Werror -Wno-unused-function -fvisibility=hidden)
+endif()
 
 # CMAKE_SYSTEM_PROCESSOR spells 64-bit ARM "aarch64" on Linux and "arm64" on
 # Darwin, so match on the family rather than a single string.  CHIMERA_ARCH_ARM64
@@ -389,7 +516,11 @@ else()
     set(CHIMERA_XXH_VECTOR XXH_AVX2)
 endif()
 
-add_definitions(${MARCH_FLAG})
+if(MSVC)
+    set(CHIMERA_XXH_VECTOR XXH_SCALAR)
+else()
+    add_definitions(${MARCH_FLAG})
+endif()
 
 if(CMAKE_C_COMPILER_ID MATCHES "GNU")
     add_link_options(-Wl,--no-as-needed)
@@ -413,7 +544,7 @@ if(CMAKE_C_COMPILER_ID MATCHES "Clang")
                     -Wno-unknown-warning-option -Wno-absolute-value)
 endif()
 
-if(NOT CHIMERA_LINUX)
+if(APPLE)
     # Apple's <stdio.h> marks sprintf(3)/vsprintf(3) __deprecated, which -Werror
     # turns into ~90 hard errors across the S3 and SMB dump paths.  glibc does
     # not, so the Linux build never sees it.  Demote it here rather than let the
@@ -621,12 +752,14 @@ set(LIBEVPL_NETNS_TESTING ${CHIMERA_NETNS_TESTING})
 # Probing the two separately is what lets those tests run in an environment
 # that grants the limits but not CAP_NET_ADMIN: previously the netns probe was
 # the only gate, so no namespace meant no tests, whatever else was available.
+if(CHIMERA_LINUX)
 execute_process(
     COMMAND bash -c "set -e; ulimit -l unlimited; test -w /proc/sys/fs/aio-max-nr"
     RESULT_VARIABLE LIMITS_PROBE_RESULT
     OUTPUT_QUIET
     ERROR_QUIET
 )
+endif()
 
 if(NOT CHIMERA_LINUX)
     # The limits are Linux concepts backing Linux-only modules (io_uring
@@ -675,6 +808,16 @@ endfunction()
 # so builds without the pynfs checkout (most non-devcontainer images) skip it.
 option(CHIMERA_ENABLE_PYNFS_TESTS "Register PyNFS test suite ctests" ON)
 find_package(Python3 COMPONENTS Interpreter QUIET)
+if(NOT DISABLE_TESTS AND CHIMERA_LINUX AND Python3_FOUND)
+    # Validate the guest lifecycle even on hosts without /dev/kvm. A completed
+    # workload must not become a timeout merely because guest poweroff hangs.
+    set(_guest_saved_tier "${CHIMERA_TEST_TIER}")
+    set(CHIMERA_TEST_TIER quick)
+    add_test(NAME chimera/kvm/guest_completion
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/kvm/run_guest_test.py)
+    set_tests_properties(chimera/kvm/guest_completion PROPERTIES TIMEOUT 20)
+    set(CHIMERA_TEST_TIER "${_guest_saved_tier}")
+endif()
 if(NOT DISABLE_TESTS
     AND CHIMERA_ENABLE_PYNFS_TESTS
     AND Python3_FOUND
@@ -685,7 +828,24 @@ else()
     message(STATUS "PyNFS testing disabled")
 endif()
 
+if(WIN32)
+    set(CHIMERA_NULL_DEVICE NUL)
+else()
+    set(CHIMERA_NULL_DEVICE /dev/null)
+endif()
 add_subdirectory(ext)
+
+if(WIN32 AND TARGET oteltracing-c)
+    # The standalone tracing project sets its own runtime directory. Keep its
+    # DLLs (including the optional SQLite sink) and tools in our common runtime
+    # directory so every consumer can load them without a build-tree PATH.
+    get_property(_otel_targets DIRECTORY ext/libevpl/ext/oteltracing-c
+                 PROPERTY BUILDSYSTEM_TARGETS)
+    foreach(_target IN LISTS _otel_targets)
+        set_target_properties(${_target} PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")
+    endforeach()
+endif()
 
 include_directories(ext/libevpl/include)
 
@@ -745,6 +905,16 @@ add_subdirectory(examples/vfs_module)
 # created until they are all known.
 if (CHIMERA_MBT_AVAILABLE)
     specs_corpus_finalize()
+endif()
+
+# Multi-config generators need CTest's -C for Debug/Release, so it cannot also
+# select our quick/extended tier. Export exactly the same quick test names the
+# add_test wrapper selects for single-config builds; no second naming policy.
+if(NOT DISABLE_TESTS)
+    get_property(_quick_tests GLOBAL PROPERTY CHIMERA_QUICK_TESTS)
+    list(REMOVE_DUPLICATES _quick_tests)
+    list(JOIN _quick_tests "\n" _quick_tests_text)
+    file(WRITE "${CMAKE_BINARY_DIR}/quick-tests.txt" "${_quick_tests_text}\n")
 endif()
 
 # Must stay last: qtm_build re-installs oteltracing.h over the copy

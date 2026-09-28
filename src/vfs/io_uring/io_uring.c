@@ -3,18 +3,37 @@
 // SPDX-License-Identifier: LGPL-2.1-only
 
 #define _GNU_SOURCE
+#include "common/thread.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#ifdef _WIN32
+#include "common/platform.h"
+#else  /* ifdef _WIN32 */
 #include <unistd.h>
+#endif /* ifdef _WIN32 */
 #include <sys/stat.h>
+#ifdef _WIN32
+#include "common/platform.h"
+#endif /* ifdef _WIN32 */
+#ifdef _WIN32
+#include "common/platform.h"
+#else  /* ifdef _WIN32 */
 #include <sys/sysmacros.h>
+#endif /* ifdef _WIN32 */
 #include <sys/types.h>
+#ifdef _WIN32
+#include "common/platform.h"
+#endif /* ifdef _WIN32 */
 #include <sys/statvfs.h>
 #include <sys/eventfd.h>
+#ifdef _WIN32
+#include "common/platform.h"
+#else  /* ifdef _WIN32 */
 #include <sys/uio.h>
-#include <dirent.h>
+#endif /* ifdef _WIN32 */
+#include "common/dirent.h"
 #include <fcntl.h>
 #include <errno.h>
 #include <sys/ioctl.h>
@@ -25,6 +44,7 @@
 #include <utlist.h>
 #include <jansson.h>
 #include <linux/version.h>
+#include <limits.h>
 
 #include "vfs/sdk/vfs_error.h"
 
@@ -145,15 +165,16 @@ struct chimera_io_uring_range {
 struct chimera_io_uring_shared {
     struct io_uring                     ring;
     int                                 readdir_verifier;
+    unsigned int                        max_inflight;
 
-    pthread_mutex_t                     range_lock;
+    evpl_mutex_t                        range_lock;
     struct chimera_io_uring_range_file *range_files;
     struct chimera_io_uring_range      *ranges;
     uint64_t                            range_next_token;
 
     /* Mount roots handed out as mount_private, so destroy can free the ones
      * no UMOUNT reclaimed.  See chimera_linux_mount_root. */
-    pthread_mutex_t                     mount_lock;
+    evpl_mutex_t                        mount_lock;
     struct chimera_linux_mount_root    *mount_roots;
 };
 
@@ -257,6 +278,91 @@ chimera_io_uring_get_personality(
     return id;
 } /* chimera_io_uring_get_personality */
 
+/* Failure-only, best-effort snapshots. Bound both buffers and line counts so
+ * diagnostics remain usable when allocations are already failing. */
+static void
+chimera_io_uring_log_resource_file(const char *path)
+{
+    char  line[512];
+    FILE *file = fopen(path, "r");
+
+    if (!file) {
+        chimera_io_uring_error("io_uring resource snapshot %s: %s", path, strerror(errno));
+        return;
+    }
+    for (unsigned int i = 0; i < 64 && fgets(line, sizeof(line), file); i++) {
+        line[strcspn(line, "\n")] = '\0';
+        chimera_io_uring_error("io_uring resource snapshot %s: %s", path, line);
+    }
+    fclose(file);
+} /* chimera_io_uring_log_resource_file */
+
+static void
+chimera_io_uring_log_cgroup_memory(const char *directory)
+{
+    const char *files[] = { "memory.current", "memory.max", "memory.peak", "memory.events" };
+    char        path[PATH_MAX];
+
+    for (unsigned int i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+        int len = snprintf(path, sizeof(path), "%s/%s", directory, files[i]);
+
+        if (len > 0 && (size_t) len < sizeof(path)) {
+            chimera_io_uring_log_resource_file(path);
+        }
+    }
+} /* chimera_io_uring_log_cgroup_memory */
+
+static void
+chimera_io_uring_log_init_failure(
+    const char                   *kind,
+    unsigned int                  entries,
+    unsigned int                  max_inflight,
+    const struct io_uring_params *params,
+    int                           rc)
+{
+    char  line[PATH_MAX];
+    char  directory[PATH_MAX];
+    FILE *file;
+
+    chimera_io_uring_error(
+        "io_uring %s queue initialization failed: entries=%u max_inflight=%u flags=0x%x wq_fd=%u rc=%d (%s)",
+        kind, entries, max_inflight, params->flags, params->wq_fd, rc, strerror(-rc));
+    if (rc != -ENOMEM) {
+        return;
+    }
+
+    chimera_io_uring_log_resource_file("/proc/meminfo");
+    chimera_io_uring_log_resource_file("/proc/self/status");
+    chimera_io_uring_log_resource_file("/proc/self/limits");
+    chimera_io_uring_log_resource_file("/proc/self/cgroup");
+
+    /* Hosted CI uses cgroup v2 at the conventional mountpoint. Capture its
+     * visible root (the container limit in a cgroup namespace) and, when the
+     * process is in a child group, that group's counters too. Membership is
+     * logged above even on hosts with v1 or a nonstandard mount layout. */
+    chimera_io_uring_log_cgroup_memory("/sys/fs/cgroup");
+    file = fopen("/proc/self/cgroup", "r");
+    if (!file) {
+        return;
+    }
+    while (fgets(line, sizeof(line), file)) {
+        if (strncmp(line, "0::/", 4) == 0) {
+            int len;
+
+            line[strcspn(line, "\n")] = '\0';
+            if (strcmp(line + 3, "/") == 0) {
+                break;
+            }
+            len = snprintf(directory, sizeof(directory), "/sys/fs/cgroup%s", line + 3);
+            if (len > 0 && (size_t) len < sizeof(directory)) {
+                chimera_io_uring_log_cgroup_memory(directory);
+            }
+            break;
+        }
+    }
+    fclose(file);
+} /* chimera_io_uring_log_init_failure */
+
 static void *
 chimera_io_uring_init(
     const char                *cfgdata,
@@ -265,36 +371,64 @@ chimera_io_uring_init(
     (void) metrics;
     struct chimera_io_uring_shared *shared;
     struct io_uring_params          params = { 0 };
+    const char                     *env;
     int                             rc;
 
     shared = calloc(1, sizeof(*shared));
 
-    // Initialize the shared ring with default parameters
-    rc = io_uring_queue_init_params(256, &shared->ring, &params);
+    /* These VFS rings are separate from libevpl's event-loop rings and are
+     * not sized by EVPL_IO_URING_ENTRIES.  Bound requests as well as entries:
+     * a VFS request can consume up to four SQEs. */
+    shared->max_inflight = 1024;
+    env                  = getenv("CHIMERA_IO_URING_MAX_INFLIGHT");
+    if (env) {
+        char *end;
+        long  value;
 
-    if (rc < 0) {
-        chimera_io_uring_error("Failed to create shared io_uring queue, io_uring disabled: %s", strerror(-rc));
-        free(shared);
-        return NULL;
+        errno = 0;
+        value = strtol(env, &end, 10);
+        chimera_io_uring_abort_if(errno || end == env || *end != '\0' ||
+                                  value < 1 || value > 8192,
+                                  "CHIMERA_IO_URING_MAX_INFLIGHT must be an integer from 1 to 8192: '%s'", env);
+        shared->max_inflight = value;
     }
-
-    pthread_mutex_init(&shared->range_lock, NULL);
-    pthread_mutex_init(&shared->mount_lock, NULL);
 
     if (cfgdata && cfgdata[0] != '\0') {
         json_error_t json_error;
         json_t      *cfg = json_loads(cfgdata, 0, &json_error);
 
         if (cfg) {
-            json_t *verf = json_object_get(cfg, "readdir_verifier");
+            json_t *verf         = json_object_get(cfg, "readdir_verifier");
+            json_t *max_inflight = json_object_get(cfg, "max_inflight");
 
             if (json_is_boolean(verf)) {
                 shared->readdir_verifier = json_boolean_value(verf);
             }
 
+            if (max_inflight) {
+                chimera_io_uring_abort_if(!json_is_integer(max_inflight) ||
+                                          json_integer_value(max_inflight) < 1 ||
+                                          json_integer_value(max_inflight) > 8192,
+                                          "io_uring max_inflight must be an integer from 1 to 8192");
+                shared->max_inflight = json_integer_value(max_inflight);
+            }
+
             json_decref(cfg);
         }
     }
+
+    /* This ring only supplies the shared worker pool, not request SQEs. */
+    rc = io_uring_queue_init_params(256, &shared->ring, &params);
+
+    if (rc < 0) {
+        chimera_io_uring_log_init_failure("shared", 256, shared->max_inflight, &params, rc);
+        chimera_io_uring_error("Failed to create shared io_uring queue, io_uring disabled: %s", strerror(-rc));
+        free(shared);
+        return NULL;
+    }
+
+    evpl_mutex_init(&shared->range_lock, NULL);
+    evpl_mutex_init(&shared->mount_lock, NULL);
 
     return shared;
 } /* io_uring_init */ /* io_uring_init */
@@ -323,7 +457,7 @@ chimera_io_uring_destroy(void *private_data)
         free(file);
     }
 
-    pthread_mutex_destroy(&shared->range_lock);
+    evpl_mutex_destroy(&shared->range_lock);
 
     io_uring_queue_exit(&shared->ring);
     free(shared);
@@ -1110,12 +1244,18 @@ chimera_io_uring_thread_init(
     params.flags |= IORING_SETUP_ATTACH_WQ;
     params.wq_fd  = shared->ring.ring_fd;
 
-    thread->max_inflight = 1024;
+    thread->max_inflight = shared->max_inflight;
 
     // Initialize io_uring with params
     rc = io_uring_queue_init_params(4 * thread->max_inflight, &thread->ring, &params);
 
-    chimera_io_uring_abort_if(rc < 0, "Failed to create io_uring queue: %s", strerror(-rc));
+    if (rc < 0) {
+        chimera_io_uring_log_init_failure("worker", 4 * thread->max_inflight,
+                                          thread->max_inflight, &params, rc);
+    }
+
+    chimera_io_uring_abort_if(rc < 0, "Failed to create io_uring queue (%u entries, %u max_inflight): %s",
+                              4 * shared->max_inflight, shared->max_inflight, strerror(-rc));
 
     evpl_add_doorbell(evpl, &thread->doorbell, chimera_io_uring_complete);
 
@@ -1429,8 +1569,11 @@ chimera_io_uring_mount(
     struct chimera_vfs_request *request,
     void                       *private_data)
 {
-    int   mount_fd, rc;
-    char *scratch = (char *) request->plugin_data;
+    struct chimera_io_uring_thread *thread = private_data;
+    int                             mount_fd, rc;
+    char                           *scratch = (char *) request->plugin_data;
+
+    --thread->inflight;
 
     TERM_STR(fullpath,
              request->mount.path,
@@ -1472,15 +1615,13 @@ chimera_io_uring_mount(
 
         if (fstat(mount_fd, &st) == 0 &&
             (root = calloc(1, sizeof(*root))) != NULL) {
-            struct chimera_io_uring_thread *thread = private_data;
-
             root->dev                      = st.st_dev;
             root->ino                      = st.st_ino;
             request->mount.r_mount_private = root;
 
-            pthread_mutex_lock(&thread->shared->mount_lock);
+            evpl_mutex_lock(&thread->shared->mount_lock);
             LL_PREPEND(thread->shared->mount_roots, root);
-            pthread_mutex_unlock(&thread->shared->mount_lock);
+            evpl_mutex_unlock(&thread->shared->mount_lock);
         }
     }
 
@@ -1499,10 +1640,12 @@ chimera_io_uring_umount(
     struct chimera_io_uring_thread  *thread = private_data;
     struct chimera_linux_mount_root *root   = request->umount.mount_private;
 
+    --thread->inflight;
+
     if (root) {
-        pthread_mutex_lock(&thread->shared->mount_lock);
+        evpl_mutex_lock(&thread->shared->mount_lock);
         LL_DELETE(thread->shared->mount_roots, root);
-        pthread_mutex_unlock(&thread->shared->mount_lock);
+        evpl_mutex_unlock(&thread->shared->mount_lock);
         free(root);
     }
     request->status = CHIMERA_VFS_OK;
@@ -2331,9 +2474,12 @@ chimera_io_uring_allocate(
     struct chimera_vfs_request *request,
     void                       *private_data)
 {
-    int fd   = (int) request->allocate.handle->vfs_private;
-    int mode = 0;
-    int rc;
+    struct chimera_io_uring_thread *thread = private_data;
+    int                             fd     = (int) request->allocate.handle->vfs_private;
+    int                             mode   = 0;
+    int                             rc;
+
+    --thread->inflight;
 
     if (request->allocate.flags & CHIMERA_VFS_ALLOCATE_DEALLOCATE) {
         mode = FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE;
@@ -2474,9 +2620,12 @@ chimera_io_uring_seek(
     struct chimera_vfs_request *request,
     void                       *private_data)
 {
-    int   fd = (int) request->seek.handle->vfs_private;
-    int   whence;
-    off_t result;
+    struct chimera_io_uring_thread *thread = private_data;
+    int                             fd     = (int) request->seek.handle->vfs_private;
+    int                             whence;
+    off_t                           result;
+
+    --thread->inflight;
 
     if (request->seek.what == 0) {
         whence = SEEK_DATA;
@@ -3061,10 +3210,10 @@ chimera_io_uring_claim_acquire(
         if (!(request->claim_acquire.flags & CHIMERA_VFS_CLAIM_TEST)) {
             range = calloc(1, sizeof(*range));
 
-            pthread_mutex_lock(&shared->range_lock);
+            evpl_mutex_lock(&shared->range_lock);
             range->token = ++shared->range_next_token;
             LL_PREPEND(shared->ranges, range);
-            pthread_mutex_unlock(&shared->range_lock);
+            evpl_mutex_unlock(&shared->range_lock);
 
             request->claim_acquire.r_token   = range->token;
             request->claim_acquire.r_granted = 1;
@@ -3075,7 +3224,7 @@ chimera_io_uring_claim_acquire(
         return;
     }
 
-    pthread_mutex_lock(&shared->range_lock);
+    evpl_mutex_lock(&shared->range_lock);
 
     file = chimera_io_uring_range_file_get(thread,
                                            request->fh,
@@ -3085,7 +3234,7 @@ chimera_io_uring_claim_acquire(
 
     rc = file ? 0 : errno;
 
-    pthread_mutex_unlock(&shared->range_lock);
+    evpl_mutex_unlock(&shared->range_lock);
 
     if (!file) {
         request->status = chimera_linux_errno_to_status(rc);
@@ -3125,7 +3274,7 @@ chimera_io_uring_claim_acquire(
         chimera_io_uring_range_resolve(&fl, file->fd, &range->offset, &range->length);
     }
 
-    pthread_mutex_lock(&shared->range_lock);
+    evpl_mutex_lock(&shared->range_lock);
 
     if (range) {
         range->token = ++shared->range_next_token;
@@ -3139,7 +3288,7 @@ chimera_io_uring_claim_acquire(
         chimera_io_uring_range_file_put(shared, file);
     }
 
-    pthread_mutex_unlock(&shared->range_lock);
+    evpl_mutex_unlock(&shared->range_lock);
 
     request->complete(request);
 } /* chimera_io_uring_claim_acquire */
@@ -3164,7 +3313,7 @@ chimera_io_uring_claim_release_ranged(
     uint64_t                            length = request->claim_release.length;
     int                                 err    = 0;
 
-    pthread_mutex_lock(&shared->range_lock);
+    evpl_mutex_lock(&shared->range_lock);
 
     file = chimera_io_uring_range_file_find(shared,
                                             request->fh,
@@ -3177,7 +3326,7 @@ chimera_io_uring_claim_release_ranged(
         file->refcnt++;
     }
 
-    pthread_mutex_unlock(&shared->range_lock);
+    evpl_mutex_unlock(&shared->range_lock);
 
     if (!file) {
         /* This owner locks nothing on this file, so there is nothing of ours
@@ -3217,16 +3366,16 @@ chimera_io_uring_claim_release_ranged(
     }
 
     if (err) {
-        pthread_mutex_lock(&shared->range_lock);
+        evpl_mutex_lock(&shared->range_lock);
         chimera_io_uring_range_file_put(shared, file);
-        pthread_mutex_unlock(&shared->range_lock);
+        evpl_mutex_unlock(&shared->range_lock);
 
         request->status = chimera_linux_errno_to_status(err);
         request->complete(request);
         return;
     }
 
-    pthread_mutex_lock(&shared->range_lock);
+    evpl_mutex_lock(&shared->range_lock);
 
     LL_FOREACH_SAFE(shared->ranges, range, tmp)
     {
@@ -3248,7 +3397,7 @@ chimera_io_uring_claim_release_ranged(
         LL_PREPEND(matched, range);
     }
 
-    pthread_mutex_unlock(&shared->range_lock);
+    evpl_mutex_unlock(&shared->range_lock);
 
     /* Outside the registry lock, as every other lock syscall on this module is.
      * F_UNLCK does not block, but the descriptor put below wants the lock and
@@ -3264,7 +3413,7 @@ chimera_io_uring_claim_release_ranged(
         fcntl(file->fd, CHIMERA_IO_URING_LOCK_SET, &fl);
     }
 
-    pthread_mutex_lock(&shared->range_lock);
+    evpl_mutex_lock(&shared->range_lock);
 
     while (matched) {
         range = matched;
@@ -3275,7 +3424,7 @@ chimera_io_uring_claim_release_ranged(
 
     chimera_io_uring_range_file_put(shared, file);
 
-    pthread_mutex_unlock(&shared->range_lock);
+    evpl_mutex_unlock(&shared->range_lock);
 
     request->status = CHIMERA_VFS_OK;
     request->complete(request);
@@ -3302,7 +3451,7 @@ chimera_io_uring_claim_release(
         return;
     }
 
-    pthread_mutex_lock(&shared->range_lock);
+    evpl_mutex_lock(&shared->range_lock);
 
     for (range = shared->ranges; range; range = range->next) {
         if (range->token == request->claim_release.token) {
@@ -3311,7 +3460,7 @@ chimera_io_uring_claim_release(
         }
     }
 
-    pthread_mutex_unlock(&shared->range_lock);
+    evpl_mutex_unlock(&shared->range_lock);
 
     if (range && range->projected) {
         fl.l_type   = F_UNLCK;
@@ -3322,9 +3471,9 @@ chimera_io_uring_claim_release(
 
         fcntl(range->file->fd, CHIMERA_IO_URING_LOCK_SET, &fl);
 
-        pthread_mutex_lock(&shared->range_lock);
+        evpl_mutex_lock(&shared->range_lock);
         chimera_io_uring_range_file_put(shared, range->file);
-        pthread_mutex_unlock(&shared->range_lock);
+        evpl_mutex_unlock(&shared->range_lock);
     }
 
     free(range);

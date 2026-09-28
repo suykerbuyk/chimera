@@ -9,7 +9,11 @@
 
 #include <stdlib.h>
 #include <stdint.h>
+#ifdef _WIN32
+#include "common/platform.h"
+#else // ifdef _WIN32
 #include <strings.h>
+#endif // ifdef _WIN32
 #include <jansson.h>
 
 #include "evpl/evpl.h"
@@ -147,6 +151,17 @@ chimera_apply_common_config(
     common = json_object_get(root, "common");
     if (!json_is_object(common)) {
         return;
+    }
+
+    /* These settings apply to every libevpl TLS connection in the process.
+     * Preserve libevpl's peer-verification default unless explicitly configured. */
+    val = json_object_get(common, "tls_verify_peer");
+    if (json_is_boolean(val)) {
+        evpl_global_config_set_tls_verify_peer(cfg, json_boolean_value(val));
+    }
+    val = json_object_get(common, "tls_ca_file");
+    if (json_is_string(val)) {
+        evpl_global_config_set_tls_ca(cfg, json_string_value(val));
     }
 
     val = json_object_get(common, "huge_pages");
@@ -307,6 +322,10 @@ chimera_common_metrics_file(json_t *root)
  * (0 == one worker per CPU, the default reclaim parallelism; a positive value
  * caps the count) or -1 when the section or key is absent, meaning "unset" so
  * the caller leaves its own default in place.  `root` may be NULL.
+ *
+ * Ignored in a build without liburcu: the rwlock fallback has no such worker
+ * pool (see src/common/chimera_rcu.h).  The key is still parsed and carried,
+ * so a config file is portable between the two builds.
  */
 static inline int
 chimera_common_rcu_reclaim_threads(json_t *root)

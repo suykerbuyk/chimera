@@ -7,11 +7,8 @@
 #include <string.h>
 #include <stdarg.h>
 #include <ctype.h>
-#include <openssl/evp.h>
-#include <openssl/hmac.h>
-#include <openssl/bio.h>
-#include <openssl/buffer.h>
-#include <urcu/urcu-qsbr.h>
+#include "common/crypto.h"
+#include "common/chimera_rcu.h"
 
 #include "evpl/evpl_http.h"
 #include "s3_auth.h"
@@ -33,12 +30,9 @@ sha256_hex(
     char                *out)
 {
     unsigned char hash[SHA256_DIGEST_LENGTH];
-    EVP_MD_CTX   *ctx = EVP_MD_CTX_new();
 
-    EVP_DigestInit_ex(ctx, EVP_sha256(), NULL);
-    EVP_DigestUpdate(ctx, data, len);
-    EVP_DigestFinal_ex(ctx, hash, NULL);
-    EVP_MD_CTX_free(ctx);
+    chimera_s3_abort_if(!chimera_crypto_digest(CHIMERA_CRYPTO_SHA256, data, len, hash, sizeof(hash)),
+                        "SHA256 failed");
 
     for (int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
         sprintf(out + (i * 2), "%02x", hash[i]);
@@ -57,9 +51,8 @@ hmac_sha256(
     size_t               data_len,
     unsigned char       *out)
 {
-    unsigned int out_len = SHA256_DIGEST_LENGTH;
-
-    HMAC(EVP_sha256(), key, key_len, data, data_len, out, &out_len);
+    chimera_s3_abort_if(!chimera_crypto_hmac(CHIMERA_CRYPTO_HMAC_SHA256,
+                                             key, key_len, data, data_len, out, 32), "HMAC failed");
 } /* hmac_sha256 */
 
 /*
@@ -73,9 +66,8 @@ hmac_sha1(
     size_t               data_len,
     unsigned char       *out)
 {
-    unsigned int out_len = SHA1_DIGEST_LENGTH;
-
-    HMAC(EVP_sha1(), key, key_len, data, data_len, out, &out_len);
+    chimera_s3_abort_if(!chimera_crypto_hmac(CHIMERA_CRYPTO_HMAC_SHA1,
+                                             key, key_len, data, data_len, out, 20), "HMAC failed");
 } /* hmac_sha1 */
 
 /*
@@ -88,29 +80,7 @@ base64_encode(
     char                *out,
     size_t               out_max)
 {
-    BIO     *b64, *bio;
-    BUF_MEM *bufferPtr;
-    int      result_len;
-
-    b64 = BIO_new(BIO_f_base64());
-    bio = BIO_new(BIO_s_mem());
-    bio = BIO_push(b64, bio);
-
-    BIO_set_flags(bio, BIO_FLAGS_BASE64_NO_NL);
-    BIO_write(bio, data, len);
-    BIO_flush(bio);
-    BIO_get_mem_ptr(bio, &bufferPtr);
-
-    result_len = bufferPtr->length;
-    if (result_len >= (int) out_max) {
-        result_len = out_max - 1;
-    }
-    memcpy(out, bufferPtr->data, result_len);
-    out[result_len] = '\0';
-
-    BIO_free_all(bio);
-
-    return result_len;
+    return chimera_crypto_base64(data, len, out, out_max);
 } /* base64_encode */
 
 /*
@@ -538,10 +508,10 @@ verify_signature_v2(
     chimera_s3_debug("V2 Header Host: %s", hdr ? hdr : "(null)");
 
     /* Look up credentials */
-    rcu_read_lock();
+    chimera_rcu_read_lock(&cred_cache->rcu);
     cred = chimera_s3_cred_cache_lookup(cred_cache, access_key, strlen(access_key));
     if (!cred) {
-        rcu_read_unlock();
+        chimera_rcu_read_unlock(&cred_cache->rcu);
         chimera_s3_debug("Unknown access key: %s", access_key);
         return CHIMERA_S3_AUTH_UNKNOWN_ACCESS_KEY;
     }
@@ -561,7 +531,7 @@ verify_signature_v2(
     /* Build string to sign */
     sts_len = build_string_to_sign_v2(request, string_to_sign, sizeof(string_to_sign));
     if (sts_len < 0) {
-        rcu_read_unlock();
+        chimera_rcu_read_unlock(&cred_cache->rcu);
         chimera_s3_debug("Failed to build string to sign");
         return CHIMERA_S3_AUTH_INVALID_AUTH_HEADER;
     }
@@ -572,11 +542,13 @@ verify_signature_v2(
     hmac_sha1((unsigned char *) cred->secret_key, strlen(cred->secret_key),
               (unsigned char *) string_to_sign, sts_len, sig_bytes);
 
-    rcu_read_unlock();
+    chimera_rcu_read_unlock(&cred_cache->rcu);
 
     /* Base64 encode the result */
-    base64_encode(sig_bytes, SHA1_DIGEST_LENGTH,
-                  expected_signature, sizeof(expected_signature));
+    if (base64_encode(sig_bytes, SHA1_DIGEST_LENGTH,
+                      expected_signature, sizeof(expected_signature)) < 0) {
+        return CHIMERA_S3_AUTH_SIGNATURE_MISMATCH;
+    }
 
     chimera_s3_debug("V2 Expected signature: %s", expected_signature);
     chimera_s3_debug("V2 Received signature: %s", signature);
@@ -1029,10 +1001,10 @@ verify_signature_v4(
     }
 
     /* Look up credentials */
-    rcu_read_lock();
+    chimera_rcu_read_lock(&cred_cache->rcu);
     cred = chimera_s3_cred_cache_lookup(cred_cache, access_key, strlen(access_key));
     if (!cred) {
-        rcu_read_unlock();
+        chimera_rcu_read_unlock(&cred_cache->rcu);
         chimera_s3_debug("Unknown access key: %s", access_key);
         return CHIMERA_S3_AUTH_UNKNOWN_ACCESS_KEY;
     }
@@ -1053,7 +1025,7 @@ verify_signature_v4(
     cr_len = build_canonical_request_v4(request, signed_headers,
                                         canonical_request, sizeof(canonical_request));
     if (cr_len < 0) {
-        rcu_read_unlock();
+        chimera_rcu_read_unlock(&cred_cache->rcu);
         return CHIMERA_S3_AUTH_INVALID_AUTH_HEADER;
     }
 
@@ -1075,7 +1047,7 @@ verify_signature_v4(
     /* Derive signing key */
     derive_signing_key_v4(cred->secret_key, date_stamp, region, service, signing_key);
 
-    rcu_read_unlock();
+    chimera_rcu_read_unlock(&cred_cache->rcu);
 
     /* Calculate expected signature */
     hmac_sha256(signing_key, SHA256_DIGEST_LENGTH,

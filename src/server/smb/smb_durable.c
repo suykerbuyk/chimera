@@ -28,6 +28,7 @@
  * global order bucket -> registry -> vfs_state holds with no inversion.
  */
 
+#include "common/thread.h"
 #include "smb_internal.h"
 #include "common/misc.h"
 #include "vfs/vfs.h"
@@ -41,7 +42,7 @@ struct chimera_smb_durable_recover_ctx {
 SYMBOL_EXPORT void
 chimera_smb_durable_table_init(struct chimera_smb_durable_table *table)
 {
-    pthread_mutex_init(&table->lock, NULL);
+    evpl_mutex_init(&table->lock, NULL);
     table->by_pid = NULL;
 } /* chimera_smb_durable_table_init */
 
@@ -62,7 +63,7 @@ chimera_smb_durable_table_destroy(struct chimera_smb_durable_table *table)
         entry = tmp;
     }
 
-    pthread_mutex_destroy(&table->lock);
+    evpl_mutex_destroy(&table->lock);
 } /* chimera_smb_durable_table_destroy */
 
 SYMBOL_EXPORT void
@@ -94,9 +95,9 @@ chimera_smb_durable_register(
     entry->name_len = name_len;
     memcpy(entry->name, name, name_len);
 
-    pthread_mutex_lock(&shared->durable.lock);
+    evpl_mutex_lock(&shared->durable.lock);
     HASH_ADD(hh, shared->durable.by_pid, persistent_id, sizeof(entry->persistent_id), entry);
-    pthread_mutex_unlock(&shared->durable.lock);
+    evpl_mutex_unlock(&shared->durable.lock);
 } /* chimera_smb_durable_register */
 
 /* Insert a cold entry recovered from a backend record at startup.  open_file is
@@ -128,10 +129,10 @@ chimera_smb_durable_recover_entry(
     entry->name_len = name_len;
     memcpy(entry->name, record->name, name_len);
 
-    pthread_mutex_lock(&shared->durable.lock);
+    evpl_mutex_lock(&shared->durable.lock);
     HASH_FIND(hh, shared->durable.by_pid, &pid, sizeof(pid), existing);
     if (existing) {
-        pthread_mutex_unlock(&shared->durable.lock);
+        evpl_mutex_unlock(&shared->durable.lock);
         free(entry);
         return;
     }
@@ -142,7 +143,7 @@ chimera_smb_durable_recover_entry(
     if (atomic_load(&shared->next_persistent_id) <= pid) {
         atomic_store(&shared->next_persistent_id, pid + 1);
     }
-    pthread_mutex_unlock(&shared->durable.lock);
+    evpl_mutex_unlock(&shared->durable.lock);
 } /* chimera_smb_durable_recover_entry */
 
 SYMBOL_EXPORT void
@@ -152,12 +153,12 @@ chimera_smb_durable_forget(
 {
     struct chimera_smb_durable_entry *entry;
 
-    pthread_mutex_lock(&shared->durable.lock);
+    evpl_mutex_lock(&shared->durable.lock);
     HASH_FIND(hh, shared->durable.by_pid, &persistent_id, sizeof(persistent_id), entry);
     if (entry) {
         HASH_DELETE(hh, shared->durable.by_pid, entry);
     }
-    pthread_mutex_unlock(&shared->durable.lock);
+    evpl_mutex_unlock(&shared->durable.lock);
 
     if (entry) {
         free(entry);
@@ -289,7 +290,7 @@ chimera_smb_durable_purge_parked(
     struct chimera_smb_durable_entry *entry;
     struct chimera_smb_open_file     *open_file = NULL;
 
-    pthread_mutex_lock(&shared->durable.lock);
+    evpl_mutex_lock(&shared->durable.lock);
     HASH_FIND(hh, shared->durable.by_pid, &persistent_id, sizeof(persistent_id), entry);
     if (entry && entry->parked && (include_persistent || !entry->persistent) &&
         !entry->cold && entry->open_file) {
@@ -297,7 +298,7 @@ chimera_smb_durable_purge_parked(
         open_file = entry->open_file;
         free(entry);
     }
-    pthread_mutex_unlock(&shared->durable.lock);
+    evpl_mutex_unlock(&shared->durable.lock);
 
     if (!open_file) {
         return false;
@@ -333,7 +334,7 @@ chimera_smb_durable_conn_disconnecting(
     struct chimera_smb_durable_entry *entry;
     enum chimera_smb_durable_yield    yield = CHIMERA_SMB_DURABLE_YIELD_NONE;
 
-    pthread_mutex_lock(&shared->durable.lock);
+    evpl_mutex_lock(&shared->durable.lock);
     HASH_FIND(hh, shared->durable.by_pid, &persistent_id, sizeof(persistent_id), entry);
     if (entry && !entry->persistent && !entry->cold && entry->open_file) {
         struct chimera_smb_conn *cc = entry->open_file->create_conn;
@@ -378,7 +379,7 @@ chimera_smb_durable_conn_disconnecting(
             yield = CHIMERA_SMB_DURABLE_YIELD_SPECULATIVE;
         }
     }
-    pthread_mutex_unlock(&shared->durable.lock);
+    evpl_mutex_unlock(&shared->durable.lock);
 
     return yield;
 } /* chimera_smb_durable_conn_disconnecting */
@@ -394,7 +395,7 @@ chimera_smb_durable_park(
 
     clock_gettime(CLOCK_MONOTONIC, &now);
 
-    pthread_mutex_lock(&shared->durable.lock);
+    evpl_mutex_lock(&shared->durable.lock);
     HASH_FIND(hh, shared->durable.by_pid, &pid, sizeof(pid), entry);
     if (entry) {
         /* The disconnect-survival timeout: a resiliency request SETS the open's
@@ -421,7 +422,7 @@ chimera_smb_durable_park(
             entry->deadline.tv_nsec -= 1000000000L;
         }
     }
-    pthread_mutex_unlock(&shared->durable.lock);
+    evpl_mutex_unlock(&shared->durable.lock);
 
     /* Park the caching grant's claim AND the share reservation so the claim
      * core treats this disconnected holder as courtesy-held (advertised H and
@@ -459,7 +460,7 @@ chimera_smb_durable_parked_hold(
 
     clock_gettime(CLOCK_MONOTONIC, &now);
 
-    pthread_mutex_lock(&shared->durable.lock);
+    evpl_mutex_lock(&shared->durable.lock);
     HASH_FIND(hh, shared->durable.by_pid, &persistent_id, sizeof(persistent_id), entry);
     if (entry && entry->parked && !entry->cold && entry->open_file) {
         bool within = entry->never_expires ||
@@ -472,7 +473,7 @@ chimera_smb_durable_parked_hold(
             }
         }
     }
-    pthread_mutex_unlock(&shared->durable.lock);
+    evpl_mutex_unlock(&shared->durable.lock);
 
     return hold;
 } /* chimera_smb_durable_parked_hold */
@@ -503,7 +504,7 @@ chimera_smb_durable_claim(
 
     clock_gettime(CLOCK_MONOTONIC, &now);
 
-    pthread_mutex_lock(&shared->durable.lock);
+    evpl_mutex_lock(&shared->durable.lock);
 
     HASH_FIND(hh, shared->durable.by_pid, &persistent_id, sizeof(persistent_id), entry);
 
@@ -601,7 +602,7 @@ chimera_smb_durable_claim(
         *status = SMB2_STATUS_SUCCESS;
     }
 
-    pthread_mutex_unlock(&shared->durable.lock);
+    evpl_mutex_unlock(&shared->durable.lock);
 
     return open_file;
 } /* chimera_smb_durable_claim */
@@ -652,7 +653,7 @@ chimera_smb_durable_claim_by_guid(
 
     *r_open_file = NULL;
 
-    pthread_mutex_lock(&shared->durable.lock);
+    evpl_mutex_lock(&shared->durable.lock);
 
     HASH_ITER(hh, shared->durable.by_pid, entry, tmp)
     {
@@ -717,7 +718,7 @@ chimera_smb_durable_claim_by_guid(
         /* else: ineligible replay on our own live open -> NONE (fresh open). */
     }
 
-    pthread_mutex_unlock(&shared->durable.lock);
+    evpl_mutex_unlock(&shared->durable.lock);
 
     return result;
 } /* chimera_smb_durable_claim_by_guid */
@@ -735,7 +736,7 @@ chimera_smb_durable_sweep(struct chimera_server_smb_thread *thread)
      * the heavyweight teardown after the lock is dropped. */
     clock_gettime(CLOCK_MONOTONIC, &now);
 
-    pthread_mutex_lock(&shared->durable.lock);
+    evpl_mutex_lock(&shared->durable.lock);
 
     HASH_ITER(hh, shared->durable.by_pid, entry, tmp)
     {
@@ -757,7 +758,7 @@ chimera_smb_durable_sweep(struct chimera_server_smb_thread *thread)
         expired          = entry;
     }
 
-    pthread_mutex_unlock(&shared->durable.lock);
+    evpl_mutex_unlock(&shared->durable.lock);
 
     while (expired) {
         struct chimera_smb_open_file *open_file = expired->open_file;
@@ -777,12 +778,12 @@ chimera_smb_durable_sweep(struct chimera_server_smb_thread *thread)
     }
 } /* chimera_smb_durable_sweep */
 
-/* Release every registry entry's live open at thread shutdown.  A parked
- * durable/persistent handle keeps its VFS open handle referenced
+/* Release every registry entry's parked open at final SMB thread shutdown.
+ * A parked durable/persistent handle keeps its VFS open handle referenced
  * indefinitely; without this the VFS close thread can never reach a
  * quiescent (zero open handles) state and chimera_vfs_destroy hangs.
  *
- * Runs from the SMB thread-destroy path, which still has a live vfs_thread
+ * Runs only from the LAST SMB thread-destroy path, with a live vfs_thread
  * (protocols are destroyed before the VFS, precisely so they can release
  * their open handles).  By that point all connections are gone, so any
  * remaining entry with a live open_file is orphaned state to reclaim --
@@ -791,31 +792,27 @@ chimera_smb_durable_sweep(struct chimera_server_smb_thread *thread)
  * Cold entries (open_file == NULL) only hold bookkeeping, freed by
  * chimera_smb_durable_table_destroy.
  *
- * The open's share reservation / byte-range locks are deliberately NOT drained
- * via chimera_smb_open_file_drain_locks: that releases the lease with a pump,
- * and pumping a pending acquire queued behind it (e.g. a blocking lock whose
- * connection already dropped) runs a completion callback that allocates a reply
- * iovec on this teardown thread for a dead connection, tripping the cross-thread
- * iovec guard.  At shutdown those waiters have no live connection to answer, so
- * dropping them is correct.  The embedded share/range leases are reclaimed
- * wholesale when chimera_vfs_state_destroy frees the per-file state (it never
- * walks the lease lists).
+ * The open's claims are drained WITHOUT pumping waiters
+ * (chimera_smb_open_file_drain_locks_nopump): pumping a pending acquire queued
+ * behind them (e.g. a blocking lock whose connection already dropped) runs a
+ * completion callback that allocates a reply iovec on this teardown thread for
+ * a dead connection, tripping the cross-thread iovec guard.  At shutdown those
+ * waiters have no live connection to answer, so leaving them is correct.
  *
- * The cache grant (oplock / SMB2 lease), however, is a standalone heap object
- * the SMB layer owns -- vfs_state_destroy frees the per-file state but never the
- * grant -- so a parked handle's grant must be released here explicitly or it
- * leaks.  Release it with pump=false to free the grant memory (and unlink its
- * lease) without waking a waiter on a dead connection. */
+ * The claims must still be UNLINKED before the open is freed: the share and
+ * range claims are embedded in the open (and its lock entries), and the VFS
+ * close thread's shutdown pass walks every file's claim lists
+ * (chimera_vfs_claim_backend_service) after the SMB threads are gone.  The
+ * cache grant is a standalone heap object vfs_state_destroy never frees, so it
+ * is released here as well. */
 SYMBOL_EXPORT void
 chimera_smb_durable_drain_all(struct chimera_server_smb_thread *thread)
 {
-    struct chimera_server_smb_shared *shared    = thread->shared;
-    struct chimera_vfs_state         *vfs_state =
-        thread->vfs_thread->vfs->vfs_state;
+    struct chimera_server_smb_shared *shared = thread->shared;
     struct chimera_smb_durable_entry *entry, *tmp;
     struct chimera_smb_durable_entry *reap = NULL;
 
-    pthread_mutex_lock(&shared->durable.lock);
+    evpl_mutex_lock(&shared->durable.lock);
 
     HASH_ITER(hh, shared->durable.by_pid, entry, tmp)
     {
@@ -827,29 +824,17 @@ chimera_smb_durable_drain_all(struct chimera_server_smb_thread *thread)
         reap             = entry;
     }
 
-    pthread_mutex_unlock(&shared->durable.lock);
+    evpl_mutex_unlock(&shared->durable.lock);
 
     while (reap) {
         struct chimera_smb_open_file *open_file = reap->open_file;
         entry = reap;
         reap  = reap->reap_next;
 
+        chimera_smb_open_file_drain_locks_nopump(thread, open_file);
         if (open_file->handle) {
             chimera_vfs_release(thread->vfs_thread, open_file->handle);
             open_file->handle = NULL;
-        }
-        /* Release the standalone cache grant (vfs_state_destroy won't); no
-         * pump -- there is no live connection left to answer a woken waiter. */
-        if (open_file->grant) {
-            chimera_smb_grant_remove_member(open_file->grant, open_file);
-            chimera_vfs_claim_grant_release(vfs_state, open_file->grant,
-                                            false /*pump*/);
-            open_file->grant                  = NULL;
-            open_file->caching_lease_inserted = false;
-        }
-        if (open_file->caching_file_state) {
-            chimera_vfs_state_put(vfs_state, open_file->caching_file_state);
-            open_file->caching_file_state = NULL;
         }
         chimera_smb_open_file_free(thread, open_file);
 

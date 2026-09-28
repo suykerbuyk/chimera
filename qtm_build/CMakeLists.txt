@@ -110,10 +110,18 @@ list(TRANSFORM QTM_TEST_VFS_HEADERS PREPEND ${CMAKE_SOURCE_DIR}/src/vfs/)
 install(FILES ${QTM_TEST_VFS_HEADERS} DESTINATION tests/include/vfs)
 
 # vfs_dump.h includes common/logging.h and vfs.h includes common/tcp_flavor.h,
-# so the C utility layer these two reach for travels with them.
+# so the C utility layer these two reach for travels with them.  The Windows
+# port (2026-09-28 sync) grew that layer: vfs.h now includes common/thread.h
+# and common/platform.h, vfs_clock.h common/atomic.h, and logging.h
+# common/compiler.h.  platform.h includes common/windows.h only under _WIN32,
+# so that one stays out of a package that only ever builds on Linux.
 install(FILES
 	${CMAKE_SOURCE_DIR}/src/common/logging.h
 	${CMAKE_SOURCE_DIR}/src/common/tcp_flavor.h
+	${CMAKE_SOURCE_DIR}/src/common/thread.h
+	${CMAKE_SOURCE_DIR}/src/common/platform.h
+	${CMAKE_SOURCE_DIR}/src/common/atomic.h
+	${CMAKE_SOURCE_DIR}/src/common/compiler.h
 	DESTINATION tests/include/common)
 
 install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/tests-include.README
