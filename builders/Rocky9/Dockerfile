@@ -4,8 +4,10 @@ FROM repository.mdh.quantum.com/rockylinux/rockylinux:9
 RUN dnf install -y dnf-plugins-core epel-release && \
     dnf config-manager --set-enabled crb
 
+# BaseOS/AppStream and CRB can briefly publish different Samba builds. Allow
+# matching available versions for libwbclient-devel's exact-version dependency.
 RUN dnf -y update && \
-    dnf -y --allowerasing install gcc gcc-c++ clang clang-tools-extra cmake ninja-build git flex bison llvm \
+    dnf -y --allowerasing --nobest install gcc gcc-c++ clang clang-tools-extra cmake ninja-build git flex bison llvm \
     libuuid-devel uthash-devel krb5-devel krb5-libs \
     rdma-core-devel jansson-devel xxhash-devel userspace-rcu-devel liburing-devel libunwind-devel libasan \
     rocksdb-devel openssl-devel openssl numactl-devel libcurl-devel libaio-devel libxcrypt-devel \
