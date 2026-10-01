@@ -1,8 +1,9 @@
 project: chimera
 default_builder_tag: develop
 # No VERSION/REVISION here on purpose.  The package version is derived from the
-# nearest reachable <X.Y.Z>-myriad* git tag by qtm_build/pkg_version.sh, which
-# every packaging task sources as its first command; a default here would be a
+# <X.Y.Z>-myriad* tags qb finds on the host (QB_BUILD_GIT_TAG and
+# QB_BUILD_GIT_DESCRIBE_TAG) by qtm_build/pkg_version.sh, which every
+# packaging task sources as its first command; a default here would be a
 # stale 0.0.0-1 that silently wins whenever the tag lookup is the thing that
 # broke.  To force a version, pass `-V VERSION=X.Y.Z [-V REVISION=r]` -- qb
 # exports every manifest variable into the build container as QB_<NAME>, and
@@ -28,6 +29,7 @@ tasks:
     architecture: [ amd64, arm64 ]
     image: builder_ubuntu22
     context: .
+    context_exclude: [ .git ]
     commands:
       - . /context/qtm_build/pkg_version.sh
       - export DESTDIR=/build/quantum-chimera-server_${PKG_VERSION}-${PKG_REVISION}_$arch
@@ -58,6 +60,7 @@ tasks:
     architecture: [ amd64, arm64 ]
     image: builder_ubuntu22
     context: .
+    context_exclude: [ .git ]
     commands:
       - . /context/qtm_build/pkg_version.sh
       - export DESTDIR=/build/quantum-chimera-server_${PKG_VERSION}-${PKG_REVISION}_$arch
@@ -102,6 +105,7 @@ tasks:
     architecture: [ amd64, arm64 ]
     image: builder_ubuntu24
     context: .
+    context_exclude: [ .git ]
     commands:
       - . /context/qtm_build/pkg_version.sh
       - export DESTDIR=/build/quantum-chimera-server_${PKG_VERSION}-${PKG_REVISION}_$arch
@@ -132,6 +136,7 @@ tasks:
     architecture: [ amd64, arm64 ]
     image: builder_ubuntu24
     context: .
+    context_exclude: [ .git ]
     commands:
       - . /context/qtm_build/pkg_version.sh
       - export DESTDIR=/build/quantum-chimera-server_${PKG_VERSION}-${PKG_REVISION}_$arch
@@ -176,6 +181,7 @@ tasks:
     architecture: [ amd64, arm64 ]
     image: builder_ubuntu26
     context: .
+    context_exclude: [ .git ]
     commands:
       - . /context/qtm_build/pkg_version.sh
       - export DESTDIR=/build/quantum-chimera-server_${PKG_VERSION}-${PKG_REVISION}_$arch
@@ -206,6 +212,7 @@ tasks:
     architecture: [ amd64, arm64 ]
     image: builder_ubuntu26
     context: .
+    context_exclude: [ .git ]
     commands:
       - . /context/qtm_build/pkg_version.sh
       - export DESTDIR=/build/quantum-chimera-server_${PKG_VERSION}-${PKG_REVISION}_$arch
@@ -250,6 +257,7 @@ tasks:
     architecture: [ amd64 ]
     image: builder_rocky9
     context: .
+    context_exclude: [ .git ]
     dependencies:
       builder:
         project: chimera
@@ -280,6 +288,7 @@ tasks:
     architecture: [ amd64 ]
     image: builder_rocky9
     context: .
+    context_exclude: [ .git ]
     dependencies:
       builder:
         project: chimera
@@ -319,10 +328,17 @@ tasks:
     type: run_container
     image: chimera-dev
     context: .
+    # Base ref for the copyright-year check.  A task variable rather than a
+    # literal in the command so that `-V COPYRIGHT_BASE=origin/main` can
+    # retarget it, and because on qb before 2.0.38 it keeps this task's
+    # context cache key distinct from the legs that drop .git: see the note
+    # above ctest_release.
+    variables:
+      COPYRIGHT_BASE: origin/develop
     commands:
       - cd /context
       - make syntax-check < /dev/null
-      - export BASE=origin/develop
+      - export BASE=${COPYRIGHT_BASE}
       - make copyright-check <  /dev/null
     dependencies:
       builder:
@@ -381,11 +397,31 @@ tasks:
   # same reason; restore the two together.  static_analysis_* keeps arm64 --
   # it builds and analyses rather than running tests, so the flakiness does not
   # reach it, and it is the only remaining arm64 compile check.
+  # Every leg from here down packs the tree with `context_exclude: [ .git ]`,
+  # as do the packaging build_* tasks above.  The .git directory (~120 MiB of
+  # packs plus the submodule stores) was nearly 90% of the compressed
+  # context: about 112 MiB with it, 14 MiB without.  None of these tasks runs
+  # git in the pod: cmake/Specs.cmake only checks that ext/specs is checked
+  # out, the coverage legs read a pre-made /context/pr.diff, regen.sh
+  # --report-only merely prints a git hint, and pkg_version.sh takes the
+  # package version from the tags qb found on the host.  syntax is the one
+  # task that keeps the full tree (copyright-year.sh diffs against
+  # origin/develop).  qb matches context_exclude entries by exact path
+  # relative to the context root -- no globs.
+  #
+  # qb caches a packed context per (source dir, arch, context entries, task
+  # variables).  Before qb 2.0.38 that key ignored context_exclude, so two
+  # tasks that shared a key in ONE qb invocation got whichever tarball was
+  # packed first; 2.0.38 adds the exclude list to the key.  The excluding
+  # tasks may share freely either way, and syntax carries a task variable
+  # (COPYRIGHT_BASE) partly so that, on an older qb, its key never collides
+  # with theirs.
   ctest_release:
     type: run_container
     architecture: [ amd64 ]
     image: chimera-dev
     context: .
+    context_exclude: [ .git ]
     empty_dir:
       - /build
     privileged: true
@@ -427,6 +463,7 @@ tasks:
     architecture: [ amd64 ]
     image: chimera-dev
     context: .
+    context_exclude: [ .git ]
     empty_dir:
       - /build
     privileged: true
@@ -464,6 +501,7 @@ tasks:
     architecture: [ amd64 ]
     image: chimera-dev
     context: .
+    context_exclude: [ .git ]
     empty_dir:
       - /build
     privileged: true
@@ -540,6 +578,7 @@ tasks:
     architecture: [ amd64 ]
     image: chimera-dev
     context: .
+    context_exclude: [ .git ]
     empty_dir:
       - /build
     privileged: true
@@ -570,6 +609,7 @@ tasks:
     architecture: [ amd64 ]
     image: chimera-dev
     context: .
+    context_exclude: [ .git ]
     empty_dir:
       - /build
     privileged: true
@@ -609,6 +649,7 @@ tasks:
     architecture: [ amd64 ]
     image: chimera-dev
     context: .
+    context_exclude: [ .git ]
     empty_dir:
       - /build
     privileged: true
@@ -717,6 +758,7 @@ tasks:
     architecture: [ amd64 ]
     image: chimera-dev
     context: .
+    context_exclude: [ .git ]
     empty_dir:
       - /build
     privileged: true
@@ -797,6 +839,7 @@ tasks:
     architecture: [ amd64 ]
     image: chimera-dev
     context: .
+    context_exclude: [ .git ]
     empty_dir:
       - /build
     privileged: true
@@ -885,6 +928,7 @@ tasks:
     architecture: [ amd64, arm64 ]
     image: chimera-dev
     context: .
+    context_exclude: [ .git ]
     empty_dir:
       - /build
     commands:
@@ -921,6 +965,7 @@ tasks:
     architecture: [ amd64, arm64 ]
     image: chimera-dev
     context: .
+    context_exclude: [ .git ]
     empty_dir:
       - /build
     commands:
@@ -951,6 +996,7 @@ tasks:
     architecture: [ amd64, arm64 ]
     image: chimera-dev
     context: .
+    context_exclude: [ .git ]
     empty_dir:
       - /build
     commands:
@@ -971,6 +1017,7 @@ tasks:
     architecture: [ amd64, arm64 ]
     image: chimera-dev
     context: .
+    context_exclude: [ .git ]
     empty_dir:
       - /build
     commands:

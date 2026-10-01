@@ -18,7 +18,7 @@ RUN apt-get -y update && \
             openssl libnuma-dev curl ca-certificates make libcurl4-openssl-dev libnfs-dev \
 	    iproute2 libs3-dev python3 python3-pip python3-venv python3-requests pkg-config \
 	    dh-python build-essential pybuild-plugin-pyproject debhelper-compat \
-	    libwbclient-dev libcrypt-dev libaio-dev
+	    libwbclient-dev libcrypt-dev libaio-dev libsqlite3-dev
 
 # install uncrustify version 0.78
 RUN curl -o /usr/local/bin/uncrustify  ${asset:uncrustify:Ubuntu26/$arch/uncrustify} && \
