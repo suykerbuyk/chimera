@@ -271,6 +271,15 @@ RUN ARCH_NAME="`dpkg --print-architecture`" \
     && mv /tmp/bin/glab /usr/local/bin/glab \
     && rm -rf /tmp/bin
 
+# sqlite3 headers, so CMake builds the sqlite KV backend (chimera_vfs_sqlite,
+# server.kv_module = "sqlite"); without them src/vfs/CMakeLists.txt skips it.
+# Installed here because the prefix above the marker must stay a verbatim copy
+# of ../Dockerfile, which does not install it.
+RUN apt-get -y update && \
+    apt-get -y --no-install-recommends install libsqlite3-dev && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
 # =============================================================================
 # Dev user -- created last. updateRemoteUserUID patches it to the host UID at
 # container start, so files written to the bind-mounted workspace are owned by
