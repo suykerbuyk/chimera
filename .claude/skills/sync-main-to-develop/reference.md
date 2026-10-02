@@ -233,7 +233,28 @@ CCACHE_DISABLE=1 scan-build ...`, and treat any local "0 bugs" produced
 without it as unproven.  To re-check one TU cheaply, `touch` it and re-run
 `scan-build ... ninja` in the already-configured tree.
 
-### Verifying with qb: the builder image is not rebuilt by default
+### Verifying with qb: qb-ci.sh first, rocky9 beside it
+
+`.devcontainer/quantum/qb-ci.sh` (CHIM-220, on develop since the 2026-09-28
+sync) is the verification entry point.  It builds `chimera-dev` once under
+its own tag (`$USER-<branch>` by default), then starts every merge-train
+leg as its own `qb -i` process -- four ctest shards per mode, the two KVM
+shards, quint, static analysis, syntax -- and prints a PASS/FAIL line per
+leg with the log path.  Compared with `qb check` that means a failure
+names a shard, a re-run costs one shard (`--no-builder --only <leg>`),
+and the leg table is checked against `.gitlab-ci.yml` before anything
+runs, so a pipeline change not mirrored here stops the run.  Pass
+`-a amd64` (only static analysis has arm64 cells and the ctest legs are
+amd64-only in CI anyway); `--all` adds the nightly legs and is not needed
+for a sync.  It warns when the tree is dirty and says when every leg has
+packed its copy; the `tee` log itself is untracked and harmless.
+
+It does not run the Rocky9 build legs: the pipeline builds Rocky9 in its
+package jobs, outside the leg table.  Rocky9 is the only place snfs
+compiles, so always add `qb -o arenaud-claude --plain rocky9`.  The two
+runs use different output tags and do not collide.
+
+### The builder image is not rebuilt by a bare single-leg qb
 
 Every `ctest_*`, `syntax` and `static_analysis_*` leg declares
 `dependencies: builder: {task: chimera-dev, tag: develop}`. Naming a single
