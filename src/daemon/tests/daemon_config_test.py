@@ -39,7 +39,7 @@ def main():
         env.update(TEMP=scratch, TMP=scratch)
         config_path = root / "config.json"
 
-        def write_config(exports, extra_server=None):
+        def write_config(exports, extra_server=None, sections=None):
             config = {
                 "common": {"huge_pages": False, "sync_delegation_threads": 2},
                 "server": {
@@ -53,6 +53,8 @@ def main():
                 "exports": exports,
             }
             config["server"].update(extra_server or {})
+            # Whole top-level sections (filesystems, mounts) replaced by a case.
+            config.update(sections or {})
             config_path.write_text(json.dumps(config), encoding="utf-8")
 
         def remove_certificates(pid):
@@ -78,27 +80,75 @@ def main():
             ("missing path", {}),
             ("negative anonuid", {"path": "/data", "anonuid": -1}),
         ]
-        cases = [(name, {"/e": export}, {}) for name, export in bad_exports]
+        # Each case: name, exports, server overrides, replaced top-level
+        # sections, and the error line the rejection must log (None for the
+        # export cases, which only check the exit status).
+        cases = [(name, {"/e": export}, {}, None, None) for name, export in bad_exports]
         cases.extend([
             ("duplicate export_id", {
                 "/e1": {"path": "/data", "export_id": 7},
                 "/e2": {"path": "/data", "export_id": 7},
-            }, {}),
+            }, {}, None, None),
             ("nfs_max_exports zero", {"/e": {"path": "/data"}},
-             {"nfs_max_exports": 0}),
+             {"nfs_max_exports": 0}, None, None),
+            # The mount names a memfs filesystem that was never declared, so
+            # it fails; serving /e over the missing root must not be the
+            # fallback.
+            ("failed mount", {"/e": {"path": "/data"}}, {},
+             {"mounts": {"data": {"module": "memfs", "path": "fs_missing"}}},
+             "Failed to mount memfs://fs_missing to /data"),
+            # Rejected before the mount is attempted, which would otherwise
+            # dereference the missing string.
+            ("mount without module", {"/e": {"path": "/data"}}, {},
+             {"mounts": {"data": {"path": "fs0"}}},
+             "Mount data missing module"),
+            ("mount without path", {"/e": {"path": "/data"}}, {},
+             {"mounts": {"data": {"module": "memfs"}}},
+             "Mount data missing path"),
+            # A filesystem that cannot be created is fatal, and the exit must
+            # be a clean 1: plain exit() here runs libevpl's atexit cleanup
+            # under live service threads and aborts (134).
+            ("mkfs unknown module", {"/e": {"path": "/data"}}, {},
+             {"filesystems": {"fs0": {"module": "memfs"}, "bad": {"module": "memf"}}},
+             "Failed to create filesystem bad in module memf"),
+            # nfs is registered on every platform and holds no named
+            # filesystems (linux, the obvious choice, exists only on Linux).
+            ("mkfs unsupported by module", {"/e": {"path": "/data"}}, {},
+             {"filesystems": {"fs0": {"module": "memfs"}, "bad": {"module": "nfs"}}},
+             "Failed to create filesystem bad in module nfs"),
+            # Malformed even though no mount names it, so it is not caught
+            # later as a failed mount.
+            ("filesystem without module", {"/e": {"path": "/data"}}, {},
+             {"filesystems": {"fs0": {"module": "memfs"}, "orphan": {}}},
+             "Filesystem orphan missing module"),
         ])
-        for name, exports, extra in cases:
-            write_config(exports, extra)
+        for name, exports, extra, sections, expect in cases:
+            write_config(exports, extra, sections)
             with subprocess.Popen(
                 [daemon, "-c", str(config_path)], stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT, env=env, creationflags=flags,
             ) as proc:
                 try:
-                    output, _ = proc.communicate(timeout=30)
+                    try:
+                        output, _ = proc.communicate(timeout=30)
+                    except subprocess.TimeoutExpired as exc:
+                        raise AssertionError(
+                            f"{name}: expected configuration rejection (exit 1), "
+                            f"but the daemon was still running after 30s"
+                        ) from exc
+                    text = output.decode(errors="replace")
                     if proc.returncode != 1:
                         raise AssertionError(
                             f"{name}: expected configuration rejection (exit 1), "
-                            f"got {proc.returncode}\n{output.decode(errors='replace')}"
+                            f"got {proc.returncode}\n{text}"
+                        )
+                    # A sanitizer report also exits 1 in Debug builds, so the
+                    # status alone does not show the config was rejected.
+                    if "Sanitizer" in text:
+                        raise AssertionError(f"{name}: sanitizer report\n{text}")
+                    if expect is not None and expect not in text:
+                        raise AssertionError(
+                            f"{name}: rejected without logging {expect!r}\n{text}"
                         )
                     print(f"PASS: {name} rejected", flush=True)
                 finally:

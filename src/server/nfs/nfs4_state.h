@@ -261,6 +261,10 @@ struct nfs_client {
      * A reclaimed client is not revived by a returning op. */
     _Atomic uint8_t          reclaim_pending;
     uint64_t                 last_touch_ns;
+    /* Monotonic ns of the last time this client's recovery record was written
+     * to the KV store (nfs_recovery_persist).  Read by the lease sweeper to
+     * decide when the record's renewal stamp is due a refresh. */
+    _Atomic uint64_t         recovery_stamp_ns;
 
     /* Owners are hashed by their byte string. */
     struct nfs_open_owner   *open_owners_by_str;
@@ -925,7 +929,8 @@ nfs_open_owner_put(
     struct nfs_open_owner *owner);
 
 /* Find an existing open_state on `owner` whose FH matches.  Returns NULL if
- * none.  Does NOT acquire a ref. */
+ * none.  The returned state holds a reference which the caller must drop with
+ * nfs_state_table_release(..., NFS4_SLOT_TYPE_OPEN, ...). */
 SYMBOL_EXPORT struct nfs_open_state *
 nfs_open_owner_find_state(
     struct nfs_open_owner *owner,

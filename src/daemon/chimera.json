@@ -17,6 +17,11 @@
 	"smb_enabled": true,
 	"threads": 16
     },
+    "filesystems": {
+	"memfs": {
+	    "module": "memfs"
+	}
+    },
     "mounts": {
 	"linux_dir": {
 	    "module": "linux",
@@ -24,7 +29,7 @@
 	},
 	"memfs_dir": {
 	    "module": "memfs",
-	    "path": "/"
+	    "path": "memfs"
 	}
     },
     "exports": {
