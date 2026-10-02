@@ -72,6 +72,13 @@ Create a todo per step. Do not skip a step because the merge was clean.
    rebuild the builder image; name `chimera-dev` alongside it. See
    reference.md.
 
+9. **Update the Jira tickets the sync resolves.** For every CHIM ticket
+   whose upstream PR landed in this range (the merge message's "Jira
+   coverage" paragraph), add a comment naming the upstream commits, the
+   sync tag, the merge commit and the branch/MR, and link it to the sync
+   ticket with a `Relates` issue link.  Then write the sync ticket's own
+   description.  Details and the comment shape in reference.md.
+
 ## Red Flags
 
 | Thought | Reality |
@@ -91,6 +98,10 @@ Create a todo per step. Do not skip a step because the merge was clean.
   an annotated message: commit list, Jira key, tag, submodule moves.
 - **Re-applying a downstream rename onto a moved upstream file.** Prefer an
   alias over a rename — see the fh-magic case in reference.md.
+- **Closing the loop on git only.** A sync that merges a CHIM fix's
+  upstream form resolves that ticket; if nobody comments and links it, the
+  ticket sits in review until someone rediscovers it (CHIM-222/223/225 at
+  the 2026-10-02 sync).
 - **Trusting a substring grep as a check.** A renamed symbol often survives
   as a trailing comment, which makes a naive `grep -q` report success on the
   broken tree.

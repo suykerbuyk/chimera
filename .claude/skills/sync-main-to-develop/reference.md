@@ -312,6 +312,42 @@ Compose in a file, then `git commit -F`. Include:
 - What was resolved and why, for any non-obvious resolution
 - `Signed-off-by: Alain Renaud <alain.renaud@quantum.com>`
 
+## Jira tickets the sync resolves
+
+Upstream-first fixes are tracked twice: a CHIM ticket here and a PR on
+chimera-nas/chimera.  When the PR merges, the next sync carries the fix
+onto develop, and that sync is the event that resolves the ticket -- not
+the upstream merge (develop did not have it yet) and not the MR merge
+alone (nobody reading the ticket sees that).
+
+Before writing the merge message, map the range to tickets: match each
+upstream commit against the open CHIM tickets' PR numbers and branch
+names (memory and the Jira "In Review" list are the sources; `git log
+--grep` on the develop topic branches confirms a match by patch-id).
+Record the mapping in the merge message's "Jira coverage" paragraph.
+
+Then, for each ticket, with the Atlassian tools (site symform.jira.com):
+
+- `createIssueLink` type `Relates`, inward = the resolved ticket,
+  outward = the sync ticket.
+- `addCommentToJiraIssue` in Markdown, one paragraph: the upstream PR
+  and commit shas, "merged on origin/main and arrives on develop with the
+  <date> code drop, [CHIM-<sync>](url)", the tag, the merge commit and a
+  link to the branch (`https://gitlab.mdh.quantum.com/chimera/chimera/-/commits/<branch>`)
+  or the MR once it exists.  Close with what happens next: "resolve once
+  the CHIM-<sync> MR merges into develop", and the downstream ticket it
+  unblocks (MD-xxxx) when there is one.
+- Leave the status alone until the MR merges; the ticket moves to Done
+  then, with the MR link.
+
+Finally give the sync ticket a description in the CHIM-214 shape:
+snapshot/tag/branch/MR, what upstream brings, downstream changes, the
+verification done, follow-ups, and the list of tickets it resolves.
+
+Partial coverage counts too: a ticket whose scope upstream only partly
+delivered (CHIM-190 got the REST docs at the 2026-10-02 sync, not the
+GET endpoints) gets a comment saying what arrived, no link to Done.
+
 ## Commit splitting
 
 - Downstream-only changes take the `CHIM-<n>:` prefix.
