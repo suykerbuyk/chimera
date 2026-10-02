@@ -16,6 +16,18 @@ target_include_directories(test_state_table PRIVATE
 add_test(NAME chimera/server/nfs/state_table
     COMMAND ${CMAKE_CURRENT_BINARY_DIR}/test_state_table)
 
+# Deterministic OPEN/CLOSE lifetime regression: cheap enough to gate merges,
+# and below the atomic wire operations modeled by the Quint tests.
+add_executable(test_open_state_lookup test_open_state_lookup.c)
+target_link_libraries(test_open_state_lookup chimera_nfs chimera_server chimera_vfs chimera_nfs_common chimera_common evpl evpl_rpc2 ${CHIMERA_UUID_LIB})
+target_include_directories(test_open_state_lookup PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/src/server/nfs
+    ${NFS_COMMON_INCLUDE_DIR})
+set(CHIMERA_TEST_TIER quick)
+add_test(NAME chimera/server/nfs/open_state_lookup COMMAND test_open_state_lookup)
+set(CHIMERA_TEST_TIER extended)
+
 # Unit test for the NFS4.1 SEQUENCE replay slot state machine.  Drives
 # nfs4_replay_slot_acquire / _finalize directly.  We compile the
 # session source file straight into the test executable (rather than
@@ -121,6 +133,16 @@ target_include_directories(test_xattr_name PRIVATE
     ${CMAKE_SOURCE_DIR}/src
     ${NFS_COMMON_INCLUDE_DIR})
 add_test(NAME chimera/server/nfs/xattr_name COMMAND test_xattr_name)
+
+# Unit test for the NLM byte-range length conventions (nfs_nlm_range.h): the
+# two wire spellings of to-EOF, the stored POSIX form, the VFS sentinel, and
+# the wire form the server itself must emit (l_len 0).
+add_executable(test_nlm_range test_nlm_range.c)
+target_include_directories(test_nlm_range PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_SOURCE_DIR}/src
+    ${NFS_COMMON_INCLUDE_DIR})
+add_test(NAME chimera/server/nfs/nlm_range COMMAND test_nlm_range)
 
 # Unit test for the ACCESS xattr-bit decision logic (nfs4_access.h), incl. the
 # RFC 8276 named-attribute bits.  nfs4_access.h pulls in the generated

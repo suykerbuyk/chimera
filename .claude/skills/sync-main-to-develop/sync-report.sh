@@ -51,7 +51,8 @@ pre() {
 
     hr "upstream Dockerfile.<os> changes (-> builders/<os>/)"
     git diff --stat "$base..origin/main" -- 'Dockerfile*' | cat
-    echo "(empty = nothing to port into builders/)"
+    echo "(empty = nothing to port into builders/; the plain Dockerfile is the"
+    echo " upstream runtime image and has no downstream mirror)"
 
     hr "upstream .devcontainer changes (-> .devcontainer/quantum/)"
     git diff --stat "$base..origin/main" -- .devcontainer | cat

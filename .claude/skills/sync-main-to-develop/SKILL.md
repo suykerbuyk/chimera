@@ -66,11 +66,24 @@ Create a todo per step. Do not skip a step because the merge was clean.
    `CHIM-<n>:` prefixed with a `Signed-off-by` trailer. `qtm_build/` and
    `qb.yaml` never share a commit with anything else.
 
-8. **Verify.** `qb -o arenaud-claude --plain check` (never `make check`
-   locally). Add `qb -o arenaud-claude --plain rocky9` — Rocky9 is the only
-   leg that compiles `snfs`. Re-running one leg on its own does **not**
-   rebuild the builder image; name `chimera-dev` alongside it. See
+8. **Verify.** On the cluster, never `make check` locally:
+   ```bash
+   .devcontainer/quantum/qb-ci.sh -a amd64 2>&1 | tee qb-ci.log
+   qb -o arenaud-claude --plain rocky9
+   ```
+   `qb-ci.sh` builds chimera-dev once and runs the merge-train legs sharded
+   the way `.gitlab-ci.yml` does, so a failure names one shard instead of
+   one hour-long pod.  It does not cover the Rocky9 build legs, and Rocky9
+   is the only leg that compiles `snfs`, so run the `rocky9` alias as well.
+   Re-running one leg: `qb-ci.sh --no-builder --only <leg>`.  See
    reference.md.
+
+9. **Update the Jira tickets the sync resolves.** For every CHIM ticket
+   whose upstream PR landed in this range (the merge message's "Jira
+   coverage" paragraph), add a comment naming the upstream commits, the
+   sync tag, the merge commit and the branch/MR, and link it to the sync
+   ticket with a `Relates` issue link.  Then write the sync ticket's own
+   description.  Details and the comment shape in reference.md.
 
 ## Red Flags
 
@@ -81,7 +94,8 @@ Create a todo per step. Do not skip a step because the merge was clean.
 | "The checks passed, skip the build" | The checks encode known failures only. The build finds the new ones. |
 | "No upstream Dockerfile change, skip step 4" | Still confirm it — recording "no-op" is the check. |
 | "snfs is Rocky-only, local build covers it" | Local build covers it only where `/usr/cvfs/include` exists. Run the rocky9 leg. |
-| "I re-ran that one qb leg, so the image has my change" | It does not. Single legs use the `develop`-tagged builder image; name `chimera-dev` too. |
+| "I re-ran that one qb leg, so the image has my change" | A bare `qb <leg>` uses the `develop`-tagged builder image; name `chimera-dev` too, or use `qb-ci.sh --only <leg>` without `--no-builder`. |
+| "qb-ci.sh was green, so snfs compiles" | Its legs are the merge train's, all Ubuntu. Only the `rocky9` alias builds snfs. |
 
 ## Common Mistakes
 
@@ -91,6 +105,10 @@ Create a todo per step. Do not skip a step because the merge was clean.
   an annotated message: commit list, Jira key, tag, submodule moves.
 - **Re-applying a downstream rename onto a moved upstream file.** Prefer an
   alias over a rename — see the fh-magic case in reference.md.
+- **Closing the loop on git only.** A sync that merges a CHIM fix's
+  upstream form resolves that ticket; if nobody comments and links it, the
+  ticket sits in review until someone rediscovers it (CHIM-222/223/225 at
+  the 2026-10-02 sync).
 - **Trusting a substring grep as a check.** A renamed symbol often survives
   as a trailing comment, which makes a naive `grep -q` report success on the
   broken tree.

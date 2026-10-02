@@ -1177,8 +1177,8 @@ main(
             int         fs_rc;
 
             if (!fs_module) {
-                chimera_server_error("Filesystem %s missing module, skipping", fsname);
-                continue;
+                chimera_server_error("Filesystem %s missing module", fsname);
+                startup_validation_fail();
             }
 
             chimera_server_info("Creating filesystem %s in module %s...", fsname, fs_module);
@@ -1190,7 +1190,7 @@ main(
             } else if (fs_rc != 0) {
                 chimera_server_error("Failed to create filesystem %s in module %s",
                                      fsname, fs_module);
-                exit(1);
+                startup_validation_fail();
             }
         }
     }
@@ -1201,10 +1201,17 @@ main(
         json_object_foreach(mounts, name, mount)
         {
             const char *mount_options;
+            int         mount_rc;
 
             module        = json_string_value(json_object_get(mount, "module"));
             path          = json_string_value(json_object_get(mount, "path"));
             mount_options = json_string_value(json_object_get(mount, "options"));
+
+            if (!module || !path) {
+                chimera_server_error("Mount %s missing %s", name,
+                                     module ? "path" : "module");
+                startup_validation_fail();
+            }
 
             /* "create": create the backend directory path (and any missing
              * parents) before mounting, for backends initialized empty.  May be
@@ -1232,7 +1239,7 @@ main(
                                 mount_options ? mount_options : "",
                                 do_create ? " (create)" : "");
 
-            if (do_create && module && path) {
+            if (do_create) {
                 if (chimera_server_mkpath(server, module, path, create_mode) != 0) {
                     /* Hard fail: the operator asked for the path to be created
                      * and it could not be, so do not silently mount a missing
@@ -1243,12 +1250,16 @@ main(
                 }
             }
 
-            if (chimera_server_mount(server, name, module, path, mount_options) != 0) {
-                /* A silently-failed mount leaves shares/exports pointing at a
-                 * nonexistent root, so clients later see confusing errors
-                 * (e.g. SMB NETWORK_NAME_DELETED).  Surface it here instead. */
-                chimera_server_error("Failed to mount %s://%s to /%s",
-                                     module, path, name);
+            mount_rc = chimera_server_mount(server, name, module, path, mount_options);
+
+            if (mount_rc != 0) {
+                /* Hard fail, like the mkpath failure above: carrying on would
+                 * add the shares/exports over a root that does not exist and
+                 * report the server ready, leaving clients with confusing
+                 * errors (e.g. NFS4ERR_NOENT on the export). */
+                chimera_server_error("Failed to mount %s://%s to /%s (vfs error %d)",
+                                     module, path, name, mount_rc);
+                startup_validation_fail();
             }
         }
     }

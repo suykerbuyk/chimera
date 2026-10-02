@@ -28,8 +28,9 @@
  *
  * When the configured KV module is non-persistent (memkv) the load finds
  * nothing, to_reclaim is empty, and grace short-circuits to in_grace = false --
- * matching the prior in-memory-only behavior.  The async KV scan is deferred to
- * the first NFSv4 compound (see nfs_recovery_kickoff).
+ * matching the prior in-memory-only behavior.  The KV scan runs synchronously
+ * from the NFS protocol start hook (nfs_recovery_cold_start), before any
+ * listener is bound, so no request ever races it.
  */
 
 struct nfs_recovery_record {
@@ -38,16 +39,23 @@ struct nfs_recovery_record {
     uint64_t       client_id_hint; /* not authoritative; just a sticky ID */
     uint64_t       verifier;
     uint64_t       boot_id;
+    /* CLOCK_REALTIME ns of the client's last lease renewal as of the last
+     * persist (see nfs_recovery_persist / the lease sweeper refresh).  0 for a
+     * record written before the stamp existed, which the loader treats as
+     * "unknown, keep". */
+    uint64_t       last_renew_ns;
     bool           reclaimed;
+    bool           returned;  /* re-established this boot (its record was re-persisted) */
     UT_hash_handle hh;
 };
 
 /*
- * Cold-start load progresses IDLE -> RUNNING -> READY.  The async KV scan that
- * populates to_reclaim needs a worker thread + a live event loop, neither of
- * which exists at shared init, so the load is deferred to the first NFSv4
- * compound (which atomically claims the IDLE->RUNNING transition).  While not
- * READY the grace gate treats the server as in-grace (reclaim-eligible).
+ * Cold-start load progresses IDLE -> RUNNING -> READY.  nfs_recovery_cold_start
+ * drives the whole transition synchronously from nfs_server_start, before the
+ * RPC listeners exist, so RUNNING is never observable by a request.  The gates
+ * that consult it (EXCHANGE_ID / CREATE_SESSION DELAY, the in-grace treatment
+ * in nfs_recovery_open_check) remain as a defence against a future caller that
+ * starts serving before the load.
  */
 enum nfs_recovery_load_state {
     NFS_REC_LOAD_IDLE    = 0,
@@ -70,24 +78,33 @@ struct nfs_recovery {
     struct chimera_vfs         *vfs;                 /* for the cold-start load */
     uint16_t                    node_id;             /* scopes our records in a shared store */
     uint32_t                    grace_time_s;        /* captured for deferred begin */
+    uint32_t                    lease_time_s;        /* refresh + heartbeat cadence, stale test */
+    /* Monotonic ns at which the next epoch heartbeat is due; claimed by CAS so
+     * exactly one sweeper thread writes it per interval. */
+    _Atomic uint64_t            next_heartbeat_ns;
     bool                        persistence_disabled;/* kv_module is non-persistent */
     bool                        nfs4_drc;            /* reply-cache persistence on   */
     _Atomic int                 load_state;          /* enum nfs_recovery_load_state */
+    uint32_t                    stale_purged;        /* records skipped + deleted at cold start */
+    uint32_t                    unreclaimed_purged;  /* records deleted at grace end, cumulative */
+    uint32_t                    store_errors;        /* KV reads that failed during the cold start */
 };
 
 struct nfs_client;
 
 /*
- * Initialize recovery state at shared init.  Records `vfs` and `grace_time_s`
- * for the deferred load, detects whether the configured KV module is
- * persistent (memkv is not -> persistence_disabled + a warning), and leaves
- * load_state = IDLE.  The actual KV scan happens later in nfs_recovery_kickoff.
+ * Initialize recovery state at shared init.  Records `vfs`, `lease_time_s`
+ * (refresh cadence and stale bound) and `grace_time_s` for the cold-start
+ * load, detects whether the configured KV module is persistent (memkv is not
+ * -> persistence_disabled + a warning), and leaves load_state = IDLE.  The KV
+ * scan itself runs in nfs_recovery_cold_start.
  */
 int
 nfs_recovery_load(
     struct nfs_recovery *rec,
     struct chimera_vfs  *vfs,
     uint16_t             node_id,
+    uint32_t             lease_time_s,
     uint32_t             grace_time_s,
     bool                 nfs4_drc);
 
@@ -96,23 +113,36 @@ nfs_recovery_free(
     struct nfs_recovery *rec);
 
 /*
- * Run-once cold-start load, triggered from the first NFSv4 compound on a
- * worker thread (which owns a live vfs_thread).  Atomically claims the
- * IDLE->RUNNING transition; the loser returns immediately.  Forces the grace
- * window open, then issues async KV reads (epoch marker + recovery-record scan,
- * and -- when nfs4_drc is on -- the session + reply-cache reload) that populate
- * to_reclaim and flip load_state to READY on completion.
+ * Run-once cold-start load.  Called from nfs_server_start on the main thread
+ * BEFORE the RPC listeners are bound: reads the boot epoch, bumps and rewrites
+ * it, scans this node's recovery records into to_reclaim, opens the grace
+ * window iff any were loaded, and flips load_state to READY -- all on a
+ * private evpl loop, so it returns only when the store has answered.  A
+ * non-persistent backend (memkv) settles to READY at once.
  */
 void
-nfs_recovery_kickoff(
-    struct chimera_server_nfs_thread *thread);
+nfs_recovery_cold_start(
+    struct nfs_recovery *rec);
+
+/*
+ * Record a KV read that failed during the cold-start load (`error` is the
+ * enum chimera_vfs_error the callback received; a missing key is not an
+ * error).  Logged at once and counted, so the completion line can say the
+ * store failed -- a failed scan must not read as "nothing was persisted",
+ * because a client owed a reclaim then meets a closed window.
+ */
+void
+nfs_recovery_note_store_error(
+    struct nfs_recovery *rec,
+    const char          *what,
+    int                  error);
 
 /*
  * True while the persistent cold-start load (recovery records + DRC session
  * reconstruction) is still in flight.  EXCHANGE_ID / CREATE_SESSION return
- * NFS4ERR_DELAY in this window so a returning client cannot race ahead of the
- * reconstructed records and create a duplicate.  Always false when persistence
- * is disabled (memkv).
+ * NFS4ERR_DELAY in this window; since the load completes before the listeners
+ * start, that is a defensive gate rather than a path clients hit.  Always
+ * false when persistence is disabled (memkv).
  */
 bool
 nfs_recovery_loading(
@@ -143,12 +173,40 @@ nfs_recovery_in_grace(
  * Persist a newly-confirmed client's recovery record to the KV store
  * (fire-and-forget).  No-op when persistence is disabled (memkv backend) or
  * client is NULL.  Safe to call from any NFSv4 compound (uses vfs_thread).
+ * Stamps client->recovery_stamp_ns so the lease sweeper knows when the record
+ * is due a refresh.
  */
 void
 nfs_recovery_persist(
     struct chimera_vfs_thread *vfs_thread,
     struct nfs_recovery       *rec,
-    const struct nfs_client   *client);
+    struct nfs_client         *client);
+
+/*
+ * Lease-sweeper cadence.  A live, confirmed client's record is re-persisted
+ * once per half lease so its last_renew_ns stays within half a lease of the
+ * truth; the epoch record is rewritten on the same cadence so its written_at
+ * field records when this instance was last alive.  Together they let the
+ * next boot tell a client that was alive at the crash from one whose lease had
+ * already lapsed (nfs_recovery_record_stale).  The interval floors at 1 s.
+ */
+bool
+nfs_recovery_persist_due(
+    const struct nfs_recovery *rec,
+    const struct nfs_client   *client,
+    uint64_t                   now_ns);
+
+/* Claims the current heartbeat slot; true for exactly one caller per interval. */
+bool
+nfs_recovery_heartbeat_due(
+    struct nfs_recovery *rec,
+    uint64_t             now_ns);
+
+/* Rewrites the epoch record if a heartbeat is due.  Fire-and-forget. */
+void
+nfs_recovery_heartbeat(
+    struct nfs_recovery       *rec,
+    struct chimera_vfs_thread *vfs_thread);
 
 /*
  * Forget a record (DESTROY_CLIENTID / lease teardown): delete it from the KV
@@ -194,12 +252,26 @@ nfs_recovery_reclaim_complete(
     const struct nfs_client *client);
 
 /*
- * Called from the lease sweeper at 1Hz.  Ends the grace window when
- * grace_end_ns has been reached or the to_reclaim set is fully reclaimed.
+ * Called from the lease sweeper at 1Hz with the sweeping thread's vfs_thread.
+ * Ends the grace window when grace_end_ns has been reached or the to_reclaim
+ * set is fully reclaimed; on the deadline, deletes the records of clients that
+ * neither reclaimed nor returned (vfs_thread may be NULL in tests: bookkeeping
+ * only).
  */
 void
 nfs_recovery_sweep_once(
-    struct nfs_recovery *rec);
+    struct nfs_recovery       *rec,
+    struct chimera_vfs_thread *vfs_thread);
+
+/*
+ * Mark a reloaded record as belonging to a client that has re-established
+ * itself this boot.  nfs_recovery_persist calls it; such a record is kept when
+ * the window closes even if the client has not yet sent RECLAIM_COMPLETE.
+ */
+void
+nfs_recovery_note_returned(
+    struct nfs_recovery     *rec,
+    const struct nfs_client *client);
 
 /* ----------------------------------------------------------------------- *
 *  Record (de)serialization -- exposed for unit tests (test_nfs_persist).  *
@@ -220,6 +292,20 @@ nfs_recovery_deserialize(
     uint32_t                    len,
     struct nfs_recovery_record *out);
 
+/*
+ * True when the record's client had provably lost its lease before the
+ * previous instance's last heartbeat (last_alive_ns, the epoch record's
+ * written_at).  The persisted stamp lags the real renewal by at most half a
+ * lease, so a gap above 1.5 leases means the lease had lapsed before the
+ * crash.  Unstamped (legacy) records and a store with no epoch are never
+ * stale.  Exposed for unit tests.
+ */
+bool
+nfs_recovery_record_stale(
+    const struct nfs_recovery        *rec,
+    const struct nfs_recovery_record *r,
+    uint64_t                          last_alive_ns);
+
 uint32_t
 nfs_recovery_epoch_serialize(
     uint8_t *buf,
@@ -229,4 +315,5 @@ int
 nfs_recovery_epoch_deserialize(
     const uint8_t *buf,
     uint32_t       len,
-    uint64_t      *out_boot_id);
+    uint64_t      *out_boot_id,
+    uint64_t      *out_written_ns);

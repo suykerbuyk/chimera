@@ -15,7 +15,10 @@ section before resolving, not after building.
 | `qtm_build/CMakeLists.txt` | `src/vfs/CMakeLists.txt` install rules | Packaging overlay | Staged install, below |
 
 In-scope OS matrix: `Rocky9`, `Ubuntu22`, `Ubuntu24`, `Ubuntu26`. Upstream's
-`Dockerfile.rocky10` has no Quantum builder — ignore it.
+`Dockerfile.rocky10` has no Quantum builder — ignore it.  The plain
+`Dockerfile` is upstream's runtime image (the one `chimera-docker.json`
+configures); nothing downstream mirrors it, so a change there is a
+no-op to record, not to port (2026-10-02: `VOLUME /export`).
 
 ## Recurring hazards
 
@@ -230,7 +233,28 @@ CCACHE_DISABLE=1 scan-build ...`, and treat any local "0 bugs" produced
 without it as unproven.  To re-check one TU cheaply, `touch` it and re-run
 `scan-build ... ninja` in the already-configured tree.
 
-### Verifying with qb: the builder image is not rebuilt by default
+### Verifying with qb: qb-ci.sh first, rocky9 beside it
+
+`.devcontainer/quantum/qb-ci.sh` (CHIM-220, on develop since the 2026-09-28
+sync) is the verification entry point.  It builds `chimera-dev` once under
+its own tag (`$USER-<branch>` by default), then starts every merge-train
+leg as its own `qb -i` process -- four ctest shards per mode, the two KVM
+shards, quint, static analysis, syntax -- and prints a PASS/FAIL line per
+leg with the log path.  Compared with `qb check` that means a failure
+names a shard, a re-run costs one shard (`--no-builder --only <leg>`),
+and the leg table is checked against `.gitlab-ci.yml` before anything
+runs, so a pipeline change not mirrored here stops the run.  Pass
+`-a amd64` (only static analysis has arm64 cells and the ctest legs are
+amd64-only in CI anyway); `--all` adds the nightly legs and is not needed
+for a sync.  It warns when the tree is dirty and says when every leg has
+packed its copy; the `tee` log itself is untracked and harmless.
+
+It does not run the Rocky9 build legs: the pipeline builds Rocky9 in its
+package jobs, outside the leg table.  Rocky9 is the only place snfs
+compiles, so always add `qb -o arenaud-claude --plain rocky9`.  The two
+runs use different output tags and do not collide.
+
+### The builder image is not rebuilt by a bare single-leg qb
 
 Every `ctest_*`, `syntax` and `static_analysis_*` leg declares
 `dependencies: builder: {task: chimera-dev, tag: develop}`. Naming a single
@@ -308,6 +332,42 @@ Compose in a file, then `git commit -F`. Include:
 - Submodule moves, old → new
 - What was resolved and why, for any non-obvious resolution
 - `Signed-off-by: Alain Renaud <alain.renaud@quantum.com>`
+
+## Jira tickets the sync resolves
+
+Upstream-first fixes are tracked twice: a CHIM ticket here and a PR on
+chimera-nas/chimera.  When the PR merges, the next sync carries the fix
+onto develop, and that sync is the event that resolves the ticket -- not
+the upstream merge (develop did not have it yet) and not the MR merge
+alone (nobody reading the ticket sees that).
+
+Before writing the merge message, map the range to tickets: match each
+upstream commit against the open CHIM tickets' PR numbers and branch
+names (memory and the Jira "In Review" list are the sources; `git log
+--grep` on the develop topic branches confirms a match by patch-id).
+Record the mapping in the merge message's "Jira coverage" paragraph.
+
+Then, for each ticket, with the Atlassian tools (site symform.jira.com):
+
+- `createIssueLink` type `Relates`, inward = the resolved ticket,
+  outward = the sync ticket.
+- `addCommentToJiraIssue` in Markdown, one paragraph: the upstream PR
+  and commit shas, "merged on origin/main and arrives on develop with the
+  <date> code drop, [CHIM-<sync>](url)", the tag, the merge commit and a
+  link to the branch (`https://gitlab.mdh.quantum.com/chimera/chimera/-/commits/<branch>`)
+  or the MR once it exists.  Close with what happens next: "resolve once
+  the CHIM-<sync> MR merges into develop", and the downstream ticket it
+  unblocks (MD-xxxx) when there is one.
+- Leave the status alone until the MR merges; the ticket moves to Done
+  then, with the MR link.
+
+Finally give the sync ticket a description in the CHIM-214 shape:
+snapshot/tag/branch/MR, what upstream brings, downstream changes, the
+verification done, follow-ups, and the list of tickets it resolves.
+
+Partial coverage counts too: a ticket whose scope upstream only partly
+delivered (CHIM-190 got the REST docs at the 2026-10-02 sync, not the
+GET endpoints) gets a comment saying what arrived, no link to Done.
 
 ## Commit splitting
 

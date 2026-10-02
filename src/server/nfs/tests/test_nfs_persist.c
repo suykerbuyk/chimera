@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "common/logging.h"
 #include "nfs_common.h"
@@ -128,6 +129,9 @@ test_recovery_record_roundtrip(void)
     c.boot_id   = 0x0102030405060708ULL;
     c.owner_len = 11;
     memcpy(c.owner_string, "client/abc1", 11);
+    /* last_touch_ns is monotonic; the record carries it as wall-clock so the
+     * next boot can compare it against the previous boot's heartbeat. */
+    c.last_touch_ns = nfs_lease_now_ns() - 5ULL * 1000000000ULL;
 
     len = nfs_recovery_serialize(buf, sizeof(buf), &c);
     CHECK(len > 0);
@@ -139,6 +143,16 @@ test_recovery_record_roundtrip(void)
     CHECK(out.owner_len == c.owner_len);
     CHECK(memcmp(out.owner_string, c.owner_string, c.owner_len) == 0);
     CHECK(!out.reclaimed);
+    {
+        struct timespec ts;
+        uint64_t        wall;
+
+        clock_gettime(CLOCK_REALTIME, &ts);
+        wall = (uint64_t) ts.tv_sec * 1000000000ULL + (uint64_t) ts.tv_nsec;
+        CHECK(out.last_renew_ns != 0);
+        CHECK(out.last_renew_ns <= wall - 4ULL * 1000000000ULL);
+        CHECK(out.last_renew_ns >= wall - 6ULL * 1000000000ULL);
+    }
 
     /* A truncated / corrupt buffer is rejected, not misparsed. */
     CHECK(nfs_recovery_deserialize(buf, 4, &out) != 0);
@@ -148,18 +162,53 @@ test_recovery_record_roundtrip(void)
     printf("ok: recovery_record_roundtrip\n");
 } /* test_recovery_record_roundtrip */
 
+/* A record written by a build that predates the renewal stamp ("NFR1", 30-byte
+* header) must still parse, with last_renew_ns == 0 marking it as unstamped. */
+static void
+test_recovery_record_legacy_v1(void)
+{
+    struct nfs_recovery_record out;
+    uint8_t                    buf[64];
+    uint32_t                   p = 0;
+
+    nfs_kv_put_le32(buf, &p, 0x3152464Eu);        /* "NFR1" */
+    nfs_kv_put_le64(buf, &p, 0x11ULL);            /* boot_id */
+    nfs_kv_put_le64(buf, &p, 0x22ULL);            /* verifier */
+    nfs_kv_put_le64(buf, &p, 0x33ULL);            /* client_id_hint */
+    buf[p++] = 5;
+    buf[p++] = 0;                                 /* owner_len = 5 */
+    memcpy(buf + p, "owner", 5);
+    p += 5;
+
+    CHECK(nfs_recovery_deserialize(buf, p, &out) == 0);
+    CHECK(out.boot_id == 0x11ULL);
+    CHECK(out.verifier == 0x22ULL);
+    CHECK(out.client_id_hint == 0x33ULL);
+    CHECK(out.last_renew_ns == 0);
+    CHECK(out.owner_len == 5);
+    CHECK(memcmp(out.owner_string, "owner", 5) == 0);
+
+    /* Truncated inside the v1 header is still rejected. */
+    CHECK(nfs_recovery_deserialize(buf, 29, &out) != 0);
+
+    printf("ok: recovery_record_legacy_v1\n");
+} /* test_recovery_record_legacy_v1 */
+
 static void
 test_epoch_record_roundtrip(void)
 {
     uint8_t  buf[64];
     uint32_t len;
-    uint64_t boot = 0;
+    uint64_t boot    = 0;
+    uint64_t written = 0;
 
     len = nfs_recovery_epoch_serialize(buf, 0x0011223344556677ULL);
     CHECK(len > 0);
-    CHECK(nfs_recovery_epoch_deserialize(buf, len, &boot) == 0);
+    CHECK(nfs_recovery_epoch_deserialize(buf, len, &boot, &written) == 0);
     CHECK(boot == 0x0011223344556677ULL);
-    CHECK(nfs_recovery_epoch_deserialize(buf, 4, &boot) != 0);
+    CHECK(written != 0);                                   /* the write time */
+    CHECK(nfs_recovery_epoch_deserialize(buf, len, &boot, NULL) == 0);
+    CHECK(nfs_recovery_epoch_deserialize(buf, 4, &boot, &written) != 0);
 
     printf("ok: epoch_record_roundtrip\n");
 } /* test_epoch_record_roundtrip */
@@ -485,8 +534,92 @@ test_reclaim_complete_not_granted_to_new_clients(void)
     printf("ok: reclaim_complete_not_granted_to_new_clients\n");
 } /* test_reclaim_complete_not_granted_to_new_clients */
 
+/* ------------------------------------------------------------------ *
+*  Hydrated client: retiring it leaves the by-owner table            *
+* ------------------------------------------------------------------ */
+
 /*
- * nfs_recovery_kickoff() forces the grace window open before its async KV
+ * A client record rebuilt out of the KV store is hashed by owner as well as by
+ * id, and every path that retires a record decides from
+ * nfs4_client_in_owner_table whether to unhash it by owner.  A hydrated
+ * record that is not flagged is freed while still hashed by owner, and the
+ * next record added for that owner links itself in through the freed memory:
+ * the write lands in whatever the allocator has handed out there since.
+ *
+ * The retirement exercised is the one a returning client takes when it
+ * reboots: EXCHANGE_ID with a new verifier registers a superseding record
+ * (RFC 8881 section 18.35.4 case 5), and CREATE_SESSION confirms it, retiring
+ * the hydrated one.
+ */
+static void
+test_hydrated_client_leaves_owner_table(void)
+{
+    struct nfs4_client_table       table;
+    struct nfs4_drc_session_record srec;
+    struct nfs4_client_principal   princ;
+    struct nfs4_exchange_id_result eid;
+    struct nfs4_client            *c;
+    struct nfs_client             *destroy_unified;
+    uint8_t                        sessionid[NFS4_SESSIONID_SIZE];
+    static const uint8_t           owner[] = "co_owner_hydrated_reboot";
+    uint64_t                       hydrated_id;
+
+    nfs4_client_table_init(&table,1);
+
+    /* --- a returning client, hydrated from its persisted session --- */
+    hydrated_id = nfs4_make_clientid(1,7);
+    memset(sessionid,0x5A,NFS4_SESSIONID_SIZE);
+
+    memset(&srec,0,sizeof(srec));
+    srec.clientid              = hydrated_id;
+    srec.verifier              = 0x1111ULL;
+    srec.princ_flavor          = 1;
+    srec.replay_max_slots      = 8;
+    srec.replay_maxresp_cached = 4096;
+    srec.owner_len             = sizeof(owner) - 1;
+    memcpy(srec.owner,owner,srec.owner_len);
+
+    nfs4_drc_reconstruct_session(&table,sessionid,&srec,0x9999ULL);
+
+    HASH_FIND(nfs4_client_hh_by_owner,table.nfs4_ct_clients_by_owner,
+              owner,sizeof(owner) - 1,c);
+    CHECK(c != NULL);
+    CHECK(c->nfs4_client_id == hydrated_id);
+
+    /* --- the client reboots: a superseding registration... --- */
+    memset(&princ,0,sizeof(princ));
+    princ.flavor = srec.princ_flavor;
+
+    nfs4_client_exchange_id(&table,owner,(int) sizeof(owner) - 1,0x2222ULL,
+                            &princ,false,1,&eid);
+    CHECK(eid.status == NFS4_OK);
+    CHECK(eid.clientid != hydrated_id);
+    CHECK(!eid.confirmed);
+
+    /* ...which CREATE_SESSION confirms, retiring the hydrated record. */
+    CHECK(nfs4_client_confirm(&table,eid.clientid,&destroy_unified));
+    CHECK(destroy_unified != NULL);
+    nfs_client_destroy(destroy_unified,NULL,NULL,true);
+
+    /* The decisive check: the superseding record is the only one left, in
+     * both tables. */
+    CHECK(HASH_CNT(nfs4_client_hh_by_id,table.nfs4_ct_clients_by_id) == 1);
+    CHECK(HASH_CNT(nfs4_client_hh_by_owner,
+                   table.nfs4_ct_clients_by_owner) == 1);
+
+    HASH_FIND(nfs4_client_hh_by_owner,table.nfs4_ct_clients_by_owner,
+              owner,sizeof(owner) - 1,c);
+    CHECK(c != NULL);
+    CHECK(c->nfs4_client_id == eid.clientid);
+
+    nfs4_client_table_destroy_unified(&table,NULL,NULL);
+    nfs4_client_table_free(&table);
+
+    printf("ok: hydrated_client_leaves_owner_table\n");
+} /* test_hydrated_client_leaves_owner_table */
+
+/*
+ * A cold-start loader that forced the grace window open before its async KV
  * reads have populated to_reclaim, so pending_reclaim is legitimately 0 while
  * the scan is in flight.  The 1 Hz sweep must not read that as "everybody
  * reclaimed" and close the window: a reclaim arriving after it would be
@@ -499,10 +632,10 @@ test_grace_survives_sweep_during_load(void)
 
     /* vfs == NULL leaves kv_module unset, so persistence stays enabled --
      * persistence_disabled keys off the module name being "memkv". */
-    CHECK(nfs_recovery_load(&rec,NULL,1,180,true) == 0);
+    CHECK(nfs_recovery_load(&rec,NULL,1,90,180,true) == 0);
     CHECK(!rec.persistence_disabled);
 
-    /* Mimic kickoff: claim the load, then force the window open with the scan
+    /* Mimic such a loader: claim the load, then force the window open with the scan
      * still outstanding and nothing counted yet. */
     atomic_store(&rec.load_state,NFS_REC_LOAD_RUNNING);
     evpl_mutex_lock(&rec.lock);
@@ -512,13 +645,13 @@ test_grace_survives_sweep_during_load(void)
     CHECK(rec.pending_reclaim == 0);
 
     /* A sweep tick lands here.  The window must survive it. */
-    nfs_recovery_sweep_once(&rec);
+    nfs_recovery_sweep_once(&rec,NULL);
     CHECK(rec.in_grace);
 
     /* Once the scan has settled with nothing to reclaim, the same tick may
      * close the window -- that is the intended fast path, still reachable. */
     atomic_store(&rec.load_state,NFS_REC_LOAD_READY);
-    nfs_recovery_sweep_once(&rec);
+    nfs_recovery_sweep_once(&rec,NULL);
     CHECK(!rec.in_grace);
 
     nfs_recovery_free(&rec);
@@ -527,13 +660,13 @@ test_grace_survives_sweep_during_load(void)
      * window while the load is in flight.  (That bounds rec->in_grace only;
      * nfs_recovery_open_check answers NFS4ERR_GRACE until the load is READY
      * regardless, so a load that never settles is an outage either way.) */
-    CHECK(nfs_recovery_load(&rec,NULL,1,180,true) == 0);
+    CHECK(nfs_recovery_load(&rec,NULL,1,90,180,true) == 0);
     atomic_store(&rec.load_state,NFS_REC_LOAD_RUNNING);
     evpl_mutex_lock(&rec.lock);
     rec.in_grace     = true;
     rec.grace_end_ns = 0;          /* deadline already in the past */
     evpl_mutex_unlock(&rec.lock);
-    nfs_recovery_sweep_once(&rec);
+    nfs_recovery_sweep_once(&rec,NULL);
     CHECK(!rec.in_grace);
 
     nfs_recovery_free(&rec);
@@ -595,10 +728,10 @@ test_grace_survives_reclaim_complete_during_load(void)
     recovery_client(&stranger,"co_owner_never_persisted");
 
     /* nfs4_drc off: the configuration in which nothing delays the clients */
-    CHECK(nfs_recovery_load(&rec,NULL,1,180,false) == 0);
+    CHECK(nfs_recovery_load(&rec,NULL,1,90,180,false) == 0);
     CHECK(!rec.persistence_disabled);
 
-    /* kickoff: load claimed, window forced open, scan outstanding */
+    /* load claimed, window forced open, scan outstanding */
     atomic_store(&rec.load_state,NFS_REC_LOAD_RUNNING);
     evpl_mutex_lock(&rec.lock);
     rec.in_grace     = true;
@@ -616,14 +749,14 @@ test_grace_survives_reclaim_complete_during_load(void)
     nfs_recovery_reclaim_complete(&rec,&a);
     CHECK(rec.pending_reclaim == 0);
     CHECK(rec.in_grace);                 /* the window must survive that... */
-    nfs_recovery_sweep_once(&rec);
+    nfs_recovery_sweep_once(&rec,NULL);
     CHECK(rec.in_grace);                 /* ...and the next tick */
 
     /* B's record lands and the scan settles with B still owed its reclaim. */
     recovery_add_record(&rec,"co_owner_b");
     CHECK(rec.pending_reclaim == 1);
     atomic_store(&rec.load_state,NFS_REC_LOAD_READY);
-    nfs_recovery_sweep_once(&rec);
+    nfs_recovery_sweep_once(&rec,NULL);
     CHECK(rec.in_grace);
 
     /* What each client's OPEN sees while B is outstanding. */
@@ -637,6 +770,7 @@ test_grace_survives_reclaim_complete_during_load(void)
     nfs_recovery_reclaim_complete(&rec,&b);
     CHECK(rec.pending_reclaim == 0);
     CHECK(!rec.in_grace);
+    CHECK(rec.unreclaimed_purged == 0);   /* everyone reclaimed: nothing to purge */
     CHECK(nfs_recovery_open_check(&rec,&b,false) == NFS4_OK);
     CHECK(nfs_recovery_open_check(&rec,&b,true) == NFS4ERR_NO_GRACE);
     CHECK(nfs_recovery_io_check(&rec) == NFS4_OK);
@@ -644,6 +778,219 @@ test_grace_survives_reclaim_complete_during_load(void)
     nfs_recovery_free(&rec);
     printf("ok: grace_survives_reclaim_complete_during_load\n");
 } /* test_grace_survives_reclaim_complete_during_load */
+
+/*
+ * The cold-start load runs synchronously from nfs_server_start, before any
+ * listener exists, so no request can observe RUNNING.  Without a VFS there is
+ * nothing to read: the load must still settle to READY with the window
+ * closed, and a second call must be a no-op.
+ */
+static void
+test_cold_start_without_store_is_ready(void)
+{
+    struct nfs_recovery      rec;
+    static struct nfs_client c;
+
+    recovery_client(&c,"co_owner_cold");
+
+    /* vfs == NULL: persistence stays enabled (only "memkv" disables it). */
+    CHECK(nfs_recovery_load(&rec,NULL,1,90,180,true) == 0);
+    CHECK(!rec.persistence_disabled);
+    CHECK(nfs_recovery_loading(&rec));          /* IDLE still counts as loading */
+
+    nfs_recovery_cold_start(&rec);
+    CHECK(!nfs_recovery_loading(&rec));
+    CHECK(!rec.in_grace);
+    CHECK(nfs_recovery_open_check(&rec,&c,false) == NFS4_OK);
+    CHECK(nfs_recovery_open_check(&rec,&c,true) == NFS4ERR_NO_GRACE);
+    CHECK(nfs_recovery_io_check(&rec) == NFS4_OK);
+
+    nfs_recovery_cold_start(&rec);              /* run-once */
+    CHECK(!nfs_recovery_loading(&rec));
+    CHECK(!rec.in_grace);
+
+    nfs_recovery_free(&rec);
+    printf("ok: cold_start_without_store_is_ready\n");
+} /* test_cold_start_without_store_is_ready */
+
+/*
+ * The lease sweeper keeps each live client's stable-storage record fresh and
+ * heartbeats the epoch record, both once per half lease.  The cadence
+ * decisions are pure so they can be pinned here; the KV writes they drive are
+ * exercised by the pynfs cold-restart leg.
+ */
+static void
+test_persist_and_heartbeat_cadence(void)
+{
+    struct nfs_recovery      rec;
+    static struct nfs_client c;
+    const uint64_t           S   = 1000000000ULL;
+    uint64_t                 now = nfs_lease_now_ns();
+
+    recovery_client(&c,"co_owner_cadence");
+    c.confirmed = 1;
+    atomic_store(&c.recovery_stamp_ns,now);
+
+    /* lease 90 s -> refresh and heartbeat every 45 s */
+    CHECK(nfs_recovery_load(&rec,NULL,1,90,180,true) == 0);
+
+    CHECK(!nfs_recovery_persist_due(&rec,&c,now));
+    CHECK(!nfs_recovery_persist_due(&rec,&c,now + 44 * S));
+    CHECK(nfs_recovery_persist_due(&rec,&c,now + 45 * S));
+    /* A reaped or unconfirmed client is never refreshed. */
+    c.expired = 1;
+    CHECK(!nfs_recovery_persist_due(&rec,&c,now + 100 * S));
+    c.expired   = 0;
+    c.confirmed = 0;
+    CHECK(!nfs_recovery_persist_due(&rec,&c,now + 100 * S));
+    c.confirmed = 1;
+
+    /* Heartbeat: the first claim wins; the next is due one interval later. */
+    CHECK(nfs_recovery_heartbeat_due(&rec,now));
+    CHECK(!nfs_recovery_heartbeat_due(&rec,now));
+    CHECK(!nfs_recovery_heartbeat_due(&rec,now + 44 * S));
+    CHECK(nfs_recovery_heartbeat_due(&rec,now + 45 * S));
+    CHECK(!nfs_recovery_heartbeat_due(&rec,now + 45 * S));
+
+    /* Nothing is written for a non-persistent backend. */
+    rec.persistence_disabled = true;
+    CHECK(!nfs_recovery_persist_due(&rec,&c,now + 400 * S));
+    CHECK(!nfs_recovery_heartbeat_due(&rec,now + 400 * S));
+    nfs_recovery_free(&rec);
+
+    /* A degenerate lease floors the interval at 1 s rather than every tick. */
+    CHECK(nfs_recovery_load(&rec,NULL,1,0,180,true) == 0);
+    atomic_store(&c.recovery_stamp_ns,now);
+    CHECK(!nfs_recovery_persist_due(&rec,&c,now + S / 2));
+    CHECK(nfs_recovery_persist_due(&rec,&c,now + S));
+    nfs_recovery_free(&rec);
+
+    printf("ok: persist_and_heartbeat_cadence\n");
+} /* test_persist_and_heartbeat_cadence */
+
+/*
+ * A reloaded record whose renewal stamp is more than 1.5 leases behind the
+ * previous instance's last heartbeat belongs to a client whose lease had
+ * lapsed before the crash; it must not open the grace window.  Anything
+ * closer, anything unstamped, and anything from a store with no heartbeat
+ * is kept: refusing a live client its reclaim loses locks, keeping a dead
+ * one costs at most one grace window (and the grace-end purge drops it).
+ */
+static void
+test_stale_record_classification(void)
+{
+    struct nfs_recovery        rec;
+    struct nfs_recovery_record r;
+    const uint64_t             S     = 1000000000ULL;
+    const uint64_t             alive = 100000ULL * S;
+
+    /* lease 90 s -> threshold 135 s */
+    CHECK(nfs_recovery_load(&rec,NULL,1,90,180,true) == 0);
+    memset(&r,0,sizeof(r));
+
+    r.last_renew_ns = 0;                       /* legacy NFR1: unknown, keep */
+    CHECK(!nfs_recovery_record_stale(&rec,&r,alive));
+    r.last_renew_ns = alive - 135 * S;         /* exactly at the bound: live */
+    CHECK(!nfs_recovery_record_stale(&rec,&r,alive));
+    r.last_renew_ns = alive - 135 * S - 1;     /* past it: lapsed before crash */
+    CHECK(nfs_recovery_record_stale(&rec,&r,alive));
+    r.last_renew_ns = alive - 3600 * S;
+    CHECK(nfs_recovery_record_stale(&rec,&r,alive));
+    r.last_renew_ns = alive + 5 * S;           /* clock stepped back: keep */
+    CHECK(!nfs_recovery_record_stale(&rec,&r,alive));
+    r.last_renew_ns = alive - 3600 * S;
+    CHECK(!nfs_recovery_record_stale(&rec,&r,0)); /* no heartbeat on record */
+
+    nfs_recovery_free(&rec);
+    printf("ok: stale_record_classification\n");
+} /* test_stale_record_classification */
+
+/*
+ * When the grace window closes on its deadline, a record that was neither
+ * reclaimed nor re-established belongs to a client that did not come back.
+ * RFC 8881 section 8.4.3 lets the server drop it, and dropping it is what
+ * stops the next restart from waiting on it again.  A client that came back
+ * (EXCHANGE_ID re-persisted its record) but has not yet sent RECLAIM_COMPLETE
+ * keeps its record: it is live, its record is fresh.
+ */
+static void
+test_grace_deadline_purges_unreclaimed_records(void)
+{
+    struct nfs_recovery      rec;
+    static struct nfs_client a,b,c;
+
+    recovery_client(&a,"co_owner_a");
+    recovery_client(&b,"co_owner_b");
+    recovery_client(&c,"co_owner_c");
+
+    CHECK(nfs_recovery_load(&rec,NULL,1,90,180,true) == 0);
+    recovery_add_record(&rec,"co_owner_a");
+    recovery_add_record(&rec,"co_owner_b");
+    recovery_add_record(&rec,"co_owner_c");
+    atomic_store(&rec.load_state,NFS_REC_LOAD_READY);
+    nfs_recovery_begin_grace(&rec,180);
+    CHECK(rec.in_grace);
+    CHECK(rec.pending_reclaim == 3);
+
+    nfs_recovery_reclaim_complete(&rec,&a);    /* a: reclaimed */
+    nfs_recovery_note_returned(&rec,&b);       /* b: back, RECLAIM_COMPLETE pending */
+    /* c never returns. */
+    CHECK(rec.in_grace);
+    CHECK(rec.pending_reclaim == 2);
+
+    /* Deadline. */
+    evpl_mutex_lock(&rec.lock);
+    rec.grace_end_ns = 0;
+    evpl_mutex_unlock(&rec.lock);
+    nfs_recovery_sweep_once(&rec,NULL);
+
+    CHECK(!rec.in_grace);
+    CHECK(rec.unreclaimed_purged == 1);        /* only c */
+    CHECK(HASH_COUNT(rec.to_reclaim) == 0);
+    CHECK(rec.pending_reclaim == 0);
+    CHECK(nfs_recovery_open_check(&rec,&c,true) == NFS4ERR_NO_GRACE);
+    CHECK(nfs_recovery_open_check(&rec,&c,false) == NFS4_OK);
+    CHECK(nfs_recovery_io_check(&rec) == NFS4_OK);
+
+    /* A second tick on a closed window is a no-op. */
+    nfs_recovery_sweep_once(&rec,NULL);
+    CHECK(rec.unreclaimed_purged == 1);
+
+    nfs_recovery_free(&rec);
+    printf("ok: grace_deadline_purges_unreclaimed_records\n");
+} /* test_grace_deadline_purges_unreclaimed_records */
+
+/*
+ * A KV read that fails during the cold start must not masquerade as "nothing
+ * was persisted": the loader counts it so the completion line can say the
+ * store failed and reclaim may be refused, instead of a quiet "grace
+ * skipped".  A store that has never been written (not-found) is not an error.
+ */
+static void
+test_cold_start_counts_store_errors(void)
+{
+    struct nfs_recovery rec;
+
+    CHECK(nfs_recovery_load(&rec,NULL,1,90,180,true) == 0);
+    CHECK(rec.store_errors == 0);
+
+    nfs_recovery_note_store_error(&rec,"epoch read",CHIMERA_VFS_EIO);
+    CHECK(rec.store_errors == 1);
+    nfs_recovery_note_store_error(&rec,"record scan",CHIMERA_VFS_EIO);
+    CHECK(rec.store_errors == 2);
+
+    /* A clean load (nothing to read) reports none. */
+    nfs_recovery_cold_start(&rec);
+    CHECK(!nfs_recovery_loading(&rec));
+    nfs_recovery_free(&rec);
+
+    CHECK(nfs_recovery_load(&rec,NULL,1,90,180,true) == 0);
+    nfs_recovery_cold_start(&rec);
+    CHECK(rec.store_errors == 0);
+    nfs_recovery_free(&rec);
+
+    printf("ok: cold_start_counts_store_errors\n");
+} /* test_cold_start_counts_store_errors */
 
 /* ------------------------------------------------------------------ *
 *  NFSv3 DRC                                                          *
@@ -1275,14 +1622,21 @@ main(void)
 
     test_key_encoding();
     test_recovery_record_roundtrip();
+    test_recovery_record_legacy_v1();
     test_epoch_record_roundtrip();
     test_session_record_roundtrip();
     test_reply_record_roundtrip();
     test_cross_reboot_replay();
     test_cross_reboot_reclaim_complete();
     test_reclaim_complete_not_granted_to_new_clients();
+    test_hydrated_client_leaves_owner_table();
     test_grace_survives_sweep_during_load();
     test_grace_survives_reclaim_complete_during_load();
+    test_cold_start_without_store_is_ready();
+    test_persist_and_heartbeat_cadence();
+    test_stale_record_classification();
+    test_grace_deadline_purges_unreclaimed_records();
+    test_cold_start_counts_store_errors();
 
     test_nfs3_key_encoding();
     test_nfs3_checksum_and_cacheable();
