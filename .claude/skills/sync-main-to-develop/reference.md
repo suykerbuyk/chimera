@@ -15,7 +15,10 @@ section before resolving, not after building.
 | `qtm_build/CMakeLists.txt` | `src/vfs/CMakeLists.txt` install rules | Packaging overlay | Staged install, below |
 
 In-scope OS matrix: `Rocky9`, `Ubuntu22`, `Ubuntu24`, `Ubuntu26`. Upstream's
-`Dockerfile.rocky10` has no Quantum builder — ignore it.
+`Dockerfile.rocky10` has no Quantum builder — ignore it.  The plain
+`Dockerfile` is upstream's runtime image (the one `chimera-docker.json`
+configures); nothing downstream mirrors it, so a change there is a
+no-op to record, not to port (2026-10-02: `VOLUME /export`).
 
 ## Recurring hazards
 
