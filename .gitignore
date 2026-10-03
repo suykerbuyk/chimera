@@ -41,3 +41,11 @@ venv/
 
 # Generated from the pinned vcpkg checkout by prepare-windows-vcpkg.ps1.
 /.vcpkg-overlays/
+
+# vibe-palace host-local AI harness (never commit)
+/CLAUDE.md
+/AGENTS.md
+/commit.msg
+/.claude/
+/.grok/
+/.vibe-palace/
