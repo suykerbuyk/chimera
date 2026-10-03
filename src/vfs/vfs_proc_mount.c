@@ -226,6 +226,17 @@ chimera_vfs_mount(
         return;
     }
 
+    /* Registered but its init failed (e.g. io_uring_setup is ENOSYS under a
+     * container's default seccomp profile): the backend is unavailable in
+     * this process.  ENXIO keeps that distinct from ENOENT (no such module)
+     * and ENOTSUP (the backing filesystem cannot serve the mount). */
+    if (!vfs->module_private[module->fh_magic]) {
+        chimera_vfs_error("chimera_vfs_mount: module %s is unavailable "
+                          "(module init failed)", module_name);
+        callback(thread, CHIMERA_VFS_ENXIO, private_data);
+        return;
+    }
+
     /* For mount operations, the module is already known - use alloc_with_module
      * since chimera_vfs_get_module returns NULL (no mount exists yet) */
     request = chimera_vfs_request_alloc_with_module(thread, cred,
