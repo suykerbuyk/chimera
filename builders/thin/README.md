@@ -141,9 +141,16 @@ Then:
 
 1. Run `make podman-image PODMAN_BUILD_FLAGS=--no-cache`.  The lock gate and
    its self-test must pass.
-2. Run `make podman-test` and compare the result with the scorecard in
-   `doc/TESTING.md`.
-3. Review the diff and commit it yourself.
+2. Save the previous run's results, then run `make podman-clean` and
+   `make podman-test`.
+3. Check parity against the saved run.  For the MBT corpus, raw hashes
+   change on every generation, so compare the output of
+   `python3 builders/thin/corpus-normhash.py <tree>/specs-corpus`.  It
+   hashes each trace without its generation-time `#meta` fields.  The full
+   procedure, the files to save first and the expected differences are in
+   [`docs/architecture/user-mode-podman.md`](../../docs/architecture/user-mode-podman.md)
+   ("Bumping the pins" and "Verifying parity").
+4. Review the diff and commit it yourself.
 
 The pins do not move on their own.  Security updates reach this image only
 when someone bumps it, for example alongside an upstream sync.

@@ -111,13 +111,18 @@ full suite).
 ### Unprivileged local loop (user-mode Podman)
 
 A host with only `podman`, `make` and `git` can build and run the quick tier
-in the `chimera-dev` CI image without installing chimera's build
-dependencies. Build the image once with `make podman-image`, then use
-`make podman-build` and `make podman-test`. The container runs as your uid
-with no added capabilities, so tests that need privilege skip. Building the
-image needs network access to the registry its Dockerfile pulls from. See
-[`builders/dev/README.md`](../builders/dev/README.md) for the targets, the
-skip list and how it differs from the CI legs.
+in a container without installing chimera's build dependencies. Build the
+image once with `make podman-image`, then use `make podman-build` and
+`make podman-test`. The container runs as your uid with no added
+capabilities, so tests that need privilege skip.
+
+The default image (`PODMAN_FLAVOR=thin`, `builders/thin/Dockerfile`) is
+pinned and can be recreated from public inputs. Building it needs no
+Quantum registry. `PODMAN_FLAVOR=dev` uses the `chimera-dev` CI image
+instead, and building that one needs the internal registry. See
+[User-mode Podman build and test](architecture/user-mode-podman.md) for the
+design, the skip list, how the loop differs from the CI legs, and how to
+maintain it.
 
 ### Other targets
 
