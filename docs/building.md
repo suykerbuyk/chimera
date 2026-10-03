@@ -74,7 +74,7 @@ exposes the targets you'll typically use.
 ### Build and test
 
 ```bash
-make                # default: build_debug
+make                # list targets (help); does not build
 make release        # build_release + test_release
 make debug          # build_debug + test_debug
 
@@ -102,8 +102,12 @@ make check          # run the full CI check matrix locally
 
 `make check` runs syntax-check, both release and debug builds and their test
 suites, Clang static analysis (`scan-build`), the REUSE / SPDX license lint,
-and the copyright-year check. Passing `make check` locally is sufficient to
-clear the equivalent CI gates.
+and the copyright-year check. Passing `make check` locally clears the
+equivalent CI gates only with the privileges CI has. Unprivileged, the tests
+that need privilege skip (exit 77) or are not registered at all, and
+`make check` covers only the quick tier (`make check_extended` covers the
+full suite). For an unprivileged containerized build (user-mode Podman), see
+`builders/dev/README.md`.
 
 ### Other targets
 

@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: 2024-2026 Chimera-NAS Project Contributors
 #
 # SPDX-License-Identifier: Unlicense
+include $(dir $(lastword $(MAKEFILE_LIST)))mk/vp-facade.mk
 
 # Default build directory:
 # - /chimera (devcontainer) uses /build

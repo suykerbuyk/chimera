@@ -12,8 +12,8 @@ endmacro()
 # These run unwrapped, but their fixture chowns the per-test session dir to
 # the target test uid/gid (CAP_CHOWN) and brings up the io_uring VFS module
 # (unlimited RLIMIT_MEMLOCK). Gate them on the raised-limit probe so an
-# unprivileged `make` skips rather than fails.  That probe is deliberately not
-# the netns one: the NFS and SMB variants below reach their server over the
+# unprivileged `make test` skips rather than fails.  That probe is deliberately
+# not the netns one: the NFS and SMB variants below reach their server over the
 # in-process transport now, so none of this needs CAP_NET_ADMIN.
 macro(add_client_test testname prog backend user)
     if(CHIMERA_LIMITS_TESTING)
@@ -38,7 +38,7 @@ target_link_libraries(client_basic chimera_client)
 # Runs unwrapped (no networking of any kind), but initializing the VFS brings
 # up the io_uring module, whose queue allocation needs an unlimited
 # RLIMIT_MEMLOCK. The limits wrapper raises that for every other test; gate
-# this one on the same privilege so unprivileged `make` doesn't abort.
+# this one on the same privilege so unprivileged `make test` doesn't abort.
 if(CHIMERA_LIMITS_TESTING)
     add_test(NAME chimera/client/basic COMMAND client_basic)
 endif()
