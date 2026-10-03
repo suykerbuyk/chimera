@@ -57,11 +57,13 @@ The container runs as your uid with no added privilege:
 
 - `--userns=keep-id --user $(id -u):$(id -g)`
 - `--cap-drop=ALL --security-opt no-new-privileges`
-- Podman's default seccomp profile (which blocks the io_uring syscalls)
+- Podman's default seccomp profile minus its `io_pgetevents` deny (see the
+  libaio paragraph below); the io_uring syscalls stay blocked
 - `--init --pids-limit=0`, `EVPL_IO_URING_ENTRIES=1024`
 
 There is no `--privileged`, no `CAP_DAC_READ_SEARCH`, no `CAP_NET_ADMIN`, and
-no relaxed seccomp, and none should be added to these targets.  Privileged
+no seccomp change beyond that one overlay, and none should be added to these
+targets.  Privileged
 and root runs belong to the qb CI legs (`qb.yaml`, `.devcontainer/quantum/qb-ci.sh`)
 and the VS Code devcontainer.
 
@@ -102,16 +104,39 @@ One substitution is neither a skip nor an absence.  The diskfs test harnesses
 pick their libevpl block backend at configure time
 (`CHIMERA_DISKFS_DEVICE_TYPE`).  Since libaio 0.3.113, `io_getevents()` is
 implemented with the `io_pgetevents` syscall.  Podman's default seccomp
-profile denies that syscall (ENOSYS), so libaio links but can never reap a
-completion.  CMake runs a small probe that submits and reaps one real read.
-When the probe fails, CMake sets `CHIMERA_DISKFS_DEVICE_TYPE=pread`, and the
-diskfs tests run on libevpl's pread backend.  The configure output says
-`diskfs device type: pread`.  Native unprivileged hosts pass the probe and
-keep `libaio`.  In the 2026-10-03 measurement above, the Podman configure
-reported "libaio is linked but unusable here" and `diskfs device type:
-pread`; the native configure reported `diskfs device type: libaio`.  So
-under Podman the diskfs tests exercise the same diskfs code over a
-different device backend; they do not cover the libaio path.
+profile lists `io_pgetevents` and `io_pgetevents_time64` in an explicit deny
+group that returns EPERM, so libaio links but can never reap a completion.
+CMake runs a small probe that submits and reaps one real read.  When the
+probe fails, CMake sets `CHIMERA_DISKFS_DEVICE_TYPE=pread`, and the diskfs
+tests run on libevpl's pread backend; the configure output says `diskfs
+device type: pread`.  Native unprivileged hosts pass the probe and keep
+`libaio`.  The 2026-10-03 scorecard above was measured that way: Podman
+`pread`, native `libaio`.
+
+The `podman-build`, `podman-test` and `podman-shell` targets now run with a
+seccomp overlay instead of the default profile.  Before each run,
+`builders/dev/seccomp-libaio.py` (run inside the image, so the host needs no
+python) reads `PODMAN_SECCOMP_BASE` (default
+`/usr/share/containers/seccomp.json`) and writes
+`$(PODMAN_BUILD_DIR)/seccomp.json`.  The overlay is the default profile with
+exactly two names removed from its lists, `io_pgetevents` and
+`io_pgetevents_time64`.  Nothing is added to any allow list.  The two calls
+now fall to the profile's default action, ENOSYS, and with that answer
+libaio reaps completions (measured with the CMake probe).  The other 33 names
+in that deny group (`vmsplice`, `userfaultfd`, `swapon`, …) stay denied, and
+`io_uring_setup`, `io_uring_enter` and `io_uring_register` stay blocked.  The
+generator refuses, and the target fails, if the base profile is missing, if
+it does not list both names, if either is still listed afterwards, or if any
+`io_uring_*` name would be allowed.  It never falls back to the default
+profile.
+
+With the overlay, configure reports `diskfs device type: libaio`.  A green
+`podman-test` therefore covers the diskfs code over libevpl's libaio backend
+on a regular file, in every test that takes `CHIMERA_DISKFS_DEVICE_TYPE`.
+Tests built on `src/vfs/diskfs/tests/diskfs_test_harness.h` still hard-code
+the pread backend.  It still proves nothing about a real block device or
+storage array (the device is an image file in the build dir), and nothing
+about io_uring, which remains SKIP.
 
 There is no `podman-check` or `podman-integration`.  The extended tier
 (`make integration`) needs privilege and is not supported under Podman.

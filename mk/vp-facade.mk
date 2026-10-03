@@ -42,21 +42,35 @@ PODMAN ?= podman
 PODMAN_IMAGE ?= localhost/chimera-dev:local
 PODMAN_BUILD_DIR ?= $(HOME)/.cache/chimera/podman-build
 PODMAN_STORAGE ?= $(HOME)/.local/share/containers
+# Podman's default seccomp profile, and the overlay derived from it.
+PODMAN_SECCOMP_BASE ?= /usr/share/containers/seccomp.json
+PODMAN_SECCOMP = $(PODMAN_BUILD_DIR)/seccomp.json
 
-# Unprivileged on purpose: host uid, no capabilities, default seccomp.  Tests
-# that need privilege SKIP (exit 77); privileged runs belong to qb and the
-# devcontainer.
+# Unprivileged on purpose: host uid, no capabilities, and the default seccomp
+# profile minus its io_pgetevents deny (builders/dev/seccomp-libaio.py) so the
+# diskfs tests can keep libaio.  io_uring stays denied.  Tests that need
+# privilege SKIP (exit 77); privileged runs belong to qb and the devcontainer.
 PODMAN_RUN = $(PODMAN) run --rm --init \
 	--userns=keep-id --user $(shell id -u):$(shell id -g) \
 	--cap-drop=ALL --security-opt no-new-privileges \
+	--security-opt seccomp=$(PODMAN_SECCOMP) \
 	--pids-limit=0 \
 	-v $(CURDIR):/chimera:Z -v $(PODMAN_BUILD_DIR):/build:Z -w /chimera \
 	-e HOME=/build/home -e EVPL_IO_URING_ENTRIES=1024
 
+# The generator runs in the image, so the host needs no python.  It refuses
+# (and the target fails) rather than fall back to the default profile.
 define _vp_podman_prep
 	@$(PODMAN) image exists $(PODMAN_IMAGE) || { \
 		echo "Image $(PODMAN_IMAGE) not found: run make podman-image first" >&2; exit 1; }
 	@mkdir -p $(PODMAN_BUILD_DIR)/home
+	@test -r $(PODMAN_SECCOMP_BASE) || { \
+		echo "Seccomp profile $(PODMAN_SECCOMP_BASE) not found: set PODMAN_SECCOMP_BASE to podman's default profile" >&2; exit 1; }
+	@$(PODMAN) run --rm -i --network=none --cap-drop=ALL --security-opt no-new-privileges \
+		-v $(PODMAN_SECCOMP_BASE):/seccomp-base.json:ro $(PODMAN_IMAGE) \
+		python3 - /seccomp-base.json < builders/dev/seccomp-libaio.py > $(PODMAN_SECCOMP).tmp || { \
+		rm -f $(PODMAN_SECCOMP).tmp; echo "Cannot generate $(PODMAN_SECCOMP); not running without it" >&2; exit 1; }
+	@mv $(PODMAN_SECCOMP).tmp $(PODMAN_SECCOMP)
 endef
 
 .PHONY: help build test integration install clean
