@@ -106,8 +106,18 @@ and the copyright-year check. Passing `make check` locally clears the
 equivalent CI gates only with the privileges CI has. Unprivileged, the tests
 that need privilege skip (exit 77) or are not registered at all, and
 `make check` covers only the quick tier (`make check_extended` covers the
-full suite). For an unprivileged containerized build (user-mode Podman), see
-`builders/dev/README.md`.
+full suite).
+
+### Unprivileged local loop (user-mode Podman)
+
+A host with only `podman`, `make` and `git` can build and run the quick tier
+in the `chimera-dev` CI image without installing chimera's build
+dependencies. Build the image once with `make podman-image`, then use
+`make podman-build` and `make podman-test`. The container runs as your uid
+with no added capabilities, so tests that need privilege skip. Building the
+image needs network access to the registry its Dockerfile pulls from. See
+[`builders/dev/README.md`](../builders/dev/README.md) for the targets, the
+skip list and how it differs from the CI legs.
 
 ### Other targets
 

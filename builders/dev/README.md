@@ -9,8 +9,14 @@ SPDX-License-Identifier: Unlicense
 dependencies the qb CI legs build and test in (`qb.yaml`, task
 `chimera-dev`).  The `podman-*` targets in the top-level Makefile (defined in
 `mk/vp-facade.mk`) build the same image locally and run the build and the
-quick test tier in it **unprivileged**.  The only difference between local
-and CI is privilege; CI runs as root.
+quick test tier in it **unprivileged**.
+
+Same image, different run.  The qb test legs run as root, run the extended
+tier (`ctest -C extended`, sharded), and the `ctest_release` /
+`ctest_debug` / `ctest_coverage` legs configure with
+`-DCHIMERA_MBT_CORPUS=OFF`.  Local `podman-test` runs unprivileged, runs the
+quick tier only, and configures with the MBT corpus on (quint is in the
+image).  A green `podman-test` is therefore not a local copy of a qb leg.
 
 ## Targets
 
@@ -71,10 +77,20 @@ legs run them.
 | `io_uring` passthrough | SKIP: `open_by_handle_at` EPERM, as above | SKIP: backend unavailable (`CHIMERA_VFS_ENXIO`). `io_uring_setup` is ENOSYS under seccomp, so the module fails to initialize |
 | everything else in the quick tier (memfs, …) | runs | runs |
 
-In the quick tier that is 11 tests: 6 `*_linux` and 5 `*_io_uring` probes.
-The SKIP line names the cause: "needs CAP_DAC_READ_SEARCH" versus "backend
-unavailable".  ENXIO covers any host where io_uring cannot initialize,
-including `kernel.io_uring_disabled=2`.
+How many quick-tier tests skip depends on whether the MBT corpus is
+configured, because the corpus adds `*_linux` and `*_io_uring` replay batches
+on top of the probes.  Measured 2026-10-03 on `develop` @ `19c2796a`, Debug,
+each in its own build dir:
+
+| Run | Corpus | ctest total | Failed | Skipped | Skip cause |
+|---|---|---|---|---|---|
+| Native unprivileged `make test` | off (no quint on the host) | 90 | 0 | 11 (6 linux, 5 io_uring) | EPERM on both |
+| `make podman-test` | on | 245 | 0 | 39 (20 linux, 19 io_uring) | linux EPERM; io_uring ENXIO, because `io_uring_setup` is denied |
+
+Neither run failed a test.  The two runs register different test sets, so
+their totals are not a ranking.  The SKIP line names the cause: "needs
+CAP_DAC_READ_SEARCH" versus "backend unavailable".  ENXIO covers any host
+where io_uring cannot initialize, including `kernel.io_uring_disabled=2`.
 
 Some suites are not skipped but simply absent.  At configure time CMake
 probes for `ip netns add` (network-namespace tests) and for raising
@@ -91,8 +107,11 @@ completion.  CMake runs a small probe that submits and reaps one real read.
 When the probe fails, CMake sets `CHIMERA_DISKFS_DEVICE_TYPE=pread`, and the
 diskfs tests run on libevpl's pread backend.  The configure output says
 `diskfs device type: pread`.  Native unprivileged hosts pass the probe and
-keep `libaio`.  So under Podman the diskfs tests exercise the same diskfs
-code over a different device backend; they do not cover the libaio path.
+keep `libaio`.  In the 2026-10-03 measurement above, the Podman configure
+reported "libaio is linked but unusable here" and `diskfs device type:
+pread`; the native configure reported `diskfs device type: libaio`.  So
+under Podman the diskfs tests exercise the same diskfs code over a
+different device backend; they do not cover the libaio path.
 
 There is no `podman-check` or `podman-integration`.  The extended tier
 (`make integration`) needs privilege and is not supported under Podman.
