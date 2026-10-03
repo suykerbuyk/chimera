@@ -82,6 +82,18 @@ probes for `ip netns add` (network-namespace tests) and for raising
 and those tests are never registered, so `ctest -N` lists fewer tests than
 CI does.
 
+One substitution is neither a skip nor an absence.  The diskfs test harnesses
+pick their libevpl block backend at configure time
+(`CHIMERA_DISKFS_DEVICE_TYPE`).  Since libaio 0.3.113, `io_getevents()` is
+implemented with the `io_pgetevents` syscall.  Podman's default seccomp
+profile denies that syscall (ENOSYS), so libaio links but can never reap a
+completion.  CMake runs a small probe that submits and reaps one real read.
+When the probe fails, CMake sets `CHIMERA_DISKFS_DEVICE_TYPE=pread`, and the
+diskfs tests run on libevpl's pread backend.  The configure output says
+`diskfs device type: pread`.  Native unprivileged hosts pass the probe and
+keep `libaio`.  So under Podman the diskfs tests exercise the same diskfs
+code over a different device backend; they do not cover the libaio path.
+
 There is no `podman-check` or `podman-integration`.  The extended tier
 (`make integration`) needs privilege and is not supported under Podman.
 
