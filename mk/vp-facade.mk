@@ -37,10 +37,19 @@ _vp_bt = $(strip \
 	$(if $(filter Release release,$(BUILD_TYPE)),release, \
 	$(if $(filter Coverage coverage,$(BUILD_TYPE)),coverage))))
 _vp_check_bt = $(if $(_vp_bt),,$(error BUILD_TYPE must be Debug, Release or Coverage (got '$(BUILD_TYPE)')))
+_vp_check_flavor = $(if $(filter thin dev,$(PODMAN_FLAVOR)),,$(error PODMAN_FLAVOR must be thin or dev (got '$(PODMAN_FLAVOR)')))
 
 PODMAN ?= podman
-PODMAN_IMAGE ?= localhost/chimera-dev:local
-PODMAN_BUILD_DIR ?= $(HOME)/.cache/chimera/podman-build
+# thin: builders/thin, the pinned quick-tier toolchain (default).  dev:
+# builders/dev, qb's chimera-dev kitchen sink.  Each flavor gets its own image
+# tag and build dir, because a tree configured in one image carries that
+# image's configure choices (libaio vs pread, found tools) into the other.
+PODMAN_FLAVOR ?= thin
+PODMAN_DOCKERFILE ?= builders/$(PODMAN_FLAVOR)/Dockerfile
+PODMAN_IMAGE ?= localhost/chimera-$(PODMAN_FLAVOR):local
+PODMAN_BUILD_DIR ?= $(HOME)/.cache/chimera/podman-$(PODMAN_FLAVOR)
+# Extra podman build flags, e.g. --no-cache for a cold rebuild.
+PODMAN_BUILD_FLAGS ?=
 PODMAN_STORAGE ?= $(HOME)/.local/share/containers
 # Podman's default seccomp profile, and the overlay derived from it.
 PODMAN_SECCOMP_BASE ?= /usr/share/containers/seccomp.json
@@ -73,8 +82,18 @@ define _vp_podman_prep
 	@mv $(PODMAN_SECCOMP).tmp $(PODMAN_SECCOMP)
 endef
 
+# Coverage forces clang (Makefile CMAKE_ARGS_COVERAGE).  Ask the image rather
+# than the flavor name, so any PODMAN_IMAGE that has clang works.
+define _vp_podman_coverage_check
+	@if [ "$(_vp_bt)" = coverage ]; then \
+		$(PODMAN) run --rm --network=none --cap-drop=ALL --security-opt no-new-privileges \
+			$(PODMAN_IMAGE) sh -c 'command -v clang' >/dev/null || { \
+			echo "BUILD_TYPE=Coverage needs clang in $(PODMAN_IMAGE) (PODMAN_FLAVOR=dev has it)" >&2; exit 1; }; \
+	fi
+endef
+
 .PHONY: help build test integration install clean
-.PHONY: podman-image podman-build podman-test podman-shell podman-clean
+.PHONY: podman-image podman-image-bump podman-build podman-test podman-shell podman-clean
 
 ##@ Standard
 
@@ -85,6 +104,8 @@ help: ## Show this help (default goal; never builds)
 	@echo ""
 	@echo "Variables: BUILD_TYPE=$(BUILD_TYPE) BUILD_DIR=$(BUILD_DIR) PREFIX=$(PREFIX)"
 	@echo "           CTEST_TIER (empty = quick, '-C extended' = full) INTEGRATION_TIMEOUT=$(INTEGRATION_TIMEOUT)"
+	@echo "Podman:    PODMAN_FLAVOR=$(PODMAN_FLAVOR) (thin or dev) PODMAN_IMAGE=$(PODMAN_IMAGE)"
+	@echo "           PODMAN_DOCKERFILE=$(PODMAN_DOCKERFILE) PODMAN_BUILD_DIR=$(PODMAN_BUILD_DIR)"
 
 build: ## Configure and build BUILD_TYPE (Debug with ASAN by default) under BUILD_DIR
 	$(_vp_check_bt)
@@ -140,26 +161,38 @@ sdk-include-check: ## Check VFS backends include only the module SDK
 
 ##@ Podman (user mode, unprivileged)
 
-podman-image: ## Build PODMAN_IMAGE from builders/dev (network; 12-25 GB with a build)
-	@echo "Disk free for podman storage and the build dir (image + build may take 12-25 GB):"
+podman-image: ## Build PODMAN_IMAGE from PODMAN_DOCKERFILE (network; see PODMAN_FLAVOR)
+	$(_vp_check_flavor)
+	@echo "Disk free for podman storage and the build dir ($(if $(filter dev,$(PODMAN_FLAVOR)),dev: image + build may take 12-25 GB,thin: image ~1 GB + ~3.6 GB per Debug tree)):"
 	@df -h $(firstword $(wildcard $(PODMAN_STORAGE)) $(HOME)) $(firstword $(wildcard $(PODMAN_BUILD_DIR)) $(HOME))
-	$(PODMAN) build -t $(PODMAN_IMAGE) -f builders/dev/Dockerfile builders/dev
+	$(PODMAN) build $(PODMAN_BUILD_FLAGS) -t $(PODMAN_IMAGE) -f $(PODMAN_DOCKERFILE) $(dir $(PODMAN_DOCKERFILE))
+
+# Network (skopeo, curl); never builds, commits or pushes.  DRY_RUN=1 shows the
+# rewrite without touching the Dockerfile.  See builders/thin/README.md.
+podman-image-bump: ## Re-resolve builders/thin pins (base digest, snapshot, quint digest) and show the diff; no build
+	@$(if $(DRY_RUN),DRY_RUN=$(DRY_RUN) )sh builders/thin/bump-pins.sh
 
 podman-build: ## Build BUILD_TYPE in the container (no network)
+	$(_vp_check_flavor)
 	$(_vp_check_bt)
 	$(_vp_podman_prep)
+	$(_vp_podman_coverage_check)
 	$(PODMAN_RUN) --network=none $(PODMAN_IMAGE) make build BUILD_TYPE=$(BUILD_TYPE)
 
 podman-test: ## Build BUILD_TYPE and run the quick tier in the container (no network)
+	$(_vp_check_flavor)
 	$(_vp_check_bt)
 	$(_vp_podman_prep)
+	$(_vp_podman_coverage_check)
 	$(PODMAN_RUN) --network=none $(PODMAN_IMAGE) make test BUILD_TYPE=$(BUILD_TYPE)
 
 podman-shell: ## Interactive shell in the container (same user and caps, default network)
+	$(_vp_check_flavor)
 	$(_vp_podman_prep)
 	$(PODMAN_RUN) -it $(PODMAN_IMAGE) bash -l
 
-podman-clean: ## Remove PODMAN_BUILD_DIR (the image is left alone)
+podman-clean: ## Remove PODMAN_BUILD_DIR for this flavor (the image is left alone)
+	$(_vp_check_flavor)
 	rm -rf $(PODMAN_BUILD_DIR)
 
 ##@ Docs

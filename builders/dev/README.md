@@ -8,11 +8,21 @@ SPDX-License-Identifier: Unlicense
 `builders/dev/Dockerfile` is the `chimera-dev` image: the toolchain and test
 dependencies the qb CI legs build and test in (`qb.yaml`, task
 `chimera-dev`).  The `podman-*` targets in the top-level Makefile (defined in
-`mk/vp-facade.mk`) build the same image locally and run the build and the
-quick test tier in it **unprivileged**.
+`mk/vp-facade.mk`) build an image locally and run the build and the quick
+test tier in it **unprivileged**.
 
-Same image, different run.  The qb test legs run as root, run the extended
-tier (`ctest -C extended`, sharded), and the `ctest_release` /
+Two images can back those targets, selected by `PODMAN_FLAVOR`:
+
+- `thin` (the default) is `builders/thin/Dockerfile`.  It is a pinned,
+  quick-tier-only toolchain that can be recreated from public inputs.  See
+  [`builders/thin/README.md`](../thin/README.md).
+- `dev` is this kitchen-sink image.
+
+Everything below about privilege, seccomp and skips applies to both.
+
+With `PODMAN_FLAVOR=dev` the local run uses the same image as qb, but runs
+it differently.  The qb test legs run as root, run the extended tier
+(`ctest -C extended`, sharded), and the `ctest_release` /
 `ctest_debug` / `ctest_coverage` legs configure with
 `-DCHIMERA_MBT_CORPUS=OFF`.  Local `podman-test` runs unprivileged, runs the
 quick tier only, and configures with the MBT corpus on (quint is in the
@@ -21,12 +31,15 @@ image).  A green `podman-test` is therefore not a local copy of a qb leg.
 ## Targets
 
 ```bash
-make podman-image   # build localhost/chimera-dev:local (network, slow)
-make podman-build   # configure + build BUILD_TYPE (default Debug) in the container
-make podman-test    # build, then run the quick ctest tier in the container
-make podman-shell   # interactive bash -l in the container, same user and caps
-make podman-clean   # remove PODMAN_BUILD_DIR (the image is left alone)
+make podman-image        # build PODMAN_IMAGE for PODMAN_FLAVOR (network)
+make podman-build        # configure + build BUILD_TYPE (default Debug) in the container
+make podman-test         # build, then run the quick ctest tier in the container
+make podman-shell        # interactive bash -l in the container, same user and caps
+make podman-clean        # remove this flavor's PODMAN_BUILD_DIR (the image is left alone)
+make podman-image-bump   # re-resolve the thin image's pins and show the diff (no build)
 ```
+
+Add `PODMAN_FLAVOR=dev` to any of them to use this image.
 
 `podman-image` is never an implicit prerequisite.  `podman-build`,
 `podman-test` and `podman-shell` stop with "run make podman-image first" when
@@ -34,8 +47,11 @@ the image is missing.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `PODMAN_IMAGE` | `localhost/chimera-dev:local` | image tag built and run |
-| `PODMAN_BUILD_DIR` | `~/.cache/chimera/podman-build` | host dir bind-mounted at `/build` |
+| `PODMAN_FLAVOR` | `thin` | `thin` or `dev`; picks the defaults below |
+| `PODMAN_DOCKERFILE` | `builders/$(PODMAN_FLAVOR)/Dockerfile` | Dockerfile `podman-image` builds |
+| `PODMAN_IMAGE` | `localhost/chimera-$(PODMAN_FLAVOR):local` | image tag built and run |
+| `PODMAN_BUILD_DIR` | `~/.cache/chimera/podman-$(PODMAN_FLAVOR)` | host dir bind-mounted at `/build` |
+| `PODMAN_BUILD_FLAGS` | empty | extra `podman build` flags, e.g. `--no-cache` |
 | `BUILD_TYPE` | `Debug` | `Debug`, `Release` or `Coverage` |
 | `PODMAN` | `podman` | container CLI |
 
@@ -46,8 +62,10 @@ the host.  `HOME` is `/build/home`.  Builds and tests run with
 
 ## Disk
 
-The image plus a Debug build can take 12–25 GB across podman storage
-(`~/.local/share/containers`) and `PODMAN_BUILD_DIR`.  `podman-image` prints
+With this image (`PODMAN_FLAVOR=dev`), the image plus a Debug build can take
+12–25 GB across podman storage (`~/.local/share/containers`) and
+`PODMAN_BUILD_DIR`.  The thin image is much smaller: see
+`builders/thin/README.md`.  `podman-image` prints
 `df` for both before it starts.  Point `PODMAN_BUILD_DIR` somewhere roomier if
 `/home` is tight.
 
