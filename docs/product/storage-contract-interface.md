@@ -16,8 +16,9 @@ SPDX-License-Identifier: LicenseRef-Quantum-Proprietary
 This document explains how the C interface in `src/vfs/contract/` maps the
 [backend storage contract](storage-contract.md) onto code. It also records
 where the interface had to take a position the contract does not yet state.
-It does not change the contract. Each provisional item (S1 to S13) is
-listed for the operator to fold into a later contract draft, or to reject.
+It does not change the contract. The provisional items S1 to S7 and S10 to
+S13 are listed for the operator to fold into a later contract draft, or to
+reject. S8 and S9 are deferred to a minor version (section 5).
 
 ## 1. What the interface is
 
@@ -48,18 +49,37 @@ The rules for threading:
 - `dispatch` never blocks.
 - A request completes on the thread that dispatched it.
 - Many requests may be in flight per thread.
+- The backend does not touch a request after completing it.
+
+The ABI rules:
+- Enumerated values travel in `uint32_t` fields.
+- No structure has implicit padding. Every gap is an explicit `reserved`
+  field that must be zero.
+- The test suite pins every value and the LP64 layout, so any change fails
+  to build until `CHIMERA_SC_ABI_VERSION` is bumped.
+
+**Lease time base.** The contract makes the fence epoch a lease (6.5, D10)
+without naming a clock.
+- `ATTACH` and `RENEW` return `r_lease_ns`: a duration, counted from the
+  moment the caller dispatched the request.
+- The caller measures it on its own `CLOCK_MONOTONIC` and must renew before
+  it runs out.
+- The backend never expires the epoch sooner than that duration after it
+  completed the request. The caller's deadline is therefore never later
+  than the backend's, and no clock is shared between them.
 
 ## 2. Contract-to-interface map
 
 | Contract item | Interface construct |
 |---|---|
+| D1 | a sibling of the module SDK with libc-only includes; proved by `sc_selfcontained` (own directory as the only include path, `-pedantic`, `-Wpadded`) and a configure-time check of every `#include` |
 | 4.1 identity, extents | `struct chimera_sc_obj_id` (16 bytes, never reused), `struct chimera_sc_extent` |
 | 4.1 references | `CREATE`, `REPLACE` and `DELETE` deltas; `obj_meta.refs`; holds on never-referenced objects only (S13) |
 | 4.2 states | `enum chimera_sc_obj_state`; `OBJ_SEAL`; `CHIMERA_SC_E_STATE` |
-| 4.3 / D2 | `OBJ_CLONE_WORKING`; `REPLACE` at the seal point; `REPLACE` never recalls |
+| 4.3 / D2 | `OBJ_CLONE_WORKING` (epoch-held, inherits stamps and retention); `HOLD` before any durability acknowledgement ahead of the seal; `REPLACE` with `UNHOLD` at the seal point; `REPLACE` never recalls |
 | 4.3 / D3 | a pending binding is a `CREATE` with a record other protocols cannot see |
 | 5.1 | opaque record keys and values (`struct chimera_sc_bytes`); `struct chimera_sc_obj_meta` |
-| 5.2 / D4 | `NS_TXN`: compares, puts, deletes and deltas commit or fail together |
+| 5.2 / D4 | `NS_TXN`: compares, puts, deletes and deltas commit or fail together; per-delta preconditions are checked in order, the never-both-referenced-and-held invariant and quota net; `r_failed_part` and `r_failed_index` name the failure |
 | 6 | `struct chimera_sc_caller` (node identity and fence epoch) in every request |
 | 6.1 | `OBJ_CREATE`, `OBJ_CLONE_WORKING`, `OBJ_READ`, `OBJ_WRITE`, `OBJ_FLUSH`, `OBJ_TRUNCATE`, `OBJ_ALLOCATE`, `OBJ_PUNCH`, `OBJ_SEAL`, `OBJ_STAT`; plus `OBJ_MAP` (S3) and `OBJ_DISCARD` (S13) |
 | 6.2 | `NS_GET`, `NS_SCAN` (stable cursor), `NS_TXN`, `NS_WATCH`; plus `NS_UNWATCH` (S2) |
@@ -68,13 +88,13 @@ The rules for threading:
 | 6.5 | `ATTACH`, `RENEW`, `FENCE`; plus `DETACH` (S2) |
 | 11 | the six domain errors, with the protocol mapping table in `sc_error.h` |
 | D5 | write level, achieved level, durability epoch on every write, flush and size change |
-| D6 | `CHIMERA_SC_E_RECALL_PENDING` with a ticket; `RECALL_WAIT` parks without a thread |
+| D6 | `CHIMERA_SC_E_RECALL_PENDING` with a ticket; `RECALL_WAIT` parks without a thread; non-blocking dispatch; completion on the dispatching thread |
 | D7 | policy-set stamp; no path anywhere in the interface |
-| D8 | `CHIMERA_SC_E_RETENTION_LOCKED`; `obj_meta.retention` |
+| D8 | `CHIMERA_SC_E_RETENTION_LOCKED`; `obj_meta.retention`; no snapshot operation (S5); the collection rule clarified for never-referenced objects (S13) |
 | D9 | protection classes declared at `ATTACH`; `CHIMERA_SC_E_DATA_UNRECOVERABLE`, `CHIMERA_SC_E_KEY_UNAVAILABLE` |
 | D10 | fence epoch per node; `CHIMERA_SC_E_FENCED` |
 | D12 | ABI version, semantic version, `chimera_sc_version_negotiate()`, four capability bits |
-| D13 | quota domains; `CHIMERA_SC_E_QUOTA_EXCEEDED`, `CHIMERA_SC_E_NO_SPACE` |
+| D13 | quota domains; S12 charging, checked net per transaction; `CHIMERA_SC_E_QUOTA_EXCEEDED`, `CHIMERA_SC_E_NO_SPACE`; `CHIMERA_SC_CAP_ESCROW_QUOTA` |
 
 ## 3. Positions on open issues
 
@@ -110,14 +130,21 @@ draft 0.2.
 | S3 | `OBJ_MAP` (data, hole, unwritten segments) | SEEK_DATA, NFS READ_PLUS and SMB allocated-range queries need the allocation map, and `OBJ_STAT` cannot return an unbounded map |
 | S4 | `NS_TXN` compares by record revision; revision 0 means "does not exist" | Makes compare-and-set exact and cheap |
 | S5 | No snapshot operation | Snapshots (D8) are taken through the administrative plane, not by Chimera |
-| S6 | Checksum algorithm and width in object metadata | S3 ETags and Content-MD5 need to know them; the contract does not name one |
+| S6 | Checksum algorithm and width in object metadata: `CHECKSUM_MD5` (1) defined, values from 256 up backend-private | S3 ETags and Content-MD5 need to know them; the contract does not name one |
 | S7 | `OBJ_CREATE` carries the stamps | Byte quota is charged at extent allocation (D13), before the binding's `CREATE` delta commits |
 | S10 | Deployment shape: an in-process binding per node, with inter-node coordination behind the interface | The contract does not say whether the backend is a linked library or a service. That choice is deferred, because it shapes E14 and E8. |
 | S11 | Bytes the backend returns are valid only until the request completes | An asynchronous interface that returns borrowed memory needs a lifetime rule. This is the module SDK's own rule for returned values. |
 | S12 | Object count is charged at the first reference and released at the last, checked net per transaction. A working version is charged for bytes on copy-on-write. | Makes a full overwrite (`REPLACE`) never fail at an exact limit, and stops a clone being charged twice |
 | S13 | The object lifecycle: epoch hold, hold flag (`HOLD`/`UNHOLD`), `OBJ_DISCARD`, and released objects returning `NOT_FOUND` | Below |
 
-**S13 in detail.** Contract D2 has Chimera create a new `open` object and
+**S13 in detail.** S13 has four parts.
+- Items 1 and 4 resolve an ambiguity and a silence in draft 0.2.
+- Items 2 and 3 are additions:
+  - item 2: the `HOLD` and `UNHOLD` delta kinds and `OBJ_DISCARD`;
+  - item 3: Chimera's obligation to hold an object before a pre-seal
+    durability acknowledgement.
+
+Contract D2 has Chimera create a new `open` object and
 `REPLACE` it in at the seal point. Between those two moments the object has
 no reference.
 

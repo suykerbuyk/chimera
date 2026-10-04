@@ -89,6 +89,7 @@ struct chimera_sc_quota_domains {
     uint64_t group;
     uint64_t project;
     uint32_t valid;     /* CHIMERA_SC_QD_* */
+    uint32_t reserved;  /* must be zero */
 };
 
 /* What Chimera stamps on an object (D7, D13, NS-3): at OBJ_CREATE, again
@@ -97,13 +98,16 @@ struct chimera_sc_stamps {
     uint64_t                        policy_set;
     struct chimera_sc_quota_domains quota_domains;
     uint64_t                        owner_principal;
-    uint32_t                        origin;  /* enum chimera_sc_origin */
+    uint32_t                        origin;   /* enum chimera_sc_origin */
+    uint32_t                        reserved; /* must be zero */
 };
 
 /* PROVISIONAL (S6): checksum algorithm identifiers.  The contract does not
  * yet name an algorithm; Chimera reads the checksum for protocol use only
  * (S3 ETag, Content-MD5), never to verify stored data (D9). */
 #define CHIMERA_SC_CHECKSUM_NONE    0
+#define CHIMERA_SC_CHECKSUM_MD5     1   /* 16 bytes; serves S3 ETag and Content-MD5 */
+#define CHIMERA_SC_CHECKSUM_PRIVATE 256 /* values >= this are backend-private */
 #define CHIMERA_SC_CHECKSUM_MAX     64
 
 /* Retention and immutability (WORM) lock (D8).  While locked, the backend
@@ -125,8 +129,9 @@ struct chimera_sc_obj_meta {
     }                        checksum;
     struct chimera_sc_stamps stamps;
     struct {
-        uint32_t mode;      /* CHIMERA_SC_RETENTION_* */
         uint64_t until_ns;
+        uint32_t mode;      /* CHIMERA_SC_RETENTION_* */
+        uint32_t reserved;  /* must be zero */
     }                        retention;
     uint64_t                 spoke_marker;  /* opaque; nonzero if a spoke copy exists */
     uint64_t                 change;        /* advances on every data or metadata change */
@@ -144,6 +149,7 @@ struct chimera_sc_protection_class {
     uint16_t n;             /* replica count */
     uint16_t k;             /* erasure-code data shards */
     uint16_t m;             /* erasure-code parity shards */
+    uint16_t reserved;      /* must be zero */
 };
 
 /*
@@ -167,7 +173,8 @@ struct chimera_sc_limits {
     uint32_t max_io;          /* bytes per OBJ_READ / OBJ_WRITE */
     uint32_t max_watch;
     uint32_t max_recall_ids;
-    uint64_t lease_ns;        /* fence-epoch lease length */
+    uint64_t lease_ns;        /* nominal fence-epoch lease length; the granted
+                               * length is ATTACH/RENEW r_lease_ns */
 };
 
 /*

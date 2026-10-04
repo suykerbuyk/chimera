@@ -24,6 +24,10 @@
  *     a new request from inside complete().
  *   - watch_event runs on a thread that ran thread_init and holds a live
  *     watch; its rec is valid only until the upcall returns (S11).
+ *     deleted != 0: the record was deleted; rec->key names it and rec->value
+ *     is empty.  overflow != 0: events under the watch's prefix were lost;
+ *     rec is NULL, and the consumer must rescan the prefix (NS_SCAN) to
+ *     resynchronise.  The watch stays live after an overflow.
  *
  * Deployment.  PROVISIONAL (S10): this is the in-process binding of the
  * contract, one backend instance per Chimera node.  How backend instances on
@@ -53,6 +57,7 @@ struct chimera_sc_upcalls {
 struct chimera_sc_backend {
     /* Required.  CHIMERA_SC_ABI_VERSION; a mismatch is refused. */
     uint32_t    abi_version;
+    uint32_t    reserved;   /* must be zero */
 
     /* Required.  Short name of the backend implementation. */
     const char *name;

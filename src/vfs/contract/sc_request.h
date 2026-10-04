@@ -20,6 +20,8 @@
  *     backend allocates data buffers into it from the dispatching thread's
  *     evpl and sets r_niov; the caller owns and releases those buffers after
  *     complete().  OBJ_WRITE buffers are borrowed until complete().
+ *   - After calling complete(), the backend must not touch the request or
+ *     anything it points to.
  *   - PROVISIONAL (S11): bytes the backend returns (NS_GET r_value, the key
  *     and value bytes inside NS_SCAN records) are valid only until complete()
  *     returns.  The caller copies what it keeps.  This holds with many
@@ -74,6 +76,7 @@ enum chimera_sc_op {
 struct chimera_sc_bytes {
     const uint8_t *data;
     uint32_t       len;
+    uint32_t       reserved;    /* must be zero */
 };
 
 struct chimera_sc_record {
@@ -104,7 +107,8 @@ struct chimera_sc_cursor {
 
 struct chimera_sc_segment {
     struct chimera_sc_extent extent;
-    uint32_t                 kind;   /* CHIMERA_SC_SEG_* */
+    uint32_t                 kind;      /* CHIMERA_SC_SEG_* */
+    uint32_t                 reserved;  /* must be zero */
 };
 
 /*
@@ -131,7 +135,8 @@ enum chimera_sc_delta_kind {
 #define CHIMERA_SC_DELTA_KIND_COUNT 8
 
 /* CREATE(binding -> obj): refs 0 -> 1 (precondition: refs 0, else E_STATE);
- * charges object count.  stamps must equal the OBJ_CREATE stamps, else
+ * charges object count.  stamps must equal the OBJ_CREATE stamps, compared
+ * field by field (reserved fields are zero and not compared), else
  * E_INVALID; changing stamps is RETAG's job.  A pending binding (D3) is a
  * CREATE. */
 struct chimera_sc_delta_create {
@@ -167,12 +172,13 @@ struct chimera_sc_delta_retag {
 
 /* RECALL_HINT(set or group tag) (D6, RCL-4): advisory.  Always accepted; a
  * backend without CAP_GROUP_RECALL ignores a group hint.  A hint never fails
- * the transaction.  Exactly one of ids/nids or group is used (nids 0 means
- * the group tag). */
+ * the transaction.  Exactly one of ids/nids or group is used: nids 0 means
+ * the group tag, and group tag 0 is reserved as invalid. */
 struct chimera_sc_delta_recall_hint {
     const struct chimera_sc_obj_id *ids;
-    uint32_t                        nids;
     uint64_t                        group;
+    uint32_t                        nids;
+    uint32_t                        reserved;  /* must be zero */
 };
 
 /* HOLD / UNHOLD (S13): set or clear the hold flag.  HOLD requires a
@@ -182,7 +188,8 @@ struct chimera_sc_delta_hold {
 };
 
 struct chimera_sc_delta {
-    uint32_t kind;     /* enum chimera_sc_delta_kind */
+    uint32_t kind;      /* enum chimera_sc_delta_kind */
+    uint32_t reserved;  /* must be zero */
     union {
         struct chimera_sc_delta_create      create;
         struct chimera_sc_delta_replace     replace;
@@ -208,7 +215,16 @@ enum chimera_sc_txn_part {
  * is 0.  If the node already holds a live epoch, the backend revokes it first
  * and completes only once no op carrying it can still commit (6.5's fence
  * condition), then grants a new one.  PROVISIONAL: draft 0.2 is silent on
- * re-attach. */
+ * re-attach.
+ *
+ * Lease time base: r_lease_ns is the lease length granted, in nanoseconds,
+ * relative to the moment the caller dispatched this request.  The caller
+ * measures it on its own CLOCK_MONOTONIC: its renew deadline is its
+ * CLOCK_MONOTONIC reading taken before dispatch plus r_lease_ns, and it must
+ * RENEW before then.  The backend never expires the epoch sooner than
+ * r_lease_ns after it completed the request, so the caller's deadline is
+ * never later than the backend's.  No clock is shared between caller and
+ * backend; the contract's lease (6.5, D10) is defined by this duration. */
 struct chimera_sc_attach_args {
     struct chimera_sc_version           want;
     struct chimera_sc_protection_class *pclasses;      /* caller array */
@@ -217,20 +233,22 @@ struct chimera_sc_attach_args {
     struct chimera_sc_version           r_version;
     uint64_t                            r_caps;        /* CHIMERA_SC_CAP_* */
     uint64_t                            r_fence_epoch;
-    uint64_t                            r_lease_expiry_ns;
+    uint64_t                            r_lease_ns;    /* relative; see above */
     uint64_t                            r_durability_epoch;
     struct chimera_sc_limits            r_limits;
 };
 
-/* RENEW: extends the caller's epoch lease.  E_FENCED if revoked or expired. */
+/* RENEW: extends the caller's epoch lease by r_lease_ns, with the same time
+ * base as ATTACH.  E_FENCED if the epoch is revoked or expired. */
 struct chimera_sc_renew_args {
-    uint64_t r_lease_expiry_ns;
+    uint64_t r_lease_ns;
 };
 
 /* FENCE(node_id): revoke that node's epoch now.  Completes only once no op
  * carrying it can still commit (D10).  A cluster manager calls this, and
  * waits for it, before a surviving node takes over the dead node's clients
- * (O14). */
+ * (O14).  FENCE of a node with no live epoch completes OK: its postcondition
+ * already holds.  The caller must itself hold a live epoch. */
 struct chimera_sc_fence_args {
     struct chimera_sc_node_id node;
 };
@@ -273,8 +291,9 @@ struct chimera_sc_obj_read_args {
     int                      niov;      /* its capacity */
     int                      r_niov;
     uint64_t                 r_length;
-    uint32_t                 r_eof;
     uint64_t                 r_ticket;
+    uint32_t                 r_eof;
+    uint32_t                 reserved;  /* must be zero */
 };
 
 /* OBJ_WRITE (D5): into an open object.  Returns the level actually achieved
@@ -287,6 +306,7 @@ struct chimera_sc_obj_write_args {
     int                      niov;
     uint32_t                 level;     /* enum chimera_sc_write_level */
     uint32_t                 r_level;
+    uint32_t                 reserved;  /* must be zero */
     uint64_t                 r_length;
     uint64_t                 r_durability_epoch;
 };
@@ -329,6 +349,7 @@ struct chimera_sc_obj_map_args {
     uint32_t                   segs_cap;
     uint32_t                   r_nsegs;
     uint32_t                   r_more;
+    uint32_t                   reserved;  /* must be zero */
 };
 
 struct chimera_sc_ns_get_args {
@@ -345,18 +366,19 @@ struct chimera_sc_ns_scan_args {
     uint32_t                  r_nrecs;
     struct chimera_sc_cursor  r_next_cursor;
     uint32_t                  r_eof;
+    uint32_t                  reserved;  /* must be zero */
 };
 
 /* NS_TXN (D4): compare-and-set over namespace records, with event deltas,
  * atomic, linearizable, durable on commit.  Rename is one transaction. */
 struct chimera_sc_ns_txn_args {
     const struct chimera_sc_compare *compares;
-    uint32_t                         ncompares;
     const struct chimera_sc_record  *puts;      /* revision ignored on input */
-    uint32_t                         nputs;
     const struct chimera_sc_bytes   *deletes;
-    uint32_t                         ndeletes;
     const struct chimera_sc_delta   *deltas;
+    uint32_t                         ncompares;
+    uint32_t                         nputs;
+    uint32_t                         ndeletes;
     uint32_t                         ndeltas;
     uint64_t                         r_revision;
     uint32_t                         r_failed_part;   /* enum chimera_sc_txn_part */
@@ -375,13 +397,15 @@ struct chimera_sc_ns_unwatch_args {
     uint64_t watch_id;
 };
 
-/* RECALL (6.4, D6, RCL-4): exactly one of ids/nids or group (nids 0 means
- * the group tag).  A group without CAP_GROUP_RECALL: E_NOT_SUPPORTED. */
+/* RECALL (6.4, D6, RCL-4): exactly one of ids/nids or group.  nids 0 means
+ * the group tag; group tag 0 is reserved as invalid (E_INVALID).  A group
+ * without CAP_GROUP_RECALL: E_NOT_SUPPORTED. */
 struct chimera_sc_recall_args {
     const struct chimera_sc_obj_id *ids;
-    uint32_t                        nids;
     uint64_t                        group;
     uint64_t                        r_ticket;
+    uint32_t                        nids;
+    uint32_t                        reserved;  /* must be zero */
 };
 
 /* RECALL_WAIT (6.4, D6): a parked request that completes when the recall
@@ -394,7 +418,7 @@ struct chimera_sc_recall_wait_args {
 
 struct chimera_sc_request {
     uint32_t                 opcode;    /* enum chimera_sc_op */
-    enum chimera_sc_error    status;
+    uint32_t                 status;    /* enum chimera_sc_error */
     struct chimera_sc_caller caller;
     void                     (*complete)(
         struct chimera_sc_request *request);

@@ -24,9 +24,25 @@
  *   - valid C11 and valid C++: tagged structures only inside anonymous
  *     unions, and no file-scope _Static_assert.
  *
- * Versions: sc_version.h.  Errors: sc_error.h.  Types, the object
- * lifecycle and quota rules: sc_types.h.  Operations and ownership:
- * sc_request.h.  Descriptor, threading and deployment: sc_backend.h.
+ * Summary (details in the headers named):
+ *   - Versions (sc_version.h): CHIMERA_SC_ABI_VERSION guards the C layout
+ *     and is refused on mismatch at registration; the contract semantic
+ *     version is negotiated at ATTACH (D12).
+ *   - Threading (sc_backend.h): dispatch() never blocks; complete() runs on
+ *     the dispatching thread; many requests may be in flight per thread.
+ *     One backend instance per Chimera node, in process (PROVISIONAL S10).
+ *   - Requests (sc_request.h): inputs are caller-owned until complete();
+ *     returned bytes live until complete() returns (S11); the backend does
+ *     not touch a request after completing it.  NS_TXN checks per-delta
+ *     preconditions in order and invariants and quota net.
+ *   - Objects (sc_types.h): at most one reference per object in v1.0; only
+ *     never-referenced objects can be held (S13); a released object is
+ *     E_NOT_FOUND to every op; object count is charged on the first
+ *     reference and released on the last (S12).
+ *   - Errors (sc_error.h): own numbering; section 11 mappings.
+ *   - ABI: no implicit padding (sc_selfcontained builds with -Wpadded on
+ *     LP64), reserved fields must be zero, and enum values are carried in
+ *     uint32_t fields.
  */
 
 #include "sc_version.h"

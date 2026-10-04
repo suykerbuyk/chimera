@@ -67,10 +67,7 @@ install(FILES
         ${CMAKE_SOURCE_DIR}/ext/libevpl/ext/oteltracing-c/oteltracing.h
         DESTINATION include/chimera)
 
-# Storage contract v1 interface (headers only): a sibling of the module SDK,
-# not part of it.
 add_subdirectory(contract)
-
 add_subdirectory(root)
 add_subdirectory(memfs)
 add_subdirectory(memkv)
