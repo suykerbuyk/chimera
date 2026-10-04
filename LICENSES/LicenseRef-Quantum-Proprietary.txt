@@ -1,0 +1,6 @@
+Copyright Quantum Corporation. All rights reserved.
+
+This file is proprietary to Quantum Corporation. No license is granted to
+copy, modify or distribute it except as Quantum Corporation agrees in
+writing. Quantum Corporation may change the terms that apply to this file
+at its discretion.
