@@ -6,6 +6,7 @@
 
 #include "smb_internal.h"
 #include "smb_procs.h"
+#include "smb_string.h"
 #include "common/misc.h"
 #include "vfs/vfs.h"
 #include "vfs/vfs_procs.h"
@@ -889,6 +890,22 @@ chimera_smb_parse_rename_info(
         chimera_smb_error("SET_INFO RENAME_INFO failed to convert new name to UTF-8");
         request->status = SMB2_STATUS_OBJECT_NAME_INVALID;
         return -1;
+    }
+
+    /* Confine the rename/link target before it is resolved: a '/' separator, an
+     * embedded NUL, or any ".." component would walk outside the share on a
+     * passthrough backend (CREATE already refuses these; SET_INFO did not).
+     * Rejected via parse_reject so only this request fails -- the connection
+     * survives.  One site covers both FILE_RENAME_INFORMATION and
+     * FILE_LINK_INFORMATION, which share this parser. */
+    {
+        uint32_t name_status = chimera_smb_name_check(rename_info->new_parent,
+                                                      (size_t) rename_info->new_parent_len,
+                                                      (size_t) rename_info->new_parent_len);
+
+        if (name_status != SMB2_STATUS_SUCCESS) {
+            return chimera_smb_parse_reject(request, name_status);
+        }
     }
 
     /* Split into parent path and name, similar to chimera_smb_parse_create */

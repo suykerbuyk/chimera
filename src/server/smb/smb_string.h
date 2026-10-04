@@ -11,6 +11,9 @@
 #include <iconv.h>
 #endif // ifdef _WIN32
 #include <stdint.h>
+#include <string.h>
+
+#include "smb_common/smb2.h"
 
 struct chimera_smb_iconv_ctx {
 #ifdef _WIN32
@@ -163,3 +166,87 @@ chimera_smb_utf8_to_utf16le(
     return dstlen;
 #endif // ifdef _WIN32
 } /* chimera_smb_utf8_to_utf16le */
+
+/* ---- SMB path-component name validation ---------------------------------
+ *
+ * A component the client names on the wire ('\' is the only separator) must not
+ * carry a path separator or an embedded NUL, and a create-type or reconnect
+ * name must not carry a ".." component.  These primitives are pure so the
+ * hardening test can drive them directly; CREATE applies them inline (its
+ * pre-existing ".." block keeps the distinct PATH_SYNTAX_BAD / INVALID_PARAMETER
+ * statuses MS-SMB2 3.3.5.9 pins), while reconnect and SET_INFO rename/link use
+ * chimera_smb_name_check for the single OBJECT_NAME_INVALID verdict. */
+
+/* Non-zero if s[0..len) contains a NUL byte (an embedded U+0000). */
+static inline int
+chimera_smb_name_has_nul(
+    const char *s,
+    size_t      len)
+{
+    return memchr(s, '\0', len) != NULL;
+} /* chimera_smb_name_has_nul */
+
+/* Non-zero if s[0..len) contains '/': not a wire separator and not allowed in a
+ * component (MS-FSCC 2.1.5.2). */
+static inline int
+chimera_smb_name_has_slash(
+    const char *s,
+    size_t      len)
+{
+    return memchr(s, '/', len) != NULL;
+} /* chimera_smb_name_has_slash */
+
+/* Non-zero if any '\'- or '/'-separated component of s[0..len) is exactly
+ * "..".  A "." component is allowed (WPTS CreateAndClose*WithDotDir). */
+static inline int
+chimera_smb_wire_path_has_dotdot(
+    const char *s,
+    size_t      len)
+{
+    size_t i = 0;
+
+    while (i < len) {
+        size_t start = i;
+
+        while (i < len && s[i] != '\\' && s[i] != '/') {
+            i++;
+        }
+        if (i - start == 2 && s[start] == '.' && s[start + 1] == '.') {
+            return 1;
+        }
+        if (i < len) {
+            i++;  /* skip the separator */
+        }
+    }
+    return 0;
+} /* chimera_smb_wire_path_has_dotdot */
+
+/* The single name verdict for a reconnect or a SET_INFO rename/link target:
+ * SMB2_STATUS_SUCCESS, or the OBJECT_NAME_INVALID to answer.  `len` is the whole
+ * UTF-8 name; `base_len` is the portion before any stream ':' (equal to `len`
+ * when there is no stream).  A "/" is judged only over the base so a stream
+ * suffix is not misread; a NUL and a ".." component are judged over the whole
+ * name; a component longer than SMB_FILENAME_MAX bytes is rejected. */
+static inline uint32_t
+chimera_smb_name_check(
+    const char *s,
+    size_t      len,
+    size_t      base_len)
+{
+    size_t i = 0, comp = 0;
+
+    if (chimera_smb_name_has_nul(s, len) ||
+        chimera_smb_name_has_slash(s, base_len) ||
+        chimera_smb_wire_path_has_dotdot(s, len)) {
+        return SMB2_STATUS_OBJECT_NAME_INVALID;
+    }
+
+    for (i = 0; i < len; i++) {
+        if (s[i] == '\\' || s[i] == '/' || s[i] == ':') {
+            comp = 0;
+        } else if (++comp > SMB_FILENAME_MAX) {
+            return SMB2_STATUS_OBJECT_NAME_INVALID;
+        }
+    }
+    return SMB2_STATUS_SUCCESS;
+} /* chimera_smb_name_check */

@@ -5272,6 +5272,13 @@ chimera_smb_parse_stream_name(
         return SMB2_STATUS_OBJECT_NAME_INVALID;
     }
 
+    /* A stream name is bounded at 255 bytes (MS-FSCC 2.1.5.3), the size of the
+     * stream_name buffers it is copied into.  Rejecting an over-long one here,
+     * before any copy, is what keeps those fixed buffers from overflowing. */
+    if (stream_len > SMB_FILENAME_MAX) {
+        return SMB2_STATUS_OBJECT_NAME_INVALID;
+    }
+
     if (stream_len == 0) {
         /* "file::$DATA" is the default data fork (open the base file); a bare
          * trailing "file:" with neither name nor type is malformed.  Flag the
@@ -5684,6 +5691,15 @@ chimera_smb_create(struct chimera_smb_request *request)
                 return;
             }
 
+            /* parse_stream_name already bounds sname_len at SMB_FILENAME_MAX;
+             * guard the copy anyway so a future parser change cannot overflow
+             * this fixed buffer. */
+            if (sname_len > sizeof(request->create.stream_name)) {
+                chimera_smb_complete_request(request,
+                                             SMB2_STATUS_OBJECT_NAME_INVALID);
+                return;
+            }
+
             request->create.has_stream      = 1;
             request->create.stream_name_len = sname_len;
             memcpy(request->create.stream_name, sname, sname_len);
@@ -5721,12 +5737,14 @@ chimera_smb_create(struct chimera_smb_request *request)
      * STATUS_OBJECT_PATH_SYNTAX_BAD (smbtorture smb2.mkdir), while a
      * "subfolder\..\" form (e.g. "x\..\y.txt") gets STATUS_INVALID_PARAMETER
      * (WPTS *DoubleDotDir).  Completed here (not in parse) so the client gets a
-     * response rather than a connection drop. */
-    if (!is_durable_reconnect &&
-        ((request->create.name_len == 2 &&
-          request->create.name[0] == '.' && request->create.name[1] == '.') ||
-         chimera_smb_path_has_dotdot(request->create.parent_path,
-                                     request->create.parent_path_len))) {
+     * response rather than a connection drop.  Applied even on a durable
+     * reconnect: a reclaim names its open by FileId, so a non-empty name that
+     * fails validation never has a legitimate reason to differ from the
+     * original and must not reach the create path unchecked. */
+    if ((request->create.name_len == 2 &&
+         request->create.name[0] == '.' && request->create.name[1] == '.') ||
+        chimera_smb_path_has_dotdot(request->create.parent_path,
+                                    request->create.parent_path_len)) {
         int begins_dotdot =
             chimera_smb_path_begins_with_dotdot(request->create.parent_path,
                                                 request->create.parent_path_len) ||
@@ -5738,6 +5756,19 @@ chimera_smb_create(struct chimera_smb_request *request)
                                      begins_dotdot ?
                                      SMB2_STATUS_OBJECT_PATH_SYNTAX_BAD :
                                      SMB2_STATUS_INVALID_PARAMETER);
+        return;
+    }
+
+    /* A '/' separator or an embedded NUL in the name (flagged in parse), or a
+     * final component longer than 255 bytes, is OBJECT_NAME_INVALID (MS-FSCC
+     * 2.1.5.2/2.1.5.3).  The length bound counts UTF-8 bytes, as the VFS
+     * {NAME_MAX} does, not UTF-16 characters, so a long non-ASCII name may be
+     * refused marginally earlier than on Windows.  Like the ".." block this
+     * runs on a reconnect too, before the pipe branch and the reconnect
+     * dispatch below. */
+    if (request->create.name_invalid ||
+        request->create.name_len > SMB_FILENAME_MAX) {
+        chimera_smb_complete_request(request, SMB2_STATUS_OBJECT_NAME_INVALID);
         return;
     }
 
@@ -6873,6 +6904,27 @@ chimera_smb_parse_create(
     if (name_size > 0 && request->create.parent_path[0] == '\\') {
         request->status = SMB2_STATUS_INVALID_PARAMETER;
         return -1;
+    }
+
+    /* Flag a name that carries an embedded NUL (over the whole name, stream
+     * suffix included) or a '/' separator (over the base, before any stream
+     * ':').  '\' is the only legal separator on the wire; a '/' or NUL in a
+     * component would reach the VFS as part of a single name and, on a
+     * passthrough backend, let the kernel resolve it outside the share.  The
+     * verdict is completed in the dispatcher (after the ".." block, which keeps
+     * its distinct statuses) so the client gets a response, and so a durable
+     * reconnect -- which skips that block -- is still validated. */
+    {
+        char  *colon    = memchr(request->create.parent_path, ':', name_size);
+        size_t base_len = colon ? (size_t) (colon - request->create.parent_path)
+                        : (size_t) name_size;
+
+        if (chimera_smb_name_has_nul(request->create.parent_path, name_size) ||
+            chimera_smb_name_has_slash(request->create.parent_path, base_len)) {
+            request->create.name_invalid = 1;
+        } else {
+            request->create.name_invalid = 0;
+        }
     }
 
     /* Split the final path component off at the last backslash.  A named-stream

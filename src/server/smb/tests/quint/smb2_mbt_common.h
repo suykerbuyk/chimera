@@ -259,6 +259,7 @@
 #define SMB2C_DURABLE_TIMEOUT_MAX_MS            300000u
 
 #define SMB2C_BUFSZ                             (1 << 20) /* per-connection scratch */
+#define SMB2C_NAME_MAX                          520       /* max ASCII name chars a stack wrapper encodes */
 #define SMB2C_MAX_BREAKS                        16
 /* Async CHANGE_NOTIFY completions queued per connection, and records per
  * completion.  Both are ceilings on what one replay STEP can produce, not on a
@@ -2626,13 +2627,16 @@ smb2c_durable_contexts(
 
 #define SMB2C_MAX_REQ_CTX 8
 
-/* Build a CREATE into c->sbuf; returns the body length.  When req->is_lease an
- * RqLs context LEADS the chain (v2 with epoch on dialect >= 3.0, else v1);
- * `extra` follows in caller order. */
+/* Build a CREATE into c->sbuf from an already-encoded UTF-16LE name; returns
+ * the body length.  The raw form lets a probe put any code unit on the wire,
+ * an embedded U+0000 included, which the ASCII utf16le() helper cannot express.
+ * When req->is_lease an RqLs context LEADS the chain (v2 with epoch on dialect
+ * >= 3.0, else v1); `extra` follows in caller order. */
 static inline int
-smb2c_build_create_full(
+smb2c_build_create_full16(
     struct smb2_conn             *c,
-    const char                   *name,
+    const uint8_t                *name16,
+    int                           nlen,
     uint32_t                      disp,
     uint32_t                      access,
     uint32_t                      share,
@@ -2644,7 +2648,6 @@ smb2c_build_create_full(
     int              b        = smb2c_begin(c, SMB2_CREATE, 0);
     uint8_t         *body     = c->sbuf + b;
     int              name_off = SMB2_HDR_SIZE + 56;
-    int              nlen     = utf16le(name, body + 56);
     uint8_t          oplevel  =
         req ? (req->is_lease ? SMB2_OPLOCK_LEVEL_LEASE : req->level)
             : SMB2_OPLOCK_LEVEL_NONE;
@@ -2664,6 +2667,9 @@ smb2c_build_create_full(
     p32(body, 40, create_options);
     p16(body, 44, name_off);          /* NameOffset */
     p16(body, 46, nlen);              /* NameLength */
+    if (nlen > 0) {
+        memcpy(body + 56, name16, nlen);
+    }
 
     if (req && req->is_lease) {
         int v2   = c->dialect >= SMB2_DIALECT_0300 && !req->force_v1;
@@ -2701,6 +2707,26 @@ smb2c_build_create_full(
     p32(body, 52, cc_len);            /* CreateContextsLength */
 
     return (cc_hoff - SMB2_HDR_SIZE) + (int) cc_len;
+} /* smb2c_build_create_full16 */
+
+/* ASCII-name wrapper: encode `name` to UTF-16LE on the stack and build. */
+static inline int
+smb2c_build_create_full(
+    struct smb2_conn             *c,
+    const char                   *name,
+    uint32_t                      disp,
+    uint32_t                      access,
+    uint32_t                      share,
+    uint32_t                      create_options,
+    const struct smb2_oplock_req *req,
+    const struct smb2_cctx       *extra,
+    int                           nextra)
+{
+    uint8_t name16[2 * SMB2C_NAME_MAX];
+    int     nlen = utf16le(name, name16);
+
+    return smb2c_build_create_full16(c, name16, nlen, disp, access, share,
+                                     create_options, req, extra, nextra);
 } /* smb2c_build_create_full */
 
 static inline int
@@ -2779,6 +2805,27 @@ smb2_create(
                             MBT_FILE_NON_DIRECTORY_FILE, req, out);
 } /* smb2_create */
 
+/* Blocking CREATE from an already-encoded UTF-16LE name of nlen bytes, so a
+ * probe can send an embedded NUL or an over-long name the ASCII helper cannot
+ * express. */
+static inline uint32_t
+smb2_create_raw16(
+    struct smb2_conn       *c,
+    const uint8_t          *name16,
+    int                     nlen,
+    uint32_t                disp,
+    uint32_t                access,
+    uint32_t                share,
+    uint32_t                create_options,
+    struct smb2_create_out *out)
+{
+    smb2c_send(c, smb2c_build_create_full16(c, name16, nlen, disp, access,
+                                            share, create_options, NULL, NULL, 0));
+    smb2c_wait(c);
+    smb2c_parse_create(c, out);
+    return out->status;
+} /* smb2_create_raw16 */
+
 /* ---- CREATE with durable-handle contexts -------------------------------- */
 
 /* Non-blocking CREATE carrying an oplock/lease request and/or the durable
@@ -2801,6 +2848,32 @@ smb2_create_dur_post(
     smb2c_send(c, smb2c_build_create_full(c, name, disp, access, share,
                                           create_options, req, ctxs, n));
 } /* smb2_create_dur_post */
+
+/* Blocking durable-reconnect CREATE from an already-encoded UTF-16LE name, so a
+ * reconnect probe can send an embedded NUL in the (normally ignored) name. */
+static inline uint32_t
+smb2_create_dur_raw16(
+    struct smb2_conn              *c,
+    const uint8_t                 *name16,
+    int                            nlen,
+    uint32_t                       disp,
+    uint32_t                       access,
+    uint32_t                       share,
+    const struct smb2_oplock_req  *req,
+    const struct smb2_durable_req *dur,
+    struct smb2_create_out        *out)
+{
+    struct smb2_cctx ctxs[4];
+    uint8_t          buf[100];
+    int              n = smb2c_durable_contexts(dur, buf, ctxs);
+
+    smb2c_send(c, smb2c_build_create_full16(c, name16, nlen, disp, access, share,
+                                            MBT_FILE_NON_DIRECTORY_FILE, req,
+                                            ctxs, n));
+    smb2c_wait(c);
+    smb2c_parse_create(c, out);
+    return out->status;
+} /* smb2_create_dur_raw16 */
 
 /* Blocking CREATE with durable contexts and explicit CreateOptions. */
 static inline uint32_t
@@ -3003,6 +3076,7 @@ smb2_lock(
 #define SMB2_FILE_STANDARD_INFO_T     0x05
 #define SMB2_FILE_INTERNAL_INFO_T     0x06
 #define SMB2_FILE_RENAME_INFO_T       0x0A
+#define SMB2_FILE_LINK_INFO_T         0x0B
 #define SMB2_FILE_DISPOSITION_T       0x0D
 #define SMB2_FILE_ENDOFFILE_INFO_T    0x14
 #define SMB2_FILE_ALL_INFO_T          0x12
@@ -3126,6 +3200,70 @@ smb2_rename(
     return smb2_set_info(c, SMB2_INFO_FILE_T, SMB2_FILE_RENAME_INFO_T,
                          file_id, buf, (uint32_t) (20 + nlen));
 } /* smb2_rename */
+
+/* FILE_RENAME_INFORMATION / FILE_LINK_INFORMATION share one wire layout; both
+ * parse through the same server path.  info_class selects rename (0x0A) vs hard
+ * link (0x0B).  The name is an already-encoded UTF-16LE run, so a probe can put
+ * an embedded NUL or any component separator on the wire. */
+static inline uint32_t
+smb2_set_namepath_raw16(
+    struct smb2_conn *c,
+    uint8_t           info_class,
+    const uint8_t     file_id[16],
+    const uint8_t    *name16,
+    int               nlen,
+    int               replace_if_exists)
+{
+    uint8_t buf[20 + 2 * SMB2C_NAME_MAX];
+
+    memset(buf, 0, 20);
+    buf[0] = (uint8_t) (replace_if_exists ? 1 : 0);
+    p64(buf, 8, 0);                    /* RootDirectory */
+    p32(buf, 16, (uint32_t) nlen);     /* FileNameLength */
+    if (nlen > 0) {
+        memcpy(buf + 20, name16, nlen);
+    }
+    return smb2_set_info(c, SMB2_INFO_FILE_T, info_class,
+                         file_id, buf, (uint32_t) (20 + nlen));
+} /* smb2_set_namepath_raw16 */
+
+static inline uint32_t
+smb2_rename_raw16(
+    struct smb2_conn *c,
+    const uint8_t     file_id[16],
+    const uint8_t    *name16,
+    int               nlen,
+    int               replace_if_exists)
+{
+    return smb2_set_namepath_raw16(c, SMB2_FILE_RENAME_INFO_T, file_id,
+                                   name16, nlen, replace_if_exists);
+} /* smb2_rename_raw16 */
+
+static inline uint32_t
+smb2_link_raw16(
+    struct smb2_conn *c,
+    const uint8_t     file_id[16],
+    const uint8_t    *name16,
+    int               nlen,
+    int               replace_if_exists)
+{
+    return smb2_set_namepath_raw16(c, SMB2_FILE_LINK_INFO_T, file_id,
+                                   name16, nlen, replace_if_exists);
+} /* smb2_link_raw16 */
+
+/* Hard link (FILE_LINK_INFORMATION) to an ASCII name. */
+static inline uint32_t
+smb2_link(
+    struct smb2_conn *c,
+    const uint8_t     file_id[16],
+    const char       *new_name,
+    int               replace_if_exists)
+{
+    uint8_t name16[2 * SMB2C_NAME_MAX];
+    int     nlen = utf16le(new_name, name16);
+
+    return smb2_link_raw16(c, file_id, name16, nlen, replace_if_exists);
+} /* smb2_link */
 
 /* FILE_DISPOSITION_INFORMATION (MS-FSCC 2.4.11): a single DeletePending byte.
  * This is the SMB spelling of "unlink on last close" -- there is no path-based

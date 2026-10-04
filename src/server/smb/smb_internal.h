@@ -561,6 +561,11 @@ struct chimera_smb_request {
             uint32_t                        create_options;
             uint16_t                        parent_path_len;
             uint16_t                        name_len;
+            /* Set by parse when the base name carries '/' or an embedded NUL;
+             * the dispatcher answers OBJECT_NAME_INVALID (after the ".." block,
+             * which keeps its own statuses), so even a durable reconnect is
+             * validated before it reaches the create path. */
+            uint8_t                         name_invalid;
             struct chimera_vfs_open_handle *parent_handle;
             struct chimera_smb_open_file   *r_open_file;
             struct chimera_smb_attrs        r_attrs;

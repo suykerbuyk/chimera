@@ -39,6 +39,20 @@ set_tests_properties(chimera/server/smb/mbt/smoke_probe_memfs PROPERTIES
     LABELS "functional;probe;smb_mbt;memfs"
     TIMEOUT 60)
 
+# Pin that a path component stays confined to its share: no separator, embedded
+# NUL, ".." component, or over-255-byte component in a CREATE, rename or
+# hard-link name, while ".", a 255-byte name and an empty name still work.
+add_executable(smb2_name_confinement_probe smb2_name_confinement_probe.c)
+target_include_directories(smb2_name_confinement_probe PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(smb2_name_confinement_probe chimera_server chimera_metrics)
+
+add_test(NAME chimera/server/smb/mbt/name_confinement_probe_memfs
+    COMMAND $<TARGET_FILE:smb2_name_confinement_probe>)
+set_tests_properties(chimera/server/smb/mbt/name_confinement_probe_memfs PROPERTIES
+    ENVIRONMENT "CHIMERA_MBT_ARTIFACTS=smb2_name_confinement_probe_memfs"
+    LABELS "functional;probe;smb_mbt;memfs"
+    TIMEOUT 90)
+
 # Hold a backend rename across TREE_DISCONNECT to exercise a completion after
 # the requesting tree has released its share.
 add_executable(smb2_rename_disconnect_probe smb2_rename_disconnect_probe.c)
