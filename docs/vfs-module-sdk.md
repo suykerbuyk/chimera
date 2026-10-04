@@ -118,6 +118,19 @@ module in `struct chimera_vfs_module`.  See `vfs_fh_magic.h`.
   modules are exempt: root is VFS-core plumbing and the NFS client
   backend is still entangled with the open cache.
 
+## Name validation
+
+A name a module receives through a `*_at` operation is a single path component:
+the VFS core refuses a protocol-supplied name that contains a path separator
+(`/`) or an embedded NUL, and refuses an exact `..` on the create-type operations
+(open-with-create, mkdir, mknod, symlink, link, and a rename target), before the
+request is dispatched.  A module therefore does not need to re-validate those,
+and must not rely on its own separator handling for share confinement.  A `.`,
+an empty name, and a lookup of `.`/`..` are still delivered, and remain the
+module's to interpret.  A multi-component path reaches a module only when it sets
+`CHIMERA_VFS_CAP_FS_PATH_OP`, and only from the core's own path procs and the
+POSIX/client dirfd layer, never from a protocol.
+
 ## Versioning
 
 The SDK contract is versioned by `CHIMERA_VFS_SDK_VERSION`

@@ -117,6 +117,13 @@ chimera_vfs_open_handle_retained(
  * If a module does not support path ops, the VFS core will resolve
  * path components one at a time using FH-relative operations.
  *
+ * A multi-component `name` reaches a backend ONLY from the VFS's own path procs
+ * and the POSIX/client dirfd layer (through the chimera_vfs_*_at_path twins); a
+ * protocol-supplied name is validated to a single component by the public
+ * chimera_vfs_*_at functions first.  A module that resolves separators itself
+ * must still not be relied on for share confinement -- the core refuses '/' and
+ * NUL in a protocol name regardless.
+ *
  * A module that sets CAP_FS_PATH_OP and does NOT set CAP_FS_RELATIVE_OP is
  * "path-only" (see chimera_vfs_module_is_path_only): it has no persistent file
  * handles.  Metadata ops are dispatched as a single path-relative op against the

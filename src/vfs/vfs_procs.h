@@ -97,6 +97,30 @@ chimera_vfs_rmfs(
     chimera_vfs_rmfs_callback_t    callback,
     void                          *private_data);
 
+/*
+ * Name-taking directory operations come in two forms.  The plain
+ * chimera_vfs_<op>_at functions take ONE path component as `name`: they refuse a
+ * `name` that contains a path separator ('/') or an embedded NUL with
+ * CHIMERA_VFS_EINVAL before any dispatch, and the create-type ones (open with
+ * CHIMERA_VFS_OPEN_CREATE, mkdir, mknod, symlink, link, and a rename target)
+ * additionally refuse an exact "..".  A "." is left to the backend, as is a
+ * lookup of "."/"..".  This is the second line of defence behind a protocol
+ * facade: a backend that resolves paths itself (linux/io_uring/snfs) must never
+ * be handed a separator it would walk outside the share.
+ *
+ * The chimera_vfs_<op>_at_path twins skip that check.  They are for the callers
+ * that legitimately pass a whole relative path to a path-resolving backend: the
+ * VFS's own path procs (chimera_vfs_open/mkdir/remove/rename/link/...) and the
+ * POSIX/client dirfd layer.  Do NOT pass a protocol-supplied name to a _path
+ * twin.
+ *
+ * Every call site of the checked functions can be listed with:
+ *   grep -rnE 'chimera_vfs_(lookup_at|open_at|open_at_hs|mkdir_at|mknod_at|\
+ *     symlink_at|remove_at|remove_at_match_fh|rename_at|link_at)[[:space:]]*\(' src \
+ *   | grep -vE '^[^:]+:[0-9]+:(chimera_vfs_|[[:space:]]*(\*|/\*|//))'
+ * which finds 143 sites at the time of writing; a new one must be classified as
+ * single-component (keep the checked call) or whole-path (move to a _path twin).
+ */
 typedef void (*chimera_vfs_lookup_at_callback_t)(
     enum chimera_vfs_error    error_code,
     struct chimera_vfs_attrs *attr,
