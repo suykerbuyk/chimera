@@ -8,18 +8,19 @@ SPDX-License-Identifier: LicenseRef-Quantum-Proprietary
 
 | | |
 |---|---|
-| Status | Draft 0.1. Not yet reviewed. |
+| Status | Draft 0.2. Not yet reviewed. |
 | Date | 2026-10-03 |
 | Owner | John Suykerbuyk |
-| Companion | [Product requirements](prd.md) (draft 0.2) |
-| Read against | `develop` @ `59ee7a98` |
+| Companion | [Product requirements](prd.md) (draft 0.3) |
+| Read against | `develop` @ `22f6b54f`, with the PRD and contract changes of 2026-10-03 not yet committed |
 
-This document specifies the contract between Chimera and its backend object
-store. The ownership boundary it formalises is PRD
+This document specifies the contract between Chimera and its backend: an
+object-level storage facade that we design and build ourselves, not a
+third-party object store. The ownership boundary it formalises is PRD
 [section 4](prd.md#4-layer-responsibilities). It also settles the items PRD
 [section 12](prd.md#12-open-questions) defers to this spec. Each decision
 (`D1`…`D13`) names the PRD requirement or question it serves. Each open issue
-(`O1`…`O14`) names the PRD question it depends on, where there is one.
+(`O1`…`O15`) names the PRD question it depends on, where there is one.
 
 Statements about current code cite `path:line` at the commit above. They come
 from a read-only review: the code was read, not run.
@@ -44,21 +45,35 @@ In scope:
 Out of scope:
 
 - the backend's internal design: allocation, protection codes, spoke formats,
-  the policy engine;
+  the policy engine, media layout. We design it too, but outside this
+  contract. Section 3 states only the media assumption it starts from;
 - Chimera's protocol facades, except for the error mappings they owe.
 
-Every decision here is a proposal until review accepts it. Two decisions are
+Every decision here is a proposal until review accepts it. Five decisions are
 recorded from the operator:
 - D1 was decided on 2026-10-03 on the criterion of reaching the PRD
   objectives.
+- O1 was decided on 2026-10-03: the seal point is NFS close or COMMIT, SMB
+  close or flush, and S3 PUT or multipart completion, with close-to-open
+  consistency.
+- O2 was decided on 2026-10-03: S3 multipart uploads and SMB persistent
+  handles on continuously available shares are stored as namespace records,
+  alongside NFSv4 state.
+- O6 was decided on 2026-10-03: pool mode and name validation stay in
+  Chimera; verifying stored data is the backend's alone.
 - O8 was decided on 2026-10-03: S3 follows Ceph RGW's error conventions.
 
 ## 2. Terms
 
 - **Chimera**: the protocol facades, plus the VFS core that implements the
   namespace. It is the "Chimera" column of PRD section 4.
-- **Backend**: the object store that owns storage, durability, placement and
-  policy. It is the "Backend" column of PRD section 4.
+- **Backend**: our own storage facade behind this contract. We design and
+  build it; it is not a third-party object store. It owns storage,
+  durability, data verification, placement and policy. It is the "Backend"
+  column of PRD section 4.
+- **Media interface**: the backend's lower interface, below this contract:
+  linear 4K block addresses, possibly one address space per namespace
+  (section 3).
 - **Object**: a byte array with a backend-assigned identity (section 4.1).
 - **Namespace record**: a key/value record that Chimera writes and the backend
   stores without interpreting it (section 5.1).
@@ -78,13 +93,25 @@ recorded from the operator:
    \   |    |    |     /
     VFS core API (chimera_vfs_*)           namespace, authorisation, mutability,
            |                               claims, open cache        (Chimera)
-    namespace module  <-- this contract -->  backend object store     (Backend)
-           |                                   hub (hot tier) + spokes
+    namespace module  <-- this contract -->  backend facade, built by us  (Backend)
+           |                                   allocation, durability, verification,
+           |                                   tiers, placement
+           |                                       |  media interface: linear 4K block
+           |                                       v  addresses, possibly per namespace
+           |                                   media: prototype = loopback file >= 1 GB;
+           |                                   real hot hub not yet defined (O15)
     [dev/test and gateway modules: memfs, linux, io_uring, nfs, smb, cairn, ...]
 ```
 
-PRD section 4 does not cover cluster membership. This spec adds two rows,
-explained in D10. They are proposed for PRD section 4 as well.
+The contract stays at objects and metadata. The backend behind it is ours
+to build. It assumes media addressed as linear 4K blocks, possibly one
+address space per namespace. The first prototype facade runs on a loopback
+file of at least 1 GB. That prototype is not the hub: the real hot hub,
+both its backend design and its hardware, is not yet defined (O15).
+
+PRD section 4 did not cover cluster membership. This spec added two rows,
+explained in D10. They were proposed for PRD section 4 as well. **Applied
+2026-10-03 (operator): both rows are now in PRD section 4.**
 
 | Concern | Owner |
 |---|---|
@@ -250,6 +277,11 @@ Serves MUT-1, MUT-2, MUT-5, MUT-6, P7 and RCL-1.
 | Namespace records | Chimera | backend, hot tier | Chimera only (LAY-1, LAY-3) | directory entries, name→object bindings, NFSv4 ACLs (ACL-1), origin protocol (NS-3), protocol attributes, NFSv4 and SMB protocol state (HA-5) |
 | Object metadata | Backend | backend, hot tier | both; Chimera reads it | size, allocation map, state (section 4.2), placement or stub marker, protection class, retention lock, checksum, policy set, quota domains |
 
+Chimera reads the checksum for protocol use only, for example to return an
+S3 ETag or to compare it with a Content-MD5 header the client sent. Chimera
+does not verify stored data against it. Data verification is the backend's
+(D9).
+
 ### 5.2 Namespace transactions (D4)
 
 #### D4. Multi-key namespace transactions
@@ -283,7 +315,7 @@ All operations carry the caller's node identity and fencing epoch (D10).
 |---|---|---|
 | `obj_create(attrs)` | create an `open` object | object ID |
 | `obj_clone_working(sealed_id)` | D2 working version | new object ID; a recall ticket if stubbed; `RETENTION_LOCKED` if the sealed object is locked (D8) |
-| `obj_read(id, extent)` | read bytes | data, or `RECALL_PENDING`(ticket) (D6) |
+| `obj_read(id, extent)` | read bytes | data, or `RECALL_PENDING`(ticket) (D6), or `DATA_UNRECOVERABLE` (D9) |
 | `obj_write(id, extent, data, level)` | write into an `open` object; `level` ∈ {buffered, durable} | bytes written, achieved level, durability epoch (D5) |
 | `obj_flush(id, extent?)` | make prior buffered writes durable | durability epoch |
 | `obj_truncate`, `obj_allocate`, `obj_punch` | size and space changes on an `open` object | as `obj_write` |
@@ -554,6 +586,13 @@ PRD section 12 defers to this spec.
   affected objects fail with `KEY_UNAVAILABLE`. Chimera maps that to a
   protocol access error, not to data corruption. Key supply and withdrawal are
   O3.
+- **Data verification** belongs to the backend alone (O6, decided): checking
+  the integrity of stored data across tiers, capacities and media, repairing
+  it from protection where it can, and the tools that do this. Chimera
+  consumes storage and does not verify it. The backend never returns data
+  that failed verification. If the data cannot be recovered, the operation
+  fails with `DATA_UNRECOVERABLE`, and Chimera maps that to the protocol's
+  I/O error (section 11).
 
 ## 11. Quota (D13) and error obligations
 
@@ -605,7 +644,17 @@ The required mappings:
 | `RECALL_PENDING` | `NFS3ERR_JUKEBOX` | `NFS4ERR_DELAY` | interim `STATUS_PENDING`, then the protocol timeout error | GET: 403 `InvalidObjectState`, and the recall starts. RestoreObject: 202, or 200 if already resident (D6) |
 | `RETENTION_LOCKED` | `NFS3ERR_ACCES` | `NFS4ERR_ACCESS` | `STATUS_ACCESS_DENIED` | 403 `AccessDenied` |
 | `KEY_UNAVAILABLE` | `NFS3ERR_ACCES` | `NFS4ERR_ACCESS` | `STATUS_ACCESS_DENIED` | 403 `AccessDenied` |
+| `DATA_UNRECOVERABLE` | `NFS3ERR_IO` | `NFS4ERR_IO` | `STATUS_DATA_ERROR` | 500 `InternalError` |
 | cross-device rename (D7) | `NFS3ERR_XDEV` | `NFS4ERR_XDEV` | `STATUS_NOT_SAME_DEVICE` | n/a |
+
+`DATA_UNRECOVERABLE` means the backend found data that failed verification
+and could not repair it (D9). The mappings are each protocol's standard
+hard I/O error. NFS has only `NFS3ERR_IO` and `NFS4ERR_IO` for this. For SMB,
+`STATUS_DATA_ERROR` reports a failed read of data; `STATUS_FILE_CORRUPT_ERROR`
+was not chosen, because it tells clients the file system structure is
+damaged and points them at a disk check. S3 has no standard data-integrity
+error, so it returns 500 `InternalError`, which clients treat as a server
+fault. FUSE returns `EIO`.
 
 ## 12. Versioning, capabilities and conformance
 
@@ -648,16 +697,17 @@ Serves P1, SUC-1 and Q-SUC-2.
 
 | ID | Issue | PRD link |
 |---|---|---|
-| O1 | Seal point: the event at which an origin protocol's working version becomes visible to other protocols (D3). Candidates: NFS close or COMMIT, SMB close or flush, S3 PUT or multipart completion. | Q-MUT-2 |
-| O2 | Which protocol state besides NFSv4 must be stored as namespace records: SMB durable or persistent handles, S3 multipart uploads. | Q-HA-2 |
+| O1 | **Decided 2026-10-03 (operator): the seal point (D3) is NFS close or COMMIT, SMB close or flush, and S3 PUT or multipart completion, with close-to-open consistency.** A reader that already has the object open is not guaranteed to see the change. | MUT-5 |
+| O2 | **Decided 2026-10-03 (operator): besides NFSv4 state, S3 multipart uploads and SMB persistent handles on continuously available shares are stored as namespace records.** No other protocol state is required to survive failover in the first release. | HA-5 |
 | O3 | Key supply and withdrawal; crypto-erase; fit with tape-drive encryption. | Q-SEC-2 |
-| O4 | Whether RDMA fabric clients do data I/O directly against backend objects, bypassing Chimera's data path. | Q-CUS-3 |
-| O5 | Whether stub, recall and spoke operations are mandatory in contract version 1. This draft recommends yes. | Q-CUS-2 |
-| O6 | Pool mode and name validation stay in Chimera. To confirm with the mode default and conversion answers. | Q-MODE-1, Q-MODE-2 |
+| O4 | Whether RDMA fabric clients do data I/O directly against backend objects, bypassing Chimera's data path. | PROTO-1 |
+| O5 | Whether stub, recall and spoke operations are mandatory in contract version 1. This draft recommends yes. | section 2.1, TIER-1 |
+| O6 | **Decided 2026-10-03 (operator): pool mode and name validation stay in Chimera; verifying stored data is the backend's alone.** Chimera requests what the pool mode needs from the backend, and the backend obliges; it does not decide. Data verification, meaning the integrity of stored data across tiers, capacities and media and the tools that check it, belongs to the backend: Chimera only consumes storage and knows none of those. Pools default to multi-protocol, and a native pool cannot be converted to multi-protocol in the first release. | MODE-1, MODE-3, MODE-4, section 4 |
 | O7 | How the conformance suite (D12) is gated alongside the protocol suites. | Q-SUC-2 |
 | O8 | **Decided 2026-10-03 (operator): follow Ceph RGW's S3 conventions.** S3 has no AWS-standard error for quota or for out-of-space, so the product uses the codes Ceph RGW returns. Source: the S3 table `rgw_http_s3_errors` in `src/rgw/rgw_common.cc` of ceph/ceph at commit `4b394111370385015fb957c91fcbdca88dddbfce` (main, read 2026-10-03), lines 46-146. `QUOTA_EXCEEDED` maps to 403 `QuotaExceeded` (line 91, `ERR_QUOTA_EXCEEDED`). `NO_SPACE` maps to 507 `InsufficientCapacity` (lines 140-141, `EDQUOT` and `ENOSPC`). Ceph's Swift table maps quota to 413 (line 157), and that does not apply to S3. Recall is not part of O8: it uses AWS's standard archived-object surface (D6). | P7 |
 | O13 | A retention lock that policy applies while a working version is outstanding (D8). Refusing the later seal would break the rule that a client is never told its writes succeeded and then refused. Recommended default: the seal is allowed, the locked sealed version is kept, because the lock pins it from garbage collection, and the new version inherits the lock. To be confirmed against the WORM semantics customers expect. | none yet |
 | O14 | Chimera cluster manager: membership protocol, failure detection, client address takeover, and its interaction with protocol grace periods (D10). No such component exists today (`src/server/server.c:471-473` is the only multi-instance provision). Recommended default: the cluster manager declares nodes dead, but never moves clients until `fence` returns or the epoch lease expires. | HA-1 to HA-5; Q-HA-2 |
+| O15 | The real hot hub is not yet defined: its backend design and its hardware. The first prototype facade runs on a loopback file of at least 1 GB of linear 4K blocks, and it is not the hub. Also open: whether the media interface is one address space per namespace. | HA-6, TIER-1 |
 | O9 | Quota default mode (strict or escrow) and escrow chunk size. | none yet |
 | O10 | Cost of the first partial write to a large sealed object: a metadata-only clone on the hub, but a full recall first if stubbed (D2, D3). | none yet |
 | O11 | Hard links: one object referenced by several bindings, against whole-object reference counting and D2 working versions. Which bindings see a working version? | none yet |

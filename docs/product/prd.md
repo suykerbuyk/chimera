@@ -8,10 +8,10 @@ SPDX-License-Identifier: LicenseRef-Quantum-Proprietary
 
 | | |
 |---|---|
-| Status | Draft 0.2. Not yet reviewed. |
+| Status | Draft 0.3. Not yet reviewed. |
 | Date | 2026-10-03 |
 | Owner | John Suykerbuyk |
-| Companion spec | Backend storage contract (to be written; depends on this document) |
+| Companion spec | [Backend storage contract](storage-contract.md) (draft 0.2) |
 
 This document states what the product must be to succeed. It is the
 reference that implementation decisions answer to. Where a requirement is
@@ -27,12 +27,9 @@ withdrawn, and its ID is not reused.
 
 The customer for this document is Quantum senior management.
 
-Myriad was built for a niche industry (Media and Entertainment) on the
-expectation that its user base would grow from there. It did not grow
-beyond that niche. Throughout, tape has continued to fund the company and
-enable sales. This product is the next-generation answer. It does not
-repeat Myriad's approach. It is built on the tape and archive business
-Quantum already has.
+Tape has continued to fund the company and enable sales. This product is
+Quantum's next-generation storage product, a product in its own right. It
+is built on the tape and archive business Quantum already has.
 
 The target market for the hot tier is neo-cloud providers: AI service
 providers serving open models, who need very fast storage reached over RDMA
@@ -43,12 +40,20 @@ delivered as storage.
 
 ## 2. Product vision
 
-One product, one administrative pane, covering the full data lifecycle:
-from the hottest tier (NVMe reached over RDMA, serving AI workloads) down to
-the coldest tier (glacier-class tape archive).
+One product, one administrative pane, covering the full data lifecycle.
+
+The hottest tier (NVMe reached over RDMA, serving AI workloads) is a hub
+with many spokes. Some spokes face clients: the network protocols and RDMA
+fabrics through which applications reach the data. Other spokes face
+lower-cost storage tiers: SSD, HDD, glacier-class tape archive and cloud
+object stores. The hub works like a railroad switch yard: it is either
+taking data on, from clients or from lower-cost tiers, or sending data on
+its way to its destination. Data lifecycle is not a one-dimensional
+timeline on which data slides from hot to cold. Data arrives at the hub and
+departs from it, in whichever direction policy sends it.
 
 - Data lands once, through whichever protocol the application uses: NFS,
-  SMB, S3, FUSE, or an RDMA fabric protocol.
+  SMB, S3, FUSE, or an RDMA fabric protocol (PROTO-1).
 - The same data is visible through the other protocols.
 - Administrator policy decides where data lives. Users and applications see
   only the namespace.
@@ -66,11 +71,23 @@ The chartered roadmap is a simplified, two-node version of ActiveScale that
 scales horizontally. It defers the tape tie-in to a later release.
 
 This document takes a different position on one point. Tape need not ship
-in the first release, but the architecture must define how the hot tier
-connects to colder storage, tape included, from the start. Adding that
-connection later would mean redesigning the hot tier around it. This is a
-decision for senior management, recorded as
-[Q-CUS-2](#12-open-questions).
+in the first release, but the architecture must define the hub's
+tier-facing spokes, tape among them, from the start. Adding them later
+would mean redesigning the hub around them. This deviation from the
+chartered roadmap still needs senior-management sign-off.
+
+### 2.2 Protocols at first ship
+
+- **PROTO-1.** NFS over RDMA is the only RDMA fabric protocol at first
+  ship. Other fabric protocols (for example, S3 over RDMA or NVMe-oF) may
+  follow in later releases.
+- **PROTO-2.** NFSv4.1 parallel NFS (pNFS) is not in the first release
+  (see [section 11](#11-non-goals)). It is a design constraint: nothing in
+  the design may preclude flex-files pNFS later. Its data servers would be
+  Chimera nodes, so client I/O stays behind the backend facade. The block
+  and SCSI layouts are excluded outright, because they give clients direct
+  access to the storage and so bypass the backend facade that owns
+  allocation and verification (LAY-4; storage contract O4).
 
 ## 3. Principles
 
@@ -100,7 +117,7 @@ follows.
   specifications. Compatibility between protocols is something the
   administrator chooses to add on top (section 6). It never weakens the
   compliance of a single protocol.
-- **P8. Hub and spoke, not a chain.** The hot tier is the hub. Colder
+- **P8. Hub and spoke, not a chain.** The hot tier is the hub. Lower-cost
   storage (HDD, tape, cloud) is reached directly from the hub, not through
   a chain of intermediate tiers. The backend moves data out to the spokes
   and brings it back as policy dictates.
@@ -115,9 +132,12 @@ When a design decision is unclear, ask which layer owns the concern.
 | Wire protocols (NFS, SMB, S3, FUSE, RDMA fabric protocols) and their standards compliance | Chimera |
 | The namespace: names, directories, positional relationships between objects | Chimera (stored as metadata in the backend hot tier) |
 | Mapping protocol permissions onto canonical NFSv4 ACLs; identity mapping | Chimera |
-| Cross-protocol compatibility mode and its enforcement (section 6) | Chimera |
+| Cross-protocol compatibility mode and its enforcement (section 6) | Chimera (it requests what the mode needs from the backend; the backend obliges and does not decide) |
 | Telling the backend that an object was created, replaced or deleted | Chimera |
+| Declaring a node dead; moving its clients to surviving nodes (address takeover, protocol grace and reclaim) | Chimera, through its cluster manager ([storage contract](storage-contract.md) O14) |
 | Object storage, allocation mapping, durability and data protection | Backend |
+| Verifying stored data: its integrity across tiers and media, and the tools that check it | Backend |
+| Issuing, expiring and revoking node fencing epochs on the backend's store | Backend |
 | Placement, migration between hub and spokes, recall, hot-copy retention | Backend |
 | Snapshots, retention, immutability (WORM) | Backend |
 | Garbage collection of unreferenced objects | Backend |
@@ -134,6 +154,14 @@ When a design decision is unclear, ask which layer owns the concern.
   replace, delete) and the backend acts on them.
 - **LAY-3.** The backend never interprets a protocol's semantics. It stores
   objects and metadata and enforces the policies set on them.
+- **LAY-4.** The backend is our own facade, which we design and build. It
+  is not a third-party object store. The boundary between Chimera and the
+  backend stays at objects and metadata, and the table above is unchanged.
+  Below that boundary, the backend assumes media addressed as linear 4K
+  blocks, possibly one address space per namespace. The first prototype
+  facade runs on a loopback file of at least 1 GB. The real hot hub, both
+  its backend design and its hardware, is not yet defined. The prototype is
+  not the hub.
 
 ## 5. Namespace and cross-protocol visibility
 
@@ -167,6 +195,10 @@ When a design decision is unclear, ask which layer owns the concern.
 - **MODE-2.** Within each protocol, both modes comply fully with that
   protocol's standards (P7). Multi-protocol mode only refuses requests
   that the standard allows a server to refuse.
+- **MODE-3.** A pool created without an explicit mode is multi-protocol.
+- **MODE-4.** A native pool cannot be converted to multi-protocol in the
+  first release. Conversion would need every existing name, permission and
+  attribute checked first.
 
 ### 6.2 Mutability
 
@@ -181,13 +213,14 @@ When a design decision is unclear, ask which layer owns the concern.
 - **MUT-4.** The mutability rule is enforced inside Chimera, below the
   individual protocol facades, so a new or changed facade cannot bypass it.
   (Proposed. It needs confirmation.)
-- **MUT-5.** Read-only consumers see current data. When the origin protocol
-  completes a change (an S3 PUT completes; an NFS or SMB writer closes or
-  flushes), every later open or read through any protocol sees the new
-  data. Read caches that other protocols hand to clients (NFS delegations,
-  SMB leases and oplocks) are recalled before the change is reported
-  complete to the origin client. (Proposed. The exact consistency point per
-  protocol is [Q-MUT-2](#12-open-questions).)
+- **MUT-5.** Read-only consumers see current data, with close-to-open
+  consistency. A change through the origin protocol becomes visible to the
+  other protocols on NFS close or COMMIT, on SMB close or flush, and on S3
+  PUT or multipart upload completion. Every open through any protocol after
+  that point sees the new data. A reader that already has the object open
+  is not guaranteed to see the change. Read caches that other protocols
+  hand to clients (NFS delegations, SMB leases and oplocks) are recalled
+  before the change is reported complete to the origin client.
 - **MUT-6.** A whole-object replace is atomic for readers. A reader on any
   protocol sees either the old object or the new one in full, never a mix
   or a partly written object. (Proposed.)
@@ -215,8 +248,8 @@ When a design decision is unclear, ask which layer owns the concern.
 
 ## 8. Security
 
-The product holds an organisation's whole data estate, from hot to
-archive, so one weak protocol endpoint exposes all of it. These
+The product holds an organisation's whole data estate, on every tier, so
+one weak protocol endpoint exposes all of it. These
 requirements set the baseline for first ship.
 
 - **SEC-1. Authenticated by default.** Every protocol authenticates its
@@ -224,7 +257,8 @@ requirements set the baseline for first ship.
   on for a specific share, export or bucket.
 - **SEC-2. Default deny.** A new share, export or bucket grants no access
   until an administrator configures it. NFS exports squash root by default
-  and can be restricted to listed client addresses.
+  and can be restricted to listed client addresses. An export whose client
+  address list is empty allows no clients.
 - **SEC-3. Fail closed.** A request naming a share, export, bucket or file
   handle that does not exist, or no longer exists, is rejected. It is never
   served with default permissions.
@@ -241,8 +275,8 @@ requirements set the baseline for first ship.
   for the administrative API. The administrative API always requires
   authentication.
 - **SEC-7. Safe shipped defaults.** The default configuration shipped with
-  the product meets SEC-1 to SEC-6. Any example configuration that does not
-  is marked as test-only and is not installed as the default.
+  the product meets SEC-1 to SEC-6 and SEC-11. Any example configuration
+  that does not is marked as test-only and is not installed as the default.
 - **SEC-8. Audit.** Administrative actions are logged with who, what and
   when. Data access is not audited in the first release. How long audit
   logs are kept is an administrator policy, in the manner of logrotate or
@@ -257,6 +291,10 @@ requirements set the baseline for first ship.
   practice for multi-protocol NAS: Active Directory and Kerberos for SMB and
   NFSv4, LDAP for POSIX identity mapping, and S3 access keys bound to those
   same directory identities. (Proposed. See [Q-SEC-1](#12-open-questions).)
+- **SEC-11. Administrative authorisation.** Every administrative action,
+  through the REST control plane or the administrative pane, is authorised
+  per action against the identity that requests it. Authentication alone
+  (SEC-6) is not enough to perform an action.
 
 ## 9. Data lifecycle, stubs and recall
 
@@ -265,8 +303,12 @@ stated here because it shapes what the protocols promise to clients.
 
 ### 9.1 Hub and spokes
 
-- **TIER-1.** The hot tier (NVMe) is the hub. The spokes are colder storage:
-  SSD, HDD, glacier-class archive (tape first), and cloud object stores.
+- **TIER-1.** The hot tier (NVMe) is the hub. Client-facing spokes are the
+  protocols and RDMA fabrics through which clients reach the data.
+  Tier-facing spokes lead to lower-cost storage: SSD, HDD, glacier-class
+  archive (tape first), and cloud object stores. Only tier-facing spokes
+  hold data, so wherever this document says a spoke holds data, it means a
+  tier-facing spoke.
 - **TIER-2.** The hot tier records every allocated byte across every
   network transaction. It holds the metadata of every object regardless of
   where the object's data is stored (P2).
@@ -328,9 +370,16 @@ stated here because it shapes what the protocols promise to clients.
   tier at all times (active/active).
 - **HA-5.** NFSv4 client state (opens, locks, delegations) survives the
   loss of a node. This is the most critical protocol state for the first
-  release. Other protocols' state is [Q-HA-2](#12-open-questions).
-- **HA-6.** Each node carries at least 16 NVMe drives of 15 TB in the hot
-  tier. (The hot-tier hardware is still being defined.)
+  release. S3 multipart uploads in progress also survive, as do SMB
+  persistent handles, on continuously available shares only. No other
+  protocol state is required to survive in the first release. The
+  acceptable failover time is [Q-HA-2](#12-open-questions).
+- **HA-6.** A design constraint, not a delivered requirement. The hardware
+  arrives long after the software stack is proven, so the software is
+  built and tested without it. The hardware concept is a node carrying at
+  least 16 NVMe drives of 15 TB in the hot tier. The software must not
+  design itself out of that concept, so that hardware integration does not
+  break it. (The hot-tier hardware is still being defined.)
 
 ### Success measure
 
@@ -341,6 +390,14 @@ optimisation after that.
 - **SUC-1.** Each advertised protocol passes its industry compliance test
   suites in full, run against the product's shipping configuration, with
   no data corruption.
+- **SUC-2.** The suites for SUC-1 are: pynfs and cthon for NFS,
+  smbtorture for SMB, the Ceph S3 tests for S3, and pjdfstest for POSIX
+  behaviour through FUSE. S3 is also load and stress tested with MinIO
+  warp, which is a benchmark tool, not a conformance suite. NFS over RDMA
+  (PROTO-1) is verified over a real NFS-over-RDMA mount; the suites for it
+  are chosen when that testing starts. Which tests in each suite make up a
+  full run is still to be listed. (Provisional. To be
+  revisited; see [Q-SUC-2](#12-open-questions).)
 
 ## 11. Non-goals
 
@@ -354,33 +411,15 @@ an omission.
 - Optimising recall time (RCL-4 requires only that the design allows it).
 - Single-node production deployment. Single-node remains supported for
   development and test.
+- Converting a native pool to multi-protocol (MODE-4).
+- RDMA fabric protocols other than NFS over RDMA (PROTO-1).
+- NFSv4.1 parallel NFS (pNFS). Flex-files pNFS must stay possible later;
+  block and SCSI layouts are excluded (PROTO-2).
 
 ## 12. Open questions
 
 Each question names the requirement it blocks. Resolved questions move into
 the requirement text, and the question is deleted.
-
-**Customer and scope**
-
-- **Q-CUS-1.** What lessons from Myriad should become requirements here?
-  Not yet known.
-- **Q-CUS-2.** Does senior management accept that the hot-tier
-  architecture must define its connection to tape and other spokes from
-  the first release, even though the roadmap ships tape later (section
-  2.1)?
-- **Q-CUS-3.** Which RDMA fabric protocols does the hot tier serve at first
-  ship (for example, NFS over RDMA, S3 over RDMA, NVMe-oF)?
-
-**Namespace and compatibility**
-
-- **Q-MODE-1.** Which mode is the default when an administrator creates a
-  pool without choosing?
-- **Q-MODE-2.** Can a native pool later be converted to multi-protocol? It
-  would need every existing name, permission and attribute checked first.
-- **Q-MUT-2.** At what point is an origin protocol's change visible to the
-  others (MUT-5)? Candidates: on NFS close or COMMIT, on SMB close or flush,
-  on S3 PUT or multipart completion. Is close-to-open consistency enough,
-  or do readers that already have the file open need to see the change?
 
 **Security**
 
@@ -395,12 +434,9 @@ the requirement text, and the question is deleted.
 
 **Platform**
 
-- **Q-HA-2.** Which other protocol state must survive node failover (SMB
-  durable or persistent handles, S3 multipart uploads), and what failover
-  time is acceptable?
-- **Q-SUC-2.** Which test suites define "full, verified compliance" for each
-  protocol (SUC-1)? Candidates already in the repository include pynfs,
-  cthon, pjdfstest, smbtorture and the Ceph S3 tests.
+- **Q-HA-2.** What failover time is acceptable (HA-3, HA-5)?
+- **Q-SUC-2.** The suite list in SUC-2 is provisional and will be
+  revisited. Which tests in each suite make up a full run?
 
 **Deferred to the backend storage contract**
 
@@ -418,7 +454,7 @@ be confirmed.
 - Chimera has a versioned backend module API, the VFS module SDK
   (`src/vfs/sdk/`, documented in `docs/vfs-module-sdk.md`). It is shaped
   like a POSIX file system: file handles, lookup, readdir, setattr, read and
-  write. All protocol facades are built on it. It is not the object-store
+  write. All protocol facades are built on it. It is not the object-level
   contract that section 4 describes: Chimera's namespace and the backend's
   storage are not yet separated.
 - Several backends implement that API. The closest to the backend this
@@ -447,9 +483,12 @@ be confirmed.
 
 ## 14. Glossary
 
-- **Hub.** The hot tier. It is the system of record for all metadata.
-- **Spoke.** A colder storage target reached directly from the hub: SSD,
-  HDD, tape or cloud.
+- **Hub.** The hot tier. It is the system of record for all metadata, and
+  every spoke connects to it.
+- **Spoke.** A connection from the hub. A client-facing spoke is a protocol
+  or RDMA fabric through which clients reach the data. A tier-facing spoke
+  leads to lower-cost storage reached directly from the hub: SSD, HDD, tape
+  or cloud.
 - **Origin protocol.** The protocol through which an object was created. By
   default it is the only protocol that may change the object.
 - **Native pool.** A storage pool where each protocol accepts everything
@@ -461,8 +500,12 @@ be confirmed.
   it.
 - **Recall.** Bringing an object's data back from a spoke so it can be
   served.
-- **Facade.** A network protocol front end (NFS, SMB, S3, FUSE, RDMA fabric
-  protocols) over the shared namespace.
+- **Facade.** The word has two senses in this document:
+  - **Protocol facade.** A network protocol front end (NFS, SMB, S3, FUSE,
+    RDMA fabric protocols) over the shared namespace, inside Chimera.
+  - **Backend facade.** The backend behind the storage contract, which we
+    design and build ourselves (LAY-4). It owns storage, allocation,
+    durability and verification on the media below it.
 - **Neo-cloud provider.** An AI service provider serving open models, as
   distinct from the frontier labs that build their own models and data
   infrastructure.
