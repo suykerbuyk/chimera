@@ -109,6 +109,18 @@ if(NOT WIN32)
     target_link_libraries(vfs_attr_gate_test chimera_vfs chimera_vfs_memfs evpl)
     set_target_properties(vfs_attr_gate_test PROPERTIES ENABLE_EXPORTS ON)
     add_test(chimera/vfs/attr_gate_test vfs_attr_gate_test)
+
+    # The pathshim module (memfs + CAP_FS_PATH_OP) is found the same way, so it
+    # is Unix-only and ENABLE_EXPORTS too.  It reaches the VFS core whole-path
+    # branches that no backend can exercise unprivileged.
+    add_executable(vfs_pathop_test vfs_pathop_test.c)
+    target_link_libraries(vfs_pathop_test chimera_vfs chimera_vfs_memfs evpl)
+    set_target_properties(vfs_pathop_test PROPERTIES ENABLE_EXPORTS ON)
+    set(_pathop_saved_tier "${CHIMERA_TEST_TIER}")
+    set(CHIMERA_TEST_TIER quick)
+    add_test(chimera/vfs/pathop_shim vfs_pathop_test)
+    set_tests_properties(chimera/vfs/pathop_shim PROPERTIES TIMEOUT 30)
+    set(CHIMERA_TEST_TIER "${_pathop_saved_tier}")
 endif()
 
 add_executable(vfs_clone_range_test vfs_clone_range_test.c)

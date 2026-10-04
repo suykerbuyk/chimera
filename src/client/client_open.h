@@ -74,7 +74,7 @@ chimera_dispatch_open_at(
     struct chimera_client_request  *request)
 {
     /* set_attr (creation mode) is initialized by the caller. */
-    chimera_vfs_open_at(
+    chimera_vfs_open_at_path(
         thread->vfs_thread,
         chimera_client_req_cred(request),
         parent_handle,

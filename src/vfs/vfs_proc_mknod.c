@@ -49,7 +49,7 @@ chimera_vfs_mknod_parent_open_complete(
 
     request->mknod.parent_handle = oh;
 
-    chimera_vfs_mknod_at(
+    chimera_vfs_mknod_at_path(
         thread,
         request->cred,
         oh,

@@ -78,7 +78,7 @@ chimera_dispatch_mkdir_at(
     struct chimera_vfs_open_handle *parent_handle,
     struct chimera_client_request  *request)
 {
-    chimera_vfs_mkdir_at(
+    chimera_vfs_mkdir_at_path(
         thread->vfs_thread,
         chimera_client_req_cred(request),
         parent_handle,

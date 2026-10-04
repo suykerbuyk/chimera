@@ -536,8 +536,30 @@ chimera_vfs_remove_recall_lookup_complete(
  * the unlink.  When it is NOT supplied and a caching protocol is enabled, the
  * VFS resolves it first (above) so a cross-protocol holder is recalled before
  * the unlink. */
+/* Public entry: validates the name, then forwards to the _path variant. The check is added in a later change; today it only forwards. */
 SYMBOL_EXPORT void
 chimera_vfs_remove_at(
+    struct chimera_vfs_thread       *thread,
+    const struct chimera_vfs_cred   *cred,
+    struct chimera_vfs_open_handle  *handle,
+    const char                      *name,
+    int                              namelen,
+    const uint8_t                   *child_fh,
+    int                              child_fh_len,
+    unsigned int                     flags,
+    uint64_t                         pre_attr_mask,
+    uint64_t                         post_attr_mask,
+    const uint8_t                   *parent_lease_skip,
+    chimera_vfs_remove_at_callback_t callback,
+    void                            *private_data)
+{
+    chimera_vfs_remove_at_path(thread, cred, handle, name, namelen, child_fh,
+                               child_fh_len, flags, pre_attr_mask, post_attr_mask,
+                               parent_lease_skip, callback, private_data);
+} /* chimera_vfs_remove_at */
+
+SYMBOL_EXPORT void
+chimera_vfs_remove_at_path(
     struct chimera_vfs_thread       *thread,
     const struct chimera_vfs_cred   *cred,
     struct chimera_vfs_open_handle  *handle,
@@ -576,9 +598,9 @@ chimera_vfs_remove_at(
         ctx->private_data      = private_data;
         ctx->child_fh_len      = 0;
 
-        chimera_vfs_lookup_at(thread, cred, handle, name, namelen,
-                              CHIMERA_VFS_ATTR_FH, 0,
-                              chimera_vfs_remove_recall_lookup_complete, ctx);
+        chimera_vfs_lookup_at_path(thread, cred, handle, name, namelen,
+                                   CHIMERA_VFS_ATTR_FH, 0,
+                                   chimera_vfs_remove_recall_lookup_complete, ctx);
         return;
     }
 

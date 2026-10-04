@@ -298,7 +298,7 @@ chimera_vfs_open_parent_open_complete(
 
     request->open.parent_handle = oh;
 
-    chimera_vfs_open_at(
+    chimera_vfs_open_at_path(
         thread,
         request->cred,
         oh,

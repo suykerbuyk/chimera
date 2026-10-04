@@ -221,8 +221,34 @@ chimera_vfs_link_at_toolong(
     callback(status, NULL, NULL, NULL, arg);
 } /* chimera_vfs_link_at_toolong */
 
+/* Public entry: validates the name, then forwards to the _path variant. The check is added in a later change; today it only forwards. */
 SYMBOL_EXPORT void
 chimera_vfs_link_at(
+    struct chimera_vfs_thread      *thread,
+    const struct chimera_vfs_cred  *cred,
+    const void                     *fh,
+    int                             fhlen,
+    const void                     *dir_fh,
+    int                             dir_fhlen,
+    const char                     *name,
+    int                             namelen,
+    unsigned int                    replace,
+    uint64_t                        attr_mask,
+    uint64_t                        pre_attr_mask,
+    uint64_t                        post_attr_mask,
+    const uint8_t                  *parent_lease_skip,
+    struct chimera_vfs_open_handle *op_handle,
+    chimera_vfs_link_at_callback_t  callback,
+    void                           *private_data)
+{
+    chimera_vfs_link_at_path(thread, cred, fh, fhlen, dir_fh, dir_fhlen, name,
+                             namelen, replace, attr_mask, pre_attr_mask,
+                             post_attr_mask, parent_lease_skip, op_handle,
+                             callback, private_data);
+} /* chimera_vfs_link_at */
+
+SYMBOL_EXPORT void
+chimera_vfs_link_at_path(
     struct chimera_vfs_thread      *thread,
     const struct chimera_vfs_cred  *cred,
     const void                     *fh,

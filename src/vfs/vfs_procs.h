@@ -115,6 +115,19 @@ chimera_vfs_lookup_at(
     chimera_vfs_lookup_at_callback_t callback,
     void                            *private_data);
 
+/* Whole relative path or internal name; for the VFS's own path procs and the POSIX/client dirfd layer only. */
+void
+chimera_vfs_lookup_at_path(
+    struct chimera_vfs_thread       *vfs,
+    const struct chimera_vfs_cred   *cred,
+    struct chimera_vfs_open_handle  *handle,
+    const char                      *name,
+    uint32_t                         namelen,
+    uint64_t                         attr_mask,
+    uint64_t                         dir_attr_mask,
+    chimera_vfs_lookup_at_callback_t callback,
+    void                            *private_data);
+
 void
 chimera_vfs_lookup(
     struct chimera_vfs_thread     *vfs,
@@ -454,11 +467,44 @@ chimera_vfs_open_at(
     chimera_vfs_open_at_callback_t  callback,
     void                           *private_data);
 
+/* Whole relative path or internal name; for the VFS's own path procs and the POSIX/client dirfd layer only. */
+void
+chimera_vfs_open_at_path(
+    struct chimera_vfs_thread      *thread,
+    const struct chimera_vfs_cred  *cred,
+    struct chimera_vfs_open_handle *handle,
+    const char                     *name,
+    int                             namelen,
+    unsigned int                    flags,
+    struct chimera_vfs_attrs       *attr,
+    uint64_t                        attr_mask,
+    uint64_t                        pre_attr_mask,
+    uint64_t                        post_attr_mask,
+    chimera_vfs_open_at_callback_t  callback,
+    void                           *private_data);
+
 /* Variant that persists an opaque handle-state record atomically with the
  * open (backends advertising CHIMERA_VFS_CAP_ATOMIC_HANDLE_STATE); handle_state
  * may be NULL, in which case it behaves exactly like chimera_vfs_open_at. */
 void
 chimera_vfs_open_at_hs(
+    struct chimera_vfs_thread       *thread,
+    const struct chimera_vfs_cred   *cred,
+    struct chimera_vfs_open_handle  *handle,
+    const char                      *name,
+    int                              namelen,
+    unsigned int                     flags,
+    struct chimera_vfs_attrs        *attr,
+    uint64_t                         attr_mask,
+    uint64_t                         pre_attr_mask,
+    uint64_t                         post_attr_mask,
+    struct chimera_vfs_handle_state *handle_state,
+    chimera_vfs_open_at_callback_t   callback,
+    void                            *private_data);
+
+/* Whole relative path or internal name; for the VFS's own path procs and the POSIX/client dirfd layer only. */
+void
+chimera_vfs_open_at_hs_path(
     struct chimera_vfs_thread       *thread,
     const struct chimera_vfs_cred   *cred,
     struct chimera_vfs_open_handle  *handle,
@@ -546,6 +592,21 @@ chimera_vfs_mkdir_at(
     chimera_vfs_mkdir_at_callback_t callback,
     void                           *private_data);
 
+/* Whole relative path or internal name; for the VFS's own path procs and the POSIX/client dirfd layer only. */
+void
+chimera_vfs_mkdir_at_path(
+    struct chimera_vfs_thread      *thread,
+    const struct chimera_vfs_cred  *cred,
+    struct chimera_vfs_open_handle *handle,
+    const char                     *name,
+    int                             namelen,
+    struct chimera_vfs_attrs       *attr,
+    uint64_t                        attr_mask,
+    uint64_t                        pre_attr_mask,
+    uint64_t                        post_attr_mask,
+    chimera_vfs_mkdir_at_callback_t callback,
+    void                           *private_data);
+
 typedef void (*chimera_vfs_mknod_at_callback_t)(
     enum chimera_vfs_error    error_code,
     struct chimera_vfs_attrs *set_attr,
@@ -568,6 +629,21 @@ chimera_vfs_mknod_at(
     chimera_vfs_mknod_at_callback_t callback,
     void                           *private_data);
 
+/* Whole relative path or internal name; for the VFS's own path procs and the POSIX/client dirfd layer only. */
+void
+chimera_vfs_mknod_at_path(
+    struct chimera_vfs_thread      *thread,
+    const struct chimera_vfs_cred  *cred,
+    struct chimera_vfs_open_handle *handle,
+    const char                     *name,
+    int                             namelen,
+    struct chimera_vfs_attrs       *attr,
+    uint64_t                        attr_mask,
+    uint64_t                        pre_attr_mask,
+    uint64_t                        post_attr_mask,
+    chimera_vfs_mknod_at_callback_t callback,
+    void                           *private_data);
+
 typedef void (*chimera_vfs_remove_at_callback_t)(
     enum chimera_vfs_error    error_code,
     struct chimera_vfs_attrs *pre_attr,
@@ -576,6 +652,23 @@ typedef void (*chimera_vfs_remove_at_callback_t)(
 
 void
 chimera_vfs_remove_at(
+    struct chimera_vfs_thread       *thread,
+    const struct chimera_vfs_cred   *cred,
+    struct chimera_vfs_open_handle  *handle,
+    const char                      *name,
+    int                              namelen,
+    const uint8_t                   *child_fh,
+    int                              child_fh_len,
+    unsigned int                     flags,
+    uint64_t                         pre_attr_mask,
+    uint64_t                         post_attr_mask,
+    const uint8_t                   *parent_lease_skip,
+    chimera_vfs_remove_at_callback_t callback,
+    void                            *private_data);
+
+/* Whole relative path or internal name; for the VFS's own path procs and the POSIX/client dirfd layer only. */
+void
+chimera_vfs_remove_at_path(
     struct chimera_vfs_thread       *thread,
     const struct chimera_vfs_cred   *cred,
     struct chimera_vfs_open_handle  *handle,
@@ -784,6 +877,23 @@ chimera_vfs_symlink_at(
     chimera_vfs_symlink_at_callback_t callback,
     void                             *private_data);
 
+/* Whole relative path or internal name; for the VFS's own path procs and the POSIX/client dirfd layer only. */
+void
+chimera_vfs_symlink_at_path(
+    struct chimera_vfs_thread        *thread,
+    const struct chimera_vfs_cred    *cred,
+    struct chimera_vfs_open_handle   *handle,
+    const char                       *name,
+    int                               namelen,
+    const char                       *target,
+    int                               targetlen,
+    struct chimera_vfs_attrs         *set_attr,
+    uint64_t                          attr_mask,
+    uint64_t                          pre_attr_mask,
+    uint64_t                          post_attr_mask,
+    chimera_vfs_symlink_at_callback_t callback,
+    void                             *private_data);
+
 typedef void (*chimera_vfs_readlink_callback_t)(
     enum chimera_vfs_error    error_code,
     int                       targetlen,
@@ -837,6 +947,29 @@ chimera_vfs_rename_at(
     chimera_vfs_rename_at_callback_t callback,
     void                            *private_data);
 
+/* Whole relative path or internal name; for the VFS's own path procs and the POSIX/client dirfd layer only. */
+void
+chimera_vfs_rename_at_path(
+    struct chimera_vfs_thread       *thread,
+    const struct chimera_vfs_cred   *cred,
+    const void                      *fh,
+    int                              fhlen,
+    const char                      *name,
+    int                              namelen,
+    const void                      *new_fh,
+    int                              new_fhlen,
+    const char                      *new_name,
+    int                              new_namelen,
+    const uint8_t                   *target_fh,
+    int                              target_fh_len,
+    unsigned int                     flags,
+    uint64_t                         pre_attr_mask,
+    uint64_t                         post_attr_mask,
+    const uint8_t                   *parent_lease_skip,
+    struct chimera_vfs_open_handle  *op_handle,
+    chimera_vfs_rename_at_callback_t callback,
+    void                            *private_data);
+
 typedef void (*chimera_vfs_link_at_callback_t)(
     enum chimera_vfs_error    error_code,
     struct chimera_vfs_attrs *r_attr,
@@ -846,6 +979,26 @@ typedef void (*chimera_vfs_link_at_callback_t)(
 
 void
 chimera_vfs_link_at(
+    struct chimera_vfs_thread      *thread,
+    const struct chimera_vfs_cred  *cred,
+    const void                     *fh,
+    int                             fhlen,
+    const void                     *dir_fh,
+    int                             dir_fhlen,
+    const char                     *name,
+    int                             namelen,
+    unsigned int                    replace,
+    uint64_t                        attr_mask,
+    uint64_t                        pre_attr_mask,
+    uint64_t                        post_attr_mask,
+    const uint8_t                  *parent_lease_skip,
+    struct chimera_vfs_open_handle *op_handle,
+    chimera_vfs_link_at_callback_t  callback,
+    void                           *private_data);
+
+/* Whole relative path or internal name; for the VFS's own path procs and the POSIX/client dirfd layer only. */
+void
+chimera_vfs_link_at_path(
     struct chimera_vfs_thread      *thread,
     const struct chimera_vfs_cred  *cred,
     const void                     *fh,

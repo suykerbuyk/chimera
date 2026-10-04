@@ -92,7 +92,7 @@ chimera_posix_fchmodat_at_exec(
     ctx->set_attr.va_set_mask = 0;
 
     /* Open the target file relative to the parent directory */
-    chimera_vfs_open_at(
+    chimera_vfs_open_at_path(
         thread->vfs_thread,
         chimera_client_req_cred(request),
         request->setattr.parent_handle,

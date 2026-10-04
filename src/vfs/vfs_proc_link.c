@@ -89,7 +89,7 @@ chimera_vfs_link_source_lookup_fast_complete(
     request->link.source_fh_len = attr->va_fh_len;
 
     /* Dest parent FH and full path already set up; skip dest lookup */
-    chimera_vfs_link_at(
+    chimera_vfs_link_at_path(
         thread,
         request->cred,
         request->link.source_fh,

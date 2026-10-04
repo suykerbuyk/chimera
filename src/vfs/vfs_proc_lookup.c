@@ -106,7 +106,7 @@ chimera_vfs_lookup_pathonly_dotdot_complete(
         return;
     }
 
-    chimera_vfs_lookup_at(
+    chimera_vfs_lookup_at_path(
         thread,
         lp_request->cred,
         oh,
@@ -171,7 +171,7 @@ chimera_vfs_lookup_open_dispatch(
             return;
         }
 
-        chimera_vfs_lookup_at(
+        chimera_vfs_lookup_at_path(
             thread,
             lp_request->cred,
             oh,

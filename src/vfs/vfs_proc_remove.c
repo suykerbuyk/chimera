@@ -132,7 +132,7 @@ chimera_vfs_remove_child_lookup_complete(
         return;
     }
 
-    chimera_vfs_remove_at(
+    chimera_vfs_remove_at_path(
         thread,
         request->cred,
         request->remove.parent_handle,
@@ -172,7 +172,7 @@ chimera_vfs_remove_parent_open_complete(
      * deletes by path) -- skip the child lookup that yields nothing usable. */
     if (chimera_vfs_module_is_path_only(request->module)) {
         request->remove.child_fh_len = 0;
-        chimera_vfs_remove_at(
+        chimera_vfs_remove_at_path(
             thread,
             request->cred,
             oh,
@@ -189,7 +189,7 @@ chimera_vfs_remove_parent_open_complete(
         return;
     }
 
-    chimera_vfs_lookup_at(
+    chimera_vfs_lookup_at_path(
         thread,
         request->cred,
         oh,

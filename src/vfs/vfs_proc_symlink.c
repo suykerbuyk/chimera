@@ -48,7 +48,7 @@ chimera_vfs_symlink_parent_open_complete(
 
     request->symlink.parent_handle = oh;
 
-    chimera_vfs_symlink_at(
+    chimera_vfs_symlink_at_path(
         thread,
         request->cred,
         oh,

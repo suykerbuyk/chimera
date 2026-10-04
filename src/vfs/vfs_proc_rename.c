@@ -182,7 +182,7 @@ chimera_vfs_rename_fast_target_lookup_complete(
         return;
     }
 
-    chimera_vfs_rename_at(
+    chimera_vfs_rename_at_path(
         thread,
         request->cred,
         request->rename.old_parent_fh,
@@ -324,7 +324,7 @@ chimera_vfs_rename(
          * different mounts. */
         if (chimera_vfs_module_is_path_only(request->module)) {
             request->rename.target_fh_len = 0;
-            chimera_vfs_rename_at(
+            chimera_vfs_rename_at_path(
                 thread,
                 cred,
                 request->rename.old_parent_fh,
@@ -396,7 +396,7 @@ chimera_vfs_rename(
 
                 request->rename.target_fh_len = 0;
 
-                chimera_vfs_rename_at(
+                chimera_vfs_rename_at_path(
                     thread,
                     cred,
                     request->rename.old_parent_fh,

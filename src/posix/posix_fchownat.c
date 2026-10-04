@@ -94,7 +94,7 @@ chimera_posix_fchownat_at_exec(
     /* Note: ctx->set_attr was already initialized by chimera_posix_fchownat */
 
     /* Open the target file relative to the parent directory */
-    chimera_vfs_open_at(
+    chimera_vfs_open_at_path(
         thread->vfs_thread,
         chimera_client_req_cred(request),
         request->setattr.parent_handle,

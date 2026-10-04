@@ -704,8 +704,37 @@ chimera_vfs_rename_at_toolong(
     callback(status, NULL, NULL, NULL, NULL, arg);
 } /* chimera_vfs_rename_at_toolong */
 
+/* Public entry: validates the name, then forwards to the _path variant. The check is added in a later change; today it only forwards. */
 SYMBOL_EXPORT void
 chimera_vfs_rename_at(
+    struct chimera_vfs_thread       *thread,
+    const struct chimera_vfs_cred   *cred,
+    const void                      *fh,
+    int                              fhlen,
+    const char                      *name,
+    int                              namelen,
+    const void                      *new_fh,
+    int                              new_fhlen,
+    const char                      *new_name,
+    int                              new_namelen,
+    const uint8_t                   *target_fh,
+    int                              target_fh_len,
+    unsigned int                     flags,
+    uint64_t                         pre_attr_mask,
+    uint64_t                         post_attr_mask,
+    const uint8_t                   *parent_lease_skip,
+    struct chimera_vfs_open_handle  *op_handle,
+    chimera_vfs_rename_at_callback_t callback,
+    void                            *private_data)
+{
+    chimera_vfs_rename_at_path(thread, cred, fh, fhlen, name, namelen, new_fh,
+                               new_fhlen, new_name, new_namelen, target_fh,
+                               target_fh_len, flags, pre_attr_mask, post_attr_mask,
+                               parent_lease_skip, op_handle, callback, private_data);
+} /* chimera_vfs_rename_at */
+
+SYMBOL_EXPORT void
+chimera_vfs_rename_at_path(
     struct chimera_vfs_thread       *thread,
     const struct chimera_vfs_cred   *cred,
     const void                      *fh,

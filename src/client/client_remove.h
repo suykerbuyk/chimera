@@ -124,7 +124,7 @@ chimera_remove_at_lookup_complete(
     memcpy(request->remove.child_fh, attr->va_fh, attr->va_fh_len);
 
     /* Now call remove with the child FH */
-    chimera_vfs_remove_at(
+    chimera_vfs_remove_at_path(
         thread->vfs_thread,
         chimera_client_req_cred(request),
         request->remove.parent_handle,
@@ -152,7 +152,7 @@ chimera_dispatch_remove_at(
     /* First lookup the child to get its FH for silly rename optimization.
      * Use NOFOLLOW (0) because we want the FH of the symlink itself,
      * not the target it points to. */
-    chimera_vfs_lookup_at(
+    chimera_vfs_lookup_at_path(
         thread->vfs_thread,
         chimera_client_req_cred(request),
         parent_handle,
