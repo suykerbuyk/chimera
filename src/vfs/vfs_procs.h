@@ -118,7 +118,7 @@ chimera_vfs_rmfs(
  *   grep -rnE 'chimera_vfs_(lookup_at|open_at|open_at_hs|mkdir_at|mknod_at|\
  *     symlink_at|remove_at|remove_at_match_fh|rename_at|link_at)[[:space:]]*\(' src \
  *   | grep -vE '^[^:]+:[0-9]+:(chimera_vfs_|[[:space:]]*(\*|/\*|//))'
- * which finds 143 sites at the time of writing; a new one must be classified as
+ * which finds 135 sites at the time of writing; a new one must be classified as
  * single-component (keep the checked call) or whole-path (move to a _path twin).
  */
 typedef void (*chimera_vfs_lookup_at_callback_t)(

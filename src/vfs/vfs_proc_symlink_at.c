@@ -177,7 +177,7 @@ chimera_vfs_symlink_at_toolong(
     callback(status, NULL, NULL, NULL, arg);
 } /* chimera_vfs_symlink_at_toolong */
 
-/* Public entry: validates the name, then forwards to the _path variant. The check is added in a later change; today it only forwards. */
+/* Public entry: validates the name (see vfs_name.h), then forwards to the _path variant. */
 SYMBOL_EXPORT void
 chimera_vfs_symlink_at(
     struct chimera_vfs_thread        *thread,

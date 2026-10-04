@@ -129,12 +129,19 @@ endif()
 add_executable(vfs_name_component_test vfs_name_component_test.c)
 target_link_libraries(vfs_name_component_test chimera_vfs chimera_vfs_memfs
                       chimera_vfs_memkv evpl)
+target_link_libraries(vfs_name_component_test chimera_vfs_linux chimera_vfs_io_uring)
 set(_namecomp_saved_tier "${CHIMERA_TEST_TIER}")
 set(CHIMERA_TEST_TIER quick)
-add_test(NAME chimera/vfs/name_component_memfs
-    COMMAND vfs_name_component_test memfs)
-set_tests_properties(chimera/vfs/name_component_memfs PROPERTIES
-    SKIP_RETURN_CODE 77 TIMEOUT 30)
+# memfs always runs; the passthrough backends carry the same core check and run
+# where they can mount -- linux/io_uring need CAP_DAC_READ_SEARCH, so they SKIP
+# (77) unprivileged and run under qb.  diskfs/cairn need a device/pool config
+# this harness does not build, so they are left to the backend MBT suites.
+foreach(_nc_backend memfs linux io_uring)
+    add_test(NAME chimera/vfs/name_component_${_nc_backend}
+        COMMAND vfs_name_component_test ${_nc_backend})
+    set_tests_properties(chimera/vfs/name_component_${_nc_backend} PROPERTIES
+        SKIP_RETURN_CODE 77 TIMEOUT 30)
+endforeach()
 set(CHIMERA_TEST_TIER "${_namecomp_saved_tier}")
 
 add_executable(vfs_clone_range_test vfs_clone_range_test.c)

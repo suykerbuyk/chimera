@@ -154,6 +154,42 @@ symlink_cb(
     G.done   = 1;
 } /* symlink_cb */
 
+static void
+link_cb(
+    enum chimera_vfs_error    st,
+    struct chimera_vfs_attrs *a,
+    struct chimera_vfs_attrs *dp,
+    struct chimera_vfs_attrs *dq,
+    void                     *p)
+{
+    G.status = st;
+    G.done   = 1;
+} /* link_cb */
+
+static void
+rename_cb(
+    enum chimera_vfs_error    st,
+    struct chimera_vfs_attrs *a,
+    struct chimera_vfs_attrs *b,
+    struct chimera_vfs_attrs *c,
+    struct chimera_vfs_attrs *d,
+    void                     *p)
+{
+    G.status = st;
+    G.done   = 1;
+} /* rename_cb */
+
+static void
+remove_cb(
+    enum chimera_vfs_error    st,
+    struct chimera_vfs_attrs *pre,
+    struct chimera_vfs_attrs *post,
+    void                     *p)
+{
+    G.status = st;
+    G.done   = 1;
+} /* remove_cb */
+
 #define CHECK(cond, ...)                      \
         do {                                  \
             if (cond) {                       \
@@ -229,6 +265,63 @@ op_lookup_at(
     return G.status;
 } /* op_lookup_at */
 
+static enum chimera_vfs_error
+op_mknod_at(
+    const char *name,
+    int         namelen)
+{
+    struct chimera_vfs_attrs sattr;
+
+    memset(&sattr, 0, sizeof(sattr));
+    sattr.va_set_mask = CHIMERA_VFS_ATTR_MODE;
+    sattr.va_mode     = S_IFIFO | 0644;
+    chimera_vfs_mknod_at(G.t, &root, dir, name, namelen, &sattr,
+                         CHIMERA_VFS_ATTR_FH, 0, 0, mkdir_cb, NULL);
+    wait_done();
+    return G.status;
+} /* op_mknod_at */
+
+static uint8_t  src_fh[CHIMERA_VFS_FH_SIZE];   /* "okfile" fh, for link/rename */
+static uint32_t src_fh_len;
+
+static enum chimera_vfs_error
+op_link_at(
+    const char *name,
+    int         namelen)
+{
+    chimera_vfs_link_at(G.t, &root, src_fh, src_fh_len, dir->fh, dir->fh_len,
+                        name, namelen, 0, CHIMERA_VFS_ATTR_FH, 0, 0, NULL, NULL,
+                        link_cb, NULL);
+    wait_done();
+    return G.status;
+} /* op_link_at */
+
+static enum chimera_vfs_error
+op_rename_at(
+    const char *to_name,
+    int         to_namelen)
+{
+    /* Rename a dedicated throwaway source so a successful oracle rename does
+     * not consume "okfile" (which link/rename rows still need). */
+    chimera_vfs_rename_at(G.t, &root, dir->fh, dir->fh_len, "renme", 5,
+                          dir->fh, dir->fh_len, to_name, to_namelen, NULL, 0, 0,
+                          0, 0, NULL, NULL, rename_cb, NULL);
+    wait_done();
+    return G.status;
+} /* op_rename_at */
+
+static enum chimera_vfs_error
+op_remove_at(
+    const char  *name,
+    int          namelen,
+    unsigned int flags)
+{
+    chimera_vfs_remove_at(G.t, &root, dir, name, namelen, NULL, 0, flags, 0, 0,
+                          NULL, remove_cb, NULL);
+    wait_done();
+    return G.status;
+} /* op_remove_at */
+
 int
 main(
     int    argc,
@@ -258,17 +351,39 @@ main(
     vfs = chimera_vfs_init(0, 0, cfgs, 2, "memkv", 0, 0, 0, 0, metrics);
     G.t = chimera_vfs_thread_init(G.evpl, vfs);
 
-    chimera_vfs_mkfs(G.t, NULL, backend, "fs0", NULL, mnt_cb, NULL);
-    wait_done();
-    if (G.status != CHIMERA_VFS_OK) {
-        fprintf(stderr, "SKIP: backend %s cannot mkfs here (0x%x)\n", backend, G.status);
-        return SKIP_RC;
-    }
-    chimera_vfs_mount(G.t, NULL, "/test", backend, "fs0", NULL, mnt_cb, NULL);
-    wait_done();
-    if (G.status != CHIMERA_VFS_OK) {
-        fprintf(stderr, "SKIP: backend %s cannot mount here (0x%x)\n", backend, G.status);
-        return SKIP_RC;
+    /* memfs is a named filesystem (mkfs + mount by name).  The passthrough
+     * backends are mounted on a host directory instead, and only resolve file
+     * handles with CAP_DAC_READ_SEARCH -- so unprivileged they fail to mount and
+     * the test SKIPs (77), which is exactly the skip contract gate 7 runs them
+     * under privileged. */
+    if (strcmp(backend, "linux") == 0 || strcmp(backend, "io_uring") == 0) {
+        char  tmpl[]  = "/tmp/vfs_name_component.XXXXXX";
+        char *hostdir = mkdtemp(tmpl);
+
+        if (!hostdir) {
+            fprintf(stderr, "SKIP: backend %s: mkdtemp failed\n", backend);
+            _exit(SKIP_RC);
+        }
+        chimera_vfs_mount(G.t, NULL, "/test", backend, hostdir, NULL, mnt_cb, NULL);
+        wait_done();
+        if (G.status != CHIMERA_VFS_OK) {
+            fprintf(stderr, "SKIP: backend %s cannot mount %s here (0x%x) -- needs "
+                    "CAP_DAC_READ_SEARCH\n", backend, hostdir, G.status);
+            _exit(SKIP_RC);
+        }
+    } else {
+        chimera_vfs_mkfs(G.t, NULL, backend, "fs0", NULL, mnt_cb, NULL);
+        wait_done();
+        if (G.status != CHIMERA_VFS_OK) {
+            fprintf(stderr, "SKIP: backend %s cannot mkfs here (0x%x)\n", backend, G.status);
+            _exit(SKIP_RC);
+        }
+        chimera_vfs_mount(G.t, NULL, "/test", backend, "fs0", NULL, mnt_cb, NULL);
+        wait_done();
+        if (G.status != CHIMERA_VFS_OK) {
+            fprintf(stderr, "SKIP: backend %s cannot mount here (0x%x)\n", backend, G.status);
+            _exit(SKIP_RC);
+        }
     }
 
     chimera_vfs_get_root_fh(vroot, &vroot_len);
@@ -277,7 +392,7 @@ main(
     wait_done();
     if (G.status != CHIMERA_VFS_OK) {
         fprintf(stderr, "SKIP: backend %s mount not reachable (0x%x)\n", backend, G.status);
-        return SKIP_RC;
+        _exit(SKIP_RC);
     }
     memcpy(mnt, G.fh, G.fh_len);
     mnt_len = G.fh_len;
@@ -291,7 +406,7 @@ main(
     wait_done();
     if (G.status != CHIMERA_VFS_OK || !G.h) {
         fprintf(stderr, "SKIP: backend %s open mount handle failed (0x%x)\n", backend, G.status);
-        return SKIP_RC;
+        _exit(SKIP_RC);
     }
     {
         struct chimera_vfs_open_handle *mroot = G.h;
@@ -306,7 +421,7 @@ main(
         chimera_vfs_release(G.t, mroot);
         if (G.status != CHIMERA_VFS_OK) {
             fprintf(stderr, "SKIP: backend %s mkdir wd failed (0x%x)\n", backend, G.status);
-            return SKIP_RC;
+            _exit(SKIP_RC);
         }
         memcpy(mnt, G.fh, G.fh_len);   /* reuse mnt/mnt_len as the "wd" base fh */
         mnt_len = G.fh_len;
@@ -318,7 +433,7 @@ main(
     wait_done();
     if (G.status != CHIMERA_VFS_OK || !G.h) {
         fprintf(stderr, "SKIP: backend %s open wd handle failed (0x%x)\n", backend, G.status);
-        return SKIP_RC;
+        _exit(SKIP_RC);
     }
     dir = G.h;
 
@@ -335,12 +450,64 @@ main(
     CHECK(op_symlink_at("a/b", 3) == CHIMERA_VFS_EINVAL, "symlink_at 'a/b'");
     CHECK(op_symlink_at("..", 2) == CHIMERA_VFS_EINVAL, "symlink_at '..'");
     CHECK(op_lookup_at("a/b", 3) == CHIMERA_VFS_EINVAL, "lookup_at 'a/b'");
+    CHECK(op_lookup_at(nul3, 3) == CHIMERA_VFS_EINVAL, "lookup_at 'a\\0b'");
 
-    /* Legal: a lookup of "." and "..", and a plain create. */
+    /* A plain create first, so link/rename have a source. */
     CHECK(op_openat("okfile", 6, CHIMERA_VFS_OPEN_CREATE) == CHIMERA_VFS_OK, "open_at CREATE 'okfile'");
+    memcpy(src_fh, G.fh, G.fh_len);
+    src_fh_len = G.fh_len;
+    CHECK(op_openat("renme", 5, CHIMERA_VFS_OPEN_CREATE) == CHIMERA_VFS_OK, "open_at CREATE 'renme'");
     CHECK(op_mkdir_at("okdir", 5) == CHIMERA_VFS_OK, "mkdir_at 'okdir'");
-    CHECK(op_lookup_at(".", 1) != CHIMERA_VFS_EINVAL, "lookup_at '.' is not refused");
-    CHECK(op_lookup_at("..", 2) != CHIMERA_VFS_EINVAL, "lookup_at '..' is not refused");
+
+    /* Refusals on every other name-taking op: '/', NUL, 'x/..', and an exact
+     * '..' on the create-type ones (rename/remove already reject dots). */
+    CHECK(op_mknod_at("a/b", 3) == CHIMERA_VFS_EINVAL, "mknod_at 'a/b'");
+    CHECK(op_mknod_at(nul3, 3) == CHIMERA_VFS_EINVAL, "mknod_at 'a\\0b'");
+    CHECK(op_mknod_at("..", 2) == CHIMERA_VFS_EINVAL, "mknod_at '..'");
+    CHECK(op_mknod_at("x/..", 4) == CHIMERA_VFS_EINVAL, "mknod_at 'x/..'");
+    CHECK(op_link_at("a/b", 3) == CHIMERA_VFS_EINVAL, "link_at 'a/b'");
+    CHECK(op_link_at(nul3, 3) == CHIMERA_VFS_EINVAL, "link_at 'a\\0b'");
+    CHECK(op_link_at("..", 2) == CHIMERA_VFS_EINVAL, "link_at '..'");
+    CHECK(op_symlink_at("x/..", 4) == CHIMERA_VFS_EINVAL, "symlink_at 'x/..'");
+    CHECK(op_rename_at("a/b", 3) == CHIMERA_VFS_EINVAL, "rename_at to 'a/b'");
+    CHECK(op_rename_at(nul3, 3) == CHIMERA_VFS_EINVAL, "rename_at to 'a\\0b'");
+    CHECK(op_remove_at("a/b", 3, 0) == CHIMERA_VFS_EINVAL, "remove_at 'a/b'");
+    CHECK(op_remove_at(nul3, 3, 0) == CHIMERA_VFS_EINVAL, "remove_at 'a\\0b'");
+
+    /* Keep-today oracle: dots and the empty name are the backend's, and remove
+     * keeps its EINVAL/ENOTEMPTY for '.'/'..'. */
+    CHECK(op_lookup_at(".", 1) != CHIMERA_VFS_EINVAL, "lookup_at '.' not refused");
+    CHECK(op_lookup_at("..", 2) != CHIMERA_VFS_EINVAL, "lookup_at '..' not refused");
+    CHECK(op_openat(".", 1, 0) != CHIMERA_VFS_EINVAL, "open_at (no create) '.' not refused");
+    CHECK(op_remove_at(".", 1, 0) == CHIMERA_VFS_EINVAL, "remove_at '.' -> EINVAL (unchanged)");
+    CHECK(op_remove_at("..", 2, CHIMERA_VFS_REMOVE_ISDIR) == CHIMERA_VFS_ENOTEMPTY,
+          "remove_at '..' -> ENOTEMPTY (unchanged)");
+    CHECK(op_rename_at("", 0) != CHIMERA_VFS_EINVAL, "rename_at to '' not newly refused");
+
+    /* Twin rows: the unchecked _path variants accept a whole path (what the
+     * core's own path procs and the dirfd layer pass). */
+    chimera_vfs_mkdir_at_path(G.t, &root, dir, "d", 1,
+                              &(struct chimera_vfs_attrs) { .va_set_mask = CHIMERA_VFS_ATTR_MODE, .va_mode = 0755 },
+                              CHIMERA_VFS_ATTR_FH, 0, 0, mkdir_cb, NULL);
+    wait_done();
+    CHECK(G.status == CHIMERA_VFS_OK, "mkdir_at 'd' (for twin rows) -> 0x%x", G.status);
+    {
+        struct chimera_vfs_attrs ts;
+        memset(&ts, 0, sizeof(ts));
+        ts.va_set_mask = CHIMERA_VFS_ATTR_MODE;
+        ts.va_mode     = 0644;
+        chimera_vfs_open_at_path(G.t, &root, dir, "d/f", 3, CHIMERA_VFS_OPEN_CREATE,
+                                 &ts, CHIMERA_VFS_ATTR_FH, 0, 0, openat_cb, NULL);
+        wait_done();
+        CHECK(G.status == CHIMERA_VFS_OK, "open_at_path 'd/f' (whole path) -> 0x%x", G.status);
+        if (G.status == CHIMERA_VFS_OK && G.h) {
+            chimera_vfs_release(G.t, G.h);
+        }
+        chimera_vfs_remove_at_path(G.t, &root, dir, "d/f", 3, NULL, 0, 0, 0, 0,
+                                   NULL, remove_cb, NULL);
+        wait_done();
+        CHECK(G.status == CHIMERA_VFS_OK, "remove_at_path 'd/f' (whole path) -> 0x%x", G.status);
+    }
 
     /* NO_DOTDOT, with no facade in front: a ".." anywhere in the whole path is
      * refused, while the same path without the flag resolves today's way. */
@@ -376,22 +543,82 @@ main(
                                 CHIMERA_VFS_OPEN_DIRECTORY, openfh_cb, NULL);
             wait_done();
             odir = G.h;
+            /* okdir/x is a real file; okdir/lnk -> "." so lnk/x resolves to
+             * okdir/x when followed. */
             memset(&s2, 0, sizeof(s2));
-            chimera_vfs_symlink_at(G.t, &root, odir, "lnk", 3, "okdir", 5, &s2,
+            s2.va_set_mask = CHIMERA_VFS_ATTR_MODE;
+            s2.va_mode     = 0644;
+            chimera_vfs_open_at(G.t, &root, odir, "x", 1, CHIMERA_VFS_OPEN_CREATE,
+                                &s2, CHIMERA_VFS_ATTR_FH, 0, 0, openat_cb, NULL);
+            wait_done();
+            if (G.status == CHIMERA_VFS_OK && G.h) {
+                chimera_vfs_release(G.t, G.h);
+            }
+            memset(&s2, 0, sizeof(s2));
+            chimera_vfs_symlink_at(G.t, &root, odir, "lnk", 3, ".", 1, &s2,
                                    CHIMERA_VFS_ATTR_FH, 0, 0, symlink_cb, NULL);
             wait_done();
             chimera_vfs_release(G.t, odir);
 
-            if (G.status == CHIMERA_VFS_OK) {
-                chimera_vfs_lookup(G.t, &root, mnt, mnt_len, "okdir/lnk/okfile", 16,
-                                   CHIMERA_VFS_ATTR_FH | CHIMERA_VFS_ATTR_MODE,
-                                   CHIMERA_VFS_LOOKUP_NO_SYMLINK, attr_cb, NULL);
+            if (G.status != CHIMERA_VFS_OK) {
+                /* A backend with no symlink support cannot exercise these rows;
+                 * that is a SKIP, not a silent pass. */
+                fprintf(stderr, "SKIP: backend %s has no symlink (0x%x)\n", backend, G.status);
+                _exit(SKIP_RC);
+            }
+
+            /* NO_SYMLINK: the non-final link is returned unfollowed (S_ISLNK). */
+            chimera_vfs_lookup(G.t, &root, mnt, mnt_len, "okdir/lnk/x", 11,
+                               CHIMERA_VFS_ATTR_FH | CHIMERA_VFS_ATTR_MODE,
+                               CHIMERA_VFS_LOOKUP_NO_SYMLINK, attr_cb, NULL);
+            wait_done();
+            CHECK(G.status == CHIMERA_VFS_OK && G.is_lnk,
+                  "lookup 'okdir/lnk/x' NO_SYMLINK stops at the link (0x%x lnk=%d)",
+                  G.status, G.is_lnk);
+
+            /* Same link, no flag: it is followed (lnk -> ".", so the path
+             * resolves to okdir/x, a regular file). */
+            chimera_vfs_lookup(G.t, &root, mnt, mnt_len, "okdir/lnk/x", 11,
+                               CHIMERA_VFS_ATTR_FH | CHIMERA_VFS_ATTR_MODE,
+                               CHIMERA_VFS_LOOKUP_FOLLOW, attr_cb, NULL);
+            wait_done();
+            CHECK(G.status == CHIMERA_VFS_OK && !G.is_lnk,
+                  "lookup 'okdir/lnk/x' (FOLLOW) resolves through the link (0x%x lnk=%d)",
+                  G.status, G.is_lnk);
+
+            /* A spliced ".." target under NO_DOTDOT is refused: okdir/dd -> ..,
+             * so okdir/dd/x expands to a ".." component. */
+            {
+                struct chimera_vfs_open_handle *od2;
+                struct chimera_vfs_attrs        s3;
+                uint8_t                         o2[CHIMERA_VFS_FH_SIZE];
+                uint32_t                        o2len;
+
+                chimera_vfs_lookup(G.t, &root, mnt, mnt_len, "okdir", 5,
+                                   CHIMERA_VFS_ATTR_FH, 0, attr_cb, NULL);
                 wait_done();
-                CHECK(G.status == CHIMERA_VFS_OK && G.is_lnk,
-                      "lookup 'okdir/lnk/okfile' NO_SYMLINK stops at the link (0x%x lnk=%d)",
-                      G.status, G.is_lnk);
-            } else {
-                printf("ok   - NO_SYMLINK case skipped (backend has no symlink, 0x%x)\n", G.status);
+                memcpy(o2, G.fh, G.fh_len);
+                o2len = G.fh_len;
+                chimera_vfs_open_fh(G.t, &root, o2, o2len,
+                                    CHIMERA_VFS_OPEN_PATH | CHIMERA_VFS_OPEN_INFERRED |
+                                    CHIMERA_VFS_OPEN_DIRECTORY, openfh_cb, NULL);
+                wait_done();
+                od2 = G.h;
+                memset(&s3, 0, sizeof(s3));
+                chimera_vfs_symlink_at(G.t, &root, od2, "dd", 2, "..", 2, &s3,
+                                       CHIMERA_VFS_ATTR_FH, 0, 0, symlink_cb, NULL);
+                wait_done();
+                chimera_vfs_release(G.t, od2);
+                if (G.status == CHIMERA_VFS_OK) {
+                    chimera_vfs_lookup(G.t, &root, mnt, mnt_len, "okdir/dd/x", 10,
+                                       CHIMERA_VFS_ATTR_FH | CHIMERA_VFS_ATTR_MODE,
+                                       CHIMERA_VFS_LOOKUP_FOLLOW | CHIMERA_VFS_LOOKUP_NO_DOTDOT,
+                                       attr_cb, NULL);
+                    wait_done();
+                    CHECK(G.status == CHIMERA_VFS_EINVAL,
+                          "lookup 'okdir/dd/x' (FOLLOW|NO_DOTDOT), spliced '..' -> EINVAL (0x%x)",
+                          G.status);
+                }
             }
         }
     }

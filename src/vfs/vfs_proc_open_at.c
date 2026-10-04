@@ -486,7 +486,7 @@ chimera_vfs_open_at_gid_getattr_complete(
     chimera_vfs_open_at_gid_complete(error_code, attr, private_data);
 } /* chimera_vfs_open_at_gid_getattr_complete */
 
-/* Public entry: validates the name, then forwards to the _path variant. The check is added in a later change; today it only forwards. */
+/* Public entry: validates the name (see vfs_name.h), then forwards to the _path variant. */
 SYMBOL_EXPORT void
 chimera_vfs_open_at_hs(
     struct chimera_vfs_thread       *thread,
@@ -690,7 +690,7 @@ chimera_vfs_open_at_hs_dispatch(
     chimera_vfs_dispatch(request);
 } /* chimera_vfs_open_at_hs_dispatch */
 
-/* Public entry: validates the name, then forwards to the _path variant. The check is added in a later change; today it only forwards. */
+/* Public entry: validates the name (see vfs_name.h), then forwards to the _path variant. */
 SYMBOL_EXPORT void
 chimera_vfs_open_at(
     struct chimera_vfs_thread      *thread,

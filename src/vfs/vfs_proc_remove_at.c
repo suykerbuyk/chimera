@@ -537,7 +537,7 @@ chimera_vfs_remove_recall_lookup_complete(
  * the unlink.  When it is NOT supplied and a caching protocol is enabled, the
  * VFS resolves it first (above) so a cross-protocol holder is recalled before
  * the unlink. */
-/* Public entry: validates the name, then forwards to the _path variant. The check is added in a later change; today it only forwards. */
+/* Public entry: validates the name (see vfs_name.h), then forwards to the _path variant. */
 SYMBOL_EXPORT void
 chimera_vfs_remove_at(
     struct chimera_vfs_thread       *thread,
