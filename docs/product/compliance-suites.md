@@ -32,7 +32,7 @@ Headline facts:
   ctest tier. The GitLab merge train gates pynfs (non-diskfs), smbtorture,
   the cthon port, pjdfstest and cthon04 in KVM. The scheduled pipeline, which
   runs three times a week, adds the rest.
-- **The Ceph S3 tests and MinIO warp never run.**
+- **MinIO warp never runs: it is not in the tree. The Ceph S3 tests never run in GitLab CI.** The test is not registered there, because the system Python lacks boto3 (job 3490972: "boto3 not found - S3 tests will be skipped"). Upstream GitHub `extended` was not measured; registration there is unlikely for the same reason.
 - **No suite runs against the shipped configuration.**
   - The harnesses enable features the defaults leave off.
   - They shorten the NFSv4 timers.
@@ -44,6 +44,17 @@ Headline facts:
   - smbtorture exits 0 on a skip.
   - One GitLab retry turned a real timeout green (pipeline 205316).
 
+### Decisions requested
+
+The operator decides each of these when answering Q-SUC-2. Every proposal
+below carries a recommendation and its evidence.
+
+- **D2: the backend a full run uses.** See "Proposed definition of a full run", Backend.
+- **D4: running pjdfstest through FUSE**, as SUC-2 states. See "pjdfstest", No FUSE path, and its proposed full run.
+- **D6: warp parameters and pass criterion.** See "MinIO warp".
+- **OQ-1 to OQ-9.** See "Open questions": advertised features, suite list, cthon over SMB, retries, interim exclusions, gate depth, the S3 public ACL, profile deviations, and delegation coverage.
+- **The per-suite selections**, in each suite's "Proposed full" subsection: pynfs, cthon, pjdfstest, smbtorture, Ceph s3-tests and MinIO warp.
+
 ## Scope and method
 
 ### Terms
@@ -54,7 +65,7 @@ Headline facts:
 | skipped | registered, but at runtime it exits 77, reports a whole-file or subtest skip, or is a pynfs OMIT |
 | excluded | deliberately not selected, with a reason in the source |
 | missing | in the pinned upstream suite but not wired, or the wiring is absent |
-| shipped default | `chimera_server_config_init()` in `src/server/server.c`, plus the backend mount parsers, plus the installed `src/daemon/chimera.json` |
+| shipped default | The installed `src/daemon/chimera.json`, including its mounts, export and shares, applied over `chimera_server_config_init()` in `src/server/server.c` and the backend mount parsers. Where the two disagree, `chimera.json` wins: 16 core threads and 1 sync delegation thread, not `server.c`'s 8 and 8 |
 
 ### Pins
 
@@ -86,12 +97,29 @@ relies on, because job artifacts expire:
 | 205316 | scheduled; the retry example | 2026-10-02 | `966c105e` |
 
 The traces and artifacts of every `ctest*` and `smbtorture_explore` job in
-those pipelines, plus the `chimera-dev` build trace (job 3490948), were saved
-on 2026-10-04, with the `smbtorture --list` output: 138 files. Their checksums are recorded in a `SHA256SUMS` file
-whose own sha256 is
-`db7dcf704c6961a0bb6eca77402bfe6f90a0cae8963969e74a87cdfbd8f18e07`. After
-expiry, a CI fact here can be checked against those copies but not
-re-fetched. It is "not reproducible after" its pipeline's expiry date.
+those pipelines were saved on 2026-10-04, together with the `chimera-dev`
+build trace (job 3490948) and the `smbtorture --list` output: 138 files.
+
+**Where the evidence is kept.** The evidence is in the vibe-palace vault at
+`Projects/chimera/doc/evidence/compliance-suite-inventory/`. Its `README.md`
+indexes the following:
+
+- `ci/excerpts-<pipeline>.txt`: every CI line this document quotes, plus each
+  job's ctest summary, failure, skip and label-total lines, with their line
+  numbers in the original trace or log;
+- `ci/SHA256SUMS`: the sha256 of all 138 saved files. The file's own sha256 is
+  `db7dcf704c6961a0bb6eca77402bfe6f90a0cae8963969e74a87cdfbd8f18e07`. The full
+  files themselves (about 13 MB) are not retained; the excerpts keep the lines
+  this document relies on;
+- `data/s3-classification.tsv`: the per-case Ceph ACL-4/SEC-1 classification;
+- `data/skip71-gates.txt`: the 71 pjdfstest whole-file gates;
+- the smbtorture list and explore-report summaries;
+- the `repro/*.repro.sh` scripts and their helpers, which regenerate the counts;
+- the citation lists and checker.
+
+After a pipeline's artifacts expire, its facts can be checked against the
+excerpts and checksums, but not re-fetched from GitLab. They are "not
+reproducible after" that pipeline's expiry date.
 
 No local privileged run was made, and no image was built. Counts not taken
 from CI come from scratch clones of the pinned upstreams and from replaying
@@ -167,7 +195,7 @@ GitHub:
 | smbtorture gated (`-L '^smbtorture$'`, :325-326) | manual | yes | yes | no | `smbtorture` shard |
 | smbtorture full matrix (`smbtorture_explore`, :512-515) | no | no | yes, informational | no | `smbtorture-matrix` job (:1183), red only on a newly failing gated subtest (:1324-1330, :1371-1377) |
 | smbtorture `rpc.*` (label `smbtorture_rpc`) | manual | yes (`rest` leg) | yes | no | `rest` shard |
-| Ceph s3-tests (label `ceph-s3`) | never: not in `builders/dev` | never | never | no | `rest` shard (`ceph-s3` is not in `EXCL`, :821) |
+| Ceph s3-tests (label `ceph-s3`) | never: not in `builders/dev` | never | never | no | configured in the `rest` shard (`ceph-s3` is not in `EXCL`, :821); not measured, and registration is unlikely without a system boto3 |
 | pjdfstest (label `pjdfstest`) | manual | yes (`rest` leg) | yes | no | `pjd` shard (:826) |
 | MinIO warp | not wired | not wired | not wired | not wired | not wired |
 | WPTS (label `wpts`) | manual | yes (`wpts` leg, :329-330) | yes | no | `wpts` shard |
@@ -209,7 +237,7 @@ Pinned pipelines:
 - **205343:** `merge_request_event`, ref `refs/merge-requests/114/train`, sha `5593f580`. 2026-10-02.
 - **205316:** `schedule`, `develop`, sha `966c105e`, an ancestor of HEAD. 2026-10-02.
 
-Artifacts expire 2026-10-09 (205343, 205316) and 2026-10-11 (205408). The trace, artifact zip, `jobs-<p>.json` and `pipeline-<p>.json` copies are in the saved evidence set (see "Scope and method"). Its `SHA256SUMS` lists 138 files (the CI copies plus the `smbtorture --list` output), all verified OK on 2026-10-04. `sha256sum SHA256SUMS` = `db7dcf704c6961a0bb6eca77402bfe6f90a0cae8963969e74a87cdfbd8f18e07`.
+Artifacts expire 2026-10-09 (205343, 205316) and 2026-10-11 (205408). The trace, artifact zip, `jobs-<p>.json` and `pipeline-<p>.json` copies were saved on 2026-10-04; excerpts and checksums are in the vault evidence directory named in "Scope and method". Its `SHA256SUMS` lists 138 files (the CI copies plus the `smbtorture --list` output), all verified OK on 2026-10-04. `sha256sum SHA256SUMS` = `db7dcf704c6961a0bb6eca77402bfe6f90a0cae8963969e74a87cdfbd8f18e07`.
 
 Each "Summary" line below is quoted from the job trace after the `[chimera/<task>]` prefix. The per-test tallies come from the job's artifact log.
 
@@ -282,7 +310,15 @@ SUC-1 asks for the suites to be "run against the product's shipping configuratio
 
 The shipped configuration has two layers:
 - the code defaults in `chimera_server_config_init` (`src/server/server.c:233-476`);
-- the installed `src/daemon/chimera.json` (`install(FILES chimera.json DESTINATION etc)`, `src/daemon/CMakeLists.txt:10`). That file sets only `nfs_enabled`, `smb_enabled` and `"threads": 16` (`src/daemon/chimera.json:15-19`), so every feature default below comes from `server.c`.
+- the installed `src/daemon/chimera.json` (`install(FILES chimera.json DESTINATION etc)`, `src/daemon/CMakeLists.txt:10`). That file (`src/daemon/chimera.json:1-48`) sets:
+  - `common`: `tcp_flavor` plain, sync delegation on with **1** sync delegation thread, async delegation off (8 threads if enabled), tracing off (`:2-14`);
+  - `server`: NFS and SMB enabled, **16** core threads (`:15-19`);
+  - a `memfs` filesystem (`:20-24`);
+  - two mounts, `linux_dir` (the `linux` passthrough module on `/var/tmp`) and `memfs_dir` (`:25-34`);
+  - one NFS export `/nfs1` on `memfs_dir` (`:35-39`);
+  - two SMB shares, `smb1` on `linux_dir` and `smb2` on `memfs_dir` (`:40-47`).
+
+  These mounts, exports and shares are part of "shipped". The daemon applies `server.threads` over the `server.c` default of 8 (`src/daemon/daemon.c:471-474`, `src/server/server.c:240`). It applies `common.sync_delegation_threads` last, over both the `server.c` default of 8 and any `server`-section key (`src/daemon/daemon.c:525-534`, `src/server/server.c:243`). **The shipped values are therefore 16 core threads and 1 sync delegation thread.** Every other feature default below comes from `server.c`.
 
 A diskfs backend that is not configured defaults to `unsafe_async` false (`src/vfs/diskfs/diskfs_mount.c:1157`, `json_is_true(...)`) and a 1 GiB intent log (`src/vfs/diskfs/space_map.h:240`).
 
@@ -320,7 +356,7 @@ This table consolidates the deviations. The per-suite sections give the full smb
 | KVM NFS wrapper (cthon04-KVM, xfstests) | diskfs `unsafe_async`; NFSv3 `nolock` (client side) | `true`; `nolock` | false; n/a | `kvm/kvm_nfs_test_wrapper.sh:165`, :270 |
 | KVM SMB wrapper (cthon04-KVM SMB, xfstests SMB) | diskfs `unsafe_async`; `smb_min_dialect` = dialect under test | `true`; pinned | false; 2.0.2 floor (`server.c:254-259`) | `kvm/kvm_smb_test_wrapper.sh:172`, :206 |
 | KVM nfstest wrappers | diskfs `unsafe_async`; `nfs4_delegations` (2-client) | `true`; `true` except `nfstest_cache` | false; off | `kvm/kvm_nfstest_test_wrapper.sh:175`; `kvm/kvm_nfstest_2client_test_wrapper.sh:155`, :130-131, :178 |
-| All the above daemons | `threads` 4, `rcu_reclaim_threads` 4 | 4 | 16 (`chimera.json:18`) / 4 (`server.c:440`) | e.g. `scripts/pynfs_test_wrapper.sh:161`, :165 |
+| All the above daemons | `threads` 4, `rcu_reclaim_threads` 4; the `delegation_threads` key they write is read by nothing, so sync delegation threads stay at the `server.c` default of 8 | 4 / 8 | 16 core (`chimera.json:18`) / 1 sync delegation (`chimera.json:5`) / 4 RCU (`server.c:440`) | e.g. `scripts/pynfs_test_wrapper.sh:161`, :165, :166 |
 
 ### The diskfs `unsafe_async` effect
 
@@ -350,20 +386,20 @@ What a green ctest result means today, suite by suite. Each suite section below 
 
 | Suite | Counts as pass today | Counts as skip | Not detected | Configuration |
 |---|---|---|---|---|
-| pynfs | No FAIL in the JUnit file. WARN and NOTSUP (an unsupported operation) pass, and an OMIT run passes (`scripts/pynfs_test_wrapper.sh:310-333`) | Only the 5 Kerberos tests have SKIP 77, and they passed in CI | Per-code WARN, NOTSUP and OMIT: GitLab keeps no JUnit | Short lease and grace, 4 threads, diskfs `unsafe_async`. Delegations and the unauthenticated REST debug endpoint are on in the combined runs |
+| pynfs | No FAIL in the JUnit file. WARN and NOTSUP (an unsupported operation) pass, and an OMIT run passes (`scripts/pynfs_test_wrapper.sh:310-333`) | Only the 5 Kerberos tests have SKIP 77, and they passed in CI | Per-code WARN, NOTSUP and OMIT: GitLab keeps no JUnit | Short lease and grace, 4 threads, diskfs `unsafe_async`. Delegations and the unauthenticated REST debug endpoint are on in the combined runs (derived from the wrapper code, not observed in CI; see Findings 1) |
 | cthon (port) | Program exit 0 | None (no SKIP 77) | — | posix harness: diskfs `unsafe_async`, 4 threads |
 | cthon04 (KVM) | `runtests` exit 0 in `-f` (functional, one iteration) mode | In-run sub-test skips (SMB `CIFS=yes`), not measured | Guest output of passing tests (`--output-on-failure`) | KVM wrappers: diskfs `unsafe_async`; SMB dialect floor pinned to the dialect under test |
 | smbtorture | smbtorture exit 0, **including a subtest that skips**. 96 `bind_negative` cells and 103 off-memfs `copy_chunk` cells pass by skipping | SKIP 77 only when the binary is missing | Subtest-level skips: the logs carry no subtest output | Persistent handles, leases, oplocks, dirleases and 2 multichannel NICs on for every run; further per-subtest overrides; `samba3=yes`; fixed seed |
-| Ceph s3-tests | pytest pass on a 214-case allowlist | SKIP 77 when the suite is missing | Never runs (boto3 missing) | Three access keys aliased to one user; no TLS |
+| Ceph s3-tests | pytest pass on a 214-case allowlist | SKIP 77 when the suite is missing | Not run in GitLab CI: not registered, because there is no system boto3 (job 3490972). GitHub `extended` not measured; registration unlikely for the same reason | Three access keys aliased to one user; no TLS |
 | pjdfstest (port) | Program exit 0 | None (SKIP 77 is set but never returned) | — | posix harness: diskfs `unsafe_async` |
-| warp | — | — | Never runs | — |
+| warp | — | — | Not in the tree; never runs | — |
 | all (GitLab) | Job exit status. `ctest`, `ctest_explore`, `ctest_kvm` and `ctest_kvm_images` retry once on `script_failure` (`.gitlab-ci.yml:260-265`) | — | A failure masked by the retry: job 3488415 failed with "2272 - chimera/server/smb/smbtorture_smb2_notify_linux (Timeout) smbtorture" and its retry, job 3488440, reported "100% tests passed, 0 tests failed out of 1741" | — |
 
 ## pynfs
 
 pynfs is the Linux NFS community's NFSv4 server conformance suite. Each test has a short code (for example `OPEN1`), a list of flags (for example `open`, `all`) and, in the 4.1 tree, an optional version range (`VERS:`). A run selects tests by naming flags or codes; `no<flag>`/`no<code>` deselects them. The last matching argument wins.
 
-Every count below is reproduced by `pynfs.repro.sh`. Lines in the pynfs trees are cited as `fork:<path>:<line>` (chimera-nas/pynfs @ b861f7b8) or `upstream:<path>:<line>` (cd470182). They are not files in this repository.
+Every count below is reproduced by `repro/pynfs.repro.sh` in the vault evidence directory (see "Scope and method"). Lines in the pynfs trees are cited as `fork:<path>:<line>` (chimera-nas/pynfs @ b861f7b8) or `upstream:<path>:<line>` (cd470182). They are not files in this repository.
 
 ### Source and pins
 
@@ -497,12 +533,12 @@ Per-backend gaps inside "run": WRT18 and SATT15 do not run on linux or io_uring;
 
 Proposal, pynfs row: "Upstream `cd470182`: 4.0, 4.1@1 and 4.2@2, plus BIND1–3. **Prerequisite:** bump the fork. (N) pNFS. (O) FSLOC, TRUNK. (P) ACL\* (ACL-1), GSS/krb5p (SEC-6), REBT/reclaim and delegations (HA-5): interim only, tied to SEC-10, `shipped-defaults-safe` and an E1 restart-harness child. (M) SECNN. `PYNFS_WRITE_FULL_SIZES=1`." Pass criterion: "PASS only. NOTSUP fails unless (O)/(N). WARN fails unless listed. OMIT fails unless it is the filter-OMIT of an excluded test. No retry." Corruption oracle: "Partial (READ/WRITE read-back)".
 
-Universe per run: 4.0 = 689 codes; 4.1@1 = 252 + BIND1–3 = 255; 4.2@2 = 266 + BIND1–3 = 269. The class lists below apply the §7 names to the pynfs flags and modules:
+Universe per run: 4.0 = 689 codes; 4.1@1 = 252 + BIND1–3 = 255; 4.2@2 = 266 + BIND1–3 = 269. The class lists below apply the class names of "Proposed definition of a full run" to the pynfs flags and modules:
 - (N) is `pnfs` or `flex`, or modules st_flex, st_block and st_getdevicelist.
 - (O) is `fslocations` and `trunking`.
 - (P) is `acl`, `gss`, `reboot`/st_reboot plus `reclaim_complete`, and `delegations`/`writedelegations`/`deleg`.
 - (M) is `secinfo_no_name`.
-- Every other code is in the full set by the §7 principle ("every test in the pinned upstream suite … minus a written exclusion list") and has no class.
+- Every other code is in the full set by the principle in "Proposed definition of a full run" ("every test in the pinned upstream suite … minus a written exclusion list") and has no class.
 
 | Minor | Class | Codes (count) | Run today | Not run today |
 |---|---|---|---|---|
@@ -534,7 +570,8 @@ Universe per run: 4.0 = 689 codes; 4.1@1 = 252 + BIND1–3 = 255; 4.2@2 = 266 + 
 |---|---|---|---|
 | NFSv4 lease (`nfs4_lease_time`) | 5 s default; 20/30/40 s per-code overrides; 90 s combined; 4 s cold_restart | 90 s | Lease length is the server's choice, reported to clients in the `lease_time` attribute (RFC 7530 §5.8.1.11 and §9.5; RFC 8881 §5.8.1.11 and §8.3) (from spec knowledge) |
 | NFSv4 grace (`nfs4_grace_time`) | 10 s; 6 s cold_restart | 180 s | The grace period is server-chosen, and the RFCs expect it to be at least as long as the lease period (RFC 7530 §9.6.2; RFC 8881 §8.4.2). The strength of that requirement (MUST or SHOULD) has not been checked (from spec knowledge). The combined runs use a 10 s grace with a 90 s lease, so their grace is shorter than their lease. That combination is therefore not declared as spec-permitted tuning; it counts as a deviation to remove |
-| Core threads | 4 | 8 | Implementation tuning; no protocol significance |
+| Core threads | 4 | 16 (`src/daemon/chimera.json:18`) | Implementation tuning; no protocol significance |
+| Sync delegation threads | 8 (the `delegation_threads` key the harness writes is unread, so the `server.c:243` default applies) | 1 (`src/daemon/chimera.json:5`) | Implementation tuning; no protocol significance |
 
 Proposal: the **release-gate full run uses the shipped timers and thread count**. The **per-change gate may use the declared tuning above**, as part of OQ-6 (gate depth versus time).
 
@@ -573,8 +610,8 @@ The wrapper writes its own `chimera.json` (`generate_config`, `scripts/pynfs_tes
 | `nfs4_grace_time` | 10 s (cold_restart 6 s) | 180 s | `scripts/pynfs_test_wrapper.sh:39`, :169; `scripts/pynfs_cold_restart_test_wrapper.sh:42` "GRACE_S=6"; `src/server/nfs/nfs4_lease.h:28` "#define NFS4_GRACE_TIME_DEFAULT_S    180"; `src/server/server.c:475` |
 | `nfs4_delegations` | `true` for per-code `delegations`/`deleg` runs and DSESS9002/9003. **Derived: also `true` for all 18 combined runs.** The wrapper's match `*"delegations "*` / `*"deleg "*` fires on the trailing `nodelegations ` / `nodeleg ` deselect tokens. That contradicts the comment that the combined run "has delegations off". `false` for other per-code runs | off (`nfs4_delegations = 0`) | `scripts/pynfs_test_wrapper.sh:79` "DELEG_ENABLE=\"false\""; :86 "*\" deleg\"* \| *\" delegations\"* \| *DELEG* \| *\"delegations \"* \| *\"deleg \"*)"; :167; `pynfs/CMakeLists.txt:170`, :295 "does not leak into the combined run -- which has delegations off -- and"; `src/server/server.c:455` "config->nfs4_delegations = 0;" |
 | REST debug fs-ops, REST auth | on whenever delegations are on (`rest_debug_fsops: true`, `rest_auth_enabled: false`, port 7780; `--serverhelper` passed to pynfs). By the derivation above, that includes every combined run | `rest_debug_fsops = 0`, `rest_auth_enabled = 1` | `scripts/pynfs_test_wrapper.sh:104` "\\\"rest_debug_fsops\\\": true,"; :105; :256 "SERVERHELPER_ARGS=(--serverhelper"; `src/server/server.c:250-251` |
-| `threads` (core threads) | 4 (flex data server 2) | 8 | `scripts/pynfs_test_wrapper.sh:165` "\"threads\": 4,"; `src/daemon/daemon.c:471`; `src/server/server.c:240` "config->core_threads             = 8;" |
-| `delegation_threads` | 4, but no code reads this key (`grep '"delegation_threads"' src` = 0), so it has no effect | sync delegation threads 8 | `scripts/pynfs_test_wrapper.sh:166` |
+| `threads` (core threads) | 4 (flex data server 2) | 16 (`src/daemon/chimera.json:18`) | `scripts/pynfs_test_wrapper.sh:165` "\"threads\": 4,"; `src/daemon/daemon.c:471`; `src/server/server.c:240` "config->core_threads             = 8;" |
+| `delegation_threads` | 4, but no code reads this key (`grep '"delegation_threads"' src` = 0), so sync delegation threads stay at the `server.c:243` default of 8 | sync delegation threads 1 (`src/daemon/chimera.json:5`, applied at `src/daemon/daemon.c:525-534`) | `scripts/pynfs_test_wrapper.sh:166` |
 | NFS Kerberos (`nfs_auth.kerberos_enabled`) | off in the main matrix (same as the default). On only in the 5 Kerberos tests | off | `src/server/server.c:364` "config->nfs_auth.kerberos_enabled            = 0;"; `scripts/nfs_kerberos_test_wrapper.sh:249` "\"kerberos_enabled\": true," |
 | pNFS | on in the flex wrapper's MDS, plus a second daemon in `data_server` mode | off (`pnfs_enabled = 0`) | `scripts/pynfs_pnfs_test_wrapper.sh:88` "\"pnfs\": { \"enabled\": true,"; :70; `src/server/server.c:382` |
 | KV store, 4.1 DRC | memkv everywhere except cold_restart (cairn KV, `nfs4_drc: true`) | DRC off | `pynfs/CMakeLists.txt:440` "Every other pynfs run uses memkv"; `scripts/pynfs_cold_restart_test_wrapper.sh:85-86`; `src/server/server.c:463` "config->nfs4_drc = 0;" |
@@ -674,7 +711,7 @@ What the KVM commands execute, derived from the upstream scripts above:
 |---|---|---|---|---|
 | diskfs `unsafe_async` (FUA/sync skipped on block writes) | `true` | `true` | off (`json_is_true` of an absent key) | `src/posix/tests/posix_test_common.h:589`; `kvm/kvm_nfs_test_wrapper.sh:165`; `kvm/kvm_smb_test_wrapper.sh:172`; `src/vfs/diskfs/diskfs_mount.c:1157`, effect :550 |
 | diskfs `intent_log_size` | 64 MiB | 64 MiB | 1 GiB | `src/posix/tests/posix_test_common.h:593`; `kvm/kvm_nfs_test_wrapper.sh:165`; `src/vfs/diskfs/space_map.h:240` |
-| core threads / sync delegation threads | 4 / 4 | `"threads": 4` (core); `"delegation_threads": 4` is not a key the daemon reads | 8 / 8 | `src/posix/tests/posix_test_common.h:659-660`; `kvm/kvm_nfs_test_wrapper.sh:196-197`; `src/daemon/daemon.c:471,505`; `src/server/server.c:240,243` |
+| core threads / sync delegation threads | 4 / 4 | 4 core; `"delegation_threads": 4` is not a key the daemon reads, so 8 sync delegation threads (`server.c:243` default) | 16 / 1 (`src/daemon/chimera.json:18`, `:5`) | `src/posix/tests/posix_test_common.h:659-660`; `kvm/kvm_nfs_test_wrapper.sh:196-197`; `src/daemon/daemon.c:471,505`; `src/server/server.c:240,243` |
 | Transport | in-process (`CHIMERA_TCP_FLAVOR_INPROC`) except forking tests | TCP over a TAP device in a netns | plain TCP | `src/posix/tests/posix_test_common.h:674-677`; `src/server/server.c:252` |
 | NFSv4 lease / grace | not set → default | not set → default | 90 s / 180 s | `src/server/server.c:474-475`; `src/server/nfs/nfs4_lease.h:27-28` |
 | NFS Kerberos | not set → off | not set → off | off | `src/server/server.c:364` |
@@ -794,7 +831,7 @@ The "nfs4" pjd rows are NFSv4.1 (`src/vfs/nfs/nfs4_mount.c:394`).
 | direct memfs, cairn, diskfs_aio, linux, io_uring | **none** | 727 |
 | direct diskfs_io_uring | **wrong** (`io_uring`) | 147 |
 
-- The simulated name set equals the 2578 pjd names in job 3490972's log exactly (`pjd_sim.py`, 0 missing, 0 extra).
+- The simulated name set equals the 2578 pjd names in job 3490972's log exactly (`helpers/pjd_sim.py` in the vault evidence directory; 0 missing, 0 extra).
 - Two stale comments:
   - :1592 says "memfs and cairn pass 134/134; diskfs/passthrough/NFS are widened by follow-up PRs". Today there are 147 programs on every backend, including NFS.
   - `.github/workflows/extended.yml:827` says "pjd tests carry both labels". The `if/else` at :1705-1708 gives a pjd test `pjdfstest` and never `posix`.
@@ -803,7 +840,7 @@ The "nfs4" pjd rows are NFSv4.1 (`src/vfs/nfs/nfs4_mount.c:394`).
 
 - The tree does not pin upstream. Clone: `https://github.com/pjd/pjdfstest`, HEAD `85a8aea9e685999ef0540392fd80535f873d7ff7` (2026-08-07).
 - 238 `.t` files in 17 categories.
-- Plans were evaluated under Linux semantics by `pjd_plan.sh`. It runs each `.t` up to its first `1..N` line, using upstream's own `supported`/`require`/`quick_exit`, with `os=Linux`, `fs=FUSE.CHIMERA`.
+- Plans were evaluated under Linux semantics by `helpers/pjd_plan.sh` in the vault evidence directory. It runs each `.t` up to its first `1..N` line, using upstream's own `supported`/`require`/`quick_exit`, with `os=Linux`, `fs=FUSE.CHIMERA`.
 - On a non-FreeBSD OS, upstream turns a whole file into `1..1` / `ok 1` (`tests/misc.sh:164-168`) when any of these hold:
   - `require chflags` (misc.sh:179-187);
   - `require posix_fallocate` (:200-206);
@@ -851,88 +888,92 @@ How the 71 Linux quick-exits break down by gate:
 
 ### Whole-file skips on Linux (71 files)
 
-A whole-file skip prints `1..1` / `ok 1` and exits 0 (`tests/misc.sh:164-168`). A TAP harness would read that as a pass. **This document counts every whole-file skip as a SKIP, never a pass.** Classified from upstream's own gates at 85a8aea: 69 files test behaviour Linux cannot provide (FreeBSD-only checks, chflags(2), `st_birthtime`, FreeBSD NFSv4-ACL tooling). 2 files skip only because upstream's capability list does not recognise Linux or the Chimera FUSE fs type.
+A whole-file skip prints `1..1` / `ok 1` and exits 0 (`tests/misc.sh:164-168`). A TAP harness would read that as a pass. **This document counts every whole-file skip as a SKIP, never a pass.** Classified at 85a8aea from each file's gate and its `desc=` line:
 
-#### Not runnable on Linux (69 files)
+- **44 files test behaviour Linux or FUSE cannot provide:** BSD file flags via chflags(2), FreeBSD ZFS NFSv4 ACLs, `st_birthtime`, and BSD-only `O_SHLOCK`/`O_EXLOCK`.
+- **27 files test behaviour a Linux FUSE mount can provide.** Their gate is FreeBSD-specific setup tooling (`mdconfig`, `newfs`, `mount -u`) or a capability list that does not recognise Linux or the Chimera FUSE fs type. These are EROFS, ENOSPC, EMLINK, EXDEV, EBUSY and ETXTBSY errno checks, plus posix_fallocate/00 and rename/22.
+- **Read-only and full filesystems are real NAS conditions**, so the 27 are in the full run as "would need X", where X is a Linux fixture. They are not platform exclusions.
+
+#### Not runnable on Linux (44 files)
 
 | File | Upstream gate | Reason |
 |---|---|---|
-| `chflags/00.t` | `require chflags;` | needs chflags(2), which Linux lacks; upstream `supported chflags` returns false off FreeBSD (`tests/misc.sh:179-187`) |
-| `chflags/01.t` | `require chflags;` | needs chflags(2), which Linux lacks; upstream `supported chflags` returns false off FreeBSD (`tests/misc.sh:179-187`) |
-| `chflags/02.t` | `require chflags;` | needs chflags(2), which Linux lacks; upstream `supported chflags` returns false off FreeBSD (`tests/misc.sh:179-187`) |
-| `chflags/03.t` | `require chflags;` | needs chflags(2), which Linux lacks; upstream `supported chflags` returns false off FreeBSD (`tests/misc.sh:179-187`) |
-| `chflags/04.t` | `require chflags;` | needs chflags(2), which Linux lacks; upstream `supported chflags` returns false off FreeBSD (`tests/misc.sh:179-187`) |
-| `chflags/05.t` | `require chflags;` | needs chflags(2), which Linux lacks; upstream `supported chflags` returns false off FreeBSD (`tests/misc.sh:179-187`) |
-| `chflags/06.t` | `require chflags;` | needs chflags(2), which Linux lacks; upstream `supported chflags` returns false off FreeBSD (`tests/misc.sh:179-187`) |
-| `chflags/07.t` | `require chflags;` | needs chflags(2), which Linux lacks; upstream `supported chflags` returns false off FreeBSD (`tests/misc.sh:179-187`) |
-| `chflags/08.t` | `require chflags;` | needs chflags(2), which Linux lacks; upstream `supported chflags` returns false off FreeBSD (`tests/misc.sh:179-187`) |
-| `chflags/09.t` | `require chflags;` | needs chflags(2), which Linux lacks; upstream `supported chflags` returns false off FreeBSD (`tests/misc.sh:179-187`) |
-| `chflags/10.t` | `require chflags;` | needs chflags(2), which Linux lacks; upstream `supported chflags` returns false off FreeBSD (`tests/misc.sh:179-187`) |
-| `chflags/11.t` | `require chflags_SF_SNAPSHOT;` | needs chflags(2), which Linux lacks; upstream `supported chflags` returns false off FreeBSD (`tests/misc.sh:179-187`) |
-| `chflags/12.t` | `require chflags;` | needs chflags(2), which Linux lacks; upstream `supported chflags` returns false off FreeBSD (`tests/misc.sh:179-187`) |
-| `chflags/13.t` | `require chflags;` | needs chflags(2), which Linux lacks; upstream `supported chflags` returns false off FreeBSD (`tests/misc.sh:179-187`) |
-| `chmod/08.t` | `require chflags;` | needs chflags(2), which Linux lacks; upstream `supported chflags` returns false off FreeBSD (`tests/misc.sh:179-187`) |
-| `chmod/09.t` | `[ "${os}:${fs}" = "FreeBSD:UFS" ] || quick_exit;` | tests FreeBSD UFS behaviour; gated on `${os}:${fs}` = `FreeBSD:UFS` |
-| `chown/08.t` | `require chflags;` | needs chflags(2), which Linux lacks; upstream `supported chflags` returns false off FreeBSD (`tests/misc.sh:179-187`) |
-| `chown/09.t` | `[ "${os}:${fs}" = "FreeBSD:UFS" ] || quick_exit;` | tests FreeBSD UFS behaviour; gated on `${os}:${fs}` = `FreeBSD:UFS` |
-| `ftruncate/08.t` | `require chflags;` | needs chflags(2), which Linux lacks; upstream `supported chflags` returns false off FreeBSD (`tests/misc.sh:179-187`) |
-| `ftruncate/10.t` | `[ "${os}:${fs}" = "FreeBSD:UFS" ] || quick_exit;` | tests FreeBSD UFS behaviour; gated on `${os}:${fs}` = `FreeBSD:UFS` |
-| `ftruncate/11.t` | `[ "${os}" = "FreeBSD" ] || quick_exit;noexec && quick_exit;` | FreeBSD-only behaviour; gated on `${os}` = `FreeBSD` |
-| `granular/00.t` | `[ "${os}:${fs}" = "FreeBSD:ZFS" ] || quick_exit;` | FreeBSD ZFS NFSv4-ACL tests; gated on `FreeBSD:ZFS` |
-| `granular/01.t` | `[ "${os}:${fs}" = "FreeBSD:ZFS" ] || quick_exit;` | FreeBSD ZFS NFSv4-ACL tests; gated on `FreeBSD:ZFS` |
-| `granular/02.t` | `[ "${os}:${fs}" = "FreeBSD:ZFS" ] || quick_exit;` | FreeBSD ZFS NFSv4-ACL tests; gated on `FreeBSD:ZFS` |
-| `granular/03.t` | `[ "${os}:${fs}" = "FreeBSD:ZFS" ] || quick_exit;` | FreeBSD ZFS NFSv4-ACL tests; gated on `FreeBSD:ZFS` |
+| `chflags/00.t` | `require chflags;` | BSD file flags via chflags(2), which Linux lacks; upstream `supported chflags` is false off FreeBSD (`tests/misc.sh:179-187`) |
+| `chflags/01.t` | `require chflags;` | BSD file flags via chflags(2), which Linux lacks; upstream `supported chflags` is false off FreeBSD (`tests/misc.sh:179-187`) |
+| `chflags/02.t` | `require chflags;` | BSD file flags via chflags(2), which Linux lacks; upstream `supported chflags` is false off FreeBSD (`tests/misc.sh:179-187`) |
+| `chflags/03.t` | `require chflags;` | BSD file flags via chflags(2), which Linux lacks; upstream `supported chflags` is false off FreeBSD (`tests/misc.sh:179-187`) |
+| `chflags/04.t` | `require chflags;` | BSD file flags via chflags(2), which Linux lacks; upstream `supported chflags` is false off FreeBSD (`tests/misc.sh:179-187`) |
+| `chflags/05.t` | `require chflags;` | BSD file flags via chflags(2), which Linux lacks; upstream `supported chflags` is false off FreeBSD (`tests/misc.sh:179-187`) |
+| `chflags/06.t` | `require chflags;` | BSD file flags via chflags(2), which Linux lacks; upstream `supported chflags` is false off FreeBSD (`tests/misc.sh:179-187`) |
+| `chflags/07.t` | `require chflags;` | BSD file flags via chflags(2), which Linux lacks; upstream `supported chflags` is false off FreeBSD (`tests/misc.sh:179-187`) |
+| `chflags/08.t` | `require chflags;` | BSD file flags via chflags(2), which Linux lacks; upstream `supported chflags` is false off FreeBSD (`tests/misc.sh:179-187`) |
+| `chflags/09.t` | `require chflags;` | BSD file flags via chflags(2), which Linux lacks; upstream `supported chflags` is false off FreeBSD (`tests/misc.sh:179-187`) |
+| `chflags/10.t` | `require chflags;` | BSD file flags via chflags(2), which Linux lacks; upstream `supported chflags` is false off FreeBSD (`tests/misc.sh:179-187`) |
+| `chflags/11.t` | `require chflags_SF_SNAPSHOT;` | BSD file flags via chflags(2), which Linux lacks; upstream `supported chflags` is false off FreeBSD (`tests/misc.sh:179-187`) |
+| `chflags/12.t` | `require chflags;` | BSD file flags via chflags(2), which Linux lacks; upstream `supported chflags` is false off FreeBSD (`tests/misc.sh:179-187`) |
+| `chflags/13.t` | `require chflags;` | BSD file flags via chflags(2), which Linux lacks; upstream `supported chflags` is false off FreeBSD (`tests/misc.sh:179-187`) |
+| `chmod/08.t` | `require chflags;` | BSD file flags via chflags(2), which Linux lacks; upstream `supported chflags` is false off FreeBSD (`tests/misc.sh:179-187`) |
+| `chown/08.t` | `require chflags;` | BSD file flags via chflags(2), which Linux lacks; upstream `supported chflags` is false off FreeBSD (`tests/misc.sh:179-187`) |
+| `ftruncate/08.t` | `require chflags;` | BSD file flags via chflags(2), which Linux lacks; upstream `supported chflags` is false off FreeBSD (`tests/misc.sh:179-187`) |
+| `granular/00.t` | `[ "${os}:${fs}" = "FreeBSD:ZFS" ] || quick_exit;` | FreeBSD ZFS NFSv4-ACL semantics; no Linux or FUSE interface sets NFSv4 ACLs |
+| `granular/01.t` | `[ "${os}:${fs}" = "FreeBSD:ZFS" ] || quick_exit;` | FreeBSD ZFS NFSv4-ACL semantics; no Linux or FUSE interface sets NFSv4 ACLs |
+| `granular/02.t` | `[ "${os}:${fs}" = "FreeBSD:ZFS" ] || quick_exit;` | FreeBSD ZFS NFSv4-ACL semantics; no Linux or FUSE interface sets NFSv4 ACLs |
+| `granular/03.t` | `[ "${os}:${fs}" = "FreeBSD:ZFS" ] || quick_exit;` | FreeBSD ZFS NFSv4-ACL semantics; no Linux or FUSE interface sets NFSv4 ACLs |
 | `granular/04.t` | `nfsv4acls || quick_exit;` | NFSv4 ACL tooling; `nfsv4acls` returns 1 off FreeBSD (`tests/misc.sh:309-312`) |
-| `granular/05.t` | `[ "${os}:${fs}" = "FreeBSD:ZFS" ] || quick_exit;` | FreeBSD ZFS NFSv4-ACL tests; gated on `FreeBSD:ZFS` |
+| `granular/05.t` | `[ "${os}:${fs}" = "FreeBSD:ZFS" ] || quick_exit;` | FreeBSD ZFS NFSv4-ACL semantics; no Linux or FUSE interface sets NFSv4 ACLs |
 | `granular/06.t` | `nfsv4acls || quick_exit;	quick_exit;` | NFSv4 ACL tooling; `nfsv4acls` returns 1 off FreeBSD (`tests/misc.sh:309-312`) |
-| `link/05.t` | `[ "${os}:${fs}" = "FreeBSD:UFS" ] || quick_exit;require link;` | tests FreeBSD UFS behaviour; gated on `${os}:${fs}` = `FreeBSD:UFS` |
-| `link/12.t` | `require chflags;require link;` | needs chflags(2), which Linux lacks; upstream `supported chflags` returns false off FreeBSD (`tests/misc.sh:179-187`) |
-| `link/13.t` | `require chflags;require link;` | needs chflags(2), which Linux lacks; upstream `supported chflags` returns false off FreeBSD (`tests/misc.sh:179-187`) |
-| `link/14.t` | `[ "${os}" = "FreeBSD" ] || quick_exit;require link;` | FreeBSD-only behaviour; gated on `${os}` = `FreeBSD` |
-| `link/15.t` | `[ "${os}:${fs}" = "FreeBSD:UFS" ] || quick_exit;require link;` | tests FreeBSD UFS behaviour; gated on `${os}:${fs}` = `FreeBSD:UFS` |
-| `link/16.t` | `[ "${os}" = "FreeBSD" ] || quick_exit;require link;` | FreeBSD-only behaviour; gated on `${os}` = `FreeBSD` |
-| `mkdir/08.t` | `require chflags;` | needs chflags(2), which Linux lacks; upstream `supported chflags` returns false off FreeBSD (`tests/misc.sh:179-187`) |
-| `mkdir/09.t` | `[ "${os}:${fs}" = "FreeBSD:UFS" ] || quick_exit;` | tests FreeBSD UFS behaviour; gated on `${os}:${fs}` = `FreeBSD:UFS` |
-| `mkdir/11.t` | `[ "${os}:${fs}" = "FreeBSD:UFS" ] || quick_exit;` | tests FreeBSD UFS behaviour; gated on `${os}:${fs}` = `FreeBSD:UFS` |
-| `mkfifo/08.t` | `[ "${os}:${fs}" = "FreeBSD:UFS" ] || quick_exit;` | tests FreeBSD UFS behaviour; gated on `${os}:${fs}` = `FreeBSD:UFS` |
-| `mkfifo/10.t` | `require chflags;` | needs chflags(2), which Linux lacks; upstream `supported chflags` returns false off FreeBSD (`tests/misc.sh:179-187`) |
-| `mkfifo/11.t` | `[ "${os}:${fs}" = "FreeBSD:UFS" ] || quick_exit;` | tests FreeBSD UFS behaviour; gated on `${os}:${fs}` = `FreeBSD:UFS` |
-| `mknod/09.t` | `require mknod;require chflags;` | needs chflags(2), which Linux lacks; upstream `supported chflags` returns false off FreeBSD (`tests/misc.sh:179-187`) |
-| `open/09.t` | `require chflags;` | needs chflags(2), which Linux lacks; upstream `supported chflags` returns false off FreeBSD (`tests/misc.sh:179-187`) |
-| `open/10.t` | `require chflags;` | needs chflags(2), which Linux lacks; upstream `supported chflags` returns false off FreeBSD (`tests/misc.sh:179-187`) |
-| `open/11.t` | `require chflags;` | needs chflags(2), which Linux lacks; upstream `supported chflags` returns false off FreeBSD (`tests/misc.sh:179-187`) |
-| `open/13.t` | `require chflags;` | needs chflags(2), which Linux lacks; upstream `supported chflags` returns false off FreeBSD (`tests/misc.sh:179-187`) |
-| `open/14.t` | `[ "${os}:${fs}" = "FreeBSD:UFS" ] || quick_exit;` | tests FreeBSD UFS behaviour; gated on `${os}:${fs}` = `FreeBSD:UFS` |
-| `open/15.t` | `[ "${os}:${fs}" = "FreeBSD:UFS" ] || quick_exit;` | tests FreeBSD UFS behaviour; gated on `${os}:${fs}` = `FreeBSD:UFS` |
-| `open/18.t` | `[ "${os}" = "FreeBSD" ] || quick_exit;` | FreeBSD-only behaviour; gated on `${os}` = `FreeBSD` |
-| `open/19.t` | `[ "${os}:${fs}" = "FreeBSD:UFS" ] || quick_exit;` | tests FreeBSD UFS behaviour; gated on `${os}:${fs}` = `FreeBSD:UFS` |
-| `open/20.t` | `[ "${os}:${fs}" = "FreeBSD:UFS" ] || quick_exit;noexec && quick_exit;` | tests FreeBSD UFS behaviour; gated on `${os}:${fs}` = `FreeBSD:UFS` |
-| `rename/06.t` | `require chflags;` | needs chflags(2), which Linux lacks; upstream `supported chflags` returns false off FreeBSD (`tests/misc.sh:179-187`) |
-| `rename/07.t` | `require chflags;` | needs chflags(2), which Linux lacks; upstream `supported chflags` returns false off FreeBSD (`tests/misc.sh:179-187`) |
-| `rename/08.t` | `require chflags;` | needs chflags(2), which Linux lacks; upstream `supported chflags` returns false off FreeBSD (`tests/misc.sh:179-187`) |
-| `rename/15.t` | `[ "${os}" = "FreeBSD" ] || quick_exit;` | FreeBSD-only behaviour; gated on `${os}` = `FreeBSD` |
-| `rename/16.t` | `[ "${os}" = "FreeBSD" ] || quick_exit;` | FreeBSD-only behaviour; gated on `${os}` = `FreeBSD` |
-| `rmdir/09.t` | `require chflags;` | needs chflags(2), which Linux lacks; upstream `supported chflags` returns false off FreeBSD (`tests/misc.sh:179-187`) |
-| `rmdir/10.t` | `require chflags;` | needs chflags(2), which Linux lacks; upstream `supported chflags` returns false off FreeBSD (`tests/misc.sh:179-187`) |
-| `rmdir/13.t` | `[ "${os}" = "FreeBSD" ] || quick_exit;` | FreeBSD-only behaviour; gated on `${os}` = `FreeBSD` |
-| `rmdir/14.t` | `[ "${os}:${fs}" = "FreeBSD:UFS" ] || quick_exit;` | tests FreeBSD UFS behaviour; gated on `${os}:${fs}` = `FreeBSD:UFS` |
-| `symlink/09.t` | `require chflags;` | needs chflags(2), which Linux lacks; upstream `supported chflags` returns false off FreeBSD (`tests/misc.sh:179-187`) |
-| `symlink/10.t` | `[ "${os}:${fs}" = "FreeBSD:UFS" ] || quick_exit;` | tests FreeBSD UFS behaviour; gated on `${os}:${fs}` = `FreeBSD:UFS` |
-| `symlink/11.t` | `[ "${os}:${fs}" = "FreeBSD:UFS" ] || quick_exit;` | tests FreeBSD UFS behaviour; gated on `${os}:${fs}` = `FreeBSD:UFS` |
-| `truncate/08.t` | `require chflags;` | needs chflags(2), which Linux lacks; upstream `supported chflags` returns false off FreeBSD (`tests/misc.sh:179-187`) |
-| `truncate/10.t` | `[ "${os}:${fs}" = "FreeBSD:UFS" ] || quick_exit;` | tests FreeBSD UFS behaviour; gated on `${os}:${fs}` = `FreeBSD:UFS` |
-| `truncate/11.t` | `[ "${os}" = "FreeBSD" ] || quick_exit;noexec && quick_exit;` | FreeBSD-only behaviour; gated on `${os}` = `FreeBSD` |
-| `unlink/09.t` | `require chflags;` | needs chflags(2), which Linux lacks; upstream `supported chflags` returns false off FreeBSD (`tests/misc.sh:179-187`) |
-| `unlink/10.t` | `require chflags;` | needs chflags(2), which Linux lacks; upstream `supported chflags` returns false off FreeBSD (`tests/misc.sh:179-187`) |
-| `unlink/12.t` | `[ "${os}:${fs}" = "FreeBSD:UFS" ] || quick_exit;` | tests FreeBSD UFS behaviour; gated on `${os}:${fs}` = `FreeBSD:UFS` |
+| `link/12.t` | `require chflags;require link;` | BSD file flags via chflags(2), which Linux lacks; upstream `supported chflags` is false off FreeBSD (`tests/misc.sh:179-187`) |
+| `link/13.t` | `require chflags;require link;` | BSD file flags via chflags(2), which Linux lacks; upstream `supported chflags` is false off FreeBSD (`tests/misc.sh:179-187`) |
+| `mkdir/08.t` | `require chflags;` | BSD file flags via chflags(2), which Linux lacks; upstream `supported chflags` is false off FreeBSD (`tests/misc.sh:179-187`) |
+| `mkfifo/10.t` | `require chflags;` | BSD file flags via chflags(2), which Linux lacks; upstream `supported chflags` is false off FreeBSD (`tests/misc.sh:179-187`) |
+| `mknod/09.t` | `require mknod;require chflags;` | BSD file flags via chflags(2), which Linux lacks; upstream `supported chflags` is false off FreeBSD (`tests/misc.sh:179-187`) |
+| `open/09.t` | `require chflags;` | BSD file flags via chflags(2), which Linux lacks; upstream `supported chflags` is false off FreeBSD (`tests/misc.sh:179-187`) |
+| `open/10.t` | `require chflags;` | BSD file flags via chflags(2), which Linux lacks; upstream `supported chflags` is false off FreeBSD (`tests/misc.sh:179-187`) |
+| `open/11.t` | `require chflags;` | BSD file flags via chflags(2), which Linux lacks; upstream `supported chflags` is false off FreeBSD (`tests/misc.sh:179-187`) |
+| `open/13.t` | `require chflags;` | BSD file flags via chflags(2), which Linux lacks; upstream `supported chflags` is false off FreeBSD (`tests/misc.sh:179-187`) |
+| `open/18.t` | `[ "${os}" = "FreeBSD" ] || quick_exit;` | tests `O_SHLOCK`/`O_EXLOCK` open flags, which exist only on BSD |
+| `rename/06.t` | `require chflags;` | BSD file flags via chflags(2), which Linux lacks; upstream `supported chflags` is false off FreeBSD (`tests/misc.sh:179-187`) |
+| `rename/07.t` | `require chflags;` | BSD file flags via chflags(2), which Linux lacks; upstream `supported chflags` is false off FreeBSD (`tests/misc.sh:179-187`) |
+| `rename/08.t` | `require chflags;` | BSD file flags via chflags(2), which Linux lacks; upstream `supported chflags` is false off FreeBSD (`tests/misc.sh:179-187`) |
+| `rmdir/09.t` | `require chflags;` | BSD file flags via chflags(2), which Linux lacks; upstream `supported chflags` is false off FreeBSD (`tests/misc.sh:179-187`) |
+| `rmdir/10.t` | `require chflags;` | BSD file flags via chflags(2), which Linux lacks; upstream `supported chflags` is false off FreeBSD (`tests/misc.sh:179-187`) |
+| `symlink/09.t` | `require chflags;` | BSD file flags via chflags(2), which Linux lacks; upstream `supported chflags` is false off FreeBSD (`tests/misc.sh:179-187`) |
+| `truncate/08.t` | `require chflags;` | BSD file flags via chflags(2), which Linux lacks; upstream `supported chflags` is false off FreeBSD (`tests/misc.sh:179-187`) |
+| `unlink/09.t` | `require chflags;` | BSD file flags via chflags(2), which Linux lacks; upstream `supported chflags` is false off FreeBSD (`tests/misc.sh:179-187`) |
+| `unlink/10.t` | `require chflags;` | BSD file flags via chflags(2), which Linux lacks; upstream `supported chflags` is false off FreeBSD (`tests/misc.sh:179-187`) |
 | `utimensat/03.t` | `require "utimensat";require stat_st_birthtime;` | needs `st_birthtime` in `struct stat`, which Linux lacks (`tests/misc.sh:228-234`) |
 
-#### Skipped on Linux, would need X (2 files)
+#### Skipped on Linux, would need X (27 files)
 
-| File | Upstream gate | Why it skips | Would need |
+| File | Upstream gate | What it tests, and why it skips | Would need (X) |
 |---|---|---|---|
+| `chmod/09.t` | `[ "${os}:${fs}" = "FreeBSD:UFS" ] || quick_exit;` | EROFS: "chmod returns EROFS if the named file resides on a read-only file system". Standard POSIX behaviour; only the fixture (`mdconfig`, `newfs`, `mount -u`, or a FreeBSD exec setup) is FreeBSD-specific | a Chimera mount that can be remounted (or exported) read-only on the Linux test host |
+| `chown/09.t` | `[ "${os}:${fs}" = "FreeBSD:UFS" ] || quick_exit;` | EROFS: "chown returns EROFS if the named file resides on a read-only file system". Standard POSIX behaviour; only the fixture (`mdconfig`, `newfs`, `mount -u`, or a FreeBSD exec setup) is FreeBSD-specific | a Chimera mount that can be remounted (or exported) read-only on the Linux test host |
+| `ftruncate/10.t` | `[ "${os}:${fs}" = "FreeBSD:UFS" ] || quick_exit;` | EROFS: "truncate returns EROFS if the named file resides on a read-only file system". Standard POSIX behaviour; only the fixture (`mdconfig`, `newfs`, `mount -u`, or a FreeBSD exec setup) is FreeBSD-specific | a Chimera mount that can be remounted (or exported) read-only on the Linux test host |
+| `ftruncate/11.t` | `[ "${os}" = "FreeBSD" ] || quick_exit;noexec && quick_exit;` | ETXTBSY: "truncate returns ETXTBSY the file is a pure procedure (shared text) file that is being exe". Standard POSIX behaviour; gated on FreeBSD only | an executable on the Chimera mount that the test runs; the result depends on the client kernel's deny-write-on-exec behaviour |
+| `link/05.t` | `[ "${os}:${fs}" = "FreeBSD:UFS" ] || quick_exit;require link;` | EMLINK: "link returns EMLINK if the link count of the file named by name1 would exceed {PC_LINK_MAX". Standard POSIX behaviour; only the fixture (`mdconfig`, `newfs`, `mount -u`, or a FreeBSD exec setup) is FreeBSD-specific | a backend whose link-count limit `{PC_LINK_MAX}` is reachable by the test |
+| `link/14.t` | `[ "${os}" = "FreeBSD" ] || quick_exit;require link;` | EXDEV: "link returns EXDEV if the source and the destination files are on different file systems". Standard POSIX behaviour; only the fixture (`mdconfig`, `newfs`, `mount -u`, or a FreeBSD exec setup) is FreeBSD-specific | a second Chimera mount on the same client, to cross |
+| `link/15.t` | `[ "${os}:${fs}" = "FreeBSD:UFS" ] || quick_exit;require link;` | ENOSPC: "link returns ENOSPC if the directory in which the entry for the new link is being placed c". Standard POSIX behaviour; only the fixture (`mdconfig`, `newfs`, `mount -u`, or a FreeBSD exec setup) is FreeBSD-specific | a Chimera mount on a small or inode-limited backend that the test can fill |
+| `link/16.t` | `[ "${os}" = "FreeBSD" ] || quick_exit;require link;` | EROFS: "link returns EROFS if the requested link requires writing in a directory on a read-only fi". Standard POSIX behaviour; only the fixture (`mdconfig`, `newfs`, `mount -u`, or a FreeBSD exec setup) is FreeBSD-specific | a Chimera mount that can be remounted (or exported) read-only on the Linux test host |
+| `mkdir/09.t` | `[ "${os}:${fs}" = "FreeBSD:UFS" ] || quick_exit;` | EROFS: "mkdir returns EROFS if the named file resides on a read-only file system". Standard POSIX behaviour; only the fixture (`mdconfig`, `newfs`, `mount -u`, or a FreeBSD exec setup) is FreeBSD-specific | a Chimera mount that can be remounted (or exported) read-only on the Linux test host |
+| `mkdir/11.t` | `[ "${os}:${fs}" = "FreeBSD:UFS" ] || quick_exit;` | ENOSPC: "mkdir returns ENOSPC if there are no free inodes on the file system on which the directory". Standard POSIX behaviour; only the fixture (`mdconfig`, `newfs`, `mount -u`, or a FreeBSD exec setup) is FreeBSD-specific | a Chimera mount on a small or inode-limited backend that the test can fill |
+| `mkfifo/08.t` | `[ "${os}:${fs}" = "FreeBSD:UFS" ] || quick_exit;` | EROFS: "mkfifo returns EROFS if the named file resides on a read-only file system". Standard POSIX behaviour; only the fixture (`mdconfig`, `newfs`, `mount -u`, or a FreeBSD exec setup) is FreeBSD-specific | a Chimera mount that can be remounted (or exported) read-only on the Linux test host |
+| `mkfifo/11.t` | `[ "${os}:${fs}" = "FreeBSD:UFS" ] || quick_exit;` | ENOSPC: "mkfifo returns ENOSPC if there are no free inodes on the file system on which the file is ". Standard POSIX behaviour; only the fixture (`mdconfig`, `newfs`, `mount -u`, or a FreeBSD exec setup) is FreeBSD-specific | a Chimera mount on a small or inode-limited backend that the test can fill |
+| `open/14.t` | `[ "${os}:${fs}" = "FreeBSD:UFS" ] || quick_exit;` | EROFS: "open returns EROFS if the named file resides on a read-only file system, and the file is t". Standard POSIX behaviour; only the fixture (`mdconfig`, `newfs`, `mount -u`, or a FreeBSD exec setup) is FreeBSD-specific | a Chimera mount that can be remounted (or exported) read-only on the Linux test host |
+| `open/15.t` | `[ "${os}:${fs}" = "FreeBSD:UFS" ] || quick_exit;` | EROFS: "open returns EROFS when O_CREAT is specified and the named file would reside on a read-onl". Standard POSIX behaviour; only the fixture (`mdconfig`, `newfs`, `mount -u`, or a FreeBSD exec setup) is FreeBSD-specific | a Chimera mount that can be remounted (or exported) read-only on the Linux test host |
+| `open/19.t` | `[ "${os}:${fs}" = "FreeBSD:UFS" ] || quick_exit;` | ENOSPC: "open returns ENOSPC when O_CREAT is specified, the file does not exist, and there are no f". Standard POSIX behaviour; only the fixture (`mdconfig`, `newfs`, `mount -u`, or a FreeBSD exec setup) is FreeBSD-specific | a Chimera mount on a small or inode-limited backend that the test can fill |
+| `open/20.t` | `[ "${os}:${fs}" = "FreeBSD:UFS" ] || quick_exit;noexec && quick_exit;` | ETXTBSY: "open returns ETXTBSY when the file is a pure procedure (shared text) file that is being ex". Standard POSIX behaviour; gated on FreeBSD only | an executable on the Chimera mount that the test runs; the result depends on the client kernel's deny-write-on-exec behaviour |
 | `posix_fallocate/00.t` | `require posix_fallocate;` | Linux has posix_fallocate(3), but upstream `supported posix_fallocate` accepts only FreeBSD and not FUSEFS (`tests/misc.sh:200-206`) | a pjdfstest `supported()` that accepts Linux and the Chimera FUSE fs type (a fork patch), or running the in-tree port's posix_fallocate/00 |
+| `rename/15.t` | `[ "${os}" = "FreeBSD" ] || quick_exit;` | EXDEV: "rename returns EXDEV if the link named by 'to' and the file named by 'from' are on differe". Standard POSIX behaviour; only the fixture (`mdconfig`, `newfs`, `mount -u`, or a FreeBSD exec setup) is FreeBSD-specific | a second Chimera mount on the same client, to cross |
+| `rename/16.t` | `[ "${os}" = "FreeBSD" ] || quick_exit;` | EROFS: "rename returns EROFS if the requested link requires writing in a directory on a read-only ". Standard POSIX behaviour; only the fixture (`mdconfig`, `newfs`, `mount -u`, or a FreeBSD exec setup) is FreeBSD-specific | a Chimera mount that can be remounted (or exported) read-only on the Linux test host |
 | `rename/22.t` | `require rename_ctime;` | POSIX leaves ctime-on-rename optional; upstream runs it only for listed fs types (`tests/misc.sh:208-224`) | pjdfstest to recognise the Chimera FUSE fs type, and a product decision that Chimera updates ctime on rename |
+| `rmdir/13.t` | `[ "${os}" = "FreeBSD" ] || quick_exit;` | EBUSY: "rmdir returns EBUSY if the directory to be removed is the mount point for a mounted file s". Standard POSIX behaviour; only the fixture (`mdconfig`, `newfs`, `mount -u`, or a FreeBSD exec setup) is FreeBSD-specific | a second mount mounted on a directory inside the Chimera mount |
+| `rmdir/14.t` | `[ "${os}:${fs}" = "FreeBSD:UFS" ] || quick_exit;` | EROFS: "rmdir returns EROFS if the named file resides on a read-only file system". Standard POSIX behaviour; only the fixture (`mdconfig`, `newfs`, `mount -u`, or a FreeBSD exec setup) is FreeBSD-specific | a Chimera mount that can be remounted (or exported) read-only on the Linux test host |
+| `symlink/10.t` | `[ "${os}:${fs}" = "FreeBSD:UFS" ] || quick_exit;` | EROFS: "symlink returns EROFS if the file name2 would reside on a read-only file system". Standard POSIX behaviour; only the fixture (`mdconfig`, `newfs`, `mount -u`, or a FreeBSD exec setup) is FreeBSD-specific | a Chimera mount that can be remounted (or exported) read-only on the Linux test host |
+| `symlink/11.t` | `[ "${os}:${fs}" = "FreeBSD:UFS" ] || quick_exit;` | ENOSPC: "symlink returns ENOSPC if there are no free inodes on the file system on which the symboli". Standard POSIX behaviour; only the fixture (`mdconfig`, `newfs`, `mount -u`, or a FreeBSD exec setup) is FreeBSD-specific | a Chimera mount on a small or inode-limited backend that the test can fill |
+| `truncate/10.t` | `[ "${os}:${fs}" = "FreeBSD:UFS" ] || quick_exit;` | EROFS: "truncate returns EROFS if the named file resides on a read-only file system". Standard POSIX behaviour; only the fixture (`mdconfig`, `newfs`, `mount -u`, or a FreeBSD exec setup) is FreeBSD-specific | a Chimera mount that can be remounted (or exported) read-only on the Linux test host |
+| `truncate/11.t` | `[ "${os}" = "FreeBSD" ] || quick_exit;noexec && quick_exit;` | ETXTBSY: "truncate returns ETXTBSY the file is a pure procedure (shared text) file that is being exe". Standard POSIX behaviour; gated on FreeBSD only | an executable on the Chimera mount that the test runs; the result depends on the client kernel's deny-write-on-exec behaviour |
+| `unlink/12.t` | `[ "${os}:${fs}" = "FreeBSD:UFS" ] || quick_exit;` | EROFS: "unlink returns EROFS if the named file resides on a read-only file system". Standard POSIX behaviour; only the fixture (`mdconfig`, `newfs`, `mount -u`, or a FreeBSD exec setup) is FreeBSD-specific | a Chimera mount that can be remounted (or exported) read-only on the Linux test host |
 
 ### CI evidence (pipeline 205408)
 
@@ -943,7 +984,7 @@ A whole-file skip prints `1..1` / `ok 1` and exits 0 (`tests/misc.sh:164-168`). 
 
 Merge train 205343, jobs 3489337/3489338: 2578 Passed each.
 
-### No FUSE path (C2)
+### No FUSE path
 
 - SUC-2 asks for "pjdfstest for POSIX behaviour through FUSE" (`docs/product/prd.md:394-395`).
 - The only POSIX-semantics test over FUSE is `fuse_posix_test`, a hand-written errno test on memfs only (`src/server/fuse/tests/CMakeLists.txt:20`, :46-99).
@@ -962,8 +1003,8 @@ The pjd port uses the same posix harness as cthon-port: diskfs `unsafe_async: tr
 |---|---|---|---|
 | 147 port programs × backends (2578) | **run**, all pass | in-process client | `src/posix/tests/CMakeLists.txt:1392-1686`; job 3490972 |
 | 28 Linux-runnable upstream files | **missing** from port | not ported | comparison table |
-| 69 upstream files | **not runnable on Linux**; upstream prints `1..1`/`ok 1`, which this document counts as **SKIP, never a pass** | platform gates (see "Whole-file skips on Linux") | `tests/misc.sh:164-168` |
-| 2 upstream files (posix_fallocate/00, rename/22) | **skipped, would need X** (counted as SKIP) | see "Whole-file skips on Linux" | `tests/misc.sh:200-224` |
+| 44 upstream files | **not runnable on Linux**; upstream prints `1..1`/`ok 1`, which this document counts as **SKIP, never a pass** | non-Linux behaviour (see "Whole-file skips on Linux") | `tests/misc.sh:164-168` |
+| 27 upstream files (25 FreeBSD-fixture errno files, posix_fallocate/00, rename/22) | **skipped, would need X** (counted as SKIP) | Linux fixture or gate change named per file in "Whole-file skips on Linux" | `tests/misc.sh:164-168`, `:200-224` |
 | 7 port programs whose upstream file quick-exits on Linux (granular ×4, open/13, posix_fallocate/00, rename/22) | run in the port anyway | port ignores upstream gates | comparison table |
 | pjdfstest over FUSE | **missing** | no wiring | `src/server/fuse/tests/CMakeLists.txt` |
 | granular over NFS | **excluded** | NFS client cannot set `FATTR4_ACL` | `src/posix/tests/CMakeLists.txt:1541-1542` |
@@ -973,8 +1014,10 @@ The pjd port uses the same posix harness as cthon-port: diskfs `unsafe_async: tr
 ### Proposed full run (PROPOSAL for Q-SUC-2)
 
 - Selection: upstream `tests/**/*.t` at a pinned commit, over a FUSE mount, run as root (D4).
-- **Not runnable on Linux:** the 69 files listed under "Whole-file skips on Linux", each with its reason. They include all of `granular` and `chflags`.
-- **Skipped, would need X:** posix_fallocate/00 and rename/22. They stay in the selection and count as SKIP until the stated need is met.
+- **Not runnable on Linux:** the 44 files listed under "Whole-file skips on Linux", each with its reason. They include all of `chflags`, all of `granular`, and open/18.
+- **Skipped, would need X:** 27 files. Each stays in the selection and counts as SKIP until its fixture or gate change exists:
+  - 25 errno checks need a Linux fixture: a read-only remount, a filled or inode-exhausted backend, a second mount, or an exec'd file;
+  - posix_fallocate/00 and rename/22 need a gate change.
 - ACL-1 (P) is covered by pynfs ACL\*, smbtorture/WPTS ACL and the in-process granular port. Gap: no NFSv4-ACL test through FUSE.
 - **Pass criterion:** TAP `ok` for every assertion of every file that runs. A whole-file skip (`1..1` from `quick_exit`) is a SKIP, never a pass. A SKIP fails the run unless the file is on the not-runnable list.
 - **Corruption oracle:** none. pjdfstest checks metadata and errno, not data. This remains a gap.
@@ -983,7 +1026,7 @@ The pjd port uses the same posix harness as cthon-port: diskfs `unsafe_async: tr
 
 - The pjd backend-label regex misses 727 direct tests and mislabels 147 (`:1710-1711`).
 - The comment at `:1592` is stale, and so is `extended.yml:827`.
-- pjdfstest is not pinned upstream and does not run over FUSE (C2).
+- pjdfstest is not pinned upstream and does not run over FUSE (see "No FUSE path").
 - The port lacks 28 Linux-runnable upstream files, including ftruncate 01–07, 09, 12, 14.
 - diskfs pjd rows run with `unsafe_async: true`.
 
@@ -1092,12 +1135,12 @@ Every client invocation carries these options (`src/server/smb/tests/smbtorture_
 | `use_iptables=yes` | `:300` | Simulates an unresponsive transport with iptables inside the per-test netns |
 | `open_brlock_deadlock_timemout=2` | `:304` | Without it, `smb2.lock.open-brlock-deadlock` self-skips |
 | `oplocktimeout=30` | `:310` | The batch22a/b break-timeout window is bracketed at 30 s, not the 35 s Windows default |
-| `client smb3 signing algorithms=%s` | `:314`, `:250-257` | GMAC+CMAC+HMAC when the test name contains `session.signing`, `session.encryption`, or `bind_negative_smb3s…toG`; CMAC only otherwise (see R3-1 below) |
+| `client smb3 signing algorithms=%s` | `:314`, `:250-257` | GMAC+CMAC+HMAC when the test name contains `session.signing`, `session.encryption`, or `bind_negative_smb3s…toG`; CMAC only otherwise (see "Encryption and signing subtests" below) |
 | `--seed=4242` | `:325` | Every randomized input is fixed (cited cause: `smb2.replay.channel-sequence` drawing 0x7fff, which is legal per MS-SMB2 3.3.5.2.10) |
 | `--fullname` | `:326` | Subtest names are reported in full |
 | `localdir=<session dir>` (linux and io_uring only) | `:334` | Lets `samba3misc` take a POSIX lock on the share path |
 
-**R3-1: encryption and signing subtests.**
+**Encryption and signing subtests.**
 - These subtests are allowlisted and gated on **all 6 backends**: `smb2.session.encryption-aes-{128,256}-{ccm,gcm}` (4), `smb2.session.signing-{aes-128-cmac,aes-128-gmac,hmac-sha-256}` (3), `anon-encryption1-3` (3), `bind_negative_smb3encGtoC{s,d}` (2) and `session-require-signing.bug15397` (1).
 - The 4 `session.encryption-*` subtests passed in ctest. Example: job 3490968 artifact line 696, "smbtorture_smb2_session_encryption_aes_128_ccm_memfs … Passed".
 - At samba-4.23.6, every `bind_negative_smb3sign*` and `bind_negative_smb3sne*` test skips with "Can't test without SMB 3.1.1 signing negotiation support" when the negotiated signing algorithm is below AES-128-GMAC. Source: `source4/torture/smb2/session.c`, for example :3363-3364.
@@ -1231,7 +1274,7 @@ Ceph s3-tests is a boto3/pytest suite that exercises the S3 API. In Chimera it r
 | Pin | `5522d1c351f75bc00ae0f64f742f3f095f5939d9` | `.devcontainer/Dockerfile:59` ("ARG S3TESTS_REF=5522d1c3…") |
 | Build switch | `ENABLE_S3TESTS=1` | `.devcontainer/Dockerfile:56` |
 | Python deps | `requirements.txt` at the pin (unpinned: `boto3 >=1.0.0`, `pytest`, …) plus `pytest-timeout`, in a `--python 3.12` venv | `.devcontainer/Dockerfile:205-206` |
-| GitLab CI image (`builders/dev`) | not installed: the file has no `s3-tests` and no `boto3` (grep: 0 hits) | `builders/dev/Dockerfile` (absence; `s3.repro.sh`) |
+| GitLab CI image (`builders/dev`) | not installed: the file has no `s3-tests` and no `boto3` (grep: 0 hits) | `builders/dev/Dockerfile` (absence; `repro/s3.repro.sh` in the vault evidence directory) |
 
 The universe was enumerated from a scratch clone at the pin (`git rev-parse HEAD` = `5522d1c3…`). It ran under pytest 9.1.1, boto3 1.43.108 and Python 3.13.5. That is not the image's 3.12; collection does not depend on the difference.
 
@@ -1306,7 +1349,7 @@ The `test_s3.py` results quoted in `docs/design/s3_ceph_compliance.md:105` ("pas
 
 ### Markers
 
-`pytest.ini` declares **59** markers. **10** of them are on no collected case: `appendobject`, `auth_aws4`, `fails_on_s3`, `fails_with_subdomain`, `object_lock`, `s3website`, `s3website_routing_rules`, `s3website_redirect_location`, `storage_class`, `versioning`. In `test_s3.py`, **239** cases carry no marker at all and **360** carry none other than `fails_on_*` (all files together: 242 and 363). Some families have tests but no usable marker: 39 `test_object_lock*` cases (marker empty), 20 `test_versioning*` (marker empty), and 13 `test_cors*` (no CORS marker). A marker-based exclusion therefore cannot express the (O) families, and a node-ID denylist is needed (§7). Among the populated markers relevant to (O) families: `encryption` 144, `bucket_logging` 113, `sse_s3` 56, `lifecycle` 48, `bucket_policy` 31, `tagging` 25, `auth_aws2` 21 (all in `test_headers.py`), `bucket_encryption` 12, `checksum` 11, `object_ownership` 8. The suite has no `xfail` anywhere.
+`pytest.ini` declares **59** markers. **10** of them are on no collected case: `appendobject`, `auth_aws4`, `fails_on_s3`, `fails_with_subdomain`, `object_lock`, `s3website`, `s3website_routing_rules`, `s3website_redirect_location`, `storage_class`, `versioning`. In `test_s3.py`, **239** cases carry no marker at all and **360** carry none other than `fails_on_*` (all files together: 242 and 363). Some families have tests but no usable marker: 39 `test_object_lock*` cases (marker empty), 20 `test_versioning*` (marker empty), and 13 `test_cors*` (no CORS marker). A marker-based exclusion therefore cannot express the (O) families, and a node-ID denylist is needed (see "Per-file decision"). Among the populated markers relevant to (O) families: `encryption` 144, `bucket_logging` 113, `sse_s3` 56, `lifecycle` 48, `bucket_policy` 31, `tagging` 25, `auth_aws2` 21 (all in `test_headers.py`), `bucket_encryption` 12, `checksum` 11, `object_ownership` 8. The suite has no `xfail` anywhere.
 
 ### Run, skipped, excluded, missing (today)
 
@@ -1336,9 +1379,9 @@ Pass semantics today: the single ctest passes if and only if pytest exits 0. A p
 | `test_s3control.py` | 1 | (O) unless advertised |
 | `test_utils.py` | 1 | **out**: it tests the suite's own `generate_random` helper and never contacts a server |
 
-### Policy, ACL and anonymous cases (R3-3 classification)
+### Policy, ACL and anonymous cases (classification)
 
-**Scope.** Every collected case in `test_s3.py` and `test_headers.py` that calls (directly or through a helper) an ACL, bucket-policy, ownership or public-access-block API, or makes an unsigned request. That is **285** cases: 279 in `test_s3.py` and 6 in `test_headers.py`, including the 4 `*_bad_authorization_{empty,none}` header cases found by name. The per-case list is `s3-classification.tsv` (node ID, class, reason). Every class was assigned by reading the test body at the pin.
+**Scope.** Every collected case in `test_s3.py` and `test_headers.py` that calls (directly or through a helper) an ACL, bucket-policy, ownership or public-access-block API, or makes an unsigned request. That is **285** cases: 279 in `test_s3.py` and 6 in `test_headers.py`, including the 4 `*_bad_authorization_{empty,none}` header cases found by name. The per-case list is `data/s3-classification.tsv` (node ID, class, reason) in the vault evidence directory (see "Scope and method"). Every class was assigned by reading the test body at the pin.
 
 **Rules:**
 - A grant or unconditioned policy whose principal and action map to an NFSv4 ACE is **canonical-mappable**. This includes owner/user grants, `AllUsers` mapped to EVERYONE@ and `AuthenticatedUsers` mapped to AUTHENTICATED@.
@@ -1577,14 +1620,35 @@ A full run is every test in the pinned **upstream** suite, minus a written exclu
 **Allowed deviations.** Every deviation is one row: the setting, its scope (all tests, one family, or one subtest) and a justification. There are two kinds:
 
 - **Profile deviations.** These enable a feature the shipped default leaves off. Each is justified by a (P) row (for example HA-5 persistent handles on continuously available shares, SEC-6 encryption, or SEC-1 per-bucket admin enablement) or by an (O) feature the operator advertises under OQ-1 (for example leases, directory leases, multichannel or streams).
-- **Spec-permitted tuning (T).** These change a value the protocol leaves to the server, without changing behaviour. Each is listed with its spec citation. Today that means the NFSv4 lease and grace times (5 s / 10 s in the harness, against 90 s / 180 s shipped) and the core thread count (4 against 8). The pynfs section gives the table.
+- **Spec-permitted tuning (T).** These change a value the protocol leaves to the server, without changing behaviour. Each is listed with its spec citation. Today that means the NFSv4 lease and grace times (5 s / 10 s in the harness, against 90 s / 180 s shipped) and the thread counts (4 core against 16 shipped; 8 sync delegation threads against 1 shipped). The pynfs section gives the table. The shipped thread values are those of the installed `src/daemon/chimera.json` (see "Harness deviations from shipped defaults").
   - **The release-gate full run uses the shipped timers and thread count.**
   - **The per-change gate may use the declared tuning** (OQ-6, gate depth against time).
   - A tuning value that leaves the spec's expectations is not tuning. For example, a grace period shorter than the lease is a deviation to remove.
 
 **Not allowed.** No undeclared deviation. Above all, no `unsafe_async` and no other non-durable backend setting, because SUC-1 requires no data corruption.
 
-**Backend (D2).** The facade, with memfs and diskfs as interim proxies.
+**Backend (D2).** This decides which storage backend a full run exercises.
+
+The facts:
+- No suite runs against the backend the product will ship. That is the E14
+  backend facade, which does not exist yet (`roadmap.md`, E14).
+- Today's runs use memfs, linux, io_uring, cairn and diskfs. Every diskfs run
+  has `unsafe_async` on (see "Harness deviations from shipped defaults").
+- The installed `chimera.json` mounts the `linux` passthrough module and memfs.
+
+The options:
+- **(a) memfs only until E14.** Fastest. Tests no persistent storage, and so
+  cannot show the absence of corruption.
+- **(b) diskfs with durable settings plus memfs until E14.** Exercises a real
+  block path with FUA/sync. Slower.
+- **(c) the shipped `chimera.json` mounts (`linux` passthrough and memfs).**
+  The closest to today's shipped configuration. It tests the host filesystem
+  rather than Chimera's own storage.
+- **(d) the E14 facade only.** Defers the release gate until E14 exists.
+
+**Recommendation:** run (b) in the interim and switch to (d) once E14 lands.
+Keep (c) as a supplementary run of the installed configuration; the
+package-level `sntest` suites already do something close to it.
 
 **Pool modes (MODE-2, MODE-3).** Every protocol suite runs in multi-protocol mode, which is the default and is required. S3 also runs in native mode for the ACL-4 rows that are native-only. No pool mode exists in code today, so those rows are "not testable yet".
 
@@ -1612,7 +1676,7 @@ The selection details, class counts and per-test lists are in each suite's "Prop
 | cthon | Real cthon04 over kernel clients on NFSv3 (with NLM), 4.0, 4.1 and 4.2: `./runtests -N 1 -b -t /mnt/test`, then the same with `-g`, `-s` and `-l`. `-f` only for the per-change gate (OQ-6). SMB is an operator option (OQ-3). The in-process port is supplementary; its `nfs3rdma` rows belong to E10 | Exit 0 for each category | Partial: basic and general verify the contents they wrote |
 | smbtorture | Every `smb2.*` subtest at the pinned Samba, plus the rpc pipes the product serves. (M) SMB1→SMB2 upgrade; (O) SMB1 `raw.*` and `base.*`; (P) ACL-2, SEC-6 and the HA-5 persistent/CA subset; (D) Samba-specific subtests and the 4 tests that block by design (`tools/smbtorture/regen.sh:259-262`); knob dispositions as in the smbtorture section | `success`. A skip fails unless the subtest is excluded. No retry | Partial: read-back subtests only. Otherwise **no corruption oracle** |
 | Ceph s3-tests | All 1053 collected cases, decided per file. Policy, ACL and anonymous cases are split per ACL-4 and SEC-1. Runs over TLS. A node-ID denylist replaces the allowlist | pytest pass. skip and xfail fail unless listed. No retry | Partial: about 316 cases read back data or check checksums |
-| pjdfstest | Upstream `tests/**/*.t` over FUSE as root. (L) the 69 files that cannot run on Linux. posix_fallocate/00 and rename/22 stay in and count as SKIP until their need is met | TAP `ok` for every assertion. A whole-file skip is a SKIP, never a pass | **None** (metadata and errno only) |
+| pjdfstest | Upstream `tests/**/*.t` over FUSE as root. (L) the 44 files that test non-Linux behaviour. The 27 "would need X" files (25 FreeBSD-fixture errno checks, posix_fallocate/00, rename/22) stay in and count as SKIP until their Linux fixture or gate change exists | TAP `ok` for every assertion. A whole-file skip is a SKIP, never a pass | **None** (metadata and errno only) |
 | MinIO warp | v1.8.2: put, get, mixed, multipart, list, delete and stat (+ versioned), **plus `atomic`**. Parameters under D6 | Zero errors and zero `atomic` violations, parsed from the output. Throughput recorded, not gated | **`atomic`**: block-by-block read-after-write content check and ETag-is-MD5 check |
 
 **Cross-suite oracle.** No suite-independent check for data corruption exists today. Only warp `atomic` and the partial read-back cases above observe data.
@@ -1641,19 +1705,19 @@ These are candidates for E1 children (D8). None is fixed by this document. Evide
 5. **GitLab retries failed test jobs once.** In pipeline 205316, job 3488415 failed on an smbtorture timeout and its retry, job 3488440, passed. See "Pass semantics today".
 6. **pynfs counts WARN and NOTSUP as passes, and GitLab keeps no per-code JUnit.**
 7. **smbtorture exits 0 on a skip.** 96 `bind_negative` cells and 103 `copy_chunk` cells off memfs pass by skipping. The `copy_chunk` skips follow from `resume_key_support=no` off memfs.
-8. **pjdfstest upstream reports a whole-file skip as `ok 1`** (71 files on Linux). This only matters once upstream pjdfstest is wired; the in-tree port is unaffected.
+8. **pjdfstest upstream reports a whole-file skip as `ok 1`** (71 files on Linux). 27 of those test behaviour Linux provides but are gated on FreeBSD fixtures or capability lists, so a wired upstream run needs Linux fixtures for them. This only matters once upstream pjdfstest is wired; the in-tree port is unaffected.
 9. **cthon04 in KVM runs the `chimera-nas` fork @ `13f4336`.** In that fork, a failing `./stat` no longer fails the `general` category. It also runs in `-f` mode, has no `-l` (lock) run, and mounts NFSv3 with `nolock`.
 
 ### Not the shipped configuration
 
 10. **diskfs `unsafe_async: true` is set by 22 harness files**, including the posix, pynfs, smbtorture, S3 and KVM harnesses. No diskfs row proves durability. See "Harness deviations from shipped defaults".
 11. **The smbtorture driver turns on persistent handles, leases, oplocks, directory leases and two multichannel NICs for every run**, and sets further per-subtest overrides. It also runs with `samba3=yes`.
-12. **pynfs runs with short lease and grace times and 4 threads.** The combined runs use a 10 s grace with a 90 s lease, so grace is shorter than lease.
+12. **pynfs runs with short lease and grace times, 4 core threads (16 shipped) and 8 sync delegation threads (1 shipped).** The combined runs use a 10 s grace with a 90 s lease, so grace is shorter than lease.
 
 ### Coverage gaps
 
-13. **pjdfstest never runs over FUSE (C2).** No test exercises NFSv4 ACLs through FUSE. The port lacks 28 upstream files that can run on Linux.
-14. **Ceph s3-tests is never registered in any CI that was checked.** The system Python lacks boto3: job 3490972 logs "boto3 not found - S3 tests will be skipped". `builders/dev` also lacks `/opt/s3-tests`.
+13. **pjdfstest never runs over FUSE** (see "No FUSE path"). No test exercises NFSv4 ACLs through FUSE. The port lacks 28 upstream files that run on Linux unchanged, and all 25 FreeBSD-fixture errno files (EROFS, ENOSPC, EMLINK, EXDEV, EBUSY, ETXTBSY).
+14. **Ceph s3-tests is not registered in GitLab CI, and GitHub `extended` was not measured.** The system Python lacks boto3: job 3490972 logs "boto3 not found - S3 tests will be skipped". `builders/dev` also lacks `/opt/s3-tests`.
 15. **MinIO warp is not in the tree.**
 16. **Pool modes (MODE-1) are not implemented**, so ACL-4 refusal in multi-protocol pools cannot be tested yet.
 17. **The pynfs fork is behind upstream**: it is missing 12 codes and the slot fixes. Bumping it is a prerequisite of the proposed pynfs full set.
@@ -1676,7 +1740,7 @@ These are candidates for E1 children (D8). None is fixed by this document. Evide
 
 ## Open questions
 
-All are for the operator. D2 (shipping backend), D4 (pjdfstest through FUSE) and D6 (warp parameters and pass criterion) are presented above as proposals.
+All are for the operator. D2 (the backend a full run uses), D4 (pjdfstest through FUSE) and D6 (warp parameters and pass criterion) are presented above as proposals.
 
 - **OQ-1. Advertised-feature matrix.**
   - It governs only the (O) rows and the profile deviations they justify. (P) and (M) rows are not the operator's to make optional.
@@ -1700,3 +1764,8 @@ All are for the operator. D2 (shipping backend), D4 (pjdfstest through FUSE) and
   - **Recommendation: no.** Enablement should be an administrative per-bucket setting. Allow-asserting anonymous cases then become declared-deviation rows.
 - **OQ-8. Profile deviations for the full run.**
   - **Recommendation:** the shipped default plus only (P)-justified deviations, until OQ-1 is answered. These are HA-5 persistent handles on a CA share and SEC-6 encryption sessions.
+- **OQ-9. How much of pynfs's delegation coverage HA-5 makes required.**
+  - Today every pynfs delegation code is classed (P) under HA-5: 4.0 DELEG ×32, and 13 each at 4.1 and 4.2.
+  - HA-5 requires only that delegation *state* survive the loss of a node.
+  - Granting delegations is optional in the spec, and the proposed "advertised" matrix lists delegations as not advertised.
+  - **Recommendation:** treat it as the smbtorture HA-5 rows are treated. The codes that test delegation state across a restart or reclaim are (P); the other delegation codes are (O), unless OQ-1 advertises delegations, and then they are (M).
