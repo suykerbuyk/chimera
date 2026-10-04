@@ -263,7 +263,7 @@ struct chimera_sc_renew_args {
  *     expired, completes OK: its postcondition already holds.
  *   - The caller must itself hold a live epoch, else E_FENCED.
  *   - FENCE of the caller's own node is E_INVALID; a node ends its own
- *     epoch with DETACH. */
+ *     epoch with DETACH.  PROVISIONAL (S14). */
 struct chimera_sc_fence_args {
     struct chimera_sc_node_id node;
 };

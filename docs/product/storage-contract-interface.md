@@ -128,7 +128,8 @@ a lease (6.5, D10) without naming a clock.
   - O4: there is no direct-I/O operation.
   - O9: there is no quota-mode field.
   - O13: `OBJ_SEAL` never returns `CHIMERA_SC_E_RETENTION_LOCKED`.
-  - O14: the `FENCE` comment restates D10's failover order.
+  - O14: the `FENCE` comment states D10's failover order, and that v1
+    failover always uses `FENCE` (S14).
 
 ## 4. Provisional additions
 
@@ -148,7 +149,7 @@ draft 0.2.
 | S11 | Bytes the backend returns are valid only until the request completes | An asynchronous interface that returns borrowed memory needs a lifetime rule. This is the module SDK's own rule for returned values. |
 | S12 | Object count is charged at the first reference and released at the last, checked net per transaction. A working version is charged for bytes on copy-on-write. | Makes a full overwrite (`REPLACE`) never fail at an exact limit, and stops a clone being charged twice |
 | S13 | The object lifecycle: epoch hold, hold flag (`HOLD`/`UNHOLD`), `OBJ_DISCARD`, and released objects returning `NOT_FOUND` | Below |
-| S14 | Lease time base: `r_lease_ns` is a duration from the caller's dispatch on the caller's `CLOCK_MONOTONIC`, a lower bound on backend expiry, at most `limits.lease_ns`; `RENEW` replaces the lease; v1 failover always uses `FENCE` (section 1) | The contract names no clock. Without a shared clock no peer can wait out another node's lease safely, so D10's wait branch is met by `FENCE` |
+| S14 | Lease time base: `r_lease_ns` is a duration from the caller's dispatch on the caller's `CLOCK_MONOTONIC`, a lower bound on backend expiry, at most `limits.lease_ns`; `RENEW` replaces the lease; v1 failover always uses `FENCE` (section 1); `FENCE` of the caller's own node is `CHIMERA_SC_E_INVALID`, and a node ends its own epoch with `DETACH` | The contract names no clock. Without a shared clock no peer can wait out another node's lease safely, so D10's wait branch is met by `FENCE` |
 
 **S13 in detail.** S13 has four parts.
 - Items 1 and 4 resolve an ambiguity and a silence in draft 0.2.

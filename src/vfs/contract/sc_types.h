@@ -114,7 +114,8 @@ struct chimera_sc_stamps {
 #define CHIMERA_SC_CHECKSUM_MAX     64
 
 /* Retention and immutability (WORM) lock (D8).  While locked, the backend
- * refuses REPLACE or DELETE of the object with CHIMERA_SC_E_RETENTION_LOCKED. */
+ * refuses REPLACE or DELETE of the object with
+ * CHIMERA_SC_E_RETENTION_LOCKED. */
 #define CHIMERA_SC_RETENTION_NONE   0
 #define CHIMERA_SC_RETENTION_LOCKED 1
 
@@ -176,8 +177,8 @@ struct chimera_sc_limits {
     uint32_t max_io;          /* bytes per OBJ_READ / OBJ_WRITE */
     uint32_t max_watch;
     uint32_t max_recall_ids;
-    uint64_t lease_ns;        /* nominal fence-epoch lease length; the granted
-                               * length is ATTACH/RENEW r_lease_ns */
+    uint64_t lease_ns;        /* maximum fence-epoch lease length: every
+                               * ATTACH/RENEW r_lease_ns is at most this */
 };
 
 /*
