@@ -123,8 +123,8 @@ module in `struct chimera_vfs_module`.  See `vfs_fh_magic.h`.
 A name a module receives through a `*_at` operation is a single path component:
 the VFS core refuses a protocol-supplied name that contains a path separator
 (`/`) or an embedded NUL, and refuses an exact `..` on the create-type operations
-(open-with-create, mkdir, mknod, symlink, link, and a rename target), before the
-request is dispatched.  A module therefore does not need to re-validate those,
+(open — on every open, create or not — mkdir, mknod, symlink, link, and a rename
+target), before the request is dispatched.  A module therefore does not need to re-validate those,
 and must not rely on its own separator handling for share confinement.  A `.`,
 an empty name, and a lookup of `.`/`..` are still delivered, and remain the
 module's to interpret.  A multi-component path reaches a module only when it sets

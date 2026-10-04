@@ -961,11 +961,12 @@ smb_send_create(
  * the path and retry.  That is how a real SMB client (and cifs.ko) follows a
  * server-side symlink; the proxy did neither and simply reported ELOOP.
  *
- * The chimera server stops only on a final-component link (it follows
- * intermediates during the walk), so UnparsedPathLength is always 0 and the
- * rewrite is: replace the last component of the requested path with the target
- * (relative), or use the target from the share root (absolute).  A chain of
- * links loops here until SMB_SYMLOOP_MAX, then surfaces the ELOOP.
+ * The chimera server stops at a symlink anywhere in the parent path, not only
+ * the final component, so UnparsedPathLength may be greater than 0: it counts
+ * the still-unresolved tail after the link.  The rewrite replaces the matching
+ * tail of the requested path with the target (relative), or resolves the target
+ * from the share root (absolute), and keeps any components past the link.  A
+ * chain of links loops here until SMB_SYMLOOP_MAX, then surfaces the ELOOP.
  */
 #define SMB_SYMLOOP_MAX 40
 

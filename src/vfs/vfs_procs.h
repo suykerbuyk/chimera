@@ -101,9 +101,10 @@ chimera_vfs_rmfs(
  * Name-taking directory operations come in two forms.  The plain
  * chimera_vfs_<op>_at functions take ONE path component as `name`: they refuse a
  * `name` that contains a path separator ('/') or an embedded NUL with
- * CHIMERA_VFS_EINVAL before any dispatch, and the create-type ones (open with
- * CHIMERA_VFS_OPEN_CREATE, mkdir, mknod, symlink, link, and a rename target)
- * additionally refuse an exact "..".  A "." is left to the backend, as is a
+ * CHIMERA_VFS_EINVAL before any dispatch.  open_at and open_at_hs refuse an
+ * exact ".." on EVERY open (create or not; decision 8), and the other
+ * create-type ones (mkdir, mknod, symlink, link, and a rename target) refuse it
+ * as well.  A "." is left to the backend, as is a
  * lookup of "."/"..".  This is the second line of defence behind a protocol
  * facade: a backend that resolves paths itself (linux/io_uring/snfs) must never
  * be handed a separator it would walk outside the share.
