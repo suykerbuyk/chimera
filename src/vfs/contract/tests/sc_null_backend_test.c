@@ -8,8 +8,8 @@
  * registration, ATTACH and a handful of requests.
  *
  * The stub is a TEST STUB, NOT A CONFORMANT BACKEND.  It completes every
- * request synchronously on the dispatching thread, models a single node's
- * epoch and nothing else, and answers the mandatory operations it does not
+ * request synchronously on the dispatching thread, models the fence epochs
+ * of a few nodes and nothing else, and answers the mandatory operations it does not
  * model with CHIMERA_SC_E_NOT_SUPPORTED.  That is a deliberate shortcut
  * outside the error's contract meaning ("needs an undeclared capability").
  * The object lifecycle and quota rules (sc_types.h) are harness obligations
@@ -28,10 +28,18 @@
 
 /* ---- the stub backend ---- */
 
+#define STUB_NODES    4
+#define STUB_LEASE_NS 10000000000ULL
+
+struct stub_node {
+    struct chimera_sc_node_id node;
+    uint64_t                  epoch;   /* 0: no live epoch */
+    int                       used;
+};
+
 struct stub_state {
     const struct chimera_sc_upcalls *upcalls;
-    struct chimera_sc_node_id        node;
-    uint64_t                         epoch;     /* 0: no live epoch */
+    struct stub_node                 nodes[STUB_NODES];
     uint64_t                         next_epoch;
     uint64_t                         next_ticket;
     uint64_t                         revision;
@@ -100,14 +108,37 @@ stub_set_upcalls(
     s->upcalls = upcalls;
 } /* stub_set_upcalls */
 
+static struct stub_node *
+stub_node_find(
+    struct stub_state               *s,
+    const struct chimera_sc_node_id *node,
+    int                              create)
+{
+    int i;
+
+    for (i = 0; i < STUB_NODES; i++) {
+        if (s->nodes[i].used && memcmp(&s->nodes[i].node, node, sizeof(*node)) == 0) {
+            return &s->nodes[i];
+        }
+    }
+    for (i = 0; create && i < STUB_NODES; i++) {
+        if (!s->nodes[i].used) {
+            s->nodes[i].used = 1;
+            s->nodes[i].node = *node;
+            return &s->nodes[i];
+        }
+    }
+    return NULL;
+} /* stub_node_find */
+
 static int
 stub_epoch_ok(
     struct stub_state               *s,
     const struct chimera_sc_request *request)
 {
-    return s->epoch != 0 &&
-           request->caller.fence_epoch == s->epoch &&
-           memcmp(&request->caller.node, &s->node, sizeof(s->node)) == 0;
+    struct stub_node *n = stub_node_find(s, &request->caller.node, 0);
+
+    return n && n->epoch != 0 && request->caller.fence_epoch == n->epoch;
 } /* stub_epoch_ok */
 
 static void
@@ -115,7 +146,8 @@ stub_attach(
     struct stub_state         *s,
     struct chimera_sc_request *request)
 {
-    struct chimera_sc_attach_args  *a    = &request->attach;
+    struct chimera_sc_attach_args  *a = &request->attach;
+    struct stub_node               *node;
     const struct chimera_sc_version have = {
         CHIMERA_SC_CONTRACT_MAJOR, CHIMERA_SC_CONTRACT_MINOR, CHIMERA_SC_CONTRACT_PATCH
     };
@@ -127,23 +159,28 @@ stub_attach(
         return;
     }
 
+    node = stub_node_find(s, &request->caller.node, 1);
+    if (!node) {
+        request->status = CHIMERA_SC_E_INVALID;
+        return;
+    }
+
     /* Re-attach from a node with a live epoch revokes that epoch first.  The
      * stub has nothing in flight, so revocation completes at once. */
-    s->node  = request->caller.node;
-    s->epoch = s->next_epoch++;
+    node->epoch = s->next_epoch++;
 
     for (i = 0; i < n && i < a->pclasses_cap; i++) {
         a->pclasses[i] = stub_pclasses[i];
     }
     a->r_npclasses        = n;
     a->r_caps             = CHIMERA_SC_CAP_PROTECTION_CLASSES;
-    a->r_fence_epoch      = s->epoch;
-    a->r_lease_expiry_ns  = 0;
+    a->r_fence_epoch      = node->epoch;
+    a->r_lease_ns         = STUB_LEASE_NS;
     a->r_durability_epoch = 1;
     memset(&a->r_limits, 0, sizeof(a->r_limits));
     a->r_limits.max_txn_ops = 64;
     a->r_limits.max_key_len = 1024;
-    a->r_limits.lease_ns    = 10000000000ULL;
+    a->r_limits.lease_ns    = STUB_LEASE_NS;
     request->status         = CHIMERA_SC_OK;
 } /* stub_attach */
 
@@ -194,8 +231,24 @@ stub_dispatch(
 
     switch (request->opcode) {
         case CHIMERA_SC_OP_RENEW:
-            request->renew.r_lease_expiry_ns = 1;
-            request->status                  = CHIMERA_SC_OK;
+            request->renew.r_lease_ns = STUB_LEASE_NS;
+            request->status           = CHIMERA_SC_OK;
+            break;
+        case CHIMERA_SC_OP_FENCE: {
+            /* FENCE of a node with no live epoch completes OK: nothing
+             * carrying its epoch can commit.  Nothing is in flight in the
+             * stub, so revocation is immediate. */
+            struct stub_node *target = stub_node_find(s, &request->fence.node, 0);
+
+            if (target) {
+                target->epoch = 0;
+            }
+            request->status = CHIMERA_SC_OK;
+            break;
+        }
+        case CHIMERA_SC_OP_DETACH:
+            stub_node_find(s, &request->caller.node, 0)->epoch = 0;
+            request->status                                    = CHIMERA_SC_OK;
             break;
         case CHIMERA_SC_OP_OBJ_READ:
             /* Every object of the stub is empty. */
@@ -205,7 +258,10 @@ stub_dispatch(
             request->status            = CHIMERA_SC_OK;
             break;
         case CHIMERA_SC_OP_RECALL:
-            if (request->recall.nids == 0) {
+            if (request->recall.nids == 0 && request->recall.group == 0) {
+                /* Group tag 0 is reserved as invalid. */
+                request->status = CHIMERA_SC_E_INVALID;
+            } else if (request->recall.nids == 0) {
                 /* A group recall needs CAP_GROUP_RECALL, not declared. */
                 request->status = CHIMERA_SC_E_NOT_SUPPORTED;
             } else {
@@ -299,7 +355,7 @@ do_attach(
     void                            *thread_private,
     const struct chimera_sc_node_id *node,
     uint16_t                         major,
-    enum chimera_sc_error           *status)
+    uint32_t                        *status)
 {
     struct chimera_sc_request          request;
     struct completion                  c;
@@ -320,6 +376,7 @@ do_attach(
     assert(request.attach.r_version.major == CHIMERA_SC_CONTRACT_MAJOR);
     assert(request.attach.r_caps == CHIMERA_SC_CAP_PROTECTION_CLASSES);
     assert(request.attach.r_fence_epoch != 0);
+    assert(request.attach.r_lease_ns == STUB_LEASE_NS);
     /* The true count comes back even when the caller's array is smaller. */
     assert(request.attach.r_npclasses == 2);
     assert(pclasses[0].id == 1 && pclasses[0].kind == CHIMERA_SC_PROTECT_REPLICA);
@@ -331,12 +388,14 @@ main(void)
 {
     struct chimera_sc_backend bad;
     struct chimera_sc_node_id node = { { 7 } };
+    struct chimera_sc_node_id peer = { { 9 } };
+    struct chimera_sc_node_id gone = { { 11 } };
     struct chimera_sc_request request;
     struct completion         c;
     struct chimera_sc_delta   hint;
-    enum chimera_sc_error     status;
+    uint32_t                  status;
     void                     *priv, *thread_private;
-    uint64_t                  epoch, epoch2;
+    uint64_t                  epoch, epoch2, peer_epoch;
 
     /* ABI gate. */
     bad             = stub_backend;
@@ -355,7 +414,7 @@ main(void)
     /* Attach; the node identity is caller.node. */
     epoch = do_attach(thread_private, &node, CHIMERA_SC_CONTRACT_MAJOR, &status);
     assert(status == CHIMERA_SC_OK);
-    assert(memcmp(&stub.node, &node, sizeof(node)) == 0);
+    assert(stub_node_find(&stub, &node, 0) != NULL);
 
     request_init(&request, &c, CHIMERA_SC_OP_RENEW, &node, epoch);
     stub_backend.dispatch(&request, thread_private);
@@ -374,6 +433,47 @@ main(void)
     assert(request.status == CHIMERA_SC_E_FENCED);
     epoch = epoch2;
 
+    /* FENCE: a surviving node revokes another node's epoch.  Every request
+     * carrying the fenced epoch is refused afterwards. */
+    peer_epoch = do_attach(thread_private, &peer, CHIMERA_SC_CONTRACT_MAJOR, &status);
+    assert(status == CHIMERA_SC_OK && peer_epoch != epoch);
+    request_init(&request, &c, CHIMERA_SC_OP_FENCE, &peer, peer_epoch);
+    request.fence.node = node;
+    stub_backend.dispatch(&request, thread_private);
+    assert(c.called == 1 && request.status == CHIMERA_SC_OK);
+    request_init(&request, &c, CHIMERA_SC_OP_RENEW, &node, epoch);
+    stub_backend.dispatch(&request, thread_private);
+    assert(request.status == CHIMERA_SC_E_FENCED);
+    request_init(&request, &c, CHIMERA_SC_OP_OBJ_READ, &node, epoch);
+    stub_backend.dispatch(&request, thread_private);
+    assert(request.status == CHIMERA_SC_E_FENCED);
+
+    /* FENCE of a node with no live epoch completes OK. */
+    request_init(&request, &c, CHIMERA_SC_OP_FENCE, &peer, peer_epoch);
+    request.fence.node = gone;
+    stub_backend.dispatch(&request, thread_private);
+    assert(request.status == CHIMERA_SC_OK);
+
+    /* A fenced node may attach again and gets a new, different epoch. */
+    epoch2 = do_attach(thread_private, &node, CHIMERA_SC_CONTRACT_MAJOR, &status);
+    assert(status == CHIMERA_SC_OK && epoch2 != epoch && epoch2 != peer_epoch);
+    epoch = epoch2;
+
+    /* DETACH ends the caller's own epoch; a fresh ATTACH grants a new one. */
+    request_init(&request, &c, CHIMERA_SC_OP_DETACH, &peer, peer_epoch);
+    stub_backend.dispatch(&request, thread_private);
+    assert(c.called == 1 && request.status == CHIMERA_SC_OK);
+    request_init(&request, &c, CHIMERA_SC_OP_RENEW, &peer, peer_epoch);
+    stub_backend.dispatch(&request, thread_private);
+    assert(request.status == CHIMERA_SC_E_FENCED);
+    epoch2 = do_attach(thread_private, &peer, CHIMERA_SC_CONTRACT_MAJOR, &status);
+    assert(status == CHIMERA_SC_OK && epoch2 != peer_epoch);
+
+    /* The node fenced earlier is unaffected by the peer's DETACH. */
+    request_init(&request, &c, CHIMERA_SC_OP_RENEW, &node, epoch);
+    stub_backend.dispatch(&request, thread_private);
+    assert(request.status == CHIMERA_SC_OK && request.renew.r_lease_ns == STUB_LEASE_NS);
+
     /* OBJ_READ of an empty object with no caller array. */
     request_init(&request, &c, CHIMERA_SC_OP_OBJ_READ, &node, epoch);
     request.obj_read.iov  = NULL;
@@ -388,6 +488,11 @@ main(void)
     request.recall.group = 42;
     stub_backend.dispatch(&request, thread_private);
     assert(request.status == CHIMERA_SC_E_NOT_SUPPORTED);
+
+    /* Group tag 0 is reserved as invalid. */
+    request_init(&request, &c, CHIMERA_SC_OP_RECALL, &node, epoch);
+    stub_backend.dispatch(&request, thread_private);
+    assert(request.status == CHIMERA_SC_E_INVALID);
 
     /* ...but a group RECALL_HINT never fails the transaction. */
     memset(&hint, 0, sizeof(hint));

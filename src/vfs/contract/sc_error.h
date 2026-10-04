@@ -15,6 +15,9 @@
  *   QUOTA_EXCEEDED       NFS3ERR_DQUOT    NFS4ERR_DQUOT    STATUS_QUOTA_EXCEEDED   403 QuotaExceeded
  *   NO_SPACE             NFS3ERR_NOSPC    NFS4ERR_NOSPC    STATUS_DISK_FULL        507 InsufficientCapacity
  *   RECALL_PENDING       NFS3ERR_JUKEBOX  NFS4ERR_DELAY    interim STATUS_PENDING  GET 403 InvalidObjectState
+ *                                                          (then the protocol      (and the recall starts);
+ *                                                          timeout error)          RestoreObject 202, or 200
+ *                                                                                  if already resident
  *   RETENTION_LOCKED     NFS3ERR_ACCES    NFS4ERR_ACCESS   STATUS_ACCESS_DENIED    403 AccessDenied
  *   KEY_UNAVAILABLE      NFS3ERR_ACCES    NFS4ERR_ACCESS   STATUS_ACCESS_DENIED    403 AccessDenied
  *   DATA_UNRECOVERABLE   NFS3ERR_IO       NFS4ERR_IO       STATUS_DATA_ERROR       500 InternalError
