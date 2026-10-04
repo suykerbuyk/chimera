@@ -15,6 +15,14 @@ else()
 endif()
 add_test(NAME chimera/contract/header COMMAND sc_header_test)
 
+# Compile the same assertions with -fshort-enums: if an ABI field were
+# enum-typed instead of uint32_t, it would shrink here and fail to build.
+if(NOT MSVC)
+    add_library(sc_header_short_enums OBJECT sc_header_test.c)
+    target_include_directories(sc_header_short_enums PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
+    target_compile_options(sc_header_short_enums PRIVATE -fshort-enums)
+endif()
+
 add_executable(sc_null_backend_test sc_null_backend_test.c)
 target_include_directories(sc_null_backend_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
 if(MSVC)

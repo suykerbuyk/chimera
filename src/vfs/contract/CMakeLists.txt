@@ -48,7 +48,9 @@ foreach(_hdr ${CHIMERA_SC_HEADERS})
     file(STRINGS ${CMAKE_CURRENT_SOURCE_DIR}/${_hdr} _includes
          REGEX "^[ \t]*#[ \t]*include")
     foreach(_inc ${_includes})
-        if(NOT _inc MATCHES "<std(int|def)\\.h>|\"sc_[a-z]+\\.h\"")
+        # Anchored to the directive, so a comment naming an allowed header
+        # cannot excuse a disallowed one.
+        if(NOT _inc MATCHES "^[ \t]*#[ \t]*include[ \t]*(<std(int|def)\\.h>|\"sc_[a-z]+\\.h\")[ \t]*$")
             message(FATAL_ERROR
                 "src/vfs/contract/${_hdr}: '${_inc}' is not allowed; contract "
                 "headers include only <stdint.h>, <stddef.h> and sc_*.h")

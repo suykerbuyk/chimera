@@ -219,14 +219,22 @@ enum chimera_sc_txn_part {
  * for), then grants a new one.  PROVISIONAL: the contract is silent on
  * re-attach.
  *
- * Lease time base: r_lease_ns is the lease length granted, in nanoseconds,
- * relative to the moment the caller dispatched this request.  The caller
- * measures it on its own CLOCK_MONOTONIC: its renew deadline is its
- * CLOCK_MONOTONIC reading taken before dispatch plus r_lease_ns, and it must
- * RENEW before then.  The backend never expires the epoch sooner than
+ * Lease time base.  PROVISIONAL: the contract makes the epoch a lease but
+ * names no clock.  r_lease_ns is the lease length granted,
+ * in nanoseconds, relative to the moment the caller dispatched this request.
+ * The caller measures it on its own CLOCK_MONOTONIC: its renew deadline is
+ * its CLOCK_MONOTONIC reading taken before dispatch plus r_lease_ns, and it
+ * must RENEW before then.  The backend never expires the epoch sooner than
  * r_lease_ns after it completed the request, so the caller's deadline is
  * never later than the backend's.  No clock is shared between caller and
- * backend; the contract's lease is defined by this duration. */
+ * backend, and r_lease_ns <= limits.lease_ns.
+ *
+ * This is a lower bound for the lease holder only.  No other node can
+ * compute when an epoch expires: it cannot see the holder's last accepted
+ * RENEW, and a partitioned holder may still be renewing.  So in v1 failover
+ * always uses FENCE: a cluster manager never infers another node's expiry,
+ * and "or wait for the lease to expire" is satisfied by a FENCE, which
+ * completes OK at once for an epoch that has already expired. */
 struct chimera_sc_attach_args {
     struct chimera_sc_version           want;
     struct chimera_sc_protection_class *pclasses;      /* caller array */
@@ -240,17 +248,23 @@ struct chimera_sc_attach_args {
     struct chimera_sc_limits            r_limits;
 };
 
-/* RENEW: extends the caller's epoch lease by r_lease_ns, with the same time
- * base as ATTACH.  E_FENCED if the epoch is revoked or expired. */
+/* RENEW: the new lease is r_lease_ns from this RENEW's dispatch, on the
+ * caller's CLOCK_MONOTONIC, with the guarantee stated for ATTACH.  It
+ * replaces the remaining lease rather than adding to it.  E_FENCED if the
+ * epoch is revoked or expired; a lease is never revived.  PROVISIONAL. */
 struct chimera_sc_renew_args {
     uint64_t r_lease_ns;
 };
 
 /* FENCE(node_id): revoke that node's epoch now.  Completes only once no op
- * carrying it can still commit.  A cluster manager calls this, and waits for
- * it, before a surviving node takes over the dead node's clients.  FENCE of
- * a node with no live epoch completes OK: its postcondition
- * already holds.  The caller must itself hold a live epoch. */
+ * carrying it can still commit.  A cluster manager calls this, and waits
+ * for it, before a surviving node takes over the dead node's clients; in v1
+ * this is the only failover path (see ATTACH).
+ *   - FENCE of a node with no live epoch, including one whose lease has
+ *     expired, completes OK: its postcondition already holds.
+ *   - The caller must itself hold a live epoch, else E_FENCED.
+ *   - FENCE of the caller's own node is E_INVALID; a node ends its own
+ *     epoch with DETACH. */
 struct chimera_sc_fence_args {
     struct chimera_sc_node_id node;
 };
