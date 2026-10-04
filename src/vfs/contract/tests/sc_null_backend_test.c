@@ -10,8 +10,9 @@
  * The stub is a TEST STUB, NOT A CONFORMANT BACKEND.  It completes every
  * request synchronously on the dispatching thread, models the fence epochs
  * of a few nodes and nothing else, and answers the mandatory operations it
- * does not model with CHIMERA_SC_E_NOT_SUPPORTED.  That is a deliberate shortcut
- * outside the error's contract meaning ("needs an undeclared capability").
+ * does not model with CHIMERA_SC_E_NOT_SUPPORTED.  That is a deliberate
+ * shortcut outside the error's contract meaning ("needs an undeclared
+ * capability").
  * The object lifecycle and quota rules (sc_types.h) are harness obligations
  * for the conformance suite, not checked here.  A cross-thread case would
  * need a second evpl thread and is likewise left to the harness.
