@@ -11,7 +11,7 @@
  * storage facade, as specified by docs/product/storage-contract.md (draft
  * 0.2).  It is not the VFS module SDK (src/vfs/sdk/): the SDK is
  * POSIX-shaped and serves development, test and gateway modules (contract
- * D1).  Interpretive positions, provisional additions (S1-S7, S10-S13) and
+ * D1).  Interpretive positions, provisional additions (S1-S7, S10-S14) and
  * deferred items (S8, S9) are recorded in
  * docs/product/storage-contract-interface.md; each appears below as a
  * PROVISIONAL marker.

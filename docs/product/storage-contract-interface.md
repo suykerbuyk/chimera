@@ -17,7 +17,7 @@ This document explains how the C interface in `src/vfs/contract/` maps the
 [backend storage contract](storage-contract.md) onto code. It also records
 where the interface had to take a position the contract does not yet state.
 It does not change the contract. The provisional items S1 to S7 and S10 to
-S13 are listed for the operator to fold into a later contract draft, or to
+S14 are listed for the operator to fold into a later contract draft, or to
 reject. S8 and S9 are deferred to a minor version (section 5).
 
 ## 1. What the interface is
@@ -55,18 +55,30 @@ The ABI rules:
 - Enumerated values travel in `uint32_t` fields.
 - No structure has implicit padding. Every gap is an explicit `reserved`
   field that must be zero.
-- The test suite pins every value and the LP64 layout, so any change fails
-  to build until `CHIMERA_SC_ABI_VERSION` is bumped.
+- The test suite pins every enumerated value, and on LP64 the size of every
+  ABI structure and the offset of every member. A layout change fails to
+  build until the assertions are updated, which is where
+  `CHIMERA_SC_ABI_VERSION` must be bumped.
+- A second compile of the assertions uses `-fshort-enums`, so an
+  enumerated field regressing to an enum type fails to build.
 
-**Lease time base.** The contract makes the fence epoch a lease (6.5, D10)
-without naming a clock.
+**Lease time base (PROVISIONAL, S14).** The contract makes the fence epoch
+a lease (6.5, D10) without naming a clock.
 - `ATTACH` and `RENEW` return `r_lease_ns`: a duration, counted from the
-  moment the caller dispatched the request.
+  moment the caller dispatched the request, and no longer than
+  `limits.lease_ns`.
 - The caller measures it on its own `CLOCK_MONOTONIC` and must renew before
-  it runs out.
+  it runs out. A `RENEW` replaces the remaining lease; it does not add to it.
 - The backend never expires the epoch sooner than that duration after it
   completed the request. The caller's deadline is therefore never later
   than the backend's, and no clock is shared between them.
+- **This bounds expiry for the lease holder only.** No other node can
+  compute when an epoch expires: it cannot see the holder's last accepted
+  `RENEW`, and a partitioned holder may still be renewing. So in v1,
+  failover always uses `FENCE`. A cluster manager never infers another
+  node's expiry. D10's "or wait for the lease to expire" is met by a
+  `FENCE`, which completes OK at once for an epoch that has already
+  expired.
 
 ## 2. Contract-to-interface map
 
@@ -130,12 +142,13 @@ draft 0.2.
 | S3 | `OBJ_MAP` (data, hole, unwritten segments) | SEEK_DATA, NFS READ_PLUS and SMB allocated-range queries need the allocation map, and `OBJ_STAT` cannot return an unbounded map |
 | S4 | `NS_TXN` compares by record revision; revision 0 means "does not exist" | Makes compare-and-set exact and cheap |
 | S5 | No snapshot operation | Snapshots (D8) are taken through the administrative plane, not by Chimera |
-| S6 | Checksum algorithm and width in object metadata: `CHECKSUM_MD5` (1) defined, values from 256 up backend-private | S3 ETags and Content-MD5 need to know them; the contract does not name one |
+| S6 | Checksum algorithm and width in object metadata: `CHECKSUM_MD5` (1) defined, 2-255 reserved for future contract versions (a consumer treats them as no checksum), values from 256 up backend-private | S3 ETags and Content-MD5 need to know them; the contract does not name one |
 | S7 | `OBJ_CREATE` carries the stamps | Byte quota is charged at extent allocation (D13), before the binding's `CREATE` delta commits |
 | S10 | Deployment shape: an in-process binding per node, with inter-node coordination behind the interface | The contract does not say whether the backend is a linked library or a service. That choice is deferred, because it shapes E14 and E8. |
 | S11 | Bytes the backend returns are valid only until the request completes | An asynchronous interface that returns borrowed memory needs a lifetime rule. This is the module SDK's own rule for returned values. |
 | S12 | Object count is charged at the first reference and released at the last, checked net per transaction. A working version is charged for bytes on copy-on-write. | Makes a full overwrite (`REPLACE`) never fail at an exact limit, and stops a clone being charged twice |
 | S13 | The object lifecycle: epoch hold, hold flag (`HOLD`/`UNHOLD`), `OBJ_DISCARD`, and released objects returning `NOT_FOUND` | Below |
+| S14 | Lease time base: `r_lease_ns` is a duration from the caller's dispatch on the caller's `CLOCK_MONOTONIC`, a lower bound on backend expiry, at most `limits.lease_ns`; `RENEW` replaces the lease; v1 failover always uses `FENCE` (section 1) | The contract names no clock. Without a shared clock no peer can wait out another node's lease safely, so D10's wait branch is met by `FENCE` |
 
 **S13 in detail.** S13 has four parts.
 - Items 1 and 4 resolve an ambiguity and a silence in draft 0.2.

@@ -9,8 +9,8 @@
  *
  * The stub is a TEST STUB, NOT A CONFORMANT BACKEND.  It completes every
  * request synchronously on the dispatching thread, models the fence epochs
- * of a few nodes and nothing else, and answers the mandatory operations it does not
- * model with CHIMERA_SC_E_NOT_SUPPORTED.  That is a deliberate shortcut
+ * of a few nodes and nothing else, and answers the mandatory operations it
+ * does not model with CHIMERA_SC_E_NOT_SUPPORTED.  That is a deliberate shortcut
  * outside the error's contract meaning ("needs an undeclared capability").
  * The object lifecycle and quota rules (sc_types.h) are harness obligations
  * for the conformance suite, not checked here.  A cross-thread case would
@@ -240,6 +240,12 @@ stub_dispatch(
              * stub, so revocation is immediate. */
             struct stub_node *target = stub_node_find(s, &request->fence.node, 0);
 
+            if (memcmp(&request->fence.node, &request->caller.node,
+                       sizeof(request->fence.node)) == 0) {
+                /* A node ends its own epoch with DETACH. */
+                request->status = CHIMERA_SC_E_INVALID;
+                break;
+            }
             if (target) {
                 target->epoch = 0;
             }
@@ -447,6 +453,23 @@ main(void)
     request_init(&request, &c, CHIMERA_SC_OP_OBJ_READ, &node, epoch);
     stub_backend.dispatch(&request, thread_private);
     assert(request.status == CHIMERA_SC_E_FENCED);
+
+    /* FENCE needs a live epoch on the caller: from the fenced node, or from a
+     * node that never attached, it is refused. */
+    request_init(&request, &c, CHIMERA_SC_OP_FENCE, &node, epoch);
+    request.fence.node = peer;
+    stub_backend.dispatch(&request, thread_private);
+    assert(request.status == CHIMERA_SC_E_FENCED);
+    request_init(&request, &c, CHIMERA_SC_OP_FENCE, &gone, 0);
+    request.fence.node = peer;
+    stub_backend.dispatch(&request, thread_private);
+    assert(request.status == CHIMERA_SC_E_FENCED);
+
+    /* FENCE of the caller's own node is invalid; DETACH is the way. */
+    request_init(&request, &c, CHIMERA_SC_OP_FENCE, &peer, peer_epoch);
+    request.fence.node = peer;
+    stub_backend.dispatch(&request, thread_private);
+    assert(request.status == CHIMERA_SC_E_INVALID);
 
     /* FENCE of a node with no live epoch completes OK. */
     request_init(&request, &c, CHIMERA_SC_OP_FENCE, &peer, peer_epoch);

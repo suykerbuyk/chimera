@@ -105,9 +105,12 @@ struct chimera_sc_stamps {
 /* PROVISIONAL (S6): checksum algorithm identifiers.  The contract does not
  * yet name an algorithm; Chimera reads the checksum for protocol use only
  * (S3 ETag, Content-MD5), never to verify stored data (D9). */
+/* Values 2-255 are reserved for future contract versions: a v1 backend
+ * never reports them, and a consumer that reads one treats the checksum as
+ * absent.  Values from CHIMERA_SC_CHECKSUM_PRIVATE up are backend-private. */
 #define CHIMERA_SC_CHECKSUM_NONE    0
 #define CHIMERA_SC_CHECKSUM_MD5     1   /* 16 bytes; serves S3 ETag and Content-MD5 */
-#define CHIMERA_SC_CHECKSUM_PRIVATE 256 /* values >= this are backend-private */
+#define CHIMERA_SC_CHECKSUM_PRIVATE 256
 #define CHIMERA_SC_CHECKSUM_MAX     64
 
 /* Retention and immutability (WORM) lock (D8).  While locked, the backend
