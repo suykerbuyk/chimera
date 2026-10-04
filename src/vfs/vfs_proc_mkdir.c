@@ -5,6 +5,7 @@
 #include <string.h>
 #include "vfs_procs.h"
 #include "vfs_internal.h"
+#include "vfs_name.h"
 #include "vfs_release.h"
 #include "vfs_mount_table.h"
 #include "common/misc.h"
@@ -74,6 +75,17 @@ chimera_vfs_mkdir_op_complete(
     struct chimera_vfs_thread   *thread   = request->thread;
     chimera_vfs_mkdir_callback_t callback = request->mkdir.callback;
     void                        *priv     = request->mkdir.private_data;
+    const char                  *final    = request->mkdir.path + request->mkdir.name_offset;
+    int                          finallen = request->mkdir.pathlen - request->mkdir.name_offset;
+
+    /* mkdir of a path whose final component is ".." is POSIX EEXIST (the parent
+     * always exists): the component check now answers EINVAL for that name, so
+     * map it back here to preserve the whole-path result.  "." is unaffected --
+     * the check never rejects it. */
+    if (error_code == CHIMERA_VFS_EINVAL &&
+        chimera_vfs_name_is_dotdot(final, finallen)) {
+        error_code = CHIMERA_VFS_EEXIST;
+    }
 
     chimera_vfs_release(thread, request->mkdir.parent_handle);
     chimera_vfs_request_free(thread, request);

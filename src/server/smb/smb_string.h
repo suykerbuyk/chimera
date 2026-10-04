@@ -221,6 +221,38 @@ chimera_smb_wire_path_has_dotdot(
     return 0;
 } /* chimera_smb_wire_path_has_dotdot */
 
+/* UTF-16 byte length of a UTF-8 run: two bytes per code unit, four for a
+ * supplementary (4-byte UTF-8) code point.  Used for a SymbolicLinkErrorResponse
+ * UnparsedPathLength, which MS-SMB2 2.2.2.2.1 counts in UTF-16 bytes, not UTF-8
+ * bytes -- the two differ for any non-ASCII component. */
+static inline uint16_t
+chimera_smb_utf8_utf16_bytes(
+    const char *s,
+    size_t      len)
+{
+    size_t   i     = 0;
+    uint16_t units = 0;
+
+    while (i < len) {
+        unsigned char c = (unsigned char) s[i];
+
+        if (c < 0x80) {
+            i     += 1;
+            units += 2;   /* one UTF-16 code unit */
+        } else if (c < 0xE0) {
+            i     += 2;
+            units += 2;
+        } else if (c < 0xF0) {
+            i     += 3;
+            units += 2;
+        } else {
+            i     += 4;
+            units += 4;   /* surrogate pair: two code units */
+        }
+    }
+    return units;
+} /* chimera_smb_utf8_utf16_bytes */
+
 /* The single name verdict for a reconnect or a SET_INFO rename/link target:
  * SMB2_STATUS_SUCCESS, or the OBJECT_NAME_INVALID to answer.  `len` is the whole
  * UTF-8 name; `base_len` is the portion before any stream ':' (equal to `len`

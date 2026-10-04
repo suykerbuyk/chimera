@@ -123,6 +123,20 @@ if(NOT WIN32)
     set(CHIMERA_TEST_TIER "${_pathop_saved_tier}")
 endif()
 
+# The VFS-core name checks are backend-independent (they run in the public entry
+# ahead of dispatch), so memfs proves them in the quick tier; the passthrough
+# backends carry the same check and run where they can mount (SKIP 77 otherwise).
+add_executable(vfs_name_component_test vfs_name_component_test.c)
+target_link_libraries(vfs_name_component_test chimera_vfs chimera_vfs_memfs
+                      chimera_vfs_memkv evpl)
+set(_namecomp_saved_tier "${CHIMERA_TEST_TIER}")
+set(CHIMERA_TEST_TIER quick)
+add_test(NAME chimera/vfs/name_component_memfs
+    COMMAND vfs_name_component_test memfs)
+set_tests_properties(chimera/vfs/name_component_memfs PROPERTIES
+    SKIP_RETURN_CODE 77 TIMEOUT 30)
+set(CHIMERA_TEST_TIER "${_namecomp_saved_tier}")
+
 add_executable(vfs_clone_range_test vfs_clone_range_test.c)
 target_link_libraries(vfs_clone_range_test chimera_vfs chimera_vfs_memfs evpl)
 add_test(chimera/vfs/clone_range_test vfs_clone_range_test)

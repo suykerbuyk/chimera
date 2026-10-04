@@ -805,6 +805,11 @@ struct chimera_smb_request {
              * for an intermediate (parent-path) symlink so the client resolves
              * the mid-path link and retries rather than seeing a bare ELOOP. */
             uint16_t                           r_symlink_unparsed;
+            /* End offset (in parent_path) of the prefix the symlink-locate is
+             * currently probing, used only on the STOPPED_ON_SYMLINK path to
+             * find which parent component is the link and size the unparsed
+             * suffix correctly for a mid-path link. */
+            uint16_t                           r_symlink_probe_end;
             char                               r_symlink_target[CHIMERA_VFS_PATH_MAX];
             struct chimera_vfs_open_handle    *r_symlink_handle;
         } create;

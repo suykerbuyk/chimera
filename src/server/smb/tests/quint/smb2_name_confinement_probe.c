@@ -25,6 +25,12 @@
 #ifndef ST_NOT_A_DIRECTORY
 #define ST_NOT_A_DIRECTORY        0xC0000103u
 #endif /* ifndef ST_NOT_A_DIRECTORY */
+#ifndef ST_STOPPED_ON_SYMLINK
+#define ST_STOPPED_ON_SYMLINK     0x8000002Du
+#endif /* ifndef ST_STOPPED_ON_SYMLINK */
+#ifndef SMB2_SYMLINK_ERROR_TAG
+#define SMB2_SYMLINK_ERROR_TAG    0x4C4D5953u  /* 'SYML' */
+#endif /* ifndef SMB2_SYMLINK_ERROR_TAG */
 
 static int failures = 0;
 
@@ -135,6 +141,63 @@ check_alive(
 {
     CHECK(smb2_echo_barrier(c) >= 0, "%s: connection still alive after reject", label);
 } /* check_alive */
+
+/* Turn an existing file into a symlink via FSCTL_SET_REPARSE_POINT.  `relative`
+ * picks SYMLINK_FLAG_RELATIVE vs ABSOLUTE.  Returns the IOCTL status. */
+static uint32_t
+plant_symlink(
+    struct smb2_conn *c,
+    const char       *name,
+    const char       *target,
+    int               relative)
+{
+    struct smb2_create_out o;
+    uint8_t                in[512];
+    int                    nlen = (int) strlen(target) * 2;
+    uint32_t               st;
+
+    st = smb2_create(c, name, MBT_FILE_OPEN_IF, MBT_FILE_ALL_ACCESS,
+                     MBT_FILE_SHARE_RWD, NULL, &o);
+    if (st != ST_SUCCESS) {
+        return st;
+    }
+
+    p32(in, 0, SMB2_IO_REPARSE_TAG_SYMLINK);
+    p16(in, 4, (uint16_t) (12 + 2 * nlen));   /* ReparseDataLength */
+    p16(in, 6, 0);
+    p16(in, 8, 0);                            /* SubstituteNameOffset */
+    p16(in, 10, (uint16_t) nlen);             /* SubstituteNameLength */
+    p16(in, 12, (uint16_t) nlen);             /* PrintNameOffset */
+    p16(in, 14, (uint16_t) nlen);             /* PrintNameLength */
+    p32(in, 16, relative ? 1 : 0);            /* SYMLINK_FLAG_RELATIVE */
+    utf16le(target, in + 20);
+    utf16le(target, in + 20 + nlen);
+
+    st = smb2_ioctl(c, SMB2_FSCTL_SET_REPARSE_POINT, o.file_id, in,
+                    (uint32_t) (20 + 2 * nlen));
+    smb2_close(c, o.file_id);
+    return st;
+} /* plant_symlink */
+
+/* Parse the SymbolicLinkErrorResponse left in the connection's receive buffer by
+ * the most recent STOPPED_ON_SYMLINK reply; returns its UnparsedPathLength (in
+ * UTF-16 bytes), or -1 if the body is not a well-formed symlink error. */
+static int
+last_symlink_unparsed(struct smb2_conn *c)
+{
+    const uint8_t *body = c->rbuf + 4 + SMB2_HDR_SIZE;
+
+    if (c->rlen < 4 + SMB2_HDR_SIZE + 24) {
+        return -1;
+    }
+    if (g16(body, 0) != 9) {            /* ERROR Response StructureSize */
+        return -1;
+    }
+    if (g32(body, 12) != SMB2_SYMLINK_ERROR_TAG) {
+        return -1;
+    }
+    return (int) g16(body, 22);         /* UnparsedPathLength */
+} /* last_symlink_unparsed */
 
 /* ---- the matrix --------------------------------------------------------- */
 
@@ -364,6 +427,90 @@ run_rename_link_rows(void)
     check_alive(inner_c, "rename/link rows");
 } /* run_rename_link_rows */
 
+/* Symlink-component confinement: a symlink used as a NON-final parent component
+ * must stop the walk (STOPPED_ON_SYMLINK for CREATE, NOT_A_DIRECTORY for
+ * rename/link), never be followed server-side.  A symlink as the LAST parent
+ * component already stopped; a legitimate in-share link now also stops, and the
+ * client resolves it and retries. */
+static void
+run_symlink_rows(void)
+{
+    struct smb2_create_out o;
+    uint8_t                fid[16];
+    uint32_t               st;
+    int                    unparsed;
+
+    /* Plant, through the root tree: inner/esc -> ../outside (climbs out),
+     * inner/abs -> / (absolute), inner/al -> sub (legit in-share), and the
+     * directories a legitimate retry needs. */
+    (void) mk(root_c, "inner\\sub\\deeper", 1, NULL, 0);
+    (void) mk(root_c, "inner\\sub\\deeper\\f", 0, "deep", 4);
+    (void) mk(root_c, "outside\\d", 1, NULL, 0);
+    (void) mk(root_c, "outside\\d\\target", 0, "OUT", 3);
+    CHECK(plant_symlink(root_c, "inner\\esc", "../outside", 1) == ST_SUCCESS, "plant esc -> ../outside");
+    CHECK(plant_symlink(root_c, "inner\\abs", "/", 0) == ST_SUCCESS, "plant abs -> /");
+    CHECK(plant_symlink(root_c, "inner\\al", "sub", 1) == ST_SUCCESS, "plant al -> sub");
+
+    /* SL1: read esc\d\target -- the escaping link as a non-final component. */
+    st = smb2_create(inner_c, "esc\\d\\target", MBT_FILE_OPEN, MBT_FILE_ALL_ACCESS,
+                     MBT_FILE_SHARE_RWD, NULL, &o);
+    CHECK(st == ST_STOPPED_ON_SYMLINK, "SL1 'esc\\d\\target' -> 0x%08x", st);
+    unparsed = last_symlink_unparsed(inner_c);
+    CHECK(unparsed == (int) strlen("\\d\\target") * 2,
+          "SL1 UnparsedPathLength=%d (expect %d)", unparsed, (int) strlen("\\d\\target") * 2);
+
+    /* SL2: create esc\d\new -- nothing lands outside. */
+    st = smb2_create(inner_c, "esc\\d\\new", MBT_FILE_OPEN_IF, MBT_FILE_ALL_ACCESS,
+                     MBT_FILE_SHARE_RWD, NULL, &o);
+    CHECK(st == ST_STOPPED_ON_SYMLINK, "SL2 create 'esc\\d\\new' -> 0x%08x", st);
+    CHECK(!exists_at_root("outside\\d\\new"), "SL2 left nothing in outside/d");
+
+    /* SL3/SL4: rename/link target through the link -- NOT_A_DIRECTORY. */
+    if (inner_source("slsrc1", fid)) {
+        st = smb2_rename(inner_c, fid, "esc\\d\\x", 0);
+        CHECK(st == ST_NOT_A_DIRECTORY, "SL3 rename 'esc\\d\\x' -> 0x%08x", st);
+        smb2_close(inner_c, fid);
+        CHECK(!exists_at_root("outside\\d\\x"), "SL3 left nothing in outside/d");
+    }
+    if (inner_source("slsrc2", fid)) {
+        st = smb2_link(inner_c, fid, "esc\\d\\y", 0);
+        CHECK(st == ST_NOT_A_DIRECTORY, "SL4 link 'esc\\d\\y' -> 0x%08x", st);
+        smb2_close(inner_c, fid);
+        CHECK(!exists_at_root("outside\\d\\y"), "SL4 left nothing in outside/d");
+    }
+
+    /* SL5: absolute-target link as a non-final component -> STOPPED. */
+    st = smb2_create(inner_c, "abs\\x\\y", MBT_FILE_OPEN, MBT_FILE_ALL_ACCESS,
+                     MBT_FILE_SHARE_RWD, NULL, &o);
+    CHECK(st == ST_STOPPED_ON_SYMLINK, "SL5 'abs\\x\\y' -> 0x%08x", st);
+
+    /* SL6: a legitimate in-share link now stops too (decision 9); the client
+     * re-issues the resolved path, which opens. */
+    st = smb2_create(inner_c, "al\\deeper\\f", MBT_FILE_OPEN, MBT_FILE_ALL_ACCESS,
+                     MBT_FILE_SHARE_RWD, NULL, &o);
+    CHECK(st == ST_STOPPED_ON_SYMLINK, "SL6 'al\\deeper\\f' -> 0x%08x", st);
+    unparsed = last_symlink_unparsed(inner_c);
+    CHECK(unparsed == (int) strlen("\\deeper\\f") * 2,
+          "SL6 UnparsedPathLength=%d (expect %d)", unparsed, (int) strlen("\\deeper\\f") * 2);
+    st = smb2_create(inner_c, "sub\\deeper\\f", MBT_FILE_OPEN, MBT_FILE_ALL_ACCESS,
+                     MBT_FILE_SHARE_RWD, NULL, &o);
+    CHECK(st == ST_SUCCESS, "SL6 client retry 'sub\\deeper\\f' opens -> 0x%08x", st);
+    if (st == ST_SUCCESS) {
+        smb2_close(inner_c, o.file_id);
+    }
+
+    /* SL7: a link as the LAST parent component -> STOPPED (unchanged), unparsed
+     * is just the final name. */
+    st = smb2_create(inner_c, "al\\inner.txt", MBT_FILE_OPEN, MBT_FILE_ALL_ACCESS,
+                     MBT_FILE_SHARE_RWD, NULL, &o);
+    CHECK(st == ST_STOPPED_ON_SYMLINK, "SL7 'al\\inner.txt' -> 0x%08x", st);
+    unparsed = last_symlink_unparsed(inner_c);
+    CHECK(unparsed == (int) strlen("\\inner.txt") * 2,
+          "SL7 UnparsedPathLength=%d (expect %d)", unparsed, (int) strlen("\\inner.txt") * 2);
+
+    check_alive(inner_c, "symlink rows");
+} /* run_symlink_rows */
+
 static void
 run_positive_rows(void)
 {
@@ -497,6 +644,7 @@ main(
     run_length_rows();
     run_stream_rows();
     run_rename_link_rows();
+    run_symlink_rows();
     run_positive_rows();
 
     /* The share root (empty name) still opens. */

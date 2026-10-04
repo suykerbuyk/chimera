@@ -5,6 +5,7 @@
 #include <string.h>
 #include "vfs_procs.h"
 #include "vfs_internal.h"
+#include "vfs_name.h"
 #include "vfs_release.h"
 #include "common/misc.h"
 #include "common/macros.h"
@@ -21,6 +22,16 @@ chimera_vfs_link_op_complete(
     struct chimera_vfs_thread  *thread   = request->thread;
     chimera_vfs_link_callback_t callback = request->link.callback;
     void                       *priv     = request->link.private_data;
+    const char                 *final    = request->link.new_path + request->link.new_name_offset;
+    int                         finallen = request->link.new_pathlen - request->link.new_name_offset;
+
+    /* link of a path whose final component is ".." is POSIX EEXIST (the parent
+     * exists): the component check answers EINVAL for that name, so map it back
+     * to preserve the whole-path result. */
+    if (error_code == CHIMERA_VFS_EINVAL &&
+        chimera_vfs_name_is_dotdot(final, finallen)) {
+        error_code = CHIMERA_VFS_EEXIST;
+    }
 
     chimera_vfs_request_free(thread, request);
 

@@ -6,6 +6,7 @@
 #include "vfs_procs.h"
 #include "vfs_claim.h"
 #include "vfs_internal.h"
+#include "vfs_name.h"
 #include "vfs_name_cache.h"
 #include "vfs_attr_cache.h"
 #include "vfs_notify.h"
@@ -727,6 +728,12 @@ chimera_vfs_rename_at(
     chimera_vfs_rename_at_callback_t callback,
     void                            *private_data)
 {
+    if (chimera_vfs_name_bad(name, namelen) ||
+        chimera_vfs_name_bad(new_name, new_namelen)) {
+        callback(CHIMERA_VFS_EINVAL, NULL, NULL, NULL, NULL, private_data);
+        return;
+    }
+
     chimera_vfs_rename_at_path(thread, cred, fh, fhlen, name, namelen, new_fh,
                                new_fhlen, new_name, new_namelen, target_fh,
                                target_fh_len, flags, pre_attr_mask, post_attr_mask,

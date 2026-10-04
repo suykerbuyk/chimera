@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include "vfs_procs.h"
 #include "vfs_internal.h"
+#include "vfs_name.h"
 #include "vfs_name_cache.h"
 #include "vfs_attr_cache.h"
 #include "sdk/vfs_access.h"
@@ -247,6 +248,11 @@ chimera_vfs_lookup_at(
     chimera_vfs_lookup_at_callback_t callback,
     void                            *private_data)
 {
+    if (chimera_vfs_name_bad(name, namelen)) {
+        callback(CHIMERA_VFS_EINVAL, NULL, NULL, private_data);
+        return;
+    }
+
     chimera_vfs_lookup_at_path(thread, cred, handle, name, namelen,
                                attr_mask, dir_attr_mask, callback, private_data);
 } /* chimera_vfs_lookup_at */

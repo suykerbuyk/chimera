@@ -151,12 +151,46 @@ chimera_vfs_lookup_open_dispatch(
         int         remlen     = strlen(remaining);
         int         prefix_len = chimera_vfs_dot_prefix_len(remaining, remlen);
 
+        /* A share-confined caller forbids a ".." anywhere in the whole path the
+         * path-only backend would otherwise resolve itself. */
+        if (lp_request->lookup.flags & CHIMERA_VFS_LOOKUP_NO_DOTDOT) {
+            int i = 0;
+
+            while (i < remlen) {
+                int start = i;
+
+                while (i < remlen && remaining[i] != '/') {
+                    i++;
+                }
+                if (i - start == 2 && remaining[start] == '.' &&
+                    remaining[start + 1] == '.') {
+                    chimera_vfs_release(thread, lp_request->lookup.handle);
+                    lp_request->lookup.callback(CHIMERA_VFS_EINVAL, NULL,
+                                                lp_request->lookup.private_data);
+                    chimera_vfs_request_free(thread, lp_request);
+                    return;
+                }
+                if (i < remlen) {
+                    i++;
+                }
+            }
+        }
+
         /* A "." or ".." after a real component collapses lexically in the
          * backend, so resolve the component(s) before it first (following
          * symlinks, as POSIX does for a non-final component): a dangling chain
          * or missing prefix is ENOENT, a non-directory prefix is ENOTDIR, and
-         * only a real directory prefix lets the whole path resolve. */
+         * only a real directory prefix lets the whole path resolve.  The
+         * caller's confinement flags carry into that sub-lookup; FOLLOW is
+         * added only when the caller did not forbid symlink traversal. */
         if (prefix_len > 0) {
+            unsigned int sub_flags = lp_request->lookup.flags &
+                (CHIMERA_VFS_LOOKUP_NO_DOTDOT | CHIMERA_VFS_LOOKUP_NO_SYMLINK);
+
+            if (!(sub_flags & CHIMERA_VFS_LOOKUP_NO_SYMLINK)) {
+                sub_flags |= CHIMERA_VFS_LOOKUP_FOLLOW;
+            }
+
             chimera_vfs_lookup(
                 thread,
                 lp_request->cred,
@@ -165,7 +199,7 @@ chimera_vfs_lookup_open_dispatch(
                 remaining,
                 prefix_len,
                 CHIMERA_VFS_ATTR_MODE,
-                CHIMERA_VFS_LOOKUP_FOLLOW,
+                sub_flags,
                 chimera_vfs_lookup_pathonly_dotdot_complete,
                 lp_request);
             return;
@@ -197,6 +231,17 @@ chimera_vfs_lookup_open_dispatch(
     }
 
     final = (*lp_request->lookup.pathc == '\0');
+
+    /* A share-confined caller forbids any ".." component: the walk must not
+     * climb above the handle it started from. */
+    if ((lp_request->lookup.flags & CHIMERA_VFS_LOOKUP_NO_DOTDOT) &&
+        componentlen == 2 && component[0] == '.' && component[1] == '.') {
+        chimera_vfs_release(thread, lp_request->lookup.handle);
+        lp_request->lookup.callback(CHIMERA_VFS_EINVAL, NULL,
+                                    lp_request->lookup.private_data);
+        chimera_vfs_request_free(thread, lp_request);
+        return;
+    }
 
     /* Always request mode so we can detect symlinks */
     chimera_vfs_lookup_at(
@@ -364,6 +409,18 @@ chimera_vfs_lookup_complete(
                                     NULL,
                                     lp_request->lookup.private_data);
 
+        chimera_vfs_request_free(thread, lp_request);
+        return;
+    }
+
+    /* A share-confined caller refuses to traverse a symlink as a non-final
+     * component: stop at it and return the link itself, so SMB answers
+     * STATUS_STOPPED_ON_SYMLINK instead of following it server-side.  The final
+     * component stays governed by LOOKUP_FOLLOW below. */
+    if (!final && (lp_request->lookup.flags & CHIMERA_VFS_LOOKUP_NO_SYMLINK) &&
+        (attr->va_set_mask & CHIMERA_VFS_ATTR_MODE) && S_ISLNK(attr->va_mode)) {
+        lp_request->lookup.callback(CHIMERA_VFS_OK, attr,
+                                    lp_request->lookup.private_data);
         chimera_vfs_request_free(thread, lp_request);
         return;
     }
@@ -618,7 +675,8 @@ chimera_vfs_lookup_pathonly_complete(
     * path-only mount returns the raw link entry, so the follow lives here. */
     if (error_code == CHIMERA_VFS_OK &&
         (attr->va_set_mask & CHIMERA_VFS_ATTR_MODE) && S_ISLNK(attr->va_mode) &&
-        (lp_request->lookup.flags & CHIMERA_VFS_LOOKUP_FOLLOW)) {
+        (lp_request->lookup.flags & CHIMERA_VFS_LOOKUP_FOLLOW) &&
+        !(lp_request->lookup.flags & CHIMERA_VFS_LOOKUP_NO_SYMLINK)) {
 
         if (++lp_request->lookup.symlink_count > CHIMERA_VFS_SYMLOOP_MAX) {
             chimera_vfs_release(thread, lp_request->lookup.handle);

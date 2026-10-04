@@ -10,6 +10,7 @@
 #include "vfs_procs.h"
 #include "vfs_pnfs.h"
 #include "vfs_internal.h"
+#include "vfs_name.h"
 #include "vfs_release.h"
 #include "sdk/vfs_access.h"
 #include "common/misc.h"
@@ -502,6 +503,12 @@ chimera_vfs_open_at_hs(
     chimera_vfs_open_at_callback_t   callback,
     void                            *private_data)
 {
+    if (chimera_vfs_name_bad(name, namelen) ||
+        chimera_vfs_name_is_dotdot(name, namelen)) {
+        callback(CHIMERA_VFS_EINVAL, NULL, NULL, NULL, NULL, NULL, private_data);
+        return;
+    }
+
     chimera_vfs_open_at_hs_path(thread, cred, handle, name, namelen, flags,
                                 set_attr, attr_mask, pre_attr_mask, post_attr_mask,
                                 handle_state, callback, private_data);
@@ -699,6 +706,12 @@ chimera_vfs_open_at(
     chimera_vfs_open_at_callback_t  callback,
     void                           *private_data)
 {
+    if (chimera_vfs_name_bad(name, namelen) ||
+        chimera_vfs_name_is_dotdot(name, namelen)) {
+        callback(CHIMERA_VFS_EINVAL, NULL, NULL, NULL, NULL, NULL, private_data);
+        return;
+    }
+
     chimera_vfs_open_at_path(thread, cred, handle, name, namelen, flags, set_attr,
                              attr_mask, pre_attr_mask, post_attr_mask,
                              callback, private_data);

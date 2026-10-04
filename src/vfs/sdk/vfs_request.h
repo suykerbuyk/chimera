@@ -56,6 +56,13 @@ struct chimera_vfs_handle_state;
 
 /* Flags for chimera_vfs_lookup */
 #define CHIMERA_VFS_LOOKUP_FOLLOW        (1U << 0) /* Follow symlinks in final component */
+/* Refuse any ".." component (a share-confined caller: the walk must not climb
+ * above the handle it started from). */
+#define CHIMERA_VFS_LOOKUP_NO_DOTDOT     (1U << 1)
+/* Do not traverse a symbolic link as a non-final component: stop at it and
+ * return the link itself, so the caller (SMB) answers STATUS_STOPPED_ON_SYMLINK
+ * rather than following the link server-side (MS-FSA 2.1.5.1). */
+#define CHIMERA_VFS_LOOKUP_NO_SYMLINK    (1U << 2)
 
 /* Maximum number of symlinks to follow before returning ELOOP */
 #define CHIMERA_VFS_SYMLOOP_MAX          40

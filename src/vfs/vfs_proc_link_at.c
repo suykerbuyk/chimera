@@ -7,6 +7,7 @@
 #include "vfs_procs.h"
 #include "vfs_claim.h"
 #include "vfs_internal.h"
+#include "vfs_name.h"
 #include "vfs_name_cache.h"
 #include "vfs_attr_cache.h"
 #include "vfs_notify.h"
@@ -241,6 +242,12 @@ chimera_vfs_link_at(
     chimera_vfs_link_at_callback_t  callback,
     void                           *private_data)
 {
+    if (chimera_vfs_name_bad(name, namelen) ||
+        chimera_vfs_name_is_dotdot(name, namelen)) {
+        callback(CHIMERA_VFS_EINVAL, NULL, NULL, NULL, private_data);
+        return;
+    }
+
     chimera_vfs_link_at_path(thread, cred, fh, fhlen, dir_fh, dir_fhlen, name,
                              namelen, replace, attr_mask, pre_attr_mask,
                              post_attr_mask, parent_lease_skip, op_handle,

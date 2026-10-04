@@ -211,7 +211,7 @@ chimera_smb_set_info_link_process(struct chimera_smb_request *request)
             rename_info->new_parent,
             rename_info->new_parent_len,
             CHIMERA_VFS_ATTR_FH,
-            0,
+            CHIMERA_VFS_LOOKUP_NO_DOTDOT | CHIMERA_VFS_LOOKUP_NO_SYMLINK,
             chimera_smb_set_info_link_lookup_parent_callback,
             request);
     } else {

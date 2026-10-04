@@ -11,6 +11,7 @@
 #include "vfs/vfs_procs.h"
 #include "vfs/vfs_claim.h"
 #include "vfs/vfs_internal.h"
+#include "vfs_name.h"
 #include "vfs/vfs_name_cache.h"
 #include "vfs/vfs_attr_cache.h"
 #include "vfs/vfs_open_cache.h"
@@ -553,6 +554,11 @@ chimera_vfs_remove_at(
     chimera_vfs_remove_at_callback_t callback,
     void                            *private_data)
 {
+    if (chimera_vfs_name_bad(name, namelen)) {
+        callback(CHIMERA_VFS_EINVAL, NULL, NULL, private_data);
+        return;
+    }
+
     chimera_vfs_remove_at_path(thread, cred, handle, name, namelen, child_fh,
                                child_fh_len, flags, pre_attr_mask, post_attr_mask,
                                parent_lease_skip, callback, private_data);
@@ -632,6 +638,11 @@ chimera_vfs_remove_at_match_fh(
     chimera_vfs_remove_at_callback_t callback,
     void                            *private_data)
 {
+    if (chimera_vfs_name_bad(name, namelen)) {
+        callback(CHIMERA_VFS_EINVAL, NULL, NULL, private_data);
+        return;
+    }
+
     chimera_vfs_remove_at_common(thread, cred, handle, name, namelen,
                                  child_fh, child_fh_len, 1 /* match_child_fh */,
                                  0 /* flags */, pre_attr_mask, post_attr_mask, parent_lease_skip,

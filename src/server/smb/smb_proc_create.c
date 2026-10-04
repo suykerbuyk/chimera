@@ -2916,10 +2916,24 @@ chimera_smb_create_parent_symlink_readlink_cb(
             }
         }
         request->create.r_symlink_target_len = target_length;
-        /* Unparsed suffix = "/" + create name, in UTF-16 bytes (the part of the
-         * path after the parent-path symlink the server stopped on). */
-        request->create.r_symlink_unparsed =
-            (uint16_t) ((request->create.name_len + 1) * 2);
+        /* Unparsed suffix (UTF-16 bytes): the part of the path the server did
+         * NOT resolve -- the parent components after the symlink, plus the
+         * separator and the final name.  r_symlink_probe_end is where the
+         * symlink component ends in parent_path, so parent_path[probe_end..]
+         * is the unresolved parent remainder ("" when the link is the last
+         * parent component, which gives the "/"+name of a final-component
+         * stop). */
+        {
+            const char *rem = request->create.parent_path +
+                request->create.r_symlink_probe_end;
+            int         rem_len = request->create.parent_path_len -
+                request->create.r_symlink_probe_end;
+
+            request->create.r_symlink_unparsed = (uint16_t)
+                (chimera_smb_utf8_utf16_bytes(rem, rem_len) + 2 +
+                 chimera_smb_utf8_utf16_bytes(request->create.name,
+                                              request->create.name_len));
+        }
         request->create.r_symlink_error = 1;
     }
 
@@ -4833,6 +4847,107 @@ chimera_smb_create_open_parent_callback(
 } /* chimera_smb_create_open_parent_callback */
 
 
+static void chimera_smb_create_parent_symlink_open_cb(
+    enum chimera_vfs_error          error_code,
+    struct chimera_vfs_open_handle *oh,
+    void                           *private_data);
+
+/* End offset in parent_path of the component beginning at `from` (the next '/',
+ * or parent_path_len). */
+static inline int
+chimera_smb_parent_component_end(
+    const struct chimera_smb_request *request,
+    int                               from)
+{
+    int i = from;
+
+    while (i < request->create.parent_path_len &&
+           request->create.parent_path[i] != '/') {
+        i++;
+    }
+    return i;
+} /* chimera_smb_parent_component_end */
+
+static void chimera_smb_create_parent_symlink_locate_probe(
+    struct chimera_smb_request *request);
+
+/* Locate which parent component is the symlink the walk stopped on, so the
+ * STOPPED_ON_SYMLINK reply's UnparsedPathLength covers the whole unresolved
+ * tail (the components after the link, plus the name), not just the name.  Only
+ * runs on the stopped path.  Each step re-resolves a growing prefix with the
+ * same confinement flags; the first prefix whose last component is a symlink is
+ * the stop component. */
+static void
+chimera_smb_create_parent_symlink_locate_cb(
+    enum chimera_vfs_error    error_code,
+    struct chimera_vfs_attrs *attr,
+    void                     *private_data)
+{
+    struct chimera_smb_request *request    = private_data;
+    struct chimera_vfs_thread  *vfs_thread = request->compound->thread->vfs_thread;
+
+    if (error_code != CHIMERA_VFS_OK) {
+        /* Could not pin the component: answer a bare STOPPED (no body), the same
+         * degradation the readlink-failure path takes. */
+        chimera_smb_complete_request(request, SMB2_STATUS_STOPPED_ON_SYMLINK);
+        return;
+    }
+
+    if ((attr->va_set_mask & CHIMERA_VFS_ATTR_MODE) && S_ISLNK(attr->va_mode)) {
+        /* probe_end already marks the end of this (symlink) component.  Reopen
+         * the link by its fh to read the target for the response body. */
+        request->create.r_symlink_handle = NULL;
+        chimera_vfs_open_fh(
+            vfs_thread,
+            &request->session_handle->session->cred,
+            attr->va_fh,
+            attr->va_fh_len,
+            CHIMERA_VFS_OPEN_NOFOLLOW | CHIMERA_VFS_OPEN_PATH,
+            chimera_smb_create_parent_symlink_open_cb,
+            request);
+        return;
+    }
+
+    /* A resolved directory: advance to the next component and probe again. */
+    {
+        int next = request->create.r_symlink_probe_end;
+
+        while (next < request->create.parent_path_len &&
+               request->create.parent_path[next] == '/') {
+            next++;
+        }
+        request->create.r_symlink_probe_end =
+            chimera_smb_parent_component_end(request, next);
+    }
+
+    if (request->create.r_symlink_probe_end >= request->create.parent_path_len) {
+        /* No symlink component found (should not happen on the stopped path):
+         * answer a bare STOPPED. */
+        chimera_smb_complete_request(request, SMB2_STATUS_STOPPED_ON_SYMLINK);
+        return;
+    }
+
+    chimera_smb_create_parent_symlink_locate_probe(request);
+} /* chimera_smb_create_parent_symlink_locate_cb */
+
+static void
+chimera_smb_create_parent_symlink_locate_probe(struct chimera_smb_request *request)
+{
+    struct chimera_vfs_thread *vfs_thread = request->compound->thread->vfs_thread;
+
+    chimera_vfs_lookup(
+        vfs_thread,
+        &request->session_handle->session->cred,
+        request->tree->fh,
+        request->tree->fh_len,
+        request->create.parent_path,
+        request->create.r_symlink_probe_end,
+        CHIMERA_VFS_ATTR_FH | CHIMERA_VFS_ATTR_MODE,
+        CHIMERA_VFS_LOOKUP_NO_DOTDOT | CHIMERA_VFS_LOOKUP_NO_SYMLINK,
+        chimera_smb_create_parent_symlink_locate_cb,
+        request);
+} /* chimera_smb_create_parent_symlink_locate_probe */
+
 static inline void
 chimera_smb_create_lookup_parent_callback(
     enum chimera_vfs_error    error_code,
@@ -4857,15 +4972,13 @@ chimera_smb_create_lookup_parent_callback(
      * suffix -- a bare STOPPED body leaves the client with only ELOOP, breaking
      * every op that traverses a symlinked directory. */
     if ((attr->va_set_mask & CHIMERA_VFS_ATTR_MODE) && S_ISLNK(attr->va_mode)) {
-        request->create.r_symlink_handle = NULL;
-        chimera_vfs_open_fh(
-            vfs_thread,
-            &request->session_handle->session->cred,
-            attr->va_fh,
-            attr->va_fh_len,
-            CHIMERA_VFS_OPEN_NOFOLLOW | CHIMERA_VFS_OPEN_PATH,
-            chimera_smb_create_parent_symlink_open_cb,
-            request);
+        /* The walk stopped on a symlink parent component (it is not followed
+         * server-side).  Locate which component it is so the STOPPED_ON_SYMLINK
+         * reply's UnparsedPathLength covers the whole unresolved tail, then read
+         * the target for the body. */
+        request->create.r_symlink_probe_end =
+            chimera_smb_parent_component_end(request, 0);
+        chimera_smb_create_parent_symlink_locate_probe(request);
         return;
     }
 
@@ -4894,7 +5007,7 @@ chimera_smb_create_process(struct chimera_smb_request *request)
             request->create.parent_path,
             request->create.parent_path_len,
             CHIMERA_VFS_ATTR_FH | CHIMERA_VFS_ATTR_MODE,
-            0,
+            CHIMERA_VFS_LOOKUP_NO_DOTDOT | CHIMERA_VFS_LOOKUP_NO_SYMLINK,
             chimera_smb_create_lookup_parent_callback,
             request);
     } else if (request->create.name_len) {
