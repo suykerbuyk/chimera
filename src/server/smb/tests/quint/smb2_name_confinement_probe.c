@@ -47,8 +47,8 @@ static int failures = 0;
             }                                 \
         } while (0)
 
-/* The share under attack is rooted at a SUBDIRECTORY of the memfs filesystem,
- * so "outside" is a sibling the client must not reach. */
+/* The confined share is rooted at a SUBDIRECTORY of the memfs filesystem, so
+ * "outside" is a sibling the client must not reach. */
 static struct smb2_conn *root_c;  /* tree on share "share" (the fs root) */
 static struct smb2_conn *inner_c; /* tree on share "inner" (= share/inner) */
 
@@ -416,7 +416,7 @@ run_rename_link_rows(void)
     uint8_t  fid[16];
     uint32_t st;
 
-    /* R2 (the confirmed escape): rename target '..\outside\r2'. */
+    /* R2: rename target '..\outside\r2' (a backslash ".." form). */
     if (inner_source("rsrc1", fid)) {
         st = smb2_rename(inner_c, fid, "..\\outside\\r2", 0);
         CHECK(st == ST_OBJECT_NAME_INVALID, "R2 rename '..\\outside\\r2' -> 0x%08x", st);
@@ -432,7 +432,7 @@ run_rename_link_rows(void)
         CHECK(!exists_at_root("outside\\r1"), "R1 left nothing in outside");
     }
 
-    /* L2 (the confirmed escape): hard-link target '..\outside\l2'. */
+    /* L2: hard-link target '..\outside\l2' (a backslash ".." form). */
     if (inner_source("lsrc1", fid)) {
         st = smb2_link(inner_c, fid, "..\\outside\\l2", 0);
         CHECK(st == ST_OBJECT_NAME_INVALID, "L2 link '..\\outside\\l2' -> 0x%08x", st);
@@ -623,9 +623,47 @@ run_symlink_rows(void)
         smb2_close(inner_c, o.file_id);
     }
 
-    /* The reads above were refused at the link, so the planted sentinel was
-     * never reached; confirm no stray escaped entry was created beside it. */
-    CHECK(!exists_at_root("outside\\d\\new2"), "SL8-11 created nothing in outside/d");
+    /* SL12/SL13: a CREATE-if THROUGH the escaping last-component link (depth 2
+     * and depth 3) is stopped at the link, so nothing is created outside. */
+    st = smb2_create(inner_c, "sub\\escd\\newx", MBT_FILE_OPEN_IF, MBT_FILE_ALL_ACCESS,
+                     MBT_FILE_SHARE_RWD, NULL, &o);
+    CHECK(st == ST_STOPPED_ON_SYMLINK, "SL12 create 'sub\\escd\\newx' -> 0x%08x", st);
+    CHECK(!exists_at_root("outside\\d\\newx"), "SL12 created nothing in outside/d");
+
+    st = smb2_create(inner_c, "sub\\mid\\escd3\\newy", MBT_FILE_OPEN_IF, MBT_FILE_ALL_ACCESS,
+                     MBT_FILE_SHARE_RWD, NULL, &o);
+    CHECK(st == ST_STOPPED_ON_SYMLINK, "SL13 create 'sub\\mid\\escd3\\newy' -> 0x%08x", st);
+    CHECK(!exists_at_root("outside\\d\\newy"), "SL13 created nothing in outside/d");
+
+    /* SL14 (M2): a non-ASCII unresolved tail after the stopped link.
+     * UnparsedPathLength counts the tail in UTF-16 bytes regardless of its UTF-8
+     * encoding.  'sub\escd' stops at the link; the tail '\t'+U+00E9+U+20AC is
+     * four UTF-16 code units = 8 bytes, as is '\'+U+00E9+'\x' (a non-ASCII
+     * component in the middle of the remainder). */
+    {
+        uint8_t n16[64];
+        int     nlen;
+
+        nlen        = utf16le("sub\\escd\\t", n16);
+        n16[nlen++] = 0xE9; n16[nlen++] = 0x00;   /* U+00E9 e-acute */
+        n16[nlen++] = 0xAC; n16[nlen++] = 0x20;   /* U+20AC euro */
+        st          = smb2_create_raw16(inner_c, n16, nlen, MBT_FILE_OPEN,
+                                        MBT_FILE_ALL_ACCESS, MBT_FILE_SHARE_RWD,
+                                        MBT_FILE_NON_DIRECTORY_FILE, &o);
+        CHECK(st == ST_STOPPED_ON_SYMLINK, "SL14 non-ASCII tail -> 0x%08x", st);
+        unparsed = last_symlink_unparsed(inner_c);
+        CHECK(unparsed == 8, "SL14 UnparsedPathLength=%d (expect 8, non-ASCII tail)", unparsed);
+
+        nlen        = utf16le("sub\\escd\\", n16);
+        n16[nlen++] = 0xE9; n16[nlen++] = 0x00;   /* U+00E9 */
+        nlen       += utf16le("\\x", n16 + nlen);
+        st          = smb2_create_raw16(inner_c, n16, nlen, MBT_FILE_OPEN,
+                                        MBT_FILE_ALL_ACCESS, MBT_FILE_SHARE_RWD,
+                                        MBT_FILE_NON_DIRECTORY_FILE, &o);
+        CHECK(st == ST_STOPPED_ON_SYMLINK, "SL14b non-ASCII mid-path tail -> 0x%08x", st);
+        unparsed = last_symlink_unparsed(inner_c);
+        CHECK(unparsed == 8, "SL14b UnparsedPathLength=%d (expect 8, non-ASCII mid-path)", unparsed);
+    }
 
     check_alive(inner_c, "symlink rows");
 } /* run_symlink_rows */
@@ -644,21 +682,21 @@ run_positive_rows(void)
     CHECK(st == ST_OBJECT_NAME_NOT_FOUND, "D2 'sub\\.' -> 0x%08x", st);
 
     /* T1-T3: a trailing backslash (an empty final component) is NOT one of the
-     * new refusals -- it keeps today's behaviour and never gets
-     * OBJECT_NAME_INVALID from the component checks. */
+     * new refusals -- each keeps exactly today's status (never the component
+     * checks' OBJECT_NAME_INVALID). */
     st = inner_open("sub\\", MBT_FILE_OPEN, NULL);
-    CHECK(st != ST_OBJECT_NAME_INVALID, "T1 'sub\\' not newly refused (0x%08x)", st);
+    CHECK(st == ST_OBJECT_NAME_NOT_FOUND, "T1 'sub\\' -> NAME_NOT_FOUND (0x%08x)", st);
     {
         struct smb2_create_out o;
         st = smb2_create_opts(inner_c, "newdir\\", MBT_FILE_CREATE, MBT_FILE_ALL_ACCESS,
                               MBT_FILE_SHARE_RWD, MBT_FILE_DIRECTORY_FILE, NULL, &o);
-        CHECK(st != ST_OBJECT_NAME_INVALID, "T2 'newdir\\' not newly refused (0x%08x)", st);
+        CHECK(st == ST_OBJECT_PATH_NOT_FOUND, "T2 'newdir\\' -> PATH_NOT_FOUND (0x%08x)", st);
         if (st == ST_SUCCESS) {
             smb2_close(inner_c, o.file_id);
         }
     }
     st = inner_open("sub\\inner.txt\\", MBT_FILE_OPEN, NULL);
-    CHECK(st != ST_OBJECT_NAME_INVALID, "T3 'sub\\inner.txt\\' not newly refused (0x%08x)", st);
+    CHECK(st == ST_NOT_A_DIRECTORY, "T3 'sub\\inner.txt\\' -> NOT_A_DIRECTORY (0x%08x)", st);
 
     check_alive(inner_c, "positive rows");
 } /* run_positive_rows */
@@ -736,8 +774,28 @@ run_reconnect_rows(void)
         CHECK(st == ST_OBJECT_NAME_INVALID, "reconnect DHnC 'a/b' -> 0x%08x", st);
     }
 
-    /* The legitimate empty-name reclaim still works (the parked handle survived
-     * every refused attempt above). */
+    /* The legitimate reclaim by the ORIGINAL name works: a persistent handle
+     * reclaims by FileId, and sending the original name (the normal client
+     * form) must not be mistaken for a crafted name.  Do not close it, so it
+     * parks again for the empty-name form below. */
+    memset(&dur, 0, sizeof(dur));
+    dur.dh2c = 1;
+    memcpy(dur.file_id, o.file_id, 16);
+    memset(dur.create_guid, 0x5A, 16);
+    st = smb2_create_dur(b, "recon", MBT_FILE_OPEN, MBT_FILE_ALL_ACCESS,
+                         MBT_FILE_SHARE_RWD, NULL, &dur, &r);
+    CHECK(st == ST_SUCCESS, "reconnect original name 'recon' reclaims -> 0x%08x", st);
+
+    /* Park the handle again (disconnect without close) and confirm the other
+     * normal form, the empty-name reclaim, still works. */
+    smb2_conn_disconnect(b);
+    smb2_quiesce(&env);
+    b = smb2_conn_reopen(&env, a);
+
+    memset(&dur, 0, sizeof(dur));
+    dur.dh2c = 1;
+    memcpy(dur.file_id, o.file_id, 16);
+    memset(dur.create_guid, 0x5A, 16);
     st = smb2_create_dur(b, "", MBT_FILE_OPEN, MBT_FILE_ALL_ACCESS,
                          MBT_FILE_SHARE_RWD, NULL, &dur, &r);
     CHECK(st == ST_SUCCESS, "reconnect empty name reclaims -> 0x%08x", st);
