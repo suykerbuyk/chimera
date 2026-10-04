@@ -128,20 +128,46 @@ endif()
 # backends carry the same check and run where they can mount (SKIP 77 otherwise).
 add_executable(vfs_name_component_test vfs_name_component_test.c)
 target_link_libraries(vfs_name_component_test chimera_vfs chimera_vfs_memfs
-                      chimera_vfs_memkv evpl)
-target_link_libraries(vfs_name_component_test chimera_vfs_linux chimera_vfs_io_uring)
+                      chimera_vfs_diskfs chimera_vfs_memkv evpl)
 set(_namecomp_saved_tier "${CHIMERA_TEST_TIER}")
 set(CHIMERA_TEST_TIER quick)
-# memfs always runs; the passthrough backends carry the same core check and run
-# where they can mount -- linux/io_uring need CAP_DAC_READ_SEARCH, so they SKIP
-# (77) unprivileged and run under qb.  diskfs/cairn need a device/pool config
-# this harness does not build, so they are left to the backend MBT suites.
-foreach(_nc_backend memfs linux io_uring)
-    add_test(NAME chimera/vfs/name_component_${_nc_backend}
-        COMMAND vfs_name_component_test ${_nc_backend})
-    set_tests_properties(chimera/vfs/name_component_${_nc_backend} PROPERTIES
+# The core name check is backend-independent (it runs in the public *_at entry
+# ahead of dispatch), so memfs proves it in the quick tier.  The engine-managed
+# diskfs/cairn legs run unprivileged from argv, gated exactly like the zerorange
+# suite above; the linux/io_uring passthrough legs need CAP_DAC_READ_SEARCH and
+# SKIP (77) otherwise.  Each leg's link AND registration is gated on the module
+# actually being built -- Darwin has no linux module, and -DIO_URING_ENABLED=OFF
+# builds no io_uring module -- so the test never links a target that is absent.
+add_test(NAME chimera/vfs/name_component_memfs COMMAND vfs_name_component_test memfs)
+set_tests_properties(chimera/vfs/name_component_memfs PROPERTIES TIMEOUT 30)
+if(HAVE_LIBAIO_USABLE)
+    add_test(NAME chimera/vfs/name_component_diskfs_aio
+        COMMAND vfs_name_component_test diskfs_aio)
+    set_tests_properties(chimera/vfs/name_component_diskfs_aio PROPERTIES
         SKIP_RETURN_CODE 77 TIMEOUT 30)
-endforeach()
+endif()
+if(CHIMERA_LINUX)
+    target_link_libraries(vfs_name_component_test chimera_vfs_linux)
+    add_test(NAME chimera/vfs/name_component_linux COMMAND vfs_name_component_test linux)
+    set_tests_properties(chimera/vfs/name_component_linux PROPERTIES
+        SKIP_RETURN_CODE 77 TIMEOUT 30)
+endif()
+if(CHIMERA_VFS_IO_URING)
+    target_link_libraries(vfs_name_component_test chimera_vfs_io_uring)
+    add_test(NAME chimera/vfs/name_component_io_uring COMMAND vfs_name_component_test io_uring)
+    set_tests_properties(chimera/vfs/name_component_io_uring PROPERTIES
+        SKIP_RETURN_CODE 77 TIMEOUT 30)
+    add_test(NAME chimera/vfs/name_component_diskfs_io_uring
+        COMMAND vfs_name_component_test diskfs_io_uring)
+    set_tests_properties(chimera/vfs/name_component_diskfs_io_uring PROPERTIES
+        SKIP_RETURN_CODE 77 TIMEOUT 30)
+endif()
+if(CAIRN_ENABLED)
+    target_link_libraries(vfs_name_component_test chimera_vfs_cairn)
+    add_test(NAME chimera/vfs/name_component_cairn COMMAND vfs_name_component_test cairn)
+    set_tests_properties(chimera/vfs/name_component_cairn PROPERTIES
+        SKIP_RETURN_CODE 77 TIMEOUT 30)
+endif()
 set(CHIMERA_TEST_TIER "${_namecomp_saved_tier}")
 
 add_executable(vfs_clone_range_test vfs_clone_range_test.c)
