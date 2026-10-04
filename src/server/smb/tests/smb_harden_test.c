@@ -21,6 +21,8 @@
 #include "server/smb/smb_internal.h"
 #include "server/smb/smb_procs.h"
 #include "server/smb/smb_ntlm.h"
+#include "server/smb/smb_string.h"
+#include "smb_common/smb2.h"
 
 static int passed = 0;
 static int failed = 0;
@@ -415,6 +417,63 @@ test_ntlm_field_valid_decodes(void)
     free(result);
 } /* test_ntlm_field_valid_decodes */
 
+/* The pure SMB name-component helpers that CREATE, the durable reconnect path
+ * and SET_INFO rename/link all use.  This table is the cover for the forms the
+ * in-process probe cannot reach (a cold durable reclaim) and for the UTF-16
+ * length arithmetic, which is otherwise exercised only with ASCII. */
+static void
+test_name_validation_helpers(void)
+{
+    char nul[6];
+
+    /* has_nul / has_slash */
+    CHECK(!chimera_smb_name_has_nul("abc", 3), "has_nul: plain name has none");
+    memcpy(nul, "a\0b", 3);
+    CHECK(chimera_smb_name_has_nul(nul, 3), "has_nul: embedded NUL found");
+    CHECK(chimera_smb_name_has_slash("a/b", 3), "has_slash: '/' found");
+    CHECK(!chimera_smb_name_has_slash("a\\b", 3), "has_slash: '\\' is not '/'");
+
+    /* wire_path_has_dotdot: a '.' component passes; '..' anywhere fails */
+    CHECK(!chimera_smb_wire_path_has_dotdot("a\\.\\b", 5), "dotdot: '.' component allowed");
+    CHECK(chimera_smb_wire_path_has_dotdot("a\\..\\b", 6), "dotdot: mid '..' found");
+    CHECK(chimera_smb_wire_path_has_dotdot("..", 2), "dotdot: lone '..' found");
+    CHECK(chimera_smb_wire_path_has_dotdot("a/../b", 6), "dotdot: '/'-separated '..' found");
+    CHECK(!chimera_smb_wire_path_has_dotdot("", 0), "dotdot: empty path has none");
+
+    /* name_check: the single verdict.  base_len == len when there is no stream. */
+    CHECK(chimera_smb_name_check("file", 4, 4) == SMB2_STATUS_SUCCESS, "name_check: plain name ok");
+    CHECK(chimera_smb_name_check("", 0, 0) == SMB2_STATUS_SUCCESS, "name_check: empty ok (share root / reconnect)");
+    CHECK(chimera_smb_name_check("a\\.\\b", 5, 5) == SMB2_STATUS_SUCCESS, "name_check: '.' component ok");
+    CHECK(chimera_smb_name_check("recon", 5, 5) == SMB2_STATUS_SUCCESS, "name_check: original reconnect name ok");
+    CHECK(chimera_smb_name_check("a/b", 3, 3) == SMB2_STATUS_OBJECT_NAME_INVALID, "name_check: '/' refused");
+    CHECK(chimera_smb_name_check("a\\..\\b", 6, 6) == SMB2_STATUS_OBJECT_NAME_INVALID, "name_check: '..' refused");
+    memcpy(nul, "a\0b", 3);
+    CHECK(chimera_smb_name_check(nul, 3, 3) == SMB2_STATUS_OBJECT_NAME_INVALID, "name_check: NUL refused");
+
+    /* name_check length boundary: 255 ok, 256 refused (base and stream). */
+    {
+        char big[300];
+        int  i;
+        for (i = 0; i < 300; i++) {
+            big[i] = 'a';
+        }
+        CHECK(chimera_smb_name_check(big, 255, 255) == SMB2_STATUS_SUCCESS, "name_check: 255-byte component ok");
+        CHECK(chimera_smb_name_check(big, 256, 256) == SMB2_STATUS_OBJECT_NAME_INVALID,
+              "name_check: 256-byte component refused");
+        /* With a stream: base 255 counts separately from the stream. */
+        memcpy(big + 255, ":s", 2);
+        CHECK(chimera_smb_name_check(big, 257, 255) == SMB2_STATUS_SUCCESS, "name_check: 255 base + stream ok");
+    }
+
+    /* utf8_utf16_bytes: 1-, 2-, 3- and 4-byte UTF-8 runs. */
+    CHECK(chimera_smb_utf8_utf16_bytes("ab", 2) == 4, "utf16_bytes: 2 ASCII -> 4");
+    CHECK(chimera_smb_utf8_utf16_bytes("\xC3\xA9", 2) == 2, "utf16_bytes: U+00E9 (2-byte) -> 2");
+    CHECK(chimera_smb_utf8_utf16_bytes("\xE2\x82\xAC", 3) == 2, "utf16_bytes: U+20AC (3-byte) -> 2");
+    CHECK(chimera_smb_utf8_utf16_bytes("\xF0\x9F\x98\x80", 4) == 4, "utf16_bytes: U+1F600 (4-byte) -> surrogate pair 4")
+    ;
+    CHECK(chimera_smb_utf8_utf16_bytes("a\xE2\x82\xAC", 4) == 4, "utf16_bytes: ASCII + 3-byte -> 4");
+} /* test_name_validation_helpers */
+
 int
 main(
     int   argc,
@@ -448,6 +507,9 @@ main(
     test_ntlm_field_offset_uint32_overflow();
     test_ntlm_field_offset_past_end();
     test_ntlm_field_valid_decodes();
+
+    fprintf(stderr, "=== SMB name-component validation helpers ===\n");
+    test_name_validation_helpers();
 
     fprintf(stderr, "\nTotal: %d passed, %d failed\n", passed, failed);
     return failed == 0 ? 0 : 1;

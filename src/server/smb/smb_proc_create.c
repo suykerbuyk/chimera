@@ -4908,7 +4908,11 @@ chimera_smb_create_parent_symlink_locate_cb(
         return;
     }
 
-    /* A resolved directory: advance to the next component and probe again. */
+    /* A resolved directory: advance to the START of the next component and
+     * probe the prefix that ends it.  Keying the give-up on the next
+     * component's start (not its end) means the LAST parent component is probed
+     * too -- its end equals parent_path_len, which must not be mistaken for
+     * "nothing left". */
     {
         int next = request->create.r_symlink_probe_end;
 
@@ -4916,15 +4920,16 @@ chimera_smb_create_parent_symlink_locate_cb(
                request->create.parent_path[next] == '/') {
             next++;
         }
+
+        if (next >= request->create.parent_path_len) {
+            /* The whole parent resolved as directories with no symlink
+             * component: answer a bare STOPPED (the walk was still refused). */
+            chimera_smb_complete_request(request, SMB2_STATUS_STOPPED_ON_SYMLINK);
+            return;
+        }
+
         request->create.r_symlink_probe_end =
             chimera_smb_parent_component_end(request, next);
-    }
-
-    if (request->create.r_symlink_probe_end >= request->create.parent_path_len) {
-        /* No symlink component found (should not happen on the stopped path):
-         * answer a bare STOPPED. */
-        chimera_smb_complete_request(request, SMB2_STATUS_STOPPED_ON_SYMLINK);
-        return;
     }
 
     chimera_smb_create_parent_symlink_locate_probe(request);

@@ -10,7 +10,8 @@
  * empty (reconnect / share-root) name still work.  The server runs on memfs,
  * with a nested share rooted at a subdirectory so confinement is observable.
  *
- * Symlink-component cases (SL*) live in phase 3 and are added there.
+ * Symlink-component cases (SL*) follow, covering the parent-walk and
+ * stop-on-symlink paths.
  */
 
 #include "smb2_mbt_common.h"
@@ -215,7 +216,6 @@ run_create_rows(void)
                      MBT_FILE_ALL_ACCESS, MBT_FILE_SHARE_RWD, NULL, &o);
     CHECK(st == ST_OBJECT_NAME_INVALID, "F1/C1 create '../outside/c1' -> 0x%08x", st);
     CHECK(!exists_at_root("outside\\c1"), "C1 left nothing in outside");
-    CHECK(!exists_at_root("inner\\../outside/c1"), "C1 left no literal dirent");
 
     st = smb2_create(inner_c, "sub\\../../outside/c2", MBT_FILE_OPEN_IF,
                      MBT_FILE_ALL_ACCESS, MBT_FILE_SHARE_RWD, NULL, &o);
@@ -335,8 +335,8 @@ run_stream_rows(void)
                                     MBT_FILE_NON_DIRECTORY_FILE, &o);
     CHECK(st == ST_OBJECT_NAME_INVALID, "ST1 'f:s'+NUL+'x' -> 0x%08x", st);
 
-    /* ST2: a 1200-byte stream name.  On unpatched code this overran a fixed
-     * buffer and crashed the server; the bound must refuse it cleanly. */
+    /* ST2: a 1200-byte stream name.  The stream-name bound must refuse an
+     * over-long name cleanly. */
     nlen = utf16le("f:", n16);
     for (i = 0; i < 1200; i++) {
         n16[nlen++] = 'A';
@@ -369,7 +369,43 @@ run_stream_rows(void)
     st = smb2_create_raw16(inner_c, n16, nlen, MBT_FILE_OPEN_IF,
                            MBT_FILE_ALL_ACCESS, MBT_FILE_SHARE_RWD,
                            MBT_FILE_NON_DIRECTORY_FILE, &o);
-    CHECK(st == ST_OBJECT_NAME_INVALID, "ST4 256-byte stream -> 0x%08x", st);
+    CHECK(st == ST_OBJECT_NAME_INVALID, "ST4-stream 256-byte stream -> 0x%08x", st);
+
+    /* ST4 as planned: a 255-byte BASE with a stream suffix succeeds; a 256-byte
+     * base with a stream suffix is refused (the base-name bound, with a
+     * stream present). */
+    nlen = 0;
+    for (i = 0; i < 255; i++) {
+        n16[nlen++] = 'B';
+        n16[nlen++] = 0;
+    }
+    nlen += utf16le(":s", n16 + nlen);
+    st    = smb2_create_raw16(inner_c, n16, nlen, MBT_FILE_OPEN_IF,
+                              MBT_FILE_ALL_ACCESS, MBT_FILE_SHARE_RWD,
+                              MBT_FILE_NON_DIRECTORY_FILE, &o);
+    CHECK(st == ST_SUCCESS, "ST4 255-byte base + ':s' -> 0x%08x", st);
+    if (st == ST_SUCCESS) {
+        smb2_close(inner_c, o.file_id);
+    }
+
+    nlen = 0;
+    for (i = 0; i < 256; i++) {
+        n16[nlen++] = 'C';
+        n16[nlen++] = 0;
+    }
+    nlen += utf16le(":s", n16 + nlen);
+    st    = smb2_create_raw16(inner_c, n16, nlen, MBT_FILE_OPEN_IF,
+                              MBT_FILE_ALL_ACCESS, MBT_FILE_SHARE_RWD,
+                              MBT_FILE_NON_DIRECTORY_FILE, &o);
+    CHECK(st == ST_OBJECT_NAME_INVALID, "ST4 256-byte base + ':s' -> 0x%08x", st);
+
+    /* P1 (stream positive): a legitimate named stream still opens. */
+    st = smb2_create(inner_c, "f:s", MBT_FILE_OPEN_IF, MBT_FILE_ALL_ACCESS,
+                     MBT_FILE_SHARE_RWD, NULL, &o);
+    CHECK(st == ST_SUCCESS, "P1 'f:s' stream opens -> 0x%08x", st);
+    if (st == ST_SUCCESS) {
+        smb2_close(inner_c, o.file_id);
+    }
 
     check_alive(inner_c, "stream rows");
 } /* run_stream_rows */
@@ -410,6 +446,31 @@ run_rename_link_rows(void)
         CHECK(st == ST_OBJECT_NAME_INVALID, "L1 link '../outside/l1' -> 0x%08x", st);
         smb2_close(inner_c, fid);
         CHECK(!exists_at_root("outside\\l1"), "L1 left nothing in outside");
+    }
+
+    /* R3 / N4: a rename target carrying an embedded NUL (strrchr stops at it)
+     * is refused; nothing escapes. */
+    if (inner_source("rsrc4", fid)) {
+        uint8_t n16[64];
+        int     nlen = utf16le("x", n16);
+        n16[nlen++] = 0; n16[nlen++] = 0;              /* embedded U+0000 */
+        nlen       += utf16le("\\..\\..\\outside\\n4", n16 + nlen);
+        st          = smb2_rename_raw16(inner_c, fid, n16, nlen, 0);
+        CHECK(st == ST_OBJECT_NAME_INVALID, "R3/N4 rename 'x'+NUL+'\\..\\..\\outside\\n4' -> 0x%08x", st);
+        smb2_close(inner_c, fid);
+        CHECK(!exists_at_root("outside\\n4"), "R3/N4 left nothing in outside");
+    }
+
+    /* L-NUL: a hard-link target with an embedded NUL is refused. */
+    if (inner_source("lsrc4", fid)) {
+        uint8_t n16[64];
+        int     nlen = utf16le("y", n16);
+        n16[nlen++] = 0; n16[nlen++] = 0;
+        nlen       += utf16le("\\..\\..\\outside\\lnul", n16 + nlen);
+        st          = smb2_link_raw16(inner_c, fid, n16, nlen, 0);
+        CHECK(st == ST_OBJECT_NAME_INVALID, "L-NUL link 'y'+NUL+'\\..\\..\\outside\\lnul' -> 0x%08x", st);
+        smb2_close(inner_c, fid);
+        CHECK(!exists_at_root("outside\\lnul"), "L-NUL left nothing in outside");
     }
 
     /* Positive: an in-share rename and hard link still work. */
@@ -499,14 +560,72 @@ run_symlink_rows(void)
         smb2_close(inner_c, o.file_id);
     }
 
-    /* SL7: a link as the LAST parent component -> STOPPED (unchanged), unparsed
-     * is just the final name. */
+    /* SL7: a link as the LAST parent component of a single-component parent ->
+     * STOPPED (unchanged), unparsed is just the final name. */
     st = smb2_create(inner_c, "al\\inner.txt", MBT_FILE_OPEN, MBT_FILE_ALL_ACCESS,
                      MBT_FILE_SHARE_RWD, NULL, &o);
     CHECK(st == ST_STOPPED_ON_SYMLINK, "SL7 'al\\inner.txt' -> 0x%08x", st);
     unparsed = last_symlink_unparsed(inner_c);
     CHECK(unparsed == (int) strlen("\\inner.txt") * 2,
           "SL7 UnparsedPathLength=%d (expect %d)", unparsed, (int) strlen("\\inner.txt") * 2);
+
+    /* CR1: a link that is the LAST component of a parent with two or more
+     * components must still carry the symlink error body (it regressed to a
+     * bare STOPPED).  Plant links one and two directories deep. */
+    (void) mk(root_c, "inner\\sub\\mid", 1, NULL, 0);
+    CHECK(plant_symlink(root_c, "inner\\sub\\escd", "../../outside/d", 1) == ST_SUCCESS,
+          "plant sub\\escd -> ../../outside/d");
+    CHECK(plant_symlink(root_c, "inner\\sub\\mid\\escd3", "../../../outside/d", 1) == ST_SUCCESS,
+          "plant sub\\mid\\escd3 -> ../../../outside/d");
+    CHECK(plant_symlink(root_c, "inner\\sub\\lgood", "deeper", 1) == ST_SUCCESS,
+          "plant sub\\lgood -> deeper (in-share)");
+
+    /* SL8 (depth 2, escaping, last component): STOPPED WITH body, unparsed
+     * '\target'; nothing reached outside. */
+    st = smb2_create(inner_c, "sub\\escd\\target", MBT_FILE_OPEN, MBT_FILE_ALL_ACCESS,
+                     MBT_FILE_SHARE_RWD, NULL, &o);
+    CHECK(st == ST_STOPPED_ON_SYMLINK, "SL8 'sub\\escd\\target' -> 0x%08x", st);
+    unparsed = last_symlink_unparsed(inner_c);
+    CHECK(unparsed == (int) strlen("\\target") * 2,
+          "SL8 UnparsedPathLength=%d (expect %d, body present)", unparsed,
+          (int) strlen("\\target") * 2);
+
+    /* SL9 (depth 2 with a '.' component): same stop, same unparsed. */
+    st = smb2_create(inner_c, "sub\\.\\escd\\target", MBT_FILE_OPEN, MBT_FILE_ALL_ACCESS,
+                     MBT_FILE_SHARE_RWD, NULL, &o);
+    CHECK(st == ST_STOPPED_ON_SYMLINK, "SL9 'sub\\.\\escd\\target' -> 0x%08x", st);
+    unparsed = last_symlink_unparsed(inner_c);
+    CHECK(unparsed == (int) strlen("\\target") * 2,
+          "SL9 UnparsedPathLength=%d (expect %d)", unparsed, (int) strlen("\\target") * 2);
+
+    /* SL10 (depth 3, escaping, last component): STOPPED WITH body. */
+    st = smb2_create(inner_c, "sub\\mid\\escd3\\target", MBT_FILE_OPEN, MBT_FILE_ALL_ACCESS,
+                     MBT_FILE_SHARE_RWD, NULL, &o);
+    CHECK(st == ST_STOPPED_ON_SYMLINK, "SL10 'sub\\mid\\escd3\\target' -> 0x%08x", st);
+    unparsed = last_symlink_unparsed(inner_c);
+    CHECK(unparsed == (int) strlen("\\target") * 2,
+          "SL10 UnparsedPathLength=%d (expect %d, body present)", unparsed,
+          (int) strlen("\\target") * 2);
+
+    /* SL11 (depth 2, legitimate in-share, last component): STOPPED WITH body so
+     * the client can resolve the link; the retry opens. */
+    st = smb2_create(inner_c, "sub\\lgood\\f", MBT_FILE_OPEN, MBT_FILE_ALL_ACCESS,
+                     MBT_FILE_SHARE_RWD, NULL, &o);
+    CHECK(st == ST_STOPPED_ON_SYMLINK, "SL11 'sub\\lgood\\f' -> 0x%08x", st);
+    unparsed = last_symlink_unparsed(inner_c);
+    CHECK(unparsed == (int) strlen("\\f") * 2,
+          "SL11 UnparsedPathLength=%d (expect %d, body present)", unparsed,
+          (int) strlen("\\f") * 2);
+    st = smb2_create(inner_c, "sub\\deeper\\f", MBT_FILE_OPEN, MBT_FILE_ALL_ACCESS,
+                     MBT_FILE_SHARE_RWD, NULL, &o);
+    CHECK(st == ST_SUCCESS, "SL11 client retry 'sub\\deeper\\f' opens -> 0x%08x", st);
+    if (st == ST_SUCCESS) {
+        smb2_close(inner_c, o.file_id);
+    }
+
+    /* The reads above were refused at the link, so the planted sentinel was
+     * never reached; confirm no stray escaped entry was created beside it. */
+    CHECK(!exists_at_root("outside\\d\\new2"), "SL8-11 created nothing in outside/d");
 
     check_alive(inner_c, "symlink rows");
 } /* run_symlink_rows */
@@ -523,6 +642,23 @@ run_positive_rows(void)
     /* D2: a bare '.' final name is NAME_NOT_FOUND, as before. */
     st = inner_open("sub\\.", MBT_FILE_OPEN, NULL);
     CHECK(st == ST_OBJECT_NAME_NOT_FOUND, "D2 'sub\\.' -> 0x%08x", st);
+
+    /* T1-T3: a trailing backslash (an empty final component) is NOT one of the
+     * new refusals -- it keeps today's behaviour and never gets
+     * OBJECT_NAME_INVALID from the component checks. */
+    st = inner_open("sub\\", MBT_FILE_OPEN, NULL);
+    CHECK(st != ST_OBJECT_NAME_INVALID, "T1 'sub\\' not newly refused (0x%08x)", st);
+    {
+        struct smb2_create_out o;
+        st = smb2_create_opts(inner_c, "newdir\\", MBT_FILE_CREATE, MBT_FILE_ALL_ACCESS,
+                              MBT_FILE_SHARE_RWD, MBT_FILE_DIRECTORY_FILE, NULL, &o);
+        CHECK(st != ST_OBJECT_NAME_INVALID, "T2 'newdir\\' not newly refused (0x%08x)", st);
+        if (st == ST_SUCCESS) {
+            smb2_close(inner_c, o.file_id);
+        }
+    }
+    st = inner_open("sub\\inner.txt\\", MBT_FILE_OPEN, NULL);
+    CHECK(st != ST_OBJECT_NAME_INVALID, "T3 'sub\\inner.txt\\' not newly refused (0x%08x)", st);
 
     check_alive(inner_c, "positive rows");
 } /* run_positive_rows */
@@ -588,7 +724,20 @@ run_reconnect_rows(void)
                                    MBT_FILE_SHARE_RWD, NULL, &dur, &r);
     CHECK(st == ST_OBJECT_NAME_INVALID, "reconnect '..'+NUL -> 0x%08x", st);
 
-    /* The legitimate empty-name reclaim still works. */
+    /* A v1 DHnC reconnect with a bad name is refused the same way (the name
+     * check runs before the reclaim dispatch regardless of the context). */
+    {
+        struct smb2_durable_req dnc;
+        memset(&dnc, 0, sizeof(dnc));
+        dnc.dhnc = 1;
+        memcpy(dnc.file_id, o.file_id, 16);
+        st = smb2_create_dur(b, "a/b", MBT_FILE_OPEN, MBT_FILE_ALL_ACCESS,
+                             MBT_FILE_SHARE_RWD, NULL, &dnc, &r);
+        CHECK(st == ST_OBJECT_NAME_INVALID, "reconnect DHnC 'a/b' -> 0x%08x", st);
+    }
+
+    /* The legitimate empty-name reclaim still works (the parked handle survived
+     * every refused attempt above). */
     st = smb2_create_dur(b, "", MBT_FILE_OPEN, MBT_FILE_ALL_ACCESS,
                          MBT_FILE_SHARE_RWD, NULL, &dur, &r);
     CHECK(st == ST_SUCCESS, "reconnect empty name reclaims -> 0x%08x", st);

@@ -126,14 +126,25 @@ chimera_smb_emit_stream_info(
         int                             name16_len;
         uint32_t                        disp_len, entry_size, aligned, next, p;
 
+        uint32_t                        nl;
+
         memcpy(&entry, records + in, sizeof(entry));
         sname = (const char *) (records + in + sizeof(entry));
 
+        /* The stream name comes from the backend; clamp the length copied into
+         * the fixed display buffer even though well-behaved backends stay under
+         * SMB_FILENAME_MAX.  The record stride below still uses the stored
+         * length so the walk stays aligned. */
+        nl = entry.name_len;
+        if (nl > SMB_FILENAME_MAX) {
+            nl = SMB_FILENAME_MAX;
+        }
+
         /* ":" + stream-name + ":$DATA"  (default fork name_len == 0 -> "::$DATA") */
         disp[0] = ':';
-        memcpy(disp + 1, sname, entry.name_len);
-        memcpy(disp + 1 + entry.name_len, ":$DATA", 6);
-        disp_len = 1 + entry.name_len + 6;
+        memcpy(disp + 1, sname, nl);
+        memcpy(disp + 1 + nl, ":$DATA", 6);
+        disp_len = 1 + nl + 6;
 
         name16_len = chimera_smb_utf8_to_utf16le(iconv, disp, disp_len,
                                                  name16, sizeof(name16));
