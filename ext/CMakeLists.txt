@@ -4,7 +4,10 @@
 
 set(CHIMERA_EXT_SRC ${CMAKE_CURRENT_SOURCE_DIR} PARENT_SCOPE)
 
-add_subdirectory(libevpl)
+# libevpl is built from the patched overlay (LIBEVPL_SRC, set by
+# cmake/ApplyPatches.cmake), not from the pinned ext/libevpl checkout.  An
+# explicit binary dir is required because the source is outside this tree.
+add_subdirectory(${LIBEVPL_SRC} ${CMAKE_BINARY_DIR}/ext/libevpl)
 
 set(XDRZCC ${XDRZCC} PARENT_SCOPE)
 

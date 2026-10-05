@@ -34,7 +34,7 @@ else()
     set(KRB5_GSSAPI_FOUND FALSE)
 endif()
 
-set(MBT_KRB5_DIR ${CMAKE_SOURCE_DIR}/ext/libevpl/src/rpc2/tests)
+set(MBT_KRB5_DIR ${LIBEVPL_SRC}/src/rpc2/tests)
 
 if(KRB5_GSSAPI_FOUND)
     message(STATUS "NFS MBT krb5 flavors enabled (krb5 ${KRB5_GSSAPI_VERSION})")

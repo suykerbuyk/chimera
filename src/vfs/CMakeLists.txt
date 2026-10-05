@@ -62,9 +62,9 @@ install(TARGETS chimera_vfs DESTINATION lib)
 install(DIRECTORY sdk/ DESTINATION include/chimera/vfs/sdk
         FILES_MATCHING PATTERN "*.h")
 install(FILES
-        ${CMAKE_SOURCE_DIR}/ext/libevpl/ext/prometheus-c/prometheus-c.h
-        ${CMAKE_SOURCE_DIR}/ext/libevpl/ext/prometheus-c/ext/stopwatch/stopwatch.h
-        ${CMAKE_SOURCE_DIR}/ext/libevpl/ext/oteltracing-c/oteltracing.h
+        ${PROMETHEUS_SRC}/prometheus-c.h
+        ${PROMETHEUS_SRC}/ext/stopwatch/stopwatch.h
+        ${OTEL_SRC}/oteltracing.h
         DESTINATION include/chimera)
 
 add_subdirectory(contract)

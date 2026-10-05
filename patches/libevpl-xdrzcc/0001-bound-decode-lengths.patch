@@ -1,0 +1,239 @@
+SPDX-FileCopyrightText: 2025-2026 Chimera-NAS Project Contributors
+SPDX-License-Identifier: LGPL-2.1-only
+
+Bound every length-driven XDR decoder against the bytes actually received.
+
+A shared helper, xdr_read_cursor_remaining(), returns the bytes still present
+from the read cursor to the end of the iovec chain in 64-bit arithmetic, so no
+32-bit wire length can wrap the comparison.  Each length-driven vector and
+contig decoder now rejects a declared length (plus its XDR pad) that exceeds
+that remaining count before it reads, aliases or copies anything.  The contig
+decoders that already open-coded the 64-bit check now express it through the
+helper; the vector decoders that lacked the check gain it.
+
+The guard call sites go through xdr_read_cursor_has_remaining(), an inline
+wrapper that answers from the current iovec alone when the field fits within it
+and only falls back to the full xdr_read_cursor_remaining() sum when the field
+spills past it, so the bound stays O(1) for a fixed-size primitive in a
+multi-iovec decode.
+
+(git apply ignores this free-text preamble and starts at the diff --git line.)
+
+diff --git a/src/xdr_builtin.c b/src/xdr_builtin.c
+--- a/src/xdr_builtin.c
++++ b/src/xdr_builtin.c
+@@ -178,6 +178,47 @@ xdr_write_cursor_flush(struct xdr_write_cursor *cursor)
+     return 0;
+ } /* xdr_write_cursor_flush */
+ 
++/* Bytes available from the cursor's current position to the end of the iovec
++ * chain, 64-bit so no 32-bit wire length can wrap it. Returns 0 when the
++ * cursor already sits past the last iovec. */
++static FORCE_INLINE uint64_t
++xdr_read_cursor_remaining(const struct xdr_read_cursor *cursor)
++{
++    xdr_iovec *iov;
++    uint64_t   remaining;
++
++    if (cursor->cur > cursor->last) {
++        return 0;
++    }
++
++    remaining = (uint64_t) xdr_iovec_len(cursor->cur) - cursor->iov_offset;
++
++    for (iov = cursor->cur + 1; iov <= cursor->last; iov++) {
++        remaining += xdr_iovec_len(iov);
++    }
++
++    return remaining;
++} /* xdr_read_cursor_remaining */
++
++/* True when at least `need` bytes remain from the cursor to the end of the
++ * iovec chain.  The common case -- the field fits within the current iovec --
++ * is answered from that one iovec without summing the whole chain; only a field
++ * that spills past the current iovec falls back to xdr_read_cursor_remaining(),
++ * keeping the bound O(1) for every fixed-size primitive in a multi-iovec
++ * decode. */
++static FORCE_INLINE int
++xdr_read_cursor_has_remaining(
++    const struct xdr_read_cursor *cursor,
++    uint64_t                      need)
++{
++    if (cursor->cur <= cursor->last &&
++        need <= (uint64_t) xdr_iovec_len(cursor->cur) - cursor->iov_offset) {
++        return 1;
++    }
++
++    return need <= xdr_read_cursor_remaining(cursor);
++} /* xdr_read_cursor_has_remaining */
++
+ static inline int
+ xdr_read_cursor_vector_extract(
+     struct xdr_read_cursor *cursor,
+@@ -186,6 +227,10 @@ xdr_read_cursor_vector_extract(
+ {
+     unsigned int left, chunk;
+ 
++    if (unlikely(!xdr_read_cursor_has_remaining(cursor, (uint64_t) bytes))) {
++        return -1;
++    }
++
+     left = bytes;
+ 
+     while (left) {
+@@ -240,6 +285,17 @@ xdr_read_cursor_vector_skip(
+ {
+     unsigned int done, chunk;
+ 
++    if (unlikely(!xdr_read_cursor_has_remaining(cursor, (uint64_t) bytes))) {
++        return -1;
++    }
++
++    /* A zero-byte skip is a no-op; return before dereferencing cursor->cur,
++     * which may already sit past the last iovec (e.g. a pad of 0 after a
++     * payload that consumed the chain exactly). */
++    if (bytes == 0) {
++        return 0;
++    }
++
+     if (cursor->iov_offset + bytes <= xdr_iovec_len(cursor->cur)) {
+         cursor->iov_offset += bytes;
+         cursor->offset     += bytes;
+@@ -718,6 +774,16 @@ __unmarshall_xdr_string_vector(
+         return -1;
+     }
+ 
++    pad = (4 - (str->len & 0x3)) & 0x3;
++
++    /* The declared length is unauthenticated input: refuse it before any read,
++     * alias or copy when it (plus its pad) exceeds the bytes still present
++     * across the iovec chain.  Computed in 64 bits so a length near UINT32_MAX
++     * cannot wrap. */
++    if (unlikely(!xdr_read_cursor_has_remaining(cursor, (uint64_t) str->len + pad))) {
++        return -1;
++    }
++
+     if (xdr_iovec_len(cursor->cur) - cursor->iov_offset >= str->len) {
+         str->str            = (char *) xdr_iovec_data(cursor->cur) + cursor->iov_offset;
+         cursor->iov_offset += str->len;
+@@ -743,7 +809,6 @@ __unmarshall_xdr_string_vector(
+     }
+ 
+     len += str->len;
+-    pad  = (4 - (str->len & 0x3)) & 0x3;
+ 
+     if (pad) {
+         rc = xdr_read_cursor_vector_skip(cursor, pad);
+@@ -782,13 +847,12 @@ __unmarshall_xdr_string_contig(
+     }
+ 
+     pad = (4 - (str->len & 0x3)) & 0x3;
+-    /* Computed in 64 bits deliberately: iov_offset, the length and the pad are
+-     * all 32-bit, so a hostile length near UINT32_MAX makes len + pad wrap to
+-     * a small value and the comparison succeed, handing back a pointer with a
+-     * multi-gigabyte length into a receive buffer.  The length is straight off
+-     * the wire, so this is reachable before any authentication. */
+-    if (unlikely((uint64_t) cursor->iov_offset + str->len + pad >
+-                 (uint64_t) xdr_iovec_len(cursor->cur))) {
++    /* Computed in 64 bits deliberately: the length and the pad are both 32-bit,
++     * so a hostile length near UINT32_MAX makes len + pad wrap to a small value
++     * and the comparison succeed, handing back a pointer with a multi-gigabyte
++     * length into a receive buffer.  The length is straight off the wire, so
++     * this is reachable before any authentication. */
++    if (unlikely(!xdr_read_cursor_has_remaining(cursor, (uint64_t) str->len + pad))) {
+         return -1;
+     }
+ 
+@@ -831,6 +895,17 @@ __unmarshall_opaque_fixed_vector(
+         return 0;
+     }
+ 
++    pad = (4 - (size & 0x3)) & 0x3;
++
++    /* The declared length is unauthenticated input: refuse it before the alias
++     * walk when it (plus its pad) exceeds the bytes still present across the
++     * iovec chain.  Computed in 64 bits so a length near UINT32_MAX cannot wrap
++     * (left is a signed int, so an unchecked size near UINT32_MAX would walk the
++     * loop with a negative count). */
++    if (unlikely(!xdr_read_cursor_has_remaining(cursor, (uint64_t) size + pad))) {
++        return -1;
++    }
++
+     v->iov = xdr_dbuf_alloc_space(sizeof(*v->iov) * ((cursor->last - cursor->cur) + 1), dbuf);
+     if (unlikely(v->iov == NULL)) {
+         return -1;
+@@ -869,8 +944,6 @@ __unmarshall_opaque_fixed_vector(
+ 
+     } while (left);
+ 
+-    pad = (4 - (size & 0x3)) & 0x3;
+-
+     xdr_read_cursor_vector_skip(cursor, pad);
+ 
+     return size + pad;
+@@ -898,13 +971,12 @@ __unmarshall_opaque_fixed_contig(
+     }
+ 
+     pad = (4 - (size & 0x3)) & 0x3;
+-    /* Computed in 64 bits deliberately: iov_offset, the length and the pad are
+-     * all 32-bit, so a hostile length near UINT32_MAX makes len + pad wrap to
+-     * a small value and the comparison succeed, handing back a pointer with a
+-     * multi-gigabyte length into a receive buffer.  The length is straight off
+-     * the wire, so this is reachable before any authentication. */
+-    if (unlikely((uint64_t) cursor->iov_offset + size + pad >
+-                 (uint64_t) xdr_iovec_len(cursor->cur))) {
++    /* Computed in 64 bits deliberately: the length and the pad are both 32-bit,
++     * so a hostile length near UINT32_MAX makes len + pad wrap to a small value
++     * and the comparison succeed, handing back a pointer with a multi-gigabyte
++     * length into a receive buffer.  The length is straight off the wire, so
++     * this is reachable before any authentication. */
++    if (unlikely(!xdr_read_cursor_has_remaining(cursor, (uint64_t) size + pad))) {
+         return -1;
+     }
+ 
+@@ -1054,6 +1126,16 @@ __unmarshall_opaque_vector(
+         return -1;
+     }
+ 
++    pad = (4 - (v->len & 0x3)) & 0x3;
++
++    /* The declared length is unauthenticated input: refuse it before any read,
++     * alias or copy when it (plus its pad) exceeds the bytes still present
++     * across the iovec chain.  Computed in 64 bits so a length near UINT32_MAX
++     * cannot wrap. */
++    if (unlikely(!xdr_read_cursor_has_remaining(cursor, (uint64_t) v->len + pad))) {
++        return -1;
++    }
++
+     if (xdr_iovec_len(cursor->cur) - cursor->iov_offset >= v->len) {
+         v->data             = (char *) xdr_iovec_data(cursor->cur) + cursor->iov_offset;
+         cursor->iov_offset += v->len;
+@@ -1076,8 +1158,6 @@ __unmarshall_opaque_vector(
+         }
+     }
+ 
+-    pad = (4 - (v->len & 0x3)) & 0x3;
+-
+     if (pad) {
+         rc = xdr_read_cursor_vector_skip(cursor, pad);
+ 
+@@ -1112,13 +1192,12 @@ __unmarshall_opaque_contig(
+     len += rc;
+ 
+     pad = (4 - (v->len & 0x3)) & 0x3;
+-    /* Computed in 64 bits deliberately: iov_offset, the length and the pad are
+-     * all 32-bit, so a hostile length near UINT32_MAX makes len + pad wrap to
+-     * a small value and the comparison succeed, handing back a pointer with a
+-     * multi-gigabyte length into a receive buffer.  The length is straight off
+-     * the wire, so this is reachable before any authentication. */
+-    if (unlikely((uint64_t) cursor->iov_offset + v->len + pad >
+-                 (uint64_t) xdr_iovec_len(cursor->cur))) {
++    /* Computed in 64 bits deliberately: the length and the pad are both 32-bit,
++     * so a hostile length near UINT32_MAX makes len + pad wrap to a small value
++     * and the comparison succeed, handing back a pointer with a multi-gigabyte
++     * length into a receive buffer.  The length is straight off the wire, so
++     * this is reachable before any authentication. */
++    if (unlikely(!xdr_read_cursor_has_remaining(cursor, (uint64_t) v->len + pad))) {
+         return -1;
+     }
+ 

@@ -1,0 +1,10 @@
+# SPDX-FileCopyrightText: 2025-2026 Chimera-NAS Project Contributors
+#
+# SPDX-License-Identifier: LGPL-2.1-only
+
+# The patch series and the overlay self-test fixture are applied verbatim with
+# `git apply` against LF-normalised targets.  A CRLF checkout of a .patch (or of
+# a fixture file a patch is applied to) would make the hunks fail to apply on a
+# Windows checkout, so pin these trees to LF and never let git rewrite them.
+patches/**                 -text
+cmake/selftest/fixture/**  -text

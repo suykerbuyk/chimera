@@ -1,0 +1,29 @@
+SPDX-FileCopyrightText: 2025-2026 Chimera-NAS Project Contributors
+SPDX-License-Identifier: LGPL-2.1-only
+
+Bound the generated fixed-size contig decode copy against the bytes received.
+
+The xdrzcc generator emits a fixed opaque[N] contig copy out of the read
+cursor's current iovec without first checking that N bytes remain.  Emit a
+remaining-bytes guard immediately before that copy, using the same
+compile-time N: the single-iovec contig wrapper is
+chosen only when the whole message is one iovec (niov == 1, cur == last), so
+xdr_read_cursor_remaining() returns exactly the bytes still present.  The
+helper is the one added to xdr_builtin.c by 0001 and embedded into every
+generated translation unit, so the emitted decoder can call it.
+
+(git apply ignores this free-text preamble and starts at the diff --git line.)
+
+diff --git a/src/xdrzcc.c b/src/xdrzcc.c
+--- a/src/xdrzcc.c
++++ b/src/xdrzcc.c
+@@ -345,6 +345,9 @@ emit_unmarshall_contig(
+ 
+     if (type->opaque) {
+         if (type->array) {
++            fprintf(output,
++                    "    if (unlikely((uint64_t) %s > xdr_read_cursor_remaining(cursor))) { return -1; }\n",
++                    type->array_size);
+             fprintf(output,
+                     "    memcpy(out->%s, (char *) xdr_iovec_data(cursor->cur) + cursor->iov_offset, %s);\n",
+                     name, type->array_size);

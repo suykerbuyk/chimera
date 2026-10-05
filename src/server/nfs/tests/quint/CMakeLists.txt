@@ -204,6 +204,26 @@ if(CHIMERA_VFS_IO_URING)
         TIMEOUT 60)
 endif()
 
+# Liveness probe for the XDR decode-length bound: drive a framed NFSv3 WRITE and
+# an NFSv4 COMPOUND/OP_WRITE whose `data` opaque declares more bytes than the
+# record delivers, split across two RPC record-mark fragments so the server
+# decodes a multi-iovec chain.  The reply does not discriminate a bounded decode
+# from an unbounded one at this altitude, so the probe asserts the end-to-end
+# liveness property: the server stays alive (a subsequent NFS NULL still
+# completes).  The accept/reject regression coverage is the unit fixture
+# chimera/nfs_common/xdr_bounds_test.
+add_executable(nfs_write_decode_probe nfs_write_decode_probe.c)
+target_include_directories(nfs_write_decode_probe PRIVATE
+    ${CMAKE_BINARY_DIR}/src/nfs_common)
+target_link_libraries(nfs_write_decode_probe
+    chimera_server chimera_nfs_common chimera_metrics jansson)
+mbt_add_krb5(nfs_write_decode_probe)
+add_test(NAME chimera/server/nfs/write_decode_length
+    COMMAND $<TARGET_FILE:nfs_write_decode_probe> -b memfs)
+set_tests_properties(chimera/server/nfs/write_decode_length PROPERTIES
+    LABELS "functional;probe;nfs3_mbt;nfs4_mbt;memfs"
+    TIMEOUT 60)
+
 # Auxiliary-protocol ground truth: pins which portmap/rpcbind, MOUNT, NLM and
 # NSM procedures chimera registers, and the constants their replies carry --
 # the facts the nfsaux model's configuration gate encodes.  Needs no corpus.

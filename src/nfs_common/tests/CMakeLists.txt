@@ -10,3 +10,5 @@ target_include_directories(nfs3_fh_test PRIVATE
     ${CMAKE_CURRENT_BINARY_DIR}/..)
 add_dependencies(nfs3_fh_test chimera_nfs_common)
 add_test(chimera/nfs_common/fh_test nfs3_fh_test)
+
+add_subdirectory(xdr)

@@ -18,10 +18,10 @@ target_link_libraries(vfs_example PRIVATE xxhash)
 
 target_include_directories(vfs_example PRIVATE
     ${CMAKE_SOURCE_DIR}/src/vfs/sdk
-    ${CMAKE_SOURCE_DIR}/ext/libevpl/include
-    ${CMAKE_SOURCE_DIR}/ext/libevpl/ext/prometheus-c
-    ${CMAKE_SOURCE_DIR}/ext/libevpl/ext/prometheus-c/ext/stopwatch
-    ${CMAKE_SOURCE_DIR}/ext/libevpl/ext/oteltracing-c)
+    ${LIBEVPL_INC}
+    ${PROMETHEUS_SRC}
+    ${PROMETHEUS_SRC}/ext/stopwatch
+    ${OTEL_SRC})
 
 # The module references SDK helpers exported by chimera_vfs; like any
 # out-of-tree module it resolves them from the hosting process at dlopen
@@ -36,10 +36,10 @@ if(NOT WIN32)
 add_executable(vfs_example_load_test vfs_example_load_test.c)
 target_include_directories(vfs_example_load_test PRIVATE
     ${CMAKE_SOURCE_DIR}/src
-    ${CMAKE_SOURCE_DIR}/ext/libevpl/include
-    ${CMAKE_SOURCE_DIR}/ext/libevpl/ext/prometheus-c
-    ${CMAKE_SOURCE_DIR}/ext/libevpl/ext/prometheus-c/ext/stopwatch
-    ${CMAKE_SOURCE_DIR}/ext/libevpl/ext/oteltracing-c)
+    ${LIBEVPL_INC}
+    ${PROMETHEUS_SRC}
+    ${PROMETHEUS_SRC}/ext/stopwatch
+    ${OTEL_SRC})
 target_link_libraries(vfs_example_load_test chimera_vfs ${CHIMERA_DL_LIB})
 
 add_test(NAME chimera/vfs/example_module_load

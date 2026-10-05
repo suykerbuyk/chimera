@@ -32,3 +32,9 @@ License: Apache-2.0
 Files: src/admin/debian/* src/admin/debian/source/format
 Copyright: 2025-2026 Chimera-NAS Project Contributors
 License: Apache-2.0
+
+# Overlay patches: .patch files carry upstream libevpl/xdrzcc hunks, which are
+# LGPL-2.1-only, so the whole patches/ tree is declared as such.
+Files: patches/**
+Copyright: 2025-2026 Chimera-NAS Project Contributors
+License: LGPL-2.1-only

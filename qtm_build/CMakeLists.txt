@@ -37,7 +37,7 @@ if(TARGET oteltracing-c)
 else()
 	set(QTM_OTEL_TRACING 0)
 endif()
-file(READ ${CMAKE_SOURCE_DIR}/ext/libevpl/ext/oteltracing-c/oteltracing.h
+file(READ ${OTEL_SRC}/oteltracing.h
 	QTM_OTEL_HEADER)
 file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/include/oteltracing.h
 	"/* OTEL_TRACING pinned by chimera packaging to match the packaged binaries. */

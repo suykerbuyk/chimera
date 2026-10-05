@@ -1,0 +1,20 @@
+SPDX-FileCopyrightText: 2025-2026 Chimera-NAS Project Contributors
+SPDX-License-Identifier: LGPL-2.1-only
+
+Fixture patch for the patches/ overlay self-test.  Adds a sentinel comment to
+the fixture source.  It is a git-style diff on purpose: a `diff --git` patch
+applied from a subdirectory of a work tree is exactly what git silently SKIPS
+without the apply-time isolation, so this file reproduces the original bug in
+the negative leg of the self-test.  (git apply ignores this free-text preamble
+and starts at the `diff --git` line below.)
+
+diff --git a/src/hello.c b/src/hello.c
+--- a/src/hello.c
++++ b/src/hello.c
+@@ -11,5 +11,6 @@
+ int
+ chimera_patch_selftest_fixture(void)
+ {
++    /* CHIMERA_PATCH_SELFTEST_SENTINEL: proves the overlay patch landed */
+     return 0;
+ }

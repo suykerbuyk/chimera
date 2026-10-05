@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: 2025-2026 Chimera-NAS Project Contributors
+# SPDX-License-Identifier: LGPL-2.1-only
+#
+# series.sha -- pins and sentinels for the libevpl/xdrzcc patch series.
+#
+# Grammar (whitespace-separated, '#' comments, blank lines ignored):
+#   repo-root <path>            path of the patched repo relative to the libevpl
+#                               overlay root; git apply uses it as --directory.
+#   base <sha>                  the upstream SHA this series was authored
+#                               against (the pinned nested xdrzcc submodule).
+#   sentinel <patch> <file> <token>
+#                               per-(patch,file) marker the apply verifier greps
+#                               for in the patched file, and asserts ABSENT from
+#                               the pristine source at authoring time.  <file> is
+#                               relative to repo-root.
+#
+# P0 declared no 'sentinel' rows (the series was empty); P1 adds the first.
+
+repo-root ext/xdrzcc
+base 31906a074efc36782c398d71f090c3e6f74c1013
+sentinel 0001-bound-decode-lengths.patch src/xdr_builtin.c xdr_read_cursor_remaining
+sentinel 0002-bound-generated-fixed-copy.patch src/xdrzcc.c xdr_read_cursor_remaining(cursor)

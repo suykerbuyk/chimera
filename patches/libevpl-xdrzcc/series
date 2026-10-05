@@ -1,0 +1,14 @@
+# SPDX-FileCopyrightText: 2025-2026 Chimera-NAS Project Contributors
+# SPDX-License-Identifier: LGPL-2.1-only
+#
+# series -- the ordered list of patches applied to the libevpl/xdrzcc overlay.
+#
+# This file is the SOLE ordering authority: one patch filename per line
+# (relative to this directory, e.g. 0001-some-fix.patch), applied top to bottom.
+# Blank lines and '#' comments are ignored.  Every listed patch must also have a
+# matching base in series.sha.
+#
+# P0 shipped this file empty (the overlay equalled the pristine submodule).
+# P1 adds the first patch below.
+0001-bound-decode-lengths.patch
+0002-bound-generated-fixed-copy.patch

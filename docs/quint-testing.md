@@ -84,6 +84,47 @@ as separate CTests, both plain and signed. A family cannot pass by skipping
 every trace. Durable fixtures shut down the server between traces to drain
 handles that intentionally outlive connections.
 
+## XDR decode-length bounds
+
+The XDR decoders bound every length-driven vector/contig field against the bytes
+actually present across the receive iovec chain before they read, alias or copy
+anything, so a declared length that exceeds the delivered bytes is refused rather
+than trusted. (The fix ships as a tracked overlay patch against the pinned
+`libevpl`/xdrzcc submodule; see `patches/README.md`.) Two quick-tier tests guard
+it, at two altitudes.
+
+* Unit fixture — `chimera/nfs_common/xdr_bounds_test`
+  (`src/nfs_common/tests/xdr/`). Compiles a small fixture `.x` with the same
+  generator the NFS sources use and drives the generated decoders directly with
+  hand-built iovec chains, asserting each length-driven decoder rejects a
+  declared length that exceeds the bytes received (including the 64-bit path
+  that keeps a length near `UINT32_MAX` from wrapping) and accepts one that
+  fits exactly. Runs under the Debug/ASan tier.
+
+  ```sh
+  ctest --test-dir build/Debug -R xdr_bounds --output-on-failure
+  ```
+
+* Liveness probe — `chimera/server/nfs/write_decode_length`
+  (`src/server/nfs/tests/quint/nfs_write_decode_probe.c`). Confirms a running
+  server stays alive and serving when the bound is applied as it decodes a framed
+  WRITE off the wire. It drives an in-process NFS server over the inproc
+  transport with an NFSv3 WRITE and an NFSv4 COMPOUND/OP_WRITE whose `data`
+  opaque declares more bytes than the record delivers, shipped as two RPC
+  record-mark fragments so the server reassembles a multi-iovec chain. The reply
+  does not distinguish a bounded decode from an unbounded one at this altitude —
+  rpc2 answers `GARBAGE_ARGS` and keeps the connection up either way — so the
+  probe asserts the end-to-end liveness property instead: the server stays alive
+  and the connection stays usable, proven by a subsequent NFS `NULL` that
+  completes. The accept/reject regression coverage is the unit fixture's; this
+  probe adds the live end-to-end leg. It needs no trace corpus and no privileges.
+
+  ```sh
+  ctest --test-dir build/Debug -R write_decode_length --output-on-failure
+  # or directly:
+  ./build/Debug/src/server/nfs/tests/quint/nfs_write_decode_probe -b memfs
+  ```
+
 ## Pending SMB CREATEs
 
 The lease model records `STATUS_PENDING` without committing the new open.

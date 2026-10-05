@@ -46,8 +46,26 @@ else
     abs_build=$(readlink -f "${BUILD_DIR}")
     # Escape regex metacharacters so the path is matched literally.
     esc_build=$(printf '%s' "${abs_build}" | sed 's/[.[\*^$()+?{|/]/\\&/g')
-    ignore_parts+=("${esc_build}/")
-    echo "coverage: excluding generated code under ${abs_build} (set COVERAGE_INCLUDE_GENERATED=1 to include)"
+    if [[ "${COVERAGE_INCLUDE_EXT:-0}" == "1" ]]; then
+        # The libevpl that compiles now lives in the build-tree overlay at
+        # <build>/ext-overlay/libevpl (cmake/ApplyPatches.cmake), so the blanket
+        # "everything under the build dir is generated" rule would hide it even
+        # though COVERAGE_INCLUDE_EXT=1 asks for the bundled ext/ projects.
+        # Carve the overlay out: ignore <build>/ whose first path segment is not
+        # "ext-overlay".  llvm-cov uses llvm::Regex (no lookahead), so the
+        # exception is spelled as a prefix-enumeration alternation.
+        seg='ext-overlay'
+        alt=''
+        for ((i = 0; i < ${#seg}; i++)); do
+            alt+="${seg:0:i}[^${seg:i:1}]|"
+        done
+        alt+="${seg}[^/]"
+        ignore_parts+=("${esc_build}/(${alt})")
+        echo "coverage: excluding generated code under ${abs_build} but keeping the libevpl overlay (COVERAGE_INCLUDE_EXT=1)"
+    else
+        ignore_parts+=("${esc_build}/")
+        echo "coverage: excluding generated code under ${abs_build} (set COVERAGE_INCLUDE_GENERATED=1 to include)"
+    fi
 fi
 
 if [[ "${COVERAGE_INCLUDE_EXT:-0}" == "1" ]]; then

@@ -252,6 +252,12 @@ endif()
 
 include(cmake/Platform.cmake)
 
+# Build-tree overlay for the pinned libevpl submodule: materialise a patched
+# copy under the build tree and point the build at it via LIBEVPL_SRC and the
+# derived LIBEVPL_INC/PROMETHEUS_SRC/OTEL_SRC, instead of editing the pinned
+# ext/libevpl checkout.  Must run before the first ext/libevpl reference below.
+include(cmake/ApplyPatches.cmake)
+
 add_definitions(-DCHIMERA_VERSION="${CHIMERA_VERSION}")
 add_definitions(-DCHIMERA_STATE_DIR="${CMAKE_INSTALL_PREFIX}/share/state")
 
@@ -327,8 +333,8 @@ else()
                    "RCU critical sections fall back to per-construct rwlocks")
 endif()
 
-include_directories(${CMAKE_CURRENT_SOURCE_DIR}/ext/libevpl/ext/prometheus-c)
-include_directories(${CMAKE_CURRENT_SOURCE_DIR}/ext/libevpl/ext/prometheus-c/ext/stopwatch)
+include_directories(${PROMETHEUS_SRC})
+include_directories(${PROMETHEUS_SRC}/ext/stopwatch)
 
 
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -901,7 +907,7 @@ if(WIN32 AND TARGET oteltracing-c)
     # The standalone tracing project sets its own runtime directory. Keep its
     # DLLs (including the optional SQLite sink) and tools in our common runtime
     # directory so every consumer can load them without a build-tree PATH.
-    get_property(_otel_targets DIRECTORY ext/libevpl/ext/oteltracing-c
+    get_property(_otel_targets DIRECTORY ${OTEL_SRC}
                  PROPERTY BUILDSYSTEM_TARGETS)
     foreach(_target IN LISTS _otel_targets)
         set_target_properties(${_target} PROPERTIES
@@ -909,14 +915,14 @@ if(WIN32 AND TARGET oteltracing-c)
     endforeach()
 endif()
 
-include_directories(ext/libevpl/include)
+include_directories(${LIBEVPL_INC})
 
 # OpenTelemetry tracing (oteltracing-c, built under libevpl/ext).  The public
 # header is always available (it is header-only no-op when the library is not
 # built).  When the library targets exist (protobuf-c present), wire chimera up
 # to use it; otherwise compile every translation unit with OTEL_TRACING=0 so all
 # embedded spans and span calls strip to nothing with no link dependency.
-include_directories(ext/libevpl/ext/oteltracing-c)
+include_directories(${OTEL_SRC})
 if(TARGET oteltracing-c)
     message(STATUS "oteltracing-c found - chimera tracing enabled")
     add_compile_definitions(CHIMERA_HAVE_OTEL=1)
@@ -947,7 +953,7 @@ if(PKG_CONFIG_FOUND)
     endif()
 endif()
 
-add_definitions(-DXDR_CUSTOM_IOVEC=${CHIMERA_EXT_SRC}/libevpl/src/rpc2/xdr_iovec.h)
+add_definitions(-DXDR_CUSTOM_IOVEC=${LIBEVPL_SRC}/src/rpc2/xdr_iovec.h)
 add_definitions(-DXDR_CUSTOM_DUMP=1)
 
 # MBT trace corpus (ext/specs): defines specs_corpus() and sets

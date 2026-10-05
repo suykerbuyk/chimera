@@ -11,11 +11,25 @@ if(NOT MSVC)
     find_package(Threads REQUIRED)
 endif()
 get_filename_component(CHIMERA_SOURCE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../.." ABSOLUTE)
+
+# libevpl headers for the native runtime tests.  In the full chimera build,
+# cmake/ApplyPatches.cmake sets LIBEVPL_SRC to the patched overlay, so use its
+# include/.  As a standalone top-level project
+# (cmake -S src/common/tests/native, see docs/windows.md) ApplyPatches never
+# runs and LIBEVPL_SRC is empty -- fall back to the pristine submodule headers
+# (N3 guarded fallback).  Pristine is correct here because this project uses
+# libevpl HEADERS ONLY and links no libevpl objects, so no patched object code
+# is involved.
+if(NOT LIBEVPL_SRC)
+    set(_native_libevpl_inc "${CHIMERA_SOURCE_ROOT}/ext/libevpl/include")
+else()
+    set(_native_libevpl_inc "${LIBEVPL_SRC}/include")
+endif()
 # The full build already registers this test against chimera_common.
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     add_executable(native_rcu_test ../rcu_test.c ../../chimera_rcu.c)
     target_include_directories(native_rcu_test PRIVATE
-        "${CHIMERA_SOURCE_ROOT}/src" "${CHIMERA_SOURCE_ROOT}/ext/libevpl/include")
+        "${CHIMERA_SOURCE_ROOT}/src" "${_native_libevpl_inc}")
     if(MSVC)
         target_compile_options(native_rcu_test PRIVATE /W4 /WX /experimental:c11atomics /UNDEBUG)
     else()
@@ -42,7 +56,7 @@ set_tests_properties(chimera/native/password_hash PROPERTIES TIMEOUT 60)
 
 add_executable(native_unicode_test ../unicode_test.c)
 target_include_directories(native_unicode_test PRIVATE
-    "${CHIMERA_SOURCE_ROOT}/src" "${CHIMERA_SOURCE_ROOT}/ext/libevpl/include")
+    "${CHIMERA_SOURCE_ROOT}/src" "${_native_libevpl_inc}")
 if(MSVC)
     target_compile_options(native_unicode_test PRIVATE /experimental:c11atomics)
 else()
@@ -53,7 +67,7 @@ add_test(NAME chimera/native/unicode COMMAND native_unicode_test)
 
 add_executable(native_atomic_test ../atomic_test.c)
 target_include_directories(native_atomic_test PRIVATE
-    "${CHIMERA_SOURCE_ROOT}/src" "${CHIMERA_SOURCE_ROOT}/ext/libevpl/include")
+    "${CHIMERA_SOURCE_ROOT}/src" "${_native_libevpl_inc}")
 if(MSVC)
     target_compile_options(native_atomic_test PRIVATE /W3 /WX /experimental:c11atomics)
 else()
@@ -65,7 +79,7 @@ set_tests_properties(chimera/native/atomic PROPERTIES TIMEOUT 60)
 if(WIN32)
     add_executable(native_file_acl_test ../file_acl_test.c)
     target_include_directories(native_file_acl_test PRIVATE
-        "${CHIMERA_SOURCE_ROOT}/src" "${CHIMERA_SOURCE_ROOT}/ext/libevpl/include")
+        "${CHIMERA_SOURCE_ROOT}/src" "${_native_libevpl_inc}")
     target_compile_definitions(native_file_acl_test PRIVATE _CRT_SECURE_NO_WARNINGS)
     target_compile_options(native_file_acl_test PRIVATE /experimental:c11atomics)
     target_link_libraries(native_file_acl_test PRIVATE advapi32)
@@ -78,7 +92,7 @@ add_test(NAME chimera/native/getopt COMMAND native_getopt_test)
 
 add_executable(native_host_fixture_test ../host_fixture_test.c)
 target_include_directories(native_host_fixture_test PRIVATE
-    "${CHIMERA_SOURCE_ROOT}/src" "${CHIMERA_SOURCE_ROOT}/ext/libevpl/include")
+    "${CHIMERA_SOURCE_ROOT}/src" "${_native_libevpl_inc}")
 if(MSVC)
     target_compile_definitions(native_host_fixture_test PRIVATE _CRT_SECURE_NO_WARNINGS)
     target_compile_options(native_host_fixture_test PRIVATE /experimental:c11atomics)
@@ -89,7 +103,7 @@ add_test(NAME chimera/native/host_fixture COMMAND native_host_fixture_test)
 if(WIN32)
     add_executable(native_watchdog_test ../watchdog_test.c)
     target_include_directories(native_watchdog_test PRIVATE
-        "${CHIMERA_SOURCE_ROOT}/src" "${CHIMERA_SOURCE_ROOT}/ext/libevpl/include")
+        "${CHIMERA_SOURCE_ROOT}/src" "${_native_libevpl_inc}")
     target_compile_options(native_watchdog_test PRIVATE /experimental:c11atomics)
     add_test(NAME chimera/native/watchdog_cancel COMMAND native_watchdog_test)
     add_test(NAME chimera/native/watchdog_expire COMMAND native_watchdog_test expire)

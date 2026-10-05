@@ -44,6 +44,10 @@ CURRENT_YEAR=$(date +%Y)
     [[ -z "$file" ]] && continue
     [[ -f "$file" ]] || continue
 
+    # The overlay patches under patches/ embed upstream diff content whose '+'
+    # lines may carry other years; do not rewrite or flag years inside them.
+    [[ "$file" == patches/* ]] && continue
+
     # Check for SPDX copyright lines or dep5-style Copyright lines
     if [[ "$file" == ".reuse/dep5" ]]; then
         PATTERN="Copyright:"
