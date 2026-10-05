@@ -1262,8 +1262,13 @@ chimera_smb_create_gen_open_file(
                                                    &conflict);
         }
 
+        /* Past the per-connection parked-CREATE ceiling the park is declined and
+         * the conflict falls through to the SHARING_VIOLATION path below, which
+         * already releases open_file and file_state -- so refusing here leaks
+         * nothing. */
         if (result == CHIMERA_CLAIM_BREAKING &&
-            request->create.gen_may_park) {
+            request->create.gen_may_park &&
+            !chimera_smb_conn_parked_creates_full(request->compound->conn)) {
             /* A batch (handle-caching) oplock holder is mid-break and may close
              * its deferred handle, freeing this share conflict.  Park the open:
              * lease_acquire re-probes and enqueues the ticket, resuming
@@ -3591,10 +3596,11 @@ chimera_smb_create_open_finish(
         thread->vfs_thread->vfs->vfs_state;
     bool                              will_park = false;
 
-    request->create.r_open_file          = open_file;
-    request->create.dir_break_pending    = 0;
-    request->create.park_on_notify       = 0;
-    request->create.break_waiter_counted = 0;
+    request->create.r_open_file           = open_file;
+    request->create.dir_break_pending     = 0;
+    request->create.park_on_notify        = 0;
+    request->create.break_waiter_counted  = 0;
+    request->create.parked_create_counted = 0;
 
     open_file->granted_access = request->create.r_granted_access;
     open_file->maximal_access = request->create.r_maximal_access;
@@ -3736,6 +3742,25 @@ chimera_smb_create_open_finish(
      * The open_file ref is held across the wait and dropped on resume. */
     if (will_park) {
         struct chimera_vfs_open_handle *oh = open_file->handle;
+
+        /* Past the per-connection parked-CREATE ceiling, refuse rather than hold
+         * this reply across the break wait.  The open is granted and hashed, so
+         * tear it down the way the post-hash error paths do
+         * (chimera_smb_create_open_getattr_callback): release a parent still held
+         * for a deferred dir break, drop the open reference, and fail the create.
+         * CREATE_PENDING is not set yet (set below) and the request is not yet on
+         * conn->parked_requests, so no park state needs unwinding. */
+        if (chimera_smb_conn_parked_creates_full(request->compound->conn)) {
+            if (request->create.dir_break_pending) {
+                chimera_smb_create_release_parent(request);
+                request->create.dir_break_pending = 0;
+            }
+            chimera_smb_open_file_release(request, request->create.r_open_file);
+            request->create.r_open_file = NULL;
+            chimera_smb_complete_request(request,
+                                         SMB2_STATUS_INSUFFICIENT_RESOURCES);
+            return;
+        }
 
         memcpy(request->create.park_fh, oh->fh, oh->fh_len);
         request->create.park_fh_len  = oh->fh_len;
@@ -5315,6 +5340,15 @@ chimera_smb_durable_reconnect(struct chimera_smb_request *request)
         return;
     }
 
+    /* Past the per-connection parked-CREATE ceiling, refuse rather than park on
+     * the reconnect-retry timer.  No open or claim state is held yet (the handle
+     * is still owned by the previous connection), so the refusal unwinds
+     * nothing. */
+    if (chimera_smb_conn_parked_creates_full(request->compound->conn)) {
+        chimera_smb_complete_request(request, SMB2_STATUS_INSUFFICIENT_RESOURCES);
+        return;
+    }
+
     /* The handle is racing its previous connection's disconnect: tell the
      * client the create is pending (so it does not time out or cancel), then
      * retry on a short timer until the disconnect is processed. */
@@ -5691,11 +5725,12 @@ chimera_smb_create(struct chimera_smb_request *request)
     enum chimera_smb_pipe_magic   pipe_magic;
     chimera_smb_pipe_transceive_t transceive;
 
-    request->create.has_stream           = 0;
-    request->create.break_waiter_counted = 0;
-    request->create.explicit_data_fork   = 0;
-    request->create.explicit_index_fork  = 0;
-    request->create.base_oh              = NULL;
+    request->create.has_stream            = 0;
+    request->create.break_waiter_counted  = 0;
+    request->create.parked_create_counted = 0;
+    request->create.explicit_data_fork    = 0;
+    request->create.explicit_index_fork   = 0;
+    request->create.base_oh               = NULL;
     /* Only the regular-file open path (open_at_callback) may park on a
      * batch-oplock break (gen_may_park); the mkdir / stream / pipe paths
      * resolve a BREAKING conflict straight to SHARING_VIOLATION.  gen_finish_cb

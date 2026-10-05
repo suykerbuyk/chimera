@@ -172,6 +172,7 @@ struct chimera_server_config {
     int                                   smb_posix_rename;
     int                                   smb_replay_pending_windows;
     int                                   smb2_max_async_credits;
+    int                                   smb2_max_parked_creates;
     uint32_t                              smb_fs_physical_bytes_per_sector;
     uint32_t                              smb_fs_sector_size_flags;
     int                                   smb_num_nic_info;
@@ -346,6 +347,13 @@ chimera_server_config_init(void)
     /* Per-connection ceiling on outstanding async (STATUS_PENDING) operations.
      * 512 matches the value smb2.credits.*_ipc_max_async_credits asserts. */
     config->smb2_max_async_credits = 512;
+
+    /* Per-connection ceiling on parked (STATUS_PENDING) CREATE requests.  Each
+     * parked CREATE arms a timer and holds half-built open state while it waits
+     * on a break ack, a share-conflict yield, or a durable reconnect, so this
+     * bounds the event-loop work a single connection can queue.  512 matches
+     * the async-credit ceiling. */
+    config->smb2_max_parked_creates = 512;
 
     /* FileFsSectorSizeInformation defaults: report 4KiB physical sectors and
      * aligned + partition-aligned flags for modern storage.  Per MS-FSCC
@@ -773,6 +781,20 @@ chimera_server_config_get_smb2_max_async_credits(const struct chimera_server_con
 {
     return config->smb2_max_async_credits;
 } /* chimera_server_config_get_smb2_max_async_credits */
+
+SYMBOL_EXPORT void
+chimera_server_config_set_smb2_max_parked_creates(
+    struct chimera_server_config *config,
+    int                           value)
+{
+    config->smb2_max_parked_creates = value;
+} /* chimera_server_config_set_smb2_max_parked_creates */
+
+SYMBOL_EXPORT int
+chimera_server_config_get_smb2_max_parked_creates(const struct chimera_server_config *config)
+{
+    return config->smb2_max_parked_creates;
+} /* chimera_server_config_get_smb2_max_parked_creates */
 
 SYMBOL_EXPORT void
 chimera_server_config_set_smb_fs_physical_bytes_per_sector(

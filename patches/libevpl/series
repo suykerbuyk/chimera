@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: 2025-2026 Chimera-NAS Project Contributors
+# SPDX-License-Identifier: LGPL-2.1-only
+#
+# series -- the ordered list of patches applied to the libevpl overlay.
+#
+# This file is the SOLE ordering authority: one patch filename per line
+# (relative to this directory), applied top to bottom.  Blank lines and '#'
+# comments are ignored.  Every listed patch must also have a matching base in
+# series.sha.
+#
+# This series carries libevpl's own event-loop capacity fixes (repo-root ".");
+# it is disjoint from the libevpl-xdrzcc series (repo-root "ext/xdrzcc"), so the
+# two apply cleanly together in any order.  0003 is reserved for the connection-
+# lifetime patch delivered in a later phase.
+0001-grow-event-loop-arrays.patch
+0002-poll-refuse-on-exhaustion.patch
+0004-test-loop-array-capacity.patch

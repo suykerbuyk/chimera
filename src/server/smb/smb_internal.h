@@ -276,6 +276,14 @@ struct chimera_smb_config {
      * beyond that it is rejected with STATUS_INSUFFICIENT_RESOURCES (the contract
      * smb2.credits.*_ipc_max_async_credits asserts).  Default 512. */
     int                            smb2_max_async_credits;
+    /* Per-connection ceiling on parked (STATUS_PENDING) CREATE requests.  A
+     * CREATE that must wait -- on a caching-break ack, a share-conflict yield,
+     * or a durable reconnect -- parks and arms a timer; past this ceiling a
+     * further park is refused (STATUS_INSUFFICIENT_RESOURCES, or a
+     * SHARING_VIOLATION on the share-conflict path) rather than queued, so one
+     * connection cannot drive the event loop's timer/deferral arrays without
+     * bound.  Default 512. */
+    int                            smb2_max_parked_creates;
     /* FileFsSectorSizeInformation values returned from SMB_QUERY_INFO. */
     uint32_t                       fs_physical_bytes_per_sector;
     uint32_t                       fs_sector_size_flags;
@@ -775,6 +783,10 @@ struct chimera_smb_request {
              * connection teardown -- so the count is symmetric however the wait
              * ends. */
             uint8_t                            break_waiter_counted;
+            /* Set when this parked CREATE is counted against
+             * conn->parked_creates (any of the three park paths), so the
+             * decrement when it leaves the parked list happens exactly once. */
+            uint8_t                            parked_create_counted;
             /* Durable-reconnect retry: a reclaim that finds its handle still
              * flagged live (the previous connection's disconnect has not yet
              * been processed -- a cross-connection race) re-arms a short timer
@@ -1492,6 +1504,12 @@ struct chimera_smb_conn {
      * Incremented when a pipe read parks, decremented when it is cancelled or
      * drained at teardown. */
     uint32_t                           async_outstanding;
+    /* Count of currently-parked CREATE requests on this connection.  Capped at
+     * config.smb2_max_parked_creates; a park past the cap is refused rather
+     * than queued.  Incremented in chimera_smb_async_interim_begin when a
+     * CREATE parks, decremented when it leaves the parked list
+     * (chimera_smb_async_interim_cancel), zeroed at teardown. */
+    uint32_t                           parked_creates;
     /* Server-side estimate of the client's current SMB2 credit balance (granted
      * minus charged), used to cap how many credits a response grants so a client
      * that keeps requesting more (e.g. the smb2.credits async flood) cannot
@@ -2618,6 +2636,20 @@ void chimera_smb_notify_cancel(
     struct chimera_smb_notify_request *nr);
 void chimera_smb_notify_drop(
     struct chimera_smb_notify_request *nr);
+
+/*
+ * True once this connection already holds the maximum number of parked CREATE
+ * requests (config.smb2_max_parked_creates).  Checked before each of the three
+ * CREATE park sites; past the cap the park is refused rather than queued, so
+ * one connection cannot drive the event loop's timer/deferral arrays without
+ * bound.
+ */
+static inline int
+chimera_smb_conn_parked_creates_full(const struct chimera_smb_conn *conn)
+{
+    return conn->parked_creates >=
+           (uint32_t) conn->thread->shared->config.smb2_max_parked_creates;
+} /* chimera_smb_conn_parked_creates_full */
 
 /*
  * Break-waiter accounting for an MS-SMB2 3.3.5.9 pending open.

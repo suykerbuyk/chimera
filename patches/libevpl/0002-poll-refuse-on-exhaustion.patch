@@ -1,0 +1,112 @@
+SPDX-FileCopyrightText: 2025-2026 Chimera-NAS Project Contributors
+SPDX-License-Identifier: LGPL-2.1-only
+
+Refuse a poll registration once the poll array is full rather than overflow it.
+
+A poll slot is the durable handle evpl_add_poll() hands back, and every
+registered poller holds one, so the array must never move or overflow.
+evpl_add_poll() now returns NULL when the fixed capacity is reached instead of
+writing past it, and the backend pollers that store the handle fail their init
+cleanly on the NULL return rather than dereferencing it.
+
+diff --git a/src/core/io_uring/io_uring.c b/src/core/io_uring/io_uring.c
+index feae7ea..9179357 100644
+--- a/src/core/io_uring/io_uring.c
++++ b/src/core/io_uring/io_uring.c
+@@ -359,6 +359,9 @@ evpl_io_uring_create(
+ 
+     ctx->poll = evpl_add_poll(evpl, evpl_io_uring_poll_enter, evpl_io_uring_poll_exit, evpl_io_uring_poll, ctx);
+ 
++    evpl_io_uring_abort_if(!ctx->poll,
++                           "evpl_add_poll returned NULL: event-loop poll-slot capacity exhausted");
++
+     return ctx;
+ } /* evpl_io_uring_create */
+ 
+diff --git a/src/core/libaio/libaio.c b/src/core/libaio/libaio.c
+index 7628a1e..53360fa 100644
+--- a/src/core/libaio/libaio.c
++++ b/src/core/libaio/libaio.c
+@@ -224,6 +224,9 @@ evpl_libaio_create(
+ 
+     ctx->poll = evpl_add_poll(evpl, evpl_libaio_poll_enter, evpl_libaio_poll_exit, evpl_libaio_poll, ctx);
+ 
++    evpl_libaio_abort_if(!ctx->poll,
++                         "evpl_add_poll returned NULL: event-loop poll-slot capacity exhausted");
++
+     return ctx;
+ } /* evpl_libaio_create */
+ 
+diff --git a/src/core/libfabric/libfabric.c b/src/core/libfabric/libfabric.c
+index 9b32f7e..a246979 100644
+--- a/src/core/libfabric/libfabric.c
++++ b/src/core/libfabric/libfabric.c
+@@ -2140,6 +2140,9 @@ evpl_libfabric_create(
+                              evpl_libfabric_poll_exit,
+                              evpl_libfabric_poll,
+                              lf);
++
++    evpl_libfabric_abort_if(!lf->poll,
++                            "evpl_add_poll returned NULL: event-loop poll-slot capacity exhausted");
+     lf->polling = evpl->poll_mode;
+     evpl_poll_set_prepare_callback(lf->poll, evpl_libfabric_prepare_wait);
+ 
+diff --git a/src/core/poll.c b/src/core/poll.c
+index 7df8da5..0e40f39 100644
+--- a/src/core/poll.c
++++ b/src/core/poll.c
+@@ -39,6 +39,13 @@ evpl_add_poll(
+     }
+ 
+     if (!poll) {
++        /* A poll slot is the durable handle every registered poller holds, so
++         * the array must never move (see the file header): refuse once the
++         * fixed capacity is reached rather than relocate live slots, and let
++         * the caller fail its init on the NULL return. */
++        if (evpl->num_poll == evpl->max_poll) {
++            return NULL;
++        }
+         poll = &evpl->poll[evpl->num_poll++];
+     }
+ 
+diff --git a/src/core/rdmacm/rdmacm.c b/src/core/rdmacm/rdmacm.c
+index c19a32b..504960b 100644
+--- a/src/core/rdmacm/rdmacm.c
++++ b/src/core/rdmacm/rdmacm.c
+@@ -1205,6 +1205,9 @@ evpl_rdmacm_create(
+                                  evpl_rdmacm_poll,
+                                  rdmacm);
+ 
++    evpl_rdmacm_abort_if(!rdmacm->poll,
++                         "evpl_add_poll returned NULL: event-loop poll-slot capacity exhausted");
++
+     if (evpl_shared->config->rdmacm_srq_prefill) {
+         evpl_rdmacm_fill_all_srq(evpl, rdmacm);
+     }
+diff --git a/src/core/vfio/vfio.c b/src/core/vfio/vfio.c
+index 47cd00c..30d8bf4 100644
+--- a/src/core/vfio/vfio.c
++++ b/src/core/vfio/vfio.c
+@@ -1866,6 +1866,9 @@ evpl_vfio_open_queue(
+ 
+     queue->poll = evpl_add_poll(evpl, NULL, NULL, evpl_vfio_poll_cq, queue);
+ 
++    evpl_vfio_abort_if(!queue->poll,
++                       "evpl_add_poll returned NULL: event-loop poll-slot capacity exhausted");
++
+     return bqueue;
+ } /* evpl_vfio_open_queue */
+ 
+diff --git a/src/core/xlio/xlio.c b/src/core/xlio/xlio.c
+index 805085b..2394748 100644
+--- a/src/core/xlio/xlio.c
++++ b/src/core/xlio/xlio.c
+@@ -465,6 +465,8 @@ evpl_xlio_socket_init(
+ 
+     if (!xlio->poll) {
+         xlio->poll            = evpl_add_poll(evpl, NULL, NULL, evpl_xlio_poll, xlio);
++        evpl_xlio_abort_if(!xlio->poll,
++                           "evpl_add_poll returned NULL: event-loop poll-slot capacity exhausted");
+         evpl->force_poll_mode = 1;
+     }
+ 

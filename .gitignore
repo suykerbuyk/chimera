@@ -49,3 +49,7 @@ venv/
 /.claude/
 /.grok/
 /.vibe-palace/
+# Claim directory the AI harness drops inside the pinned libevpl submodule; it
+# is untracked and must never be staged (patches are generated from the overlay
+# staging copy, which excludes it).
+ext/libevpl/src/.vibe-palace/

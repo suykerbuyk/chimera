@@ -5322,3 +5322,16 @@ elseif(CHIMERA_NETNS_TESTING)
 endif()
 
 endif() # NOT WIN32: external Samba drivers use Unix processes and tools.
+
+# Per-connection parked-CREATE ceiling: the configuration knob and the gate
+# every CREATE park path consults.  A fast, self-contained unit test, so place
+# it in the quick tier (bracketing the single registration rather than flipping
+# the whole directory).
+add_executable(smb_parked_create_cap_test smb_parked_create_cap_test.c)
+target_link_libraries(smb_parked_create_cap_test chimera_server chimera_smb chimera_vfs ${CHIMERA_RCU_LIBS})
+target_include_directories(smb_parked_create_cap_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+set(CHIMERA_TEST_TIER "quick")
+add_test(NAME chimera/server/smb/parked_create_cap
+    COMMAND ${CMAKE_CURRENT_BINARY_DIR}/smb_parked_create_cap_test)
+set(CHIMERA_TEST_TIER "extended")

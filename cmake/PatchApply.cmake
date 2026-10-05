@@ -54,7 +54,14 @@ function(chimera_patch_git_apply)
         set(_launcher ${A_GIT})
     endif()
 
-    set(_args apply -p1 -v --whitespace=nowarn --directory=${A_DIRECTORY})
+    # git apply rejects --directory=. ("invalid path './...'"), so for a series
+    # whose repo-root IS the overlay root ("."), omit --directory entirely and
+    # let the paths apply relative to WORKING_DIRECTORY (the staging root).  A
+    # real subdirectory repo-root (e.g. ext/xdrzcc) is passed through unchanged.
+    set(_args apply -p1 -v --whitespace=nowarn)
+    if(NOT A_DIRECTORY STREQUAL "" AND NOT A_DIRECTORY STREQUAL ".")
+        list(APPEND _args --directory=${A_DIRECTORY})
+    endif()
     if(A_CHECK)
         list(APPEND _args --check)
     endif()

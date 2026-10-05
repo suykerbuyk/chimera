@@ -1,0 +1,164 @@
+SPDX-FileCopyrightText: 2025-2026 Chimera-NAS Project Contributors
+SPDX-License-Identifier: LGPL-2.1-only
+
+Add a unit test that arms more than 256 timers and deferrals on one evpl.
+
+The test exceeds the arrays' initial capacity so they must extend past it; it
+fails under AddressSanitizer against the unpatched arrays (a write past the
+allocation) and passes once they grow on demand.
+
+diff --git a/src/core/tests/CMakeLists.txt b/src/core/tests/CMakeLists.txt
+index 77af74f..c623fb9 100644
+--- a/src/core/tests/CMakeLists.txt
++++ b/src/core/tests/CMakeLists.txt
+@@ -3,6 +3,12 @@
+ # SPDX-License-Identifier: LGPL-2.1-only
+ 
+ unit_test(core init_no_config init_no_config.c)
++
++# Arms more than the initial 256 timers and deferrals on one evpl: the loop
++# arrays must grow past their initial capacity rather than overflow.  Creates
++# and destroys an evpl without touching the network, so it needs neither a
++# namespace nor the shared port lock.
++unit_test(core loop_array_capacity loop_array_capacity.c)
+ unit_test_all_mechs(core destroy_pending destroy_pending.c)
+ unit_test_all_mechs(core listener_lifetime listener_lifetime.c)
+ 
+diff --git a/src/core/tests/loop_array_capacity.c b/src/core/tests/loop_array_capacity.c
+new file mode 100644
+index 0000000..6a520c2
+--- /dev/null
++++ b/src/core/tests/loop_array_capacity.c
+@@ -0,0 +1,132 @@
++// SPDX-FileCopyrightText: 2026 Ben Jarvis
++//
++// SPDX-License-Identifier: LGPL-2.1-only
++
++/*
++ * Capacity test for the event loop's per-thread pointer arrays.
++ *
++ * timers, active_deferrals and active_events start at a fixed 256-entry
++ * allocation.  This test arms more than 256 one-shot timers and more than 256
++ * deferrals on a single evpl, so the timer and deferral arrays must extend past
++ * their initial capacity.  With the arrays grown on demand every insert is in
++ * bounds and all of them dispatch; without the growth the inserts write past
++ * the allocation (caught here under AddressSanitizer in the Debug build).
++ */
++
++#include <stdio.h>
++
++#include "core/os.h"
++
++#include "evpl/evpl.h"
++#include "tests/test_common.h"
++
++/* Comfortably above the 256-entry initial capacity so at least one growth is
++ * forced for both arrays. */
++#define CAPACITY_TEST_N 300
++
++/* Bound on periodic-timer ticks before giving up, so a regression that strands
++ * an entry fails the test instead of hanging. */
++#define CAPACITY_TEST_MAX_TICKS 2000
++
++static volatile int         test_done;
++static volatile int         test_failed;
++static int                  deferral_fired;
++static int                  timer_fired;
++static int                  ticks;
++static struct evpl_deferral deferrals[CAPACITY_TEST_N];
++static struct evpl_timer    timers[CAPACITY_TEST_N];
++static struct evpl_timer    watchdog;
++
++static void
++deferral_cb(
++    struct evpl *evpl,
++    void        *private_data)
++{
++    deferral_fired++;
++} /* deferral_cb */
++
++static void
++timer_cb(
++    struct evpl       *evpl,
++    struct evpl_timer *timer)
++{
++    timer_fired++;
++} /* timer_cb */
++
++/* Periodic tick that keeps the loop live and declares the result once both
++ * arrays have fully dispatched (or the tick budget runs out). */
++static void
++watchdog_cb(
++    struct evpl       *evpl,
++    struct evpl_timer *timer)
++{
++    if (deferral_fired >= CAPACITY_TEST_N && timer_fired >= CAPACITY_TEST_N) {
++        test_done = 1;
++    } else if (++ticks >= CAPACITY_TEST_MAX_TICKS) {
++        test_failed = 1;
++        test_done   = 1;
++    }
++} /* watchdog_cb */
++
++static void *
++capacity_thread_init(
++    struct evpl *evpl,
++    void        *private_data)
++{
++    int i;
++
++    /* Arm more deferrals and timers than the arrays' initial capacity, all
++     * before the loop dispatches any, so every array must extend to hold them. */
++    for (i = 0; i < CAPACITY_TEST_N; i++) {
++        evpl_deferral_init(&deferrals[i], deferral_cb, NULL);
++        evpl_defer(evpl, &deferrals[i]);
++    }
++
++    for (i = 0; i < CAPACITY_TEST_N; i++) {
++        evpl_add_oneshot_timer(evpl, &timers[i], timer_cb, 1000 /* us */);
++    }
++
++    evpl_add_timer(evpl, &watchdog, watchdog_cb, 1000 /* us periodic */);
++
++    return private_data;
++} /* capacity_thread_init */
++
++static void
++capacity_thread_shutdown(
++    struct evpl *evpl,
++    void        *private_data)
++{
++    evpl_remove_timer(evpl, &watchdog);
++} /* capacity_thread_shutdown */
++
++int
++main(
++    int   argc,
++    char *argv[])
++{
++    struct evpl_thread *thread;
++
++    test_evpl_config();
++
++    thread = evpl_thread_create(NULL, capacity_thread_init,
++                                capacity_thread_shutdown, NULL);
++
++    while (!test_done) {
++        evpl_sleep_us(1000);
++    }
++
++    evpl_thread_destroy(thread);
++
++    if (test_failed || deferral_fired != CAPACITY_TEST_N ||
++        timer_fired != CAPACITY_TEST_N) {
++        fprintf(stderr,
++                "loop array capacity test FAILED: deferrals fired %d, timers "
++                "fired %d, expected %d of each\n",
++                deferral_fired, timer_fired, CAPACITY_TEST_N);
++        return 1;
++    }
++
++    printf("loop array capacity test passed (%d timers, %d deferrals)\n",
++           CAPACITY_TEST_N, CAPACITY_TEST_N);
++    return 0;
++} /* main */

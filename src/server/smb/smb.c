@@ -270,6 +270,7 @@ chimera_smb_server_init(
     shared->config.mode_from_sid                = chimera_server_config_get_smb_mode_from_sid(config);
     shared->config.posix_rename                 = chimera_server_config_get_smb_posix_rename(config);
     shared->config.smb2_max_async_credits       = chimera_server_config_get_smb2_max_async_credits(config);
+    shared->config.smb2_max_parked_creates      = chimera_server_config_get_smb2_max_parked_creates(config);
     shared->config.fs_physical_bytes_per_sector = chimera_server_config_get_smb_fs_physical_bytes_per_sector(config);
     shared->config.fs_sector_size_flags         = chimera_server_config_get_smb_fs_sector_size_flags(config);
     shared->config.replay_pending_windows       = chimera_server_config_get_smb_replay_pending_windows(config);
@@ -2811,6 +2812,7 @@ chimera_smb_server_accept(
     conn->flags              = 0;
     conn->requests_completed = 0;
     conn->async_outstanding  = 0;
+    conn->parked_creates     = 0;
     conn->credits_balance    = 0;
     /* Connection.CommandSequenceWindow starts holding exactly MessageId 0 -- the
      * one implicit credit a client may use for its first request (NEGOTIATE)

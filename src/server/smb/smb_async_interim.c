@@ -141,6 +141,15 @@ chimera_smb_async_interim_begin(struct chimera_smb_request *request)
     request->async.park_next = conn->parked_requests;
     conn->parked_requests    = request;
 
+    /* Count a parked CREATE against the per-connection ceiling.  This is the one
+     * point every CREATE park path funnels through (break-ack, share-conflict
+     * yield, durable reconnect), and the early-out above makes it run once per
+     * park; the decrement is in chimera_smb_async_interim_cancel. */
+    if (request->smb2_hdr.command == SMB2_CREATE) {
+        conn->parked_creates++;
+        request->create.parked_create_counted = 1;
+    }
+
     chimera_smb_async_interim_send(request);
 } /* chimera_smb_async_interim_begin */
 
@@ -155,6 +164,17 @@ chimera_smb_async_interim_cancel(struct chimera_smb_request *request)
     evpl_remove_timer(compound->thread->evpl, &request->async.timer);
 
     chimera_smb_async_interim_unlink(conn, request);
+
+    /* Balance the per-connection parked-CREATE count taken in
+     * chimera_smb_async_interim_begin.  Guarded by the per-request flag so a
+     * CREATE that never parked (or a non-CREATE command) does not decrement. */
+    if (request->smb2_hdr.command == SMB2_CREATE &&
+        request->create.parked_create_counted) {
+        request->create.parked_create_counted = 0;
+        if (conn->parked_creates) {
+            conn->parked_creates--;
+        }
+    }
 
     chimera_smb_create_break_waiter_retire(request);
 
@@ -240,6 +260,8 @@ chimera_smb_async_interim_drain(struct chimera_smb_conn *conn)
     }
 
     /* All parked requests are gone, including any blocking named-pipe READs that
-     * counted against the async ceiling. */
+     * counted against the async ceiling and any parked CREATEs that counted
+     * against the parked-CREATE ceiling. */
     conn->async_outstanding = 0;
+    conn->parked_creates    = 0;
 } /* chimera_smb_async_interim_drain */

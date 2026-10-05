@@ -1,0 +1,198 @@
+SPDX-FileCopyrightText: 2025-2026 Chimera-NAS Project Contributors
+SPDX-License-Identifier: LGPL-2.1-only
+
+Grow the event loop's fixed-base pointer arrays instead of overflowing them.
+
+timers, active_deferrals and active_events were allocated at a fixed 256-entry
+capacity whose max_* field was never consulted, so an insert past 256 wrote
+past the allocation.  Each array is addressed only through its evpl->* field by
+index, with no cached base pointer and no stored back-index, so a realloc that
+moves the buffer is observed on the next index.  A shared helper,
+evpl_loop_array_grow(), doubles the capacity on exhaustion (updating the
+matching max_* field so it becomes the live capacity) and computes the new
+element count and byte size in size_t, aborting rather than wrapping before the
+value is narrowed to evpl_realloc's unsigned int size argument.
+
+evpl_timer_insert() and evpl_defer() grow in place; the five active-events
+append sites are funnelled through a single evpl_active_event_append() helper
+that performs the same check in one place.
+
+diff --git a/src/core/deferral.c b/src/core/deferral.c
+index 92c0874..d17b8e1 100644
+--- a/src/core/deferral.c
++++ b/src/core/deferral.c
+@@ -4,6 +4,7 @@
+ 
+ #include "core/evpl.h"
+ #include "core/macros.h"
++#include "core/loop_array.h"
+ 
+ SYMBOL_EXPORT void
+ evpl_defer(
+@@ -16,6 +17,12 @@ evpl_defer(
+         deferral->armed = 1;
+         index           = evpl->num_active_deferrals;
+ 
++        if (index == evpl->max_active_deferrals) {
++            evpl->active_deferrals = evpl_loop_array_grow(
++                evpl->active_deferrals, &evpl->max_active_deferrals,
++                sizeof(*evpl->active_deferrals));
++        }
++
+         evpl->active_deferrals[index] = deferral;
+ 
+         ++evpl->num_active_deferrals;
+diff --git a/src/core/event_fn.h b/src/core/event_fn.h
+index 693f4b2..4b3a7bd 100644
+--- a/src/core/event_fn.h
++++ b/src/core/event_fn.h
+@@ -7,6 +7,24 @@
+ #include "core/event.h"
+ #include "core/evpl.h"
+ #include "core/logging.h"
++#include "core/loop_array.h"
++
++/* Append an event to the active-events array, growing it first if the fixed
++ * base capacity is reached.  Factors the single write every interest/mark path
++ * below performs so the capacity check lives in exactly one place. */
++static inline void
++evpl_active_event_append(
++    struct evpl       *evpl,
++    struct evpl_event *event)
++{
++    if (evpl->num_active_events == evpl->max_active_events) {
++        evpl->active_events = evpl_loop_array_grow(
++            evpl->active_events, &evpl->max_active_events,
++            sizeof(*evpl->active_events));
++    }
++
++    evpl->active_events[evpl->num_active_events++] = event;
++} /* evpl_active_event_append */
+ 
+ 
+ static inline void
+@@ -26,7 +44,7 @@ evpl_event_read_interest(
+ 
+         event->flags |= EVPL_ACTIVE;
+ 
+-        evpl->active_events[evpl->num_active_events++] = event;
++        evpl_active_event_append(evpl, event);
+         evpl_external_wake(evpl);
+     }
+ 
+@@ -63,7 +81,7 @@ evpl_event_write_interest(
+ 
+         event->flags |= EVPL_ACTIVE;
+ 
+-        evpl->active_events[evpl->num_active_events++] = event;
++        evpl_active_event_append(evpl, event);
+         evpl_external_wake(evpl);
+     }
+ 
+@@ -97,7 +115,7 @@ evpl_event_mark_readable(
+ 
+         event->flags |= EVPL_ACTIVE;
+ 
+-        evpl->active_events[evpl->num_active_events++] = event;
++        evpl_active_event_append(evpl, event);
+         evpl_external_wake(evpl);
+     }
+ } /* evpl_event_mark_readable */
+@@ -126,7 +144,7 @@ evpl_event_mark_writable(
+ 
+         event->flags |= EVPL_ACTIVE;
+ 
+-        evpl->active_events[evpl->num_active_events++] = event;
++        evpl_active_event_append(evpl, event);
+         evpl_external_wake(evpl);
+     }
+ 
+@@ -153,7 +171,7 @@ evpl_event_mark_error(
+ 
+     if (!(event->flags & EVPL_ACTIVE)) {
+         event->flags                                  |= EVPL_ACTIVE;
+-        evpl->active_events[evpl->num_active_events++] = event;
++        evpl_active_event_append(evpl, event);
+         evpl_external_wake(evpl);
+     }
+ 
+diff --git a/src/core/loop_array.h b/src/core/loop_array.h
+new file mode 100644
+index 0000000..e76eff1
+--- /dev/null
++++ b/src/core/loop_array.h
+@@ -0,0 +1,50 @@
++// SPDX-FileCopyrightText: 2026 Ben Jarvis
++//
++// SPDX-License-Identifier: LGPL-2.1-only
++
++#pragma once
++
++#include <stddef.h>
++#include <limits.h>
++#include <string.h>
++
++#include "core/evpl.h"
++#include "core/logging.h"
++
++/*
++ * Geometric (doubling) growth for the event loop's fixed-base pointer arrays
++ * (timers, active_deferrals, active_events).  Each is addressed only through
++ * its evpl->* field by index -- there is no cached base pointer and no stored
++ * back-index -- so a realloc that moves the buffer is observed on the next
++ * index.  Doubling keeps inserts amortized O(1) and makes the matching max_*
++ * field the live capacity rather than a dead initial value.
++ *
++ * The doubled element count and its byte size are computed in size_t so the
++ * arithmetic cannot wrap before it is narrowed to evpl_realloc's unsigned int
++ * size argument; an overflow aborts rather than wrapping.  The work that drives
++ * these arrays is bounded per connection, so the overflow path is unreachable
++ * in practice and the guard is purely defensive.
++ */
++static inline void *
++evpl_loop_array_grow(
++    void   *array,
++    int    *capacity,
++    size_t  elem_size)
++{
++    int    old_cap = *capacity;
++    size_t new_cap = (size_t) old_cap * 2;
++    size_t bytes   = new_cap * elem_size;
++
++    evpl_core_abort_if(old_cap <= 0 || new_cap > (size_t) INT_MAX ||
++                       bytes / elem_size != new_cap || bytes > (size_t) UINT_MAX,
++                       "event loop array growth capacity overflow");
++
++    array = evpl_realloc(array, (unsigned int) bytes);
++
++    memset((char *) array + (size_t) old_cap * elem_size, 0,
++           (new_cap - (size_t) old_cap) * elem_size);
++
++    *capacity = (int) new_cap;
++
++    return array;
++} /* evpl_loop_array_grow */
+diff --git a/src/core/timer.c b/src/core/timer.c
+index 695bdcc..07ccb01 100644
+--- a/src/core/timer.c
++++ b/src/core/timer.c
+@@ -6,6 +6,7 @@
+ #include "core/timer.h"
+ #include "core/macros.h"
+ #include "core/evpl_shared.h"
++#include "core/loop_array.h"
+ 
+ #include "core/timing.h"
+ 
+@@ -93,6 +94,11 @@ evpl_timer_insert(
+     /* interval is in microseconds; arm the deadline in stopwatch ticks. */
+     timer->deadline = evpl_now_ticks() + evpl_ns_to_ticks(timer->interval * 1000);
+ 
++    if (evpl->num_timers == evpl->max_timers) {
++        evpl->timers = evpl_loop_array_grow(evpl->timers, &evpl->max_timers,
++                                            sizeof(*evpl->timers));
++    }
++
+     evpl->timers[evpl->num_timers] = timer;
+ 
+     i = evpl->num_timers++;

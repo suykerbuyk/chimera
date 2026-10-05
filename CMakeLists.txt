@@ -361,7 +361,7 @@ endif()
 # those of its subdirectories, in the quick tier.  Tests registered by
 # submodules we do not edit are matched by name instead.
 set(CHIMERA_TEST_TIER "extended")
-set(CHIMERA_QUICK_TEST_REGEX "^libevpl/.*quint"
+set(CHIMERA_QUICK_TEST_REGEX "^libevpl/(.*quint|core/loop_array_capacity|rpc2/conn_lifetime)"
     CACHE STRING "Test-name regex forced into the quick tier")
 
 function(add_test)

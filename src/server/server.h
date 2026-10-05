@@ -222,6 +222,15 @@ chimera_server_config_get_smb2_max_async_credits(
     const struct chimera_server_config *config);
 
 void
+chimera_server_config_set_smb2_max_parked_creates(
+    struct chimera_server_config *config,
+    int                           value);
+
+int
+chimera_server_config_get_smb2_max_parked_creates(
+    const struct chimera_server_config *config);
+
+void
 chimera_server_config_set_smb_fs_physical_bytes_per_sector(
     struct chimera_server_config *config,
     uint32_t                      value);
