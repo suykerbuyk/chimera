@@ -1,0 +1,566 @@
+SPDX-FileCopyrightText: 2025-2026 Chimera-NAS Project Contributors
+SPDX-License-Identifier: LGPL-2.1-only
+
+Keep an rpc2 server connection alive until its in-flight requests complete.
+
+A server request can still be in the VFS when its connection disconnects, and
+the reply it eventually produces must not run against a freed connection or a
+recycled bind.  A server request now takes a reference on its connection at
+dispatch (request->conn_pinned) and releases it at the single request-free
+chokepoint, so the connection object outlives every request that may still
+reply on it.  On disconnect the connection is latched closed up front and the
+handler holds a guard reference across its own body, so any reference a notify
+callback or the client pending_calls completion drops cannot free the
+connection mid-handler; its teardown (reassembly iovecs, RPCSEC_GSS contexts,
+free) runs exactly once, when the guard and every in-flight server reference
+are gone.  The reply path drops a reply on a closed connection at the rpc2
+layer -- before reading connection state and before touching the bind --
+releasing the marshalled payload so nothing leaks; the bind, which may already
+be recycled, is never dereferenced.  Client requests take no reference and are
+unaffected.
+
+A loopback test defers a server reply, disconnects the client, and then
+completes the reply: it fails under AddressSanitizer against the old behaviour
+(a read of the freed connection) and passes once the reference keeps the
+connection alive and the late reply is dropped.
+
+diff --git a/include/evpl/evpl_rpc2.h b/include/evpl/evpl_rpc2.h
+index 2850d56..f02bfbe 100644
+--- a/include/evpl/evpl_rpc2.h
++++ b/include/evpl/evpl_rpc2.h
+@@ -117,6 +117,14 @@ struct evpl_rpc2_conn {
+     int                              reasm_niov;
+     int                              reasm_cap;
+     uint32_t                         reasm_length;
++
++    /* Connection-lifetime accounting (Defect 2 as described in the task).  A
++     * server request in flight holds a reference here (server_refs) so the conn
++     * outlives it; `closed` latches once the transport has disconnected.  The
++     * conn is freed when it is closed and the last reference drops -- see
++     * evpl_rpc2_conn_ref / evpl_rpc2_conn_release. */
++    int                              server_refs;
++    int                              closed;
+ };
+ 
+ typedef void (*evpl_rpc2_notify_callback_t)(
+@@ -218,6 +226,31 @@ EVPL_RPC2_API void *
+ evpl_rpc2_conn_get_private_data(
+     struct evpl_rpc2_conn *conn);
+ 
++/*
++ * Connection-lifetime pin (Defect 2 as described in the task).
++ *
++ * A server request takes a reference on the connection it arrived on for the
++ * duration of its processing, so the connection object is not freed while a
++ * reply may still be produced for it.  evpl_rpc2_conn_ref() takes a reference;
++ * evpl_rpc2_conn_release() drops one and, once the connection has been closed
++ * and the last reference is gone, performs the deferred teardown.
++ * evpl_rpc2_conn_is_closed() reports whether the transport has disconnected, so
++ * a late reply can be dropped rather than written to a recycled bind.  All run
++ * on the connection's owning rpc2 thread.
++ */
++EVPL_RPC2_API void
++evpl_rpc2_conn_ref(
++    struct evpl_rpc2_conn *conn);
++
++EVPL_RPC2_API void
++evpl_rpc2_conn_release(
++    struct evpl           *evpl,
++    struct evpl_rpc2_conn *conn);
++
++EVPL_RPC2_API int
++evpl_rpc2_conn_is_closed(
++    struct evpl_rpc2_conn *conn);
++
+ /*
+  * The XID a client connection will place on its next call, and a way to choose
+  * it.  RFC 5531 makes the XID the caller's property: it exists so the caller
+diff --git a/src/rpc2/rpc2.c b/src/rpc2/rpc2.c
+index 33ee2a9..3a90eed 100644
+--- a/src/rpc2/rpc2.c
++++ b/src/rpc2/rpc2.c
+@@ -80,6 +80,9 @@ struct evpl_rpc2_request {
+     uint32_t                              rdma_credits;
+     uint16_t                              pending_reads;
+     uint8_t                               dbg_reply_sent; /* RNR diag: 1 once reply SENT */
++    /* Set on a server request once it has taken a reference on request->conn
++     * (Defect 2): the reference is released when the request is freed. */
++    uint8_t                               conn_pinned;
+     struct evpl_bind                     *bind;
+     struct evpl_rpc2_conn                *conn;
+     struct evpl_rpc2_thread              *thread;
+@@ -276,6 +279,7 @@ evpl_rpc2_request_alloc(struct evpl_rpc2_thread *thread)
+     request->metric                      = NULL;
+     request->rdma_credits                = 1;
+     request->dbg_reply_sent              = 0;
++    request->conn_pinned                 = 0;
+     request->pending_reads               = 0;
+     request->read_chunk.niov             = 0;
+     request->read_chunk.length           = 0;
+@@ -345,6 +349,16 @@ evpl_rpc2_request_free(
+         request->reply_verf_flavor = AUTH_NONE;
+     }
+ 
++    /* Release the connection-lifetime pin a server request took at dispatch
++     * (Defect 2).  This is the sole free chokepoint for every request, so the
++     * pin is balanced however the request terminates -- reply sent, reply
++     * dropped on a closed conn, or an early error.  A closed conn whose last
++     * server request drops here is freed by evpl_rpc2_conn_release. */
++    if (request->conn_pinned) {
++        request->conn_pinned = 0;
++        evpl_rpc2_conn_release(evpl, request->conn);
++    }
++
+     LL_PREPEND(thread->free_requests, request);
+ } /* evpl_rpc2_request_free */
+ 
+@@ -779,6 +793,16 @@ evpl_rpc2_dispatch_reply(
+ {
+     struct evpl_rpc2_thread *thread = request->thread;
+ 
++    /* Defect 2: never write a reply to a closed connection's bind -- it may be
++     * recycled onto a different connection.  Release the reply iovecs we were
++     * handed (evpl_sendv would otherwise consume them under TAKE_REF) and drop
++     * the reply; evpl_rpc2_request_free releases the connection pin. */
++    if (evpl_rpc2_conn_is_closed(request->conn)) {
++        evpl_iovecs_release_internal(evpl, reply_iov, reply_niov);
++        evpl_rpc2_request_free(thread, request);
++        return;
++    }
++
+     evpl_sendv(
+         evpl,
+         request->bind,
+@@ -838,11 +862,27 @@ evpl_rpc2_send_reply(
+     struct evpl_iovec            *segment_iov, *reply_segment_iov;
+     struct evpl_rpc2_iovec_cursor write_cursor, reply_cursor;
+     int                           segment_niov;
+-    int                           i, reduce = 0, rdma = request->conn->rdma;
++    int                           i, reduce = 0, rdma;
+     struct evpl_iovec            *final_reply_iov;
+     int                           final_reply_niov, final_reply_length;
+     struct evpl_iovec             gss_wrapped_iov;
+ 
++    /* Defect 2: if the connection closed while this server request was in
++     * flight, drop the reply rather than build and send it -- the bind may
++     * already be recycled onto a different connection.  The conn itself is
++     * still alive (this request holds a pin on it), so reading conn state is
++     * safe; evpl_rpc2_request_free releases the pin.  Checked before conn->rdma
++     * is read and before request->bind is touched.  Release the caller's
++     * already-marshalled reply payload (it would otherwise be consumed by the
++     * send) so dropping leaks nothing. */
++    if (evpl_rpc2_conn_is_closed(request->conn)) {
++        evpl_iovecs_release_internal(evpl, msg_iov, msg_niov);
++        evpl_rpc2_request_free(request->thread, request);
++        return 0;
++    }
++
++    rdma = request->conn->rdma;
++
+     /* RNR diag: affirm exactly one reply SEND per request.  A second reply for
+      * the same request would post a SEND the client reserved no receive for
+      * (an RNR source independent of credits).  Abort to capture it definitively. */
+@@ -3686,8 +3726,13 @@ evpl_rpc2_recv_msg(
+             request->m_inflight = thread->m_inflight[EVPL_RPC2_ROLE_SERVER];
+             prometheus_gauge_add(request->m_inflight, 1);
+ 
+-            request->conn         = rpc2_conn;
+-            request->bind         = bind;
++            request->conn = rpc2_conn;
++            request->bind = bind;
++            /* Pin the connection for this server request's lifetime (Defect 2),
++             * so a reply it may still produce is never built against a freed
++             * conn; released in evpl_rpc2_request_free. */
++            evpl_rpc2_conn_ref(rpc2_conn);
++            request->conn_pinned  = 1;
+             request->xid          = deny_xid;
+             request->encoding.xid = deny_xid;
+             prometheus_stopwatch_start(&request->timestamp);
+@@ -3747,8 +3792,13 @@ evpl_rpc2_recv_msg(
+             request->m_inflight = thread->m_inflight[EVPL_RPC2_ROLE_SERVER];
+             prometheus_gauge_add(request->m_inflight, 1);
+ 
+-            request->conn         = rpc2_conn;
+-            request->bind         = bind;
++            request->conn = rpc2_conn;
++            request->bind = bind;
++            /* Pin the connection for this server request's lifetime (Defect 2),
++             * so a reply it may still produce is never built against a freed
++             * conn; released in evpl_rpc2_request_free. */
++            evpl_rpc2_conn_ref(rpc2_conn);
++            request->conn_pinned  = 1;
+             request->xid          = rpc_msg.xid;
+             request->encoding.xid = request->xid;
+             request->proc         = rpc_msg.body.cbody.proc;
+@@ -4108,6 +4158,52 @@ evpl_rpc2_recv_msg(
+ } /* evpl_rpc2_recv_msg */
+ 
+ 
++/*
++ * Connection-lifetime teardown and pin (Defect 2 as described in the task).
++ *
++ * evpl_rpc2_conn_maybe_free() performs the one-time teardown the disconnect
++ * handler used to do inline (drop any reassembly iovecs, tear down RPCSEC_GSS
++ * contexts, free the conn object).  It runs either straight from disconnect
++ * when no server request is in flight, or from the last evpl_rpc2_conn_release
++ * once the in-flight requests have drained -- exactly once either way.
++ */
++static void
++evpl_rpc2_conn_maybe_free(
++    struct evpl           *evpl,
++    struct evpl_rpc2_conn *conn)
++{
++    evpl_rpc2_reasm_reset(evpl, conn);
++    evpl_rpc2_gss_conn_cleanup(conn->thread, conn);
++    evpl_free(conn);
++} /* evpl_rpc2_conn_maybe_free */
++
++SYMBOL_EXPORT void
++evpl_rpc2_conn_ref(struct evpl_rpc2_conn *conn)
++{
++    conn->server_refs++;
++} /* evpl_rpc2_conn_ref */
++
++SYMBOL_EXPORT void
++evpl_rpc2_conn_release(
++    struct evpl           *evpl,
++    struct evpl_rpc2_conn *conn)
++{
++    evpl_rpc2_abort_if(conn->server_refs == 0,
++                       "evpl_rpc2_conn_release underflow");
++    conn->server_refs--;
++
++    if (conn->closed && conn->server_refs == 0) {
++        evpl_rpc2_conn_maybe_free(evpl, conn);
++    }
++} /* evpl_rpc2_conn_release */
++
++SYMBOL_EXPORT int
++evpl_rpc2_conn_is_closed(struct evpl_rpc2_conn *conn)
++{
++    return conn->closed;
++} /* evpl_rpc2_conn_is_closed */
++
++
+ static void
+ evpl_rpc2_event(
+     struct evpl        *evpl,
+@@ -4129,6 +4225,20 @@ evpl_rpc2_event(
+             }
+             break;
+         case EVPL_NOTIFY_DISCONNECTED:
++            /* Defect 2: latch the conn closed first, before any callback runs
++             * in this handler.  A server reply that completes synchronously
++             * from within the notify_callback below must see closed==1 so it
++             * drops rather than writing to a bind that may already be recycled;
++             * the client-reply / pending_calls completion does not consult
++             * `closed`, so latching early is safe for it. */
++            rpc2_conn->closed = 1;
++            /* Defect 2: hold a guard reference across this whole handler.  A
++             * notify callback (or the pending_calls completion) may release the
++             * last server-request reference on this conn; without the guard that
++             * would free the conn mid-handler, under the code that still touches
++             * it below.  The matching release at the end frees the conn only
++             * once the guard and every in-flight server pin are gone. */
++            rpc2_conn->server_refs++;
+             DL_DELETE(rpc2_thread->conns, rpc2_conn);
+             HASH_ITER(hh, rpc2_conn->pending_calls, rpc2_request, tmp)
+             {
+@@ -4150,11 +4260,15 @@ evpl_rpc2_event(
+                 rpc2_conn->thread->notify_callback(rpc2_conn->thread, rpc2_conn, &rpc2_notify, rpc2_thread->private_data
+                                                    );
+             }
+-            /* Release any iovecs stashed mid-reassembly. */
+-            evpl_rpc2_reasm_reset(evpl, rpc2_conn);
+-            /* Tear down any RPCSEC_GSS contexts established on this conn. */
+-            evpl_rpc2_gss_conn_cleanup(rpc2_conn->thread, rpc2_conn);
+-            evpl_free(rpc2_conn);
++            /* Defect 2: drop the guard taken at the top.  The conn is torn down
++             * here only if no in-flight server request still pins it; otherwise
++             * the last such request's release performs the deferred teardown
++             * (reassembly iovecs, GSS contexts, free), which runs exactly once
++             * in evpl_rpc2_conn_maybe_free. */
++            rpc2_conn->server_refs--;
++            if (rpc2_conn->server_refs == 0) {
++                evpl_rpc2_conn_maybe_free(evpl, rpc2_conn);
++            }
+             break;
+         case EVPL_NOTIFY_RECV_MSG:
+ 
+diff --git a/src/rpc2/tests/CMakeLists.txt b/src/rpc2/tests/CMakeLists.txt
+index 0b0df22..10533b2 100644
+--- a/src/rpc2/tests/CMakeLists.txt
++++ b/src/rpc2/tests/CMakeLists.txt
+@@ -166,6 +166,7 @@ endmacro()
+ # Build RPC2 test executables
+ unit_test_rpc2(hello_world hello_world.x hello_world.c)
+ unit_test_rpc2(builtin_bool builtin_bool.x builtin_bool.c)
++unit_test_rpc2(conn_lifetime conn_lifetime.x conn_lifetime.c)
+ unit_test_rpc2(rdma_ddp rdma_ddp.x rdma_ddp.c)
+ unit_test_rpc2(multifrag hello_world.x multifrag.c)
+ unit_test_rpc2(client_xid hello_world.x client_xid.c)
+@@ -186,6 +187,7 @@ endif()
+ # Add test instances for STREAM_SOCKET_TCP
+ unit_test_rpc2_instance(hello_world STREAM_SOCKET_TCP 8100)
+ unit_test_rpc2_instance(builtin_bool STREAM_SOCKET_TCP 8101)
++unit_test_rpc2_instance(conn_lifetime STREAM_SOCKET_TCP 8105)
+ unit_test_rpc2_instance(rdma_ddp STREAM_SOCKET_TCP 8102)
+ # multifrag is TCP-only: RDMA bypasses rpc2_segment_callback entirely.
+ unit_test_rpc2_instance(multifrag STREAM_SOCKET_TCP 8103)
+diff --git a/src/rpc2/tests/conn_lifetime.c b/src/rpc2/tests/conn_lifetime.c
+new file mode 100644
+index 0000000..79bd192
+--- /dev/null
++++ b/src/rpc2/tests/conn_lifetime.c
+@@ -0,0 +1,229 @@
++// SPDX-FileCopyrightText: 2026 Ben Jarvis
++//
++// SPDX-License-Identifier: LGPL-2.1-only
++
++/*
++ * Connection-lifetime test (Defect 2 as described in the task).
++ *
++ * A server handler defers its reply (as a real server does across an async VFS
++ * operation) instead of answering inline, so a server request is still in
++ * flight when the client connection drops.  The test then disconnects the
++ * client, waits for the server to observe the disconnect, and only afterwards
++ * completes the deferred reply.
++ *
++ * The reply must be dropped safely: the server connection the request arrived
++ * on is kept alive by the in-flight request's reference until the reply is
++ * produced, and because the connection is closed the reply is discarded rather
++ * than written to a bind that may already have been recycled.  Without the
++ * connection-lifetime pin the deferred reply dereferences a freed connection --
++ * a use-after-free the Debug (AddressSanitizer) build catches.
++ */
++
++#include "core/os.h"
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#ifdef _WIN32
++#include "tests/test_options.h"
++#else  /* ifdef _WIN32 */
++#include <getopt.h>
++#endif /* ifdef _WIN32 */
++
++#include "evpl/evpl.h"
++#include "evpl/evpl_rpc2.h"
++
++#include "core/test_log.h"
++#include "test_common.h"
++
++#include "conn_lifetime_xdr.h"
++
++static enum evpl_protocol_id proto = EVPL_STREAM_SOCKET_TCP;
++static int                   port  = 8000;
++
++struct test_state {
++    struct CONNLIFE_V1        *prog;
++    struct evpl_rpc2_encoding *stashed_encoding;
++    struct evpl_rpc2_conn     *client_conn;
++    int                        server_received;
++    int                        server_disconnected;
++};
++
++/* Keep the single-threaded event loop live so evpl_continue() does not block
++ * indefinitely once the exchange goes idle between phases. */
++static void
++keepalive_cb(
++    struct evpl       *evpl,
++    struct evpl_timer *timer)
++{
++} /* keepalive_cb */
++
++/* rpc2 connection notifications: both the client and the accepted server
++ * connection report through here.  Flag the server connection's disconnect --
++ * the one that is NOT the client connection -- so the test can wait for the
++ * server to have observed the drop before completing the deferred reply. */
++static void
++conn_notify(
++    struct evpl_rpc2_thread *thread,
++    struct evpl_rpc2_conn   *conn,
++    struct evpl_rpc2_notify *notify,
++    void                    *private_data)
++{
++    struct test_state *state = private_data;
++
++    if (notify->notify_type == EVPL_RPC2_NOTIFY_DISCONNECTED &&
++        conn != state->client_conn) {
++        state->server_disconnected = 1;
++    }
++} /* conn_notify */
++
++/* Server-side: stash the reply handle and return WITHOUT replying, leaving the
++ * request in flight on its connection. */
++void
++server_recv_ping(
++    struct evpl               *evpl,
++    struct evpl_rpc2_conn     *conn,
++    struct evpl_rpc2_cred     *cred,
++    struct CLMsg              *call,
++    struct evpl_rpc2_encoding *encoding,
++    void                      *private_data)
++{
++    struct test_state *state = private_data;
++
++    evpl_test_info("Server received PING id=%u; deferring reply", call->id);
++
++    state->stashed_encoding = encoding;
++    state->server_received  = 1;
++} /* server_recv_ping */
++
++/* Client-side: a reply must never arrive -- the connection is torn down before
++ * one is produced, and the deferred reply is dropped. */
++void
++client_recv_reply_ping(
++    struct evpl                 *evpl,
++    const struct evpl_rpc2_verf *verf,
++    struct CLMsg                *reply,
++    int                          status,
++    void                        *callback_private_data)
++{
++    evpl_test_info("Client reply callback fired (status=%d)", status);
++} /* client_recv_reply_ping */
++
++static void
++usage(const char *prog_name)
++{
++    fprintf(stderr, "Usage: %s [-r protocol] [-p port]\n", prog_name);
++    exit(1);
++} /* usage */
++
++int
++main(
++    int   argc,
++    char *argv[])
++{
++    struct evpl              *evpl;
++    struct evpl_rpc2_server  *server;
++    struct evpl_rpc2_conn    *conn;
++    struct evpl_rpc2_thread  *thread;
++    struct evpl_endpoint     *endpoint;
++    struct evpl_timer         keepalive;
++    struct CONNLIFE_V1        prog;
++    struct CLMsg              request, reply;
++    struct evpl_rpc2_program *programs[1];
++    struct test_state         state = { 0 };
++    int                       opt, rc, i;
++
++    test_evpl_config();
++
++    while ((opt = getopt(argc, argv, "r:p:")) != -1) {
++        switch (opt) {
++            case 'r':
++                rc = evpl_protocol_lookup(&proto, optarg);
++                if (rc) {
++                    fprintf(stderr, "Invalid protocol '%s'\n", optarg);
++                    return 1;
++                }
++                break;
++            case 'p':
++                port = atoi(optarg);
++                break;
++            default:
++                usage(argv[0]);
++        } /* switch */
++    }
++
++    evpl = evpl_create(NULL);
++
++    CONNLIFE_V1_init(&prog);
++    prog.recv_call_PING = server_recv_ping;
++    programs[0]         = &prog.rpc2;
++    state.prog          = &prog;
++
++    server   = evpl_rpc2_server_init(programs, 1);
++    endpoint = evpl_endpoint_create(test_address(proto, "127.0.0.1", argv[0]), port);
++    evpl_rpc2_server_start(server, proto, endpoint);
++
++    thread = evpl_rpc2_thread_init(evpl, programs, 1, conn_notify, &state);
++    evpl_rpc2_server_attach(thread, server, &state);
++
++    evpl_add_timer(evpl, &keepalive, keepalive_cb, 1000 /* us periodic */);
++
++    conn = evpl_rpc2_client_connect(thread, proto, endpoint, NULL, 0, NULL);
++    if (!conn) {
++        evpl_test_error("Failed to create RPC2 client");
++        evpl_destroy(evpl);
++        return 1;
++    }
++    state.client_conn = conn;
++
++    request.id = 7;
++    xdr_set_str_static(&request, text, "ping", strlen("ping"));
++
++    evpl_test_info("Client sending PING");
++    prog.send_call_PING(&prog.rpc2, evpl, conn, NULL, &request, 0, 0, NULL, 0, 0,
++                        client_recv_reply_ping, &state);
++
++    /* Let the server receive the call and stash the deferred reply handle. */
++    for (i = 0; i < 5000 && !state.server_received; i++) {
++        evpl_continue(evpl);
++    }
++    evpl_test_abort_if(!state.server_received, "server never received the call");
++
++    /* Drop the client connection with the server reply still outstanding. */
++    evpl_test_info("Disconnecting client with a server reply still in flight");
++    evpl_rpc2_client_disconnect(thread, conn);
++
++    /* Wait for the server to observe the disconnect: the server-side connection
++     * is latched closed (kept alive only by the in-flight request's pin) and
++     * its bind is torn down and may be recycled. */
++    for (i = 0; i < 5000 && !state.server_disconnected; i++) {
++        evpl_continue(evpl);
++    }
++    evpl_test_abort_if(!state.server_disconnected,
++                       "server never observed the disconnect");
++
++    /* Now complete the deferred reply.  With the connection-lifetime pin this is
++     * dropped safely (the connection is closed); without it this dereferences a
++     * freed connection and, under ASan, aborts here. */
++    reply.id = 100;
++    xdr_set_str_static(&reply, text, "pong", strlen("pong"));
++    evpl_test_info("Completing the deferred reply on the dead connection");
++    rc = prog.send_reply_PING(evpl, NULL, &reply, state.stashed_encoding);
++    evpl_test_abort_if(rc, "send_reply_PING returned an error");
++
++    /* Pump a little so the drop path (request free, pin release, deferred conn
++     * free) runs to completion and ASan can flag any late use. */
++    for (i = 0; i < 200; i++) {
++        evpl_continue(evpl);
++    }
++
++    evpl_remove_timer(evpl, &keepalive);
++    evpl_rpc2_server_stop(server);
++    evpl_rpc2_server_detach(thread, server);
++    evpl_rpc2_thread_destroy(thread);
++    evpl_rpc2_server_destroy(server);
++    evpl_destroy(evpl);
++
++    printf("Test PASSED\n");
++    return 0;
++} /* main */
+diff --git a/src/rpc2/tests/conn_lifetime.x b/src/rpc2/tests/conn_lifetime.x
+new file mode 100644
+index 0000000..fdb8619
+--- /dev/null
++++ b/src/rpc2/tests/conn_lifetime.x
+@@ -0,0 +1,16 @@
++
++/*
++ * SPDX-FileCopyrightText: 2026 Ben Jarvis
++ * SPDX-License-Identifier: BSD-3-Clause
++ */
++
++struct CLMsg {
++    unsigned int    id;
++    string          text;
++};
++
++program CONNLIFE_PROGRAM {
++    version CONNLIFE_V1 {
++        CLMsg PING(CLMsg) = 1;
++    } = 1;
++} = 4242;

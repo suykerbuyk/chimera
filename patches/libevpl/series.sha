@@ -19,4 +19,5 @@ repo-root .
 base 8a3db7c7fa30ab27933ddc8b2619412bfc96497b
 sentinel 0001-grow-event-loop-arrays.patch src/core/loop_array.h evpl_loop_array_grow
 sentinel 0002-poll-refuse-on-exhaustion.patch src/core/poll.c relocate
+sentinel 0003-rpc2-conn-lifetime-pin.patch src/rpc2/rpc2.c evpl_rpc2_conn_ref
 sentinel 0004-test-loop-array-capacity.patch src/core/tests/loop_array_capacity.c CAPACITY_TEST_N
