@@ -13,6 +13,7 @@
  * CHIMERA_SC_ABI_VERSION bump (update the assertions in the same commit).
  */
 
+#undef NDEBUG
 #include <assert.h>
 #include <stddef.h>
 #include <stdio.h>

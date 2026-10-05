@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <fcntl.h>
+#undef NDEBUG
 #include <assert.h>
 #include <sys/types.h>
 
