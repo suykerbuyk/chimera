@@ -67,3 +67,9 @@ install(DIRECTORY ./
 if(NOT DISABLE_TESTS)
     add_subdirectory(tests)
 endif()
+
+# The conformance harness and its in-memory fixture.  Linux-only, like the
+# media and facade backends it is run against.
+if(CHIMERA_LINUX)
+    add_subdirectory(conformance)
+endif()
