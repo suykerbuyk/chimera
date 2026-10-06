@@ -15,3 +15,4 @@
 0002-poll-refuse-on-exhaustion.patch
 0003-rpc2-conn-lifetime-pin.patch
 0004-test-loop-array-capacity.patch
+0005-block-open-enxio-on-unavailable-framework.patch

@@ -1,0 +1,48 @@
+SPDX-FileCopyrightText: 2025-2026 Chimera-NAS Project Contributors
+SPDX-License-Identifier: LGPL-2.1-only
+
+Fail a framework-backed block open cleanly when the backend is unavailable.
+
+A framework-backed block backend (io_uring) attaches its framework inside
+evpl_block_open_device, and that attach runs the framework's availability probe
+lazily.  When the probe reports the backend unavailable -- io_uring_setup
+returning ENOSYS under a container's default seccomp profile, a pre-5.1 kernel,
+or io_uring disabled -- it leaves framework_private NULL, yet open_device still
+completed as success.  The per-thread ring was then never created, so the first
+read/write dispatched into the backend and dereferenced a NULL framework
+context (a crash deferred from open to first I/O).
+
+Check the probe verdict once the attach has produced it (after
+protocol_private_data is read, not at the earlier unregistered-protocol branch
+where framework_private is still NULL on every host): when the protocol is
+framework-backed and its framework did not come up, complete the open with
+ENXIO.  This is the same uniform asynchronous failure already used for an
+unregistered backend, and it lets every libevpl block consumer fail the open
+cleanly instead of crashing on first use.  Non-framework backends (pread) and
+backends whose probe passed are unaffected.
+
+diff --git a/src/core/block.c b/src/core/block.c
+index 1b16df6..7e897b8 100644
+--- a/src/core/block.c
++++ b/src/core/block.c
+@@ -233,6 +233,20 @@ evpl_block_open_device(
+         protocol_private_data = NULL;
+     }
+
++    /* A framework-backed block backend (io_uring) attaches its framework just
++     * above, and that attach runs the framework's availability probe lazily:
++     * framework_private stays NULL when the backend is framework-unavailable
++     * here -- io_uring_setup returning ENOSYS under a container's seccomp
++     * profile, a pre-5.1 kernel, or io_uring disabled.  Opening anyway would
++     * succeed now and defer a NULL-context dereference to the first
++     * read/write; fail the open cleanly instead, the same uniform asynchronous
++     * failure used for an unregistered backend above. */
++    if (protocol->framework && !protocol_private_data) {
++        request->status = ENXIO;
++        evpl_defer(evpl, &request->deferral);
++        return;
++    }
++
+     protocol->open_device(evpl, request->uri, protocol_private_data,
+                           evpl_block_open_complete, request);
+ } /* evpl_block_open_device */
