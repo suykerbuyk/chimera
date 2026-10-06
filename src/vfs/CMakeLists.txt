@@ -101,8 +101,12 @@ endfunction()
 
 set(CHIMERA_VFS_BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR})
 
-# The storage-contract interface: portable, libc-only headers.
+# The storage-contract interface (portable headers), and the Linux-only
+# 4K block-media layer.
 add_subdirectory(contract)
+if (CHIMERA_LINUX)
+    add_subdirectory(media)
+endif()
 
 add_subdirectory(memfs)
 add_subdirectory(memkv)
