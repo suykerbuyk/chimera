@@ -53,3 +53,5 @@ venv/
 # is untracked and must never be staged (patches are generated from the overlay
 # staging copy, which excludes it).
 ext/libevpl/src/.vibe-palace/
+.claude/**
+.vibe-palace.toml

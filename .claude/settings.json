@@ -16,9 +16,8 @@
       "Bash(ldd:*)",
       "Bash(find:*)",
       "Bash(reuse:*)",
-      "Read(/build/**)",
-      "Write(/build/**)",
-      "Edit(/build/**)"
+      "Read(./build/**)",
+      "Edit(./build/**)"
     ]
   }
 }
