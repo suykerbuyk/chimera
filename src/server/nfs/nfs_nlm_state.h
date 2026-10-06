@@ -408,3 +408,12 @@ nlm_client_release_all_locks(
     struct chimera_vfs_thread *vfs_thread,
     struct chimera_vfs_state  *vfs_state,
     struct chimera_vfs_cred   *cred);
+
+/* Free an nlm_lock_ctx (defined in nfs_nlm.c), releasing the connection
+ * reference it holds iff it took one.  Declared here because the generic
+ * lock-state teardown frees a cancelled blocking ticket's acquire ctx, which is
+ * always an nlm_lock_ctx; `ctx` is void * so this header needs no struct
+ * definition. */
+void
+nlm_lock_ctx_free(
+    void *ctx);

@@ -200,6 +200,12 @@ struct nlm_test_ctx {
     int32_t                           svid;
     uint8_t                           fh[NFS4_FHSIZE];
     uint32_t                          fh_len;
+    /* Defect 2 as described in the task: set for the async proc (TEST_MSG,
+     * proc 16) only, which has already acked its originating request -- and so
+     * released the request's connection reference -- before the async open.
+     * The reference taken here keeps ctx->conn alive across that open; released
+     * once when the ctx is freed. */
+    bool                              conn_pinned;
 };
 
 static void
@@ -283,12 +289,23 @@ chimera_nfs_nlm4_test_open_cb(
     chimera_nfs_debug("NLM TEST cb: stat=%d", res.test_stat.stat);
 
     if (ctx->proc == 16) {
-        shared->nlm_v4.send_call_NLMPROC4_TEST_RES(&shared->nlm_v4.rpc2, evpl,
-                                                   ctx->conn, NULL, &res, 0, 0, NULL, 0, 0,
-                                                   nlm4_res_sent_cb, NULL);
+        /* Defect 2: the async TEST_MSG result rides ctx->conn, which was pinned
+         * across the open.  Drop it if the connection closed meanwhile rather
+         * than write on a bind that may already be recycled. */
+        if (!evpl_rpc2_conn_is_closed(ctx->conn)) {
+            shared->nlm_v4.send_call_NLMPROC4_TEST_RES(&shared->nlm_v4.rpc2, evpl,
+                                                       ctx->conn, NULL, &res, 0, 0, NULL, 0, 0,
+                                                       nlm4_res_sent_cb, NULL);
+        }
     } else {
         rc = shared->nlm_v4.send_reply_NLMPROC4_TEST(evpl, NULL, &res, encoding);
         chimera_nfs_abort_if(rc, "Failed to send NLM TEST reply");
+    }
+    /* Release the async-open pin (proc 16 only) exactly once; this is the sole
+     * terminal of the TEST open callback (every path reaches send_reply). */
+    if (ctx->conn_pinned) {
+        ctx->conn_pinned = false;
+        evpl_rpc2_conn_release(ctx->evpl, ctx->conn);
     }
     free(ctx);
 } /* chimera_nfs_nlm4_test_open_cb */
@@ -317,6 +334,12 @@ struct nlm_lock_ctx {
     /* Client IP (no port), captured at request time so the out-of-band GRANTED
      * callback can portmap-resolve the client's NLM service. */
     char                              client_addr[80];
+    /* Defect 2 as described in the task: set once this ctx has taken a
+     * reference on ctx->conn -- across the async open for proc 17
+     * (chimera_nfs_nlm4_do_lock) and/or for a blocked lock's lifetime
+     * (chimera_nfs_nlm4_lock_blocked_cb) -- so the reference is released
+     * exactly once when the ctx is freed. */
+    bool                              conn_pinned;
 };
 
 /* Work owed by a completed lock acquire that MUST run on ctx->thread: an
@@ -337,6 +360,29 @@ struct nlm_lock_resume {
     uint32_t                        stat;
     struct nlm_lock_resume         *next;
 };
+
+/* The single free chokepoint for an nlm_lock_ctx (Defect 2).  Releases the
+ * connection reference iff this ctx took one, then frees the ctx.  `vctx` is
+ * void * so the generic lock-state teardown (nlm_client_release_all_locks) can
+ * route its ticket private_data through here without the struct definition.  A
+ * ctx that never pinned (a non-blocked, non-async-open path) is a plain free.
+ *
+ * The connection release is immediate on every path, including the
+ * disconnect-cancel path: the rpc2 disconnect handler holds a guard reference
+ * across its notify callback, so releasing the last ctx pin here cannot free
+ * the connection out from under the rpc2 layer. */
+void
+nlm_lock_ctx_free(void *vctx)
+{
+    struct nlm_lock_ctx *ctx = vctx;
+
+    if (ctx->conn_pinned) {
+        ctx->conn_pinned = false;
+        evpl_rpc2_conn_release(ctx->evpl, ctx->conn);
+    }
+
+    free(ctx);
+} /* nlm_lock_ctx_free */
 
 /* Snapshot a self-contained grant job from the now-granted lock entry.
  *
@@ -415,6 +461,16 @@ chimera_nfs_nlm4_lock_blocked_cb(void *private_data)
 
     ctx->was_blocked = true;
 
+    /* Defect 2: the original RPC is about to be answered NLM4_BLOCKED, after
+     * which nothing else holds this connection alive, yet the eventual grant or
+     * decide for this blocked lock must still be deliverable on it.  Pin the
+     * connection for the lifetime of this blocked-lock ctx -- exactly once;
+     * released when the ctx is freed (nlm_lock_ctx_free). */
+    if (!ctx->conn_pinned) {
+        evpl_rpc2_conn_ref(ctx->conn);
+        ctx->conn_pinned = true;
+    }
+
     res.cookie.len  = ctx->cookie.len;
     res.cookie.data = ctx->cookie.data;
     res.stat        = NLM4_BLOCKED;
@@ -427,9 +483,13 @@ chimera_nfs_nlm4_lock_blocked_cb(void *private_data)
      * the interim result via LOCK_RES.  NM_LOCK (22) never blocks (non-blocking
      * by definition) so it never reaches here. */
     if (ctx->proc == 17) {
-        shared->nlm_v4.send_call_NLMPROC4_LOCK_RES(&shared->nlm_v4.rpc2, evpl,
-                                                   ctx->conn, NULL, &res, 0, 0,
-                                                   NULL, 0, 0, nlm4_res_sent_cb, NULL);
+        /* Conn still live here (the original request keeps it so), but gate for
+         * uniformity with the out-of-band sends below. */
+        if (!evpl_rpc2_conn_is_closed(ctx->conn)) {
+            shared->nlm_v4.send_call_NLMPROC4_LOCK_RES(&shared->nlm_v4.rpc2, evpl,
+                                                       ctx->conn, NULL, &res, 0, 0,
+                                                       NULL, 0, 0, nlm4_res_sent_cb, NULL);
+        }
     } else {
         rc = shared->nlm_v4.send_reply_NLMPROC4_LOCK(evpl, NULL, &res, encoding);
         chimera_nfs_abort_if(rc, "Failed to send NLM4_BLOCKED reply");
@@ -470,12 +530,12 @@ chimera_nfs_nlm4_lock_resume_run(
     if (r->deliver) {
         chimera_nfs_debug("NLM LOCK: deferred lock granted -> NLM_GRANTED callback");
         chimera_nfs_nlm4_submit_grant(ctx, &r->grant);
-        free(ctx);
+        nlm_lock_ctx_free(ctx);
         return;
     }
 
     if (!r->reply) {
-        free(ctx);
+        nlm_lock_ctx_free(ctx);
         return;
     }
 
@@ -491,11 +551,16 @@ chimera_nfs_nlm4_lock_resume_run(
                                                          ctx->encoding);
             break;
         case 17:
-            shared->nlm_v4.send_call_NLMPROC4_LOCK_RES(&shared->nlm_v4.rpc2,
-                                                       ctx->evpl, ctx->conn,
-                                                       NULL, &res, 0, 0, NULL,
-                                                       0, 0, nlm4_res_sent_cb,
-                                                       NULL);
+            /* Defect 2: a blocked lock's out-of-band result -- drop it if the
+             * connection has closed while the lock waited, rather than write on
+             * a bind that may already be recycled. */
+            if (!evpl_rpc2_conn_is_closed(ctx->conn)) {
+                shared->nlm_v4.send_call_NLMPROC4_LOCK_RES(&shared->nlm_v4.rpc2,
+                                                           ctx->evpl, ctx->conn,
+                                                           NULL, &res, 0, 0, NULL,
+                                                           0, 0, nlm4_res_sent_cb,
+                                                           NULL);
+            }
             break;
         default:
             rc = shared->nlm_v4.send_reply_NLMPROC4_NM_LOCK(ctx->evpl, NULL,
@@ -504,7 +569,7 @@ chimera_nfs_nlm4_lock_resume_run(
     } /* switch */
     chimera_nfs_abort_if(rc, "Failed to send NLM LOCK reply");
 
-    free(ctx);
+    nlm_lock_ctx_free(ctx);
 } /* chimera_nfs_nlm4_lock_resume_run */
 
 /* Drain completions bounced here by chimera_nfs_nlm4_lock_acquire_cb.  Runs
@@ -722,16 +787,19 @@ chimera_nfs_nlm4_lock_open_cb(
                 rc = shared->nlm_v4.send_reply_NLMPROC4_LOCK(evpl, NULL, &res, encoding);
                 break;
             case 17:
-                shared->nlm_v4.send_call_NLMPROC4_LOCK_RES(&shared->nlm_v4.rpc2, evpl, ctx->conn, NULL, &res, 0, 0, NULL
-                                                           , 0, 0,
-                                                           nlm4_res_sent_cb, NULL);
+                /* Defect 2: skip the out-of-band result on a closed conn. */
+                if (!evpl_rpc2_conn_is_closed(ctx->conn)) {
+                    shared->nlm_v4.send_call_NLMPROC4_LOCK_RES(&shared->nlm_v4.rpc2, evpl, ctx->conn, NULL, &res, 0, 0,
+                                                               NULL, 0, 0,
+                                                               nlm4_res_sent_cb, NULL);
+                }
                 break;
             default:
                 rc = shared->nlm_v4.send_reply_NLMPROC4_NM_LOCK(evpl, NULL, &res, encoding);
                 break;
         } /* switch */
         chimera_nfs_abort_if(rc, "Failed to send NLM LOCK reply");
-        free(ctx);
+        nlm_lock_ctx_free(ctx);
         return;
     }
 
@@ -755,16 +823,19 @@ chimera_nfs_nlm4_lock_open_cb(
                 rc = shared->nlm_v4.send_reply_NLMPROC4_LOCK(evpl, NULL, &res, encoding);
                 break;
             case 17:
-                shared->nlm_v4.send_call_NLMPROC4_LOCK_RES(&shared->nlm_v4.rpc2, evpl, ctx->conn, NULL, &res, 0, 0, NULL
-                                                           , 0, 0,
-                                                           nlm4_res_sent_cb, NULL);
+                /* Defect 2: skip the out-of-band result on a closed conn. */
+                if (!evpl_rpc2_conn_is_closed(ctx->conn)) {
+                    shared->nlm_v4.send_call_NLMPROC4_LOCK_RES(&shared->nlm_v4.rpc2, evpl, ctx->conn, NULL, &res, 0, 0,
+                                                               NULL, 0, 0,
+                                                               nlm4_res_sent_cb, NULL);
+                }
                 break;
             default:
                 rc = shared->nlm_v4.send_reply_NLMPROC4_NM_LOCK(evpl, NULL, &res, encoding);
                 break;
         } /* switch */
         chimera_nfs_abort_if(rc, "Failed to send NLM LOCK OOM reply");
-        free(ctx);
+        nlm_lock_ctx_free(ctx);
         return;
     }
 
@@ -929,6 +1000,16 @@ chimera_nfs_nlm4_do_test(
         memcpy(ctx->cookie_buf, args->cookie.data, args->cookie.len);
     }
 
+    /* Defect 2: TEST_MSG (proc 16) already acked its originating request, so the
+     * request's connection reference is gone; the open below is async on a cache
+     * miss, leaving ctx->conn otherwise unreferenced.  Pin it across the open so
+     * the open callback never reports on a freed connection.  The sync TEST
+     * (proc 1) replies inline on its still-live request and takes no pin. */
+    if (proc == 16) {
+        evpl_rpc2_conn_ref(ctx->conn);
+        ctx->conn_pinned = true;
+    }
+
     /* Conflict detection is delegated to vfs_state — the test_open_cb
      * does the lookup and probe synchronously once the FH is validated. */
     chimera_vfs_open_fh(thread->vfs_thread, &nlm_system_cred,
@@ -1074,7 +1155,7 @@ chimera_nfs_nlm4_do_lock(
         } /* switch */
         chimera_nfs_abort_if(rc, "Failed to send NLM LOCK grace reply");
         nlm_lock_entry_free(entry);
-        free(ctx);
+        nlm_lock_ctx_free(ctx);
         return;
     }
 
@@ -1083,7 +1164,7 @@ chimera_nfs_nlm4_do_lock(
     if (!client) {
         evpl_mutex_unlock(&shared->nlm_state.mutex);
         nlm_lock_entry_free(entry);
-        free(ctx);
+        nlm_lock_ctx_free(ctx);
         nlm4_send_res(shared, evpl, conn, encoding, &args->cookie, NLM4_DENIED_NOLOCKS, proc);
         return;
     }
@@ -1112,9 +1193,12 @@ chimera_nfs_nlm4_do_lock(
                 rc = shared->nlm_v4.send_reply_NLMPROC4_LOCK(evpl, NULL, &res, encoding);
                 break;
             case 17:
-                shared->nlm_v4.send_call_NLMPROC4_LOCK_RES(&shared->nlm_v4.rpc2, evpl, ctx->conn, NULL, &res, 0, 0, NULL
-                                                           , 0, 0,
-                                                           nlm4_res_sent_cb, NULL);
+                /* Defect 2: skip the out-of-band result on a closed conn. */
+                if (!evpl_rpc2_conn_is_closed(ctx->conn)) {
+                    shared->nlm_v4.send_call_NLMPROC4_LOCK_RES(&shared->nlm_v4.rpc2, evpl, ctx->conn, NULL, &res, 0, 0,
+                                                               NULL, 0, 0,
+                                                               nlm4_res_sent_cb, NULL);
+                }
                 break;
             default:
                 rc = shared->nlm_v4.send_reply_NLMPROC4_NM_LOCK(evpl, NULL, &res, encoding);
@@ -1122,7 +1206,7 @@ chimera_nfs_nlm4_do_lock(
         } /* switch */
         chimera_nfs_abort_if(rc, "Failed to send NLM LOCK duplicate reply");
         nlm_lock_entry_free(entry);
-        free(ctx);
+        nlm_lock_ctx_free(ctx);
         return;
     }
 
@@ -1139,6 +1223,18 @@ chimera_nfs_nlm4_do_lock(
         evpl_mutex_lock(&shared->nlm_state.mutex);
         client->conn_count++;
         evpl_mutex_unlock(&shared->nlm_state.mutex);
+    }
+
+    /* Defect 2: LOCK_MSG (proc 17) already acked its originating request, so the
+     * request's connection reference is gone before this async open (async on a
+     * cache miss).  Pin ctx->conn across the open so the open callback never
+     * reports on a freed connection.  If the lock later blocks, blocked_cb's
+     * !conn_pinned guard avoids a second reference.  The sync LOCK (proc 2) does
+     * not pin here -- its request reference spans the open, and blocked_cb pins
+     * it only if it blocks. */
+    if (proc == 17) {
+        evpl_rpc2_conn_ref(ctx->conn);
+        ctx->conn_pinned = true;
     }
 
     chimera_vfs_open_fh(thread->vfs_thread, &nlm_system_cred,

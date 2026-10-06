@@ -375,7 +375,14 @@ nlm_client_release_all_locks(
                 entry->reaped = true;
                 continue;
             }
-            free(entry->ticket.private_data);
+            /* The cancelled ticket's private_data is the blocking lock's acquire
+             * ctx (an nlm_lock_ctx).  Route it through nlm_lock_ctx_free so the
+             * connection reference it holds is released (Defect 2), not merely
+             * freed.  The release is safe inline even on the disconnect
+             * teardown: the rpc2 disconnect handler holds a guard reference
+             * across its notify callback, so the connection is not freed out
+             * from under it. */
+            nlm_lock_ctx_free(entry->ticket.private_data);
             entry->ticket.private_data = NULL;
             entry->pending             = false;
         }
