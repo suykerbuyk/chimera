@@ -68,6 +68,7 @@ install(FILES
         DESTINATION include/chimera)
 
 add_subdirectory(contract)
+add_subdirectory(media)
 add_subdirectory(root)
 add_subdirectory(memfs)
 add_subdirectory(memkv)
