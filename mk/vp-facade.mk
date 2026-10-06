@@ -169,8 +169,9 @@ podman-image: ## Build PODMAN_IMAGE from PODMAN_DOCKERFILE (network; see PODMAN_
 
 # Network (skopeo, curl); never builds, commits or pushes.  DRY_RUN=1 shows the
 # rewrite without touching the Dockerfile.  See builders/thin/README.md.
-podman-image-bump: ## Re-resolve builders/thin pins (base digest, snapshot, quint digest) and show the diff; no build
-	@$(if $(DRY_RUN),DRY_RUN=$(DRY_RUN) )sh builders/thin/bump-pins.sh
+podman-image-bump: ## Re-resolve the flavor's pins and show the diff (thin: base/snapshot/quint, no build; dev: base digest + regenerate packages.lock from a reference build)
+	$(_vp_check_flavor)
+	@$(if $(DRY_RUN),DRY_RUN=$(DRY_RUN) )sh builders/$(PODMAN_FLAVOR)/bump-pins.sh
 
 podman-build: ## Build BUILD_TYPE in the container (no network)
 	$(_vp_check_flavor)

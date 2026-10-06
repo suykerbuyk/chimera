@@ -69,6 +69,115 @@ With this image (`PODMAN_FLAVOR=dev`), the image plus a Debug build can take
 `df` for both before it starts.  Point `PODMAN_BUILD_DIR` somewhere roomier if
 `/home` is tight.
 
+## Reproducibility: the apt+base lock
+
+The dev image carries the `builders/thin` reproducibility discipline for its
+**apt+base layer, as the image ships by default (`ENABLE_DOCA=0`)**: the base is
+digest-pinned, every apt package is pinned to an exact version, and a lock gate
+fails the build if the installed set drifts from a committed closure. This is
+narrower than thin's guarantee, and the limits are spelled out below — read them
+before trusting a green build.
+
+The closure is **amd64-specific**. dev is amd64 in practice (the StorNext step is
+amd64-only); an arm64 build would install arm64 package versions that are not in
+`packages.lock` and so would fail the gate wholesale. Re-bumping on arm64 would
+produce a different lock.
+
+### What is and is not locked
+
+**Locked (apt+base, `ENABLE_DOCA=0`):** the base image and every `apt-get install`
+across all layers — the internal mirror and `download.docker.com` (`docker-ce`
+et al.).
+
+**Not locked (a separate follow-on):** the from-source and out-of-band tools —
+`fio`/`libdpcp`/`libxlio` git branches, `elbencho`/`pynfs` clones, the
+`dotnet-install --channel 8.0` SDK, `pip`/`gem`/`npm` installs, oras, WPTS, and
+the StorNext `…-master` tarball. **Also not locked: `ENABLE_DOCA=1`.** That build
+adds `cuda-toolkit-12-8` from the NVIDIA repo, unpinned and absent from
+`packages.lock`, so a `DOCA=1` gate-on build is not reproducible and would fail
+the gate — pinning cuda is deferred to the external-source follow-on. The lock
+gate says **"apt+base layer frozen,"** never "the image reproduces." A green gate
+is not a whole-image reproducibility claim.
+
+### Pins
+
+| Pin | What | Where |
+|---|---|---|
+| `BASE_IMAGE` | `repository.mdh.quantum.com/ubuntu:26.04@sha256:<index>` — the base by its multi-arch index digest | `ARG BASE_IMAGE` at the top of the Dockerfile (used by `FROM`) |
+| apt versions | every named package as `pkg=version` on the install lines | the `apt-get install` lines |
+| `packages.lock` | the full realized apt+base closure (all 964 installed packages, transitive deps and base residuals included), in apt `Packages`-stanza format | `builders/dev/packages.lock` |
+
+Two names stay unpinned on purpose: `debhelper-compat` and `libboost-system-dev`
+are virtual packages with no installable version of their own (provided by
+`debhelper` and `libboost1.90-dev`, which the closure — and so the gate — still
+covers).
+
+### How apt is locked — and the mutable-mirror caveat
+
+Unlike thin, dev has **no dated/immutable apt snapshot**. The internal mirror
+(`repository.mdh.quantum.com`, "Artifact Depot") and `download.docker.com` serve
+a **live, mutable** suite; there is no snapshot URL to freeze. So determinism is
+achieved by pinning exact versions and committing the realized closure as the
+frozen reference — the frozen point is the checked-in `packages.lock`, not the
+mirror.
+
+**Retention-horizon, loud fail (operator decision).** Reproducibility holds only
+while the mirror still **retains** every pinned version. When a pinned version
+ages out of the mirror, `apt-get install pkg=version` **fails the build loudly**,
+naming the package — it never silently installs a newer one. That is the signal
+to do a conscious **re-bump** (below), which is a deliberate mutation of the
+frozen set. This is weaker than thin's immutable-snapshot guarantee by design:
+thin can always rebuild its exact set from `snapshot.ubuntu.com`; dev cannot once
+the mirror has moved. No `.deb` vendoring and no switch to `snapshot.ubuntu.com`
+(which would change qb's egress contract and not cover docker-ce) were taken.
+
+### Lock gate
+
+The last layer runs `builders/dev/lock-gate.py`, a **byte-identical copy** of
+`builders/thin/lock-gate.py` (keep the two in sync; a drift is a bug — their
+sha256 must match). It is fed the committed `packages.lock` as `--lists` and the
+live `dpkg-query` status as `--status`, and asserts every installed
+`(Package, Arch, Version)` is in the closure. Exit codes: `0` all present; `2`
+bad input; `3` some installed package is outside the closure (it prints exactly
+those `Package:Arch=Version` triples). The same step then re-runs the gate with
+an injected `openssl:amd64=0.0-leak` row and fails unless that run exits `3` and
+names exactly that row — proving on every build that the gate can fail.
+
+On success the image records its inputs under `/usr/share/chimera-dev`
+(`packages.txt`, `pins`).
+
+### Rebuild
+
+```bash
+make podman-clean PODMAN_FLAVOR=dev
+make podman-image PODMAN_FLAVOR=dev PODMAN_BUILD_FLAGS=--no-cache   # lock gate must print "apt+base layer frozen"
+```
+
+A `--no-cache` build proves the pinned set is installable and the gate is green;
+it does **not** prove bit-for-bit time-reproducibility (the non-apt sources
+above are not frozen).
+
+### Bumping the pins
+
+```bash
+make podman-image-bump PODMAN_FLAVOR=dev              # re-resolve base digest, regenerate packages.lock
+make podman-image-bump PODMAN_FLAVOR=dev DRY_RUN=1    # resolve + report only, no rewrite, no build
+```
+
+`builders/dev/bump-pins.sh` re-resolves the base index digest (skopeo,
+cross-checked like thin's) and rewrites the one `ARG BASE_IMAGE=` line, then
+runs a reference build with the gate off (`DEV_LOCK_GATE=off`) and regenerates
+`packages.lock` from that build's `dpkg-query` — **not** from the live mirror
+index, which would not match the real resolution, base residuals or the
+non-mirror (docker.com) packages. It never builds the verify image, commits or
+pushes. After it runs: review the `packages.lock` diff, re-pin any changed
+`pkg=version` on the install lines to match, run a normal `--no-cache` build so
+the gate verifies, and commit yourself. Needs the network, `skopeo` and
+`podman`.
+
+The pins never move on their own. A security update reaches this image only
+when someone bumps it.
+
 ## Privilege model
 
 The container runs as your uid with no added privilege:

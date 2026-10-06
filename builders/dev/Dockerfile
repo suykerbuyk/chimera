@@ -1,7 +1,17 @@
 # SPDX-FileCopyrightText: 2025-2026 Chimera-NAS Project Contributors
 #
 # SPDX-License-Identifier: Unlicense
-FROM repository.mdh.quantum.com/ubuntu:26.04
+# Base image, pinned by its multi-arch index digest and re-resolved by
+# builders/dev/bump-pins.sh.  Declared before FROM so FROM can use it; re-declared
+# after FROM so the lock-gate RUN can record it in the manifest.
+ARG BASE_IMAGE=repository.mdh.quantum.com/ubuntu:26.04@sha256:f3d28607ddd78734bb7f71f117f3c6706c666b8b76cbff7c9ff6e5718d46ff64
+FROM ${BASE_IMAGE}
+ARG BASE_IMAGE
+
+# DEV_LOCK_GATE=off skips the apt+base lock gate; used by the capture/reference
+# builds in builders/dev/bump-pins.sh that regenerate packages.lock.  A normal
+# `make podman-image PODMAN_FLAVOR=dev` leaves it on.
+ARG DEV_LOCK_GATE=on
 
 ARG ENABLE_XLIO=1
 ARG ENABLE_DOCA=0
@@ -39,17 +49,23 @@ RUN if [ -n "$APT_MIRROR" ]; then \
     fi
 
 # Quantum note. We do not need to unminimize since it is only a build_container
+# Every apt package is pinned to the exact version captured in packages.lock
+# (see builders/dev/README.md).  No blind `apt upgrade`: the frozen set is the
+# only thing installed, so the resolved closure stays put until a conscious
+# bump.  debhelper-compat and libboost-system-dev are left unpinned on purpose:
+# they are virtual packages with no installable version of their own (provided
+# by debhelper and libboost1.90-dev, which the lock gate covers via the closure).
 RUN apt-get -y update && \
-    apt-get -y --no-install-recommends upgrade && \
-    apt-get -y --no-install-recommends install clang clang-tools cmake ninja-build git flex bison lldb gdb less vim psmisc uncrustify \
-    net-tools tshark tcpdump uuid-dev iproute2 man-db manpages-dev ca-certificates ssh libjansson-dev libclang-rt-21-dev llvm wget \
-    libxxhash-dev liburcu-dev librdmacm-dev liburing-dev libaio-dev libunwind-dev librocksdb-dev libsqlite3-dev libcurl4-openssl-dev clangd uthash-dev libnuma-dev \
-    libboost-dev libboost-program-options-dev libboost-thread-dev libboost-system-dev \
-    libcurl4-openssl-dev build-essential ruby-full autoconf automake make libtool pkg-config libs3-dev gh npm reuse libssl-dev openssl \
-    libkrb5-3 libkrb5-dev libgssapi-krb5-2 libwbclient-dev libcrypt-dev curl jq libicu-dev awscli \
-    krb5-kdc krb5-admin-server krb5-user python3-pip python3-setuptools python3-venv \
-    dh-python pybuild-plugin-pyproject debhelper-compat \
-    samba samba-ad-dc samba-ad-provision samba-vfs-modules smbclient samba-testsuite && \
+    apt-get -y --no-install-recommends install \
+    clang=1:21.1.6-71 clang-tools=1:21.1.6-71 cmake=4.2.3-2ubuntu2 ninja-build=1.13.2-1 git=1:2.53.0-1ubuntu1 flex=2.6.4-8.2build2 bison=2:3.8.2+dfsg-1build4 lldb=1:21.1.6-71 gdb=17.1-2ubuntu1 less=668-1build1 vim=2:9.1.2141-1ubuntu4.1 psmisc=23.7-2ubuntu2 uncrustify=0.78.1+dfsg1-1build1 \
+    net-tools=2.10-2ubuntu1 tshark=4.6.4-1 tcpdump=4.99.6-1 uuid-dev=2.41.3-3ubuntu2 iproute2=6.19.0-1ubuntu1 man-db=2.13.1-1build1 manpages-dev=6.17-1 ca-certificates=20260223 ssh=1:10.2p1-2ubuntu3.2 libjansson-dev=2.14-2build4 libclang-rt-21-dev=1:21.1.8-6ubuntu1 llvm=1:21.1.6-71 wget=1.25.0-2ubuntu4 \
+    libxxhash-dev=0.8.3-2build1 liburcu-dev=0.15.6-1 librdmacm-dev=61.0-2ubuntu3 liburing-dev=2.14-1 libaio-dev=0.3.113-8build1 libunwind-dev=1.8.3-0ubuntu1 librocksdb-dev=9.11.2-1 libsqlite3-dev=3.46.1-9 libcurl4-openssl-dev=8.18.0-1ubuntu2.1 clangd=1:21.1.6-71 uthash-dev=2.3.0-2build1 libnuma-dev=2.0.19-1build1 \
+    libboost-dev=1.90.0.1ubuntu3 libboost-program-options-dev=1.90.0.1ubuntu3 libboost-thread-dev=1.90.0.1ubuntu3 libboost-system-dev \
+    build-essential=12.12ubuntu2 ruby-full=1:3.3build1 autoconf=2.72-3.1ubuntu2 automake=1:1.18.1-3build1 make=4.4.1-3 libtool=2.5.4-9 pkg-config=2.5.1-4 libs3-dev=2.0-4ubuntu4 gh=2.46.0-4 npm=9.2.0~ds3-1 reuse=5.0.2-1build1 libssl-dev=3.5.5-1ubuntu3 openssl=3.5.5-1ubuntu3 \
+    libkrb5-3=1.22.1-2ubuntu4 libkrb5-dev=1.22.1-2ubuntu4 libgssapi-krb5-2=1.22.1-2ubuntu4 libwbclient-dev=2:4.23.6+dfsg-1ubuntu2 libcrypt-dev=1:4.5.1-1 curl=8.18.0-1ubuntu2.1 jq=1.8.1-4ubuntu2 libicu-dev=78.2-2ubuntu1 awscli=2.31.35-1 \
+    krb5-kdc=1.22.1-2ubuntu4 krb5-admin-server=1.22.1-2ubuntu4 krb5-user=1.22.1-2ubuntu4 python3-pip=25.1.1+dfsg-1ubuntu2 python3-setuptools=78.1.1-0.1build1 python3-venv=3.14.3-0ubuntu2 \
+    dh-python=7.20260309 pybuild-plugin-pyproject=7.20260309 debhelper-compat \
+    samba=2:4.23.6+dfsg-1ubuntu2 samba-ad-dc=2:4.23.6+dfsg-1ubuntu2 samba-ad-provision=2:4.23.6+dfsg-1ubuntu2 samba-vfs-modules=2:4.23.6+dfsg-1ubuntu2 smbclient=2:4.23.6+dfsg-1ubuntu2 samba-testsuite=2:4.23.6+dfsg-1ubuntu2 && \
     gem install jekyll bundler
 
 RUN if [ "$ENABLE_CLAUDE" = "1" ] ; then \
@@ -85,7 +101,7 @@ RUN if [ "$ENABLE_DOCA" = "1" ] ; then \
     wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa/cuda-keyring_1.1-1_all.deb && \
     dpkg -i cuda-keyring_1.1-1_all.deb && \
     apt-get update && \
-    apt-get -y install cuda-toolkit-12-8 ; \
+    apt-get -y --no-install-recommends install cuda-toolkit-12-8 ; \
     fi
 
 RUN if [ "$ENABLE_XLIO" = "1" ] ; then \
@@ -104,14 +120,14 @@ RUN if [ "$ENABLE_XLIO" = "1" ] ; then \
     fi
 
 RUN apt-get -y update && \
-    apt-get -y --no-install-recommends install qemu-system-x86  qemu-utils && \
+    apt-get -y --no-install-recommends install qemu-system-x86=1:10.2.1+ds-1ubuntu3 qemu-utils=1:10.2.1+ds-1ubuntu3 && \
     install -m 0755 -d /etc/apt/keyrings && \
     curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc && \
     chmod a+r /etc/apt/keyrings/docker.asc && \
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu resolute stable" \
         > /etc/apt/sources.list.d/docker.list && \
     apt-get -y update && \
-    apt-get -y --no-install-recommends install docker-ce docker-ce-cli containerd.io docker-buildx-plugin && \
+    apt-get -y --no-install-recommends install docker-ce=5:29.8.2-1~ubuntu.26.04~resolute docker-ce-cli=5:29.8.2-1~ubuntu.26.04~resolute containerd.io=2.3.6-1~ubuntu.26.04~resolute docker-buildx-plugin=0.37.1-1~ubuntu.26.04~resolute && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
@@ -133,7 +149,7 @@ RUN curl -fsSL \
     oras version
 
 RUN apt-get -y update && \
-    apt-get -y --no-install-recommends install python3-ply python3-gssapi python3-pip && \
+    apt-get -y --no-install-recommends install python3-ply=3.11-10 python3-gssapi=1.10.1-1build1 python3-pip=25.1.1+dfsg-1ubuntu2 && \
     pip3 install --break-system-packages xdrlib3 && \
     git clone https://github.com/chimera-nas/pynfs.git /opt/pynfs && \
     cd /opt/pynfs && git checkout "$PYNFS_REF" && python3 ./setup.py build && \
@@ -209,4 +225,46 @@ RUN npm install -g @informalsystems/quint@${QUINT_VERSION} && \
 RUN if [ "`dpkg --print-architecture`" = "amd64" ] ; then \
         curl -s http://qsan.mdh.quantum.com/sw/rels/sn/7.2.5_E/GA/delivery/saveobjs/Ubuntu25_x86_64/objs-snfs-130-master.tar.gz | \
         tar zxvf - -C / ./usr/cvfs/include ./usr/cvfs/lib ; \
+    fi
+
+# ---------------------------------------------------------------------------
+# apt+base lock gate.  Runs last, after every apt install across all RUN layers
+# (nothing below the pynfs layer touches dpkg: the git/dotnet/npm/StorNext steps
+# install to /usr/local, /opt and /usr/cvfs, not the dpkg database).  It is the
+# dev counterpart of builders/thin's lock gate, but dev has no immutable apt
+# snapshot: the internal mirror (and download.docker.com) are mutable, so the
+# frozen reference IS the committed builders/dev/packages.lock, captured from a
+# reference build's dpkg-query (see builders/dev/bump-pins.sh).  lock-gate.py is
+# byte-identical to builders/thin/lock-gate.py; only what feeds its --lists
+# differs (the committed closure, not a live snapshot index).
+#
+# The gate asserts every installed (Package, Arch, Version) is in packages.lock.
+# That freezes the apt+base layer ONLY -- it says NOTHING about the git/dotnet/
+# npm/StorNext sources, so its success line must never claim the image reproduces.
+# DEV_LOCK_GATE=off skips it (the bump/reference capture builds).
+COPY lock-gate.py /usr/local/lib/chimera-dev/lock-gate.py
+COPY packages.lock /usr/local/lib/chimera-dev/packages.lock
+RUN set -eu; \
+    if [ "$DEV_LOCK_GATE" = off ]; then \
+        echo "lock gate: SKIPPED (DEV_LOCK_GATE=off; reference/bump capture build)"; \
+    else \
+        gate=/usr/local/lib/chimera-dev/lock-gate.py; \
+        lists=/usr/local/lib/chimera-dev/packages.lock; \
+        dpkg-query -W -f '${db:Status-Status}\t${Package}\t${Architecture}\t${Version}\n' > /tmp/status; \
+        rc=0; python3 "$gate" --status /tmp/status --lists "$lists" \
+            --pin BASE_IMAGE="${BASE_IMAGE}" --manifest /usr/share/chimera-dev > /tmp/gate.out 2>/tmp/gate.err || rc=$?; \
+        if [ "$rc" != 0 ]; then \
+            echo "lock gate: FAILED (exit $rc) -- installed packages not in builders/dev/packages.lock (re-bump: make podman-image-bump PODMAN_FLAVOR=dev):" >&2; \
+            cat /tmp/gate.out /tmp/gate.err >&2; \
+            exit "$rc"; fi; \
+        n=$(grep -c '^Package: ' "$lists"); \
+        echo "lock gate: apt+base layer frozen -- $n packages, every installed package present in builders/dev/packages.lock"; \
+        echo "lock gate: covers the DEFAULT (ENABLE_DOCA=0) apt+base layer only -- internal mirror + download.docker.com; it does NOT cover ENABLE_DOCA=1 cuda packages, nor the git/dotnet/npm/StorNext sources, and is NOT a full-image reproducibility claim"; \
+        cp /tmp/status /tmp/status.leak; \
+        printf 'installed\topenssl\tamd64\t0.0-leak\n' >> /tmp/status.leak; \
+        rc=0; python3 "$gate" --status /tmp/status.leak --lists "$lists" > /tmp/leak.out 2>/dev/null || rc=$?; \
+        if [ "$rc" != 3 ] || [ "$(cat /tmp/leak.out)" != 'openssl:amd64=0.0-leak' ]; then \
+            echo "lock gate self-test FAILED (exit $rc): $(cat /tmp/leak.out)" >&2; exit 1; fi; \
+        echo "lock gate self-test: injected openssl:amd64=0.0-leak rejected (exit 3)"; \
+        rm -f /tmp/status /tmp/status.leak /tmp/gate.out /tmp/gate.err /tmp/leak.out; \
     fi
