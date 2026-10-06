@@ -570,6 +570,12 @@ main(
         chimera_server_config_set_smb_persistent_handles(server_config, json_is_true(json_value));
     }
 
+    json_value = json_object_get(server_params, "smb_persistent_cold_reclaim_window");
+    if (json_is_integer(json_value)) {
+        chimera_server_config_set_smb_persistent_cold_reclaim_window(server_config,
+                                                                     json_integer_value(json_value));
+    }
+
     json_value = json_object_get(server_params, "smb_directory_leases");
     if (json_is_boolean(json_value)) {
         chimera_server_config_set_smb_directory_leases(server_config, json_is_true(json_value));

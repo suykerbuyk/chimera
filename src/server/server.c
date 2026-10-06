@@ -159,6 +159,7 @@ struct chimera_server_config {
     int                                   smb_num_dialects;
     uint32_t                              smb_dialects[16];
     int                                   smb_persistent_handles;
+    int                                   smb_persistent_cold_reclaim_window;
     int                                   smb_directory_leases;
     int                                   smb_named_streams;
     int                                   smb_signing_required;
@@ -264,6 +265,12 @@ chimera_server_config_init(void)
     /* SMB3 durable/persistent handles are off by default; they are an
      * opt-in feature gated by the "smb_persistent_handles" config flag. */
     config->smb_persistent_handles = 0;
+    /* Cap (ms) on how long a cold (restart-recovered) persistent handle holds
+     * its file reserved for reclaim; the effective window is min(recorded
+     * durable timeout, this).  Defaults to the durable-timeout ceiling
+     * (CHIMERA_SMB_DURABLE_TIMEOUT_MAX_MS, 300000) so a recovered handle never
+     * outlasts a fresh one's maximum grace; 0 == no cap. */
+    config->smb_persistent_cold_reclaim_window = 300000;
 
     /* SMB3 directory leases are off by default; they are an opt-in feature
      * gated by the "smb_directory_leases" config flag.  When enabled the server
@@ -590,6 +597,20 @@ chimera_server_config_get_smb_persistent_handles(const struct chimera_server_con
 {
     return config->smb_persistent_handles;
 } /* chimera_server_config_get_smb_persistent_handles */
+
+SYMBOL_EXPORT void
+chimera_server_config_set_smb_persistent_cold_reclaim_window(
+    struct chimera_server_config *config,
+    int                           window_ms)
+{
+    config->smb_persistent_cold_reclaim_window = window_ms;
+} /* chimera_server_config_set_smb_persistent_cold_reclaim_window */
+
+SYMBOL_EXPORT int
+chimera_server_config_get_smb_persistent_cold_reclaim_window(const struct chimera_server_config *config)
+{
+    return config->smb_persistent_cold_reclaim_window;
+} /* chimera_server_config_get_smb_persistent_cold_reclaim_window */
 
 SYMBOL_EXPORT void
 chimera_server_config_set_smb_directory_leases(

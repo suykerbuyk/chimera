@@ -300,23 +300,29 @@
 /* ---- harness types ------------------------------------------------------ */
 
 struct smb2_env_opts {
-    int oplocks;            /* advertise legacy oplocks (set_smb_oplocks) */
-    int leases;             /* advertise SMB2 leases (set_smb_leases) */
-    int directory_leases;   /* advertise directory leases */
-    int persistent_handles; /* advertise durable/persistent handles */
+    int         oplocks;    /* advertise legacy oplocks (set_smb_oplocks) */
+    int         leases;     /* advertise SMB2 leases (set_smb_leases) */
+    int         directory_leases; /* advertise directory leases */
+    int         persistent_handles; /* advertise durable/persistent handles */
     /* SMB2_SHAREFLAG_FORCE_LEVELII_OPLOCK on the share: the server caps every
      * caching grant to a read (LEVEL_II / R) cache (MS-SMB2 2.2.10; the WPTS
      * OplockOnShareWithForceLevel2 / ShareForceLevel2 families). */
-    int force_level2;
+    int         force_level2;
     /* SMB2_SHARE_CAP_CONTINUOUS_AVAILABILITY on the share.  This is what makes
      * a PERSISTENT durable handle (DH2Q with SMB2_DHANDLE_FLAG_PERSISTENT)
      * grantable at all (MS-SMB2 3.3.5.9.10); on a non-CA share the server
      * grants an ordinary durable handle instead. */
-    int continuous_availability;
+    int         continuous_availability;
     /* Advertise named streams (SMB2_FILE_ATTRIBUTE_* / the "file:stream" create
      * syntax).  Off by default in the server, and only meaningful on a backend
      * that implements the stream ops -- memfs does. */
-    int named_streams;
+    int         named_streams;
+    /* VFS key-value module for persisted state (NULL/"" => the default in-memory
+     * "memkv", which does NOT survive a restart).  Set to "sqlite" for a probe
+     * that restarts the server and expects persisted durable records to be
+     * recovered; the harness points the module at <session_dir>/kv.db.  Must
+     * point at storage that outlives the env (a literal or static buffer). */
+    const char *kv_module;
 };
 
 /* Do the two profiles configure the server identically?  Compared field by
@@ -334,7 +340,9 @@ smb2_env_opts_eq(
            a->persistent_handles == b->persistent_handles &&
            a->force_level2 == b->force_level2 &&
            a->continuous_availability == b->continuous_availability &&
-           a->named_streams == b->named_streams;
+           a->named_streams == b->named_streams &&
+           ((a->kv_module == NULL && b->kv_module == NULL) ||
+            (a->kv_module && b->kv_module && strcmp(a->kv_module, b->kv_module) == 0));
 } /* smb2_env_opts_eq */
 
 /* How a connection is negotiated, authenticated and protected.
@@ -1125,6 +1133,19 @@ smb2_env_open_wire(
                                                          opts->persistent_handles);
         chimera_server_config_set_smb_named_streams(config,
                                                     opts->named_streams);
+        if (opts->kv_module && opts->kv_module[0]) {
+            /* Pre-register the KV module WITH its path config: chimera_vfs_init
+             * auto-registers an unknown kv_module with no config, which makes
+             * sqlite_init abort ("'path' missing"), so it must be registered
+             * here first.  The file lives in the state dir so it survives a
+             * smb2_env_restart. */
+            char kvcfg[320];
+
+            snprintf(kvcfg, sizeof(kvcfg), "{\"path\":\"%s/kv.db\"}",
+                     env->session_dir);
+            chimera_server_config_add_module(config, opts->kv_module, NULL, kvcfg);
+            chimera_server_config_set_kv_module(config, opts->kv_module);
+        }
     }
 
     if (opts) {
@@ -1371,6 +1392,94 @@ smb2_env_stop(struct smb2_env *env)
         fprintf(stderr, "warning: failed to remove %s\n", env->session_dir);
     }
 } /* smb2_env_stop */
+
+/* Restart the server in place: tear down the running server and client loop but
+ * KEEP the state dir (so a persistent KV and a persistent file backend living
+ * under it survive, exactly as real storage does across a server restart), then
+ * bring the server back up against the SAME state dir and opts.  Mounts/shares
+ * are NOT restored here (chimera_server_destroy drops them) -- the caller
+ * re-mounts and re-creates its share afterward, which is also what triggers the
+ * lazy cold-handle recovery scan.  All connections are invalidated; the caller
+ * opens fresh ones. */
+static inline void
+smb2_env_restart(struct smb2_env *env)
+{
+    struct chimera_server_config *config;
+
+    /* Conn structs must outlive evpl_destroy (final DISCONNECTED dereferences
+     * them), same ordering as smb2_env_stop -- but do NOT remove the state dir. */
+    evpl_destroy(env->evpl);
+    for (int i = 0; i < env->nconns; i++) {
+        free(env->conns[i]->sbuf);
+        free(env->conns[i]->rbuf);
+        free(env->conns[i]->create_reply);
+        free(env->conns[i]->xbuf);
+        free(env->conns[i]->ebuf);
+        free(env->conns[i]->dbuf);
+        free(env->conns[i]);
+        env->conns[i] = NULL;
+    }
+    env->nconns = 0;
+    if (env->server) {
+        chimera_server_destroy(env->server);
+        env->server = NULL;
+    }
+    prometheus_metrics_destroy(env->metrics);
+
+    /* Bring the server back up against the same state dir and opts (mirrors the
+    * relevant parts of smb2_env_open_wire; env->session_dir/opts/wire kept). */
+    env->metrics = prometheus_metrics_create(NULL, NULL, 0);
+
+    config = chimera_server_config_init();
+    chimera_server_config_set_state_dir(config, env->session_dir);
+    chimera_server_config_set_tcp_flavor(config, CHIMERA_TCP_FLAVOR_INPROC);
+    chimera_server_config_set_smb_enabled(config, 1);
+
+    if (env->wire && env->wire->sign) {
+        chimera_server_config_set_smb_signing_required(config, 1);
+    }
+    if (env->wire && env->wire->encrypt) {
+        chimera_server_config_set_smb_encryption(config, 2);
+    }
+    if (env->wire && env->wire->compress) {
+        chimera_server_config_set_smb_compression(config, 1);
+    }
+    if (env->wire && env->wire->max_dialect == 0x0311) {
+        chimera_server_config_set_smb_min_dialect(config, 0x0210);
+    }
+
+    chimera_server_config_set_smb_oplocks(config, env->opts.oplocks);
+    chimera_server_config_set_smb_leases(config, env->opts.leases);
+    chimera_server_config_set_smb_directory_leases(config, env->opts.directory_leases);
+    chimera_server_config_set_smb_persistent_handles(config, env->opts.persistent_handles);
+    chimera_server_config_set_smb_named_streams(config, env->opts.named_streams);
+    if (env->opts.kv_module && env->opts.kv_module[0]) {
+        char kvcfg[320];
+
+        snprintf(kvcfg, sizeof(kvcfg), "{\"path\":\"%s/kv.db\"}", env->session_dir);
+        chimera_server_config_add_module(config, env->opts.kv_module, NULL, kvcfg);
+        chimera_server_config_set_kv_module(config, env->opts.kv_module);
+    }
+
+    env->server = chimera_server_init(config, env->metrics);
+    chimera_server_start(env->server);
+
+    if (env->wire && env->wire->ntlmv2) {
+        const uint32_t gids[1] = { SMB2W_GID };
+
+        if (chimera_server_add_user(env->server, SMB2W_USER, SMB2W_PASSWORD,
+                                    SMB2W_PASSWORD, NULL,
+                                    SMB2W_UID, SMB2W_GID, 1, gids, 1) != 0) {
+            fprintf(stderr, "restart: failed to re-register SMB test user\n");
+            exit(1);
+        }
+    }
+
+    struct evpl_thread_config *tcfg = evpl_thread_config_init();
+
+    evpl_thread_config_set_wait_ms(tcfg, 1);
+    env->evpl = evpl_create(tcfg);
+} /* smb2_env_restart */
 
 /* ---- break queue helpers ------------------------------------------------ */
 

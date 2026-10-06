@@ -256,8 +256,10 @@ chimera_smb_server_init(
     smb_ntlm_resolve_server_identity(&shared->config.auth,
                                      &shared->config.auth.server_identity);
 
-    shared->config.soft_fail_bad_req            = chimera_server_config_get_soft_fail_bad_req(config);
-    shared->config.persistent_handles           = chimera_server_config_get_smb_persistent_handles(config);
+    shared->config.soft_fail_bad_req              = chimera_server_config_get_soft_fail_bad_req(config);
+    shared->config.persistent_handles             = chimera_server_config_get_smb_persistent_handles(config);
+    shared->config.persistent_cold_reclaim_window = chimera_server_config_get_smb_persistent_cold_reclaim_window(config)
+    ;
     shared->config.directory_leases             = chimera_server_config_get_smb_directory_leases(config);
     shared->config.named_streams                = chimera_server_config_get_smb_named_streams(config);
     shared->config.signing_required             = chimera_server_config_get_smb_signing_required(config);

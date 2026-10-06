@@ -562,6 +562,19 @@ chimera_smb_create_grant_durable(
         return;
     }
 
+    /* Cold-reclaim re-open (a DH2C reconnect whose matching handle was recovered
+     * from the persistent KV after a restart): persist_pid was forced by the
+     * reconnect path.  Re-establish the persistent durable grant on the reopened
+     * handle so it is reclaimable again, blocks conflicting opens, and its
+     * on-disk record is deleted at the final close.  The create_guid was already
+     * verified against the record in chimera_smb_durable_claim. */
+    if ((ctx & CHIMERA_SMB_CREATE_CTX_DH2C) && request->create.persist_pid != 0) {
+        memcpy(open_file->create_guid, request->create.dh2c.create_guid, 16);
+        open_file->durable_flags      = CHIMERA_SMB_DURABLE_V2 | CHIMERA_SMB_DURABLE_PERSISTENT;
+        open_file->durable_timeout_ms = CHIMERA_SMB_DURABLE_TIMEOUT_DEFAULT_MS;
+        return;
+    }
+
     has_caching = (open_file->oplock_level == SMB2_OPLOCK_LEVEL_BATCH) ||
         (open_file->lease_state & SMB2_LEASE_HANDLE_CACHING);
 
@@ -1049,6 +1062,21 @@ chimera_smb_create_gen_open_file(
                     break;
                 }
             }
+        }
+
+        /* A COLD (restart-recovered) persistent handle reserves this file too,
+         * but it holds no live open and therefore no claim -- the parked-pid
+         * scan above cannot see it.  Check the cold registry by (share, path).
+         * Skip the reclaim's OWN re-open (persist_pid set), which targets
+         * exactly this reservation and must not self-block. */
+        if (!blocked && thread->shared->config.persistent_handles &&
+            request->create.persist_pid == 0 &&
+            chimera_smb_durable_cold_reserves(thread->shared,
+                                              tree->share->name,
+                                              (uint32_t) strlen(tree->share->name),
+                                              open_file->full_path,
+                                              open_file->full_path_len)) {
+            blocked = true;
         }
 
         if (blocked) {
@@ -4449,6 +4477,38 @@ chimera_smb_create_persist_prepare(
     rec.name_len = name_len;
     memcpy(rec.name, request->create.name, name_len);
 
+    /* V2 identity: the owner to authenticate a cold reclaim against, the share
+     * it was granted on, and the share-relative full path to re-open on reclaim
+     * (never the reconnect's name).  persist_prepare runs BEFORE the open, so
+     * open_file->full_path does not exist yet -- reconstruct it here from the
+     * parsed parent_path (forward-slash) + leaf, in the same backslash,
+     * no-leading-separator form chimera_smb_create_gen_open_file builds. */
+    rec.owner_uid = request->session_handle->session->cred.uid;
+
+    rec.share_name_len = strlen(tree->share->name);
+    if (rec.share_name_len > CHIMERA_SMB_DURABLE_SHARE_MAX) {
+        rec.share_name_len = CHIMERA_SMB_DURABLE_SHARE_MAX;
+    }
+    memcpy(rec.share_name, tree->share->name, rec.share_name_len);
+
+    {
+        uint32_t parent_len = request->create.parent_path_len;
+
+        if (parent_len + 1 + name_len > SMB_PATH_MAX - 1) {
+            parent_len = 0; /* defensive clamp, mirrors gen_open_file */
+        }
+        if (parent_len > 0) {
+            memcpy(rec.full_path, request->create.parent_path, parent_len);
+            chimera_smb_slash_forward_to_back(rec.full_path, parent_len);
+            rec.full_path[parent_len] = '\\';
+            memcpy(rec.full_path + parent_len + 1, request->create.name, name_len);
+            rec.full_path_len = parent_len + 1 + name_len;
+        } else {
+            memcpy(rec.full_path, request->create.name, name_len);
+            rec.full_path_len = name_len;
+        }
+    }
+
     request->create.persist_hs.key       = request->create.persist_key;
     request->create.persist_hs.key_len   = chimera_smb_durable_key(request->create.persist_key, pid);
     request->create.persist_hs.value     = request->create.persist_value;
@@ -5022,6 +5082,42 @@ chimera_smb_create_lookup_parent_callback(
         request);
 } /* chimera_smb_create_lookup_parent_callback */
 
+/* Begin (or resume, after a tree revalidation) a durable-handle reclaim. */
+static void
+chimera_smb_durable_reconnect_begin(
+    struct chimera_smb_request *request);
+
+/* Compose a share-relative, backslash-joined path (no leading separator) from a
+ * parsed parent_path (forward-slash) + leaf, into `out` (SMB_PATH_MAX).  Matches
+ * the form chimera_smb_create_gen_open_file builds into open_file->full_path and
+ * that chimera_smb_create_persist_prepare records.  Returns the length. */
+static uint32_t
+chimera_smb_compose_share_path(
+    const char *parent_path,
+    uint32_t    parent_len,
+    const char *name,
+    uint32_t    name_len,
+    char       *out)
+{
+    uint32_t total;
+
+    if (parent_len + 1 + name_len > SMB_PATH_MAX - 1) {
+        parent_len = 0;
+    }
+    if (parent_len > 0) {
+        memcpy(out, parent_path, parent_len);
+        chimera_smb_slash_forward_to_back(out, parent_len);
+        out[parent_len] = '\\';
+        memcpy(out + parent_len + 1, name, name_len);
+        total = parent_len + 1 + name_len;
+    } else {
+        memcpy(out, name, name_len);
+        total = name_len;
+    }
+    out[total] = '\0';
+    return total;
+} /* chimera_smb_compose_share_path */
+
 static inline void
 chimera_smb_create_process(struct chimera_smb_request *request)
 {
@@ -5063,6 +5159,41 @@ chimera_smb_create_process(struct chimera_smb_request *request)
 } /* chimera_smb_create_process */
 
 
+/* Resume after a tree revalidation (and, when one was kicked off, after cold
+ * recovery has COMPLETED): a durable reconnect goes to the reclaim path, a
+ * fresh create to the open path.  Used both directly (no recovery needed) and
+ * as the recover_share completion continuation (recovery needed), so the first
+ * post-restart reclaim never races an async KV scan that has not yet populated
+ * the registry. */
+static void
+chimera_smb_revalidate_resume(void *arg)
+{
+    struct chimera_smb_request *request = arg;
+
+    if (request->create.reconnecting) {
+        request->create.reconnecting = 0;
+        chimera_smb_durable_reconnect_begin(request);
+    } else {
+        chimera_smb_create_process(request);
+    }
+} /* chimera_smb_revalidate_resume */
+
+/* recover_share completion: the scan is done and every recovered cold entry is
+ * in the registry.  Mark the share recovered (and no longer in flight) so later
+ * CREATEs skip the scan, then resume this request. */
+static void
+chimera_smb_recovery_done(void *arg)
+{
+    struct chimera_smb_request *request = arg;
+    struct chimera_smb_tree    *tree    = request->tree;
+
+    if (tree->type == CHIMERA_SMB_TREE_TYPE_SHARE && tree->share) {
+        tree->share->durable_recovered  = true;
+        tree->share->durable_recovering = false;
+    }
+    chimera_smb_revalidate_resume(request);
+} /* chimera_smb_recovery_done */
+
 static void
 chimera_smb_revalidate_tree_callback(
     enum chimera_vfs_error    error_code,
@@ -5086,16 +5217,26 @@ chimera_smb_revalidate_tree_callback(
 
     /* First time we hold this CA share's root handle, scan its backend for
      * persisted handle records left by a previous server instance and rebuild
-     * cold registry entries so they can be reclaimed on reconnect. */
+     * cold registry entries so they can be reclaimed on reconnect.  The scan is
+     * asynchronous (the persistent KV is CAP_BLOCKING, so recover_cb runs on a
+     * delegation thread); resume ONLY from its completion, so a reclaim that is
+     * the first CREATE on the share sees a populated registry instead of racing
+     * an empty one. */
     if (request->compound->thread->shared->config.persistent_handles &&
         tree->share && tree->share->continuous_availability &&
-        !tree->share->durable_recovered) {
-        tree->share->durable_recovered = true;
+        !tree->share->durable_recovered && !tree->share->durable_recovering) {
+        tree->share->durable_recovering = true;
         chimera_smb_durable_recover_share(request->compound->thread,
-                                          tree->fh, tree->fh_len);
+                                          tree->fh, tree->fh_len,
+                                          chimera_smb_recovery_done, request);
+        return;
     }
 
-    chimera_smb_create_process(request);
+    /* Either recovery is already complete, or a concurrent op has a scan in
+     * flight.  Resume now; a reconnect that finds the registry not-yet-populated
+     * (scan still in flight) retries on its own timer (see
+     * chimera_smb_durable_reconnect_attempt). */
+    chimera_smb_revalidate_resume(request);
 } /* chimera_smb_revalidate_tree_callback */
 
 static inline void
@@ -5220,6 +5361,7 @@ chimera_smb_durable_reconnect_attempt(struct chimera_smb_request *request)
 {
     struct chimera_server_smb_thread *thread = request->compound->thread;
     struct chimera_server_smb_shared *shared = thread->shared;
+    struct chimera_smb_tree          *tree   = request->tree;
     struct chimera_smb_open_file     *open_file;
     const uint8_t                    *create_guid = NULL;
     const uint8_t                    *lease_key   = NULL;
@@ -5227,8 +5369,13 @@ chimera_smb_durable_reconnect_attempt(struct chimera_smb_request *request)
     uint32_t                          status = SMB2_STATUS_OBJECT_NAME_NOT_FOUND;
     uint32_t                          ctx    = request->create.ctx_present_mask;
     bool                              has_lease_ctx;
-    bool                              cold  = false;
-    bool                              retry = false;
+    bool                              cold       = false;
+    bool                              retry      = false;
+    const char                       *share_name = (tree->type == CHIMERA_SMB_TREE_TYPE_SHARE &&
+                                                    tree->share) ? tree->share->name : "";
+    uint32_t                          share_name_len = (uint32_t) strlen(share_name);
+    char                              cold_full_path[SMB_PATH_MAX];
+    uint32_t                          cold_full_path_len = 0;
 
     if (ctx & CHIMERA_SMB_CREATE_CTX_DH2C) {
         persistent_id = request->create.dh2c.persistent;
@@ -5248,26 +5395,80 @@ chimera_smb_durable_reconnect_attempt(struct chimera_smb_request *request)
     bool reconnect_persistent = (ctx & CHIMERA_SMB_CREATE_CTX_DH2C) &&
         (request->create.dh2c.flags & SMB2_DHANDLE_FLAG_PERSISTENT);
 
+    /* The reconnect's composed path, for the cold NAME binding inside the claim.
+     * A durable reconnect normally sends an empty name (always so for v2): then
+     * recon_path_len is 0 and the claim binds to the recorded path.  A non-empty
+     * reconnect name is composed here and the claim rejects it if it names a
+     * different path than the record (INVALID_PARAMETER), without consuming the
+     * entry. */
+    char     recon_path[SMB_PATH_MAX];
+    uint32_t recon_path_len = 0;
+
+    if (request->create.name_len > 0 || request->create.parent_path_len > 0) {
+        recon_path_len = chimera_smb_compose_share_path(
+            request->create.parent_path, request->create.parent_path_len,
+            request->create.name, request->create.name_len, recon_path);
+    }
+
     open_file = chimera_smb_durable_claim(shared, persistent_id, create_guid,
                                           request->compound->conn->client_guid,
                                           request->session_handle->session->cred.uid,
                                           request->create.name, request->create.name_len,
                                           has_lease_ctx, lease_key, reconnect_persistent,
+                                          recon_path, recon_path_len,
+                                          share_name, share_name_len,
+                                          cold_full_path, &cold_full_path_len,
                                           &cold, &retry, &status);
 
     if (cold) {
         /* Recovered-after-restart persistent handle: there is no live open to
-         * re-home.  Re-open the file from scratch via the normal create path
-         * (the reconnect CREATE carries the name + access), forcing the
-         * recovered persistent id so the open re-adopts its identity and the
-         * backend record is refreshed atomically. */
+         * re-home.  Owner, CreateGuid, client GUID, share AND name were all
+         * verified in the claim.  Re-open the RECORDED path (never the
+         * reconnect's), forcing the
+         * recovered persistent id so the reopened handle re-adopts its identity.
+         * Override parent_path/name with the recorded path split into
+         * parent (forward-slash) + leaf, mirroring the CREATE parse; an empty
+         * reconnect name therefore reopens the record, which is also the fix for
+         * the former empty-name-opens-the-share-root behaviour.  The on-disk
+         * record already holds the original owner and path and is left intact
+         * (deleted only at the final close). */
+        memcpy(request->create.parent_path, cold_full_path, cold_full_path_len);
+        request->create.parent_path[cold_full_path_len] = '\0';
+        request->create.parent_path_len                 = cold_full_path_len;
+        {
+            char *slash = strrchr(request->create.parent_path, '\\');
+
+            if (slash) {
+                *slash                   = '\0';
+                request->create.name     = slash + 1;
+                request->create.name_len = cold_full_path_len -
+                    (uint32_t) (slash - request->create.parent_path) - 1;
+                request->create.parent_path_len = (uint32_t) (slash - request->create.parent_path);
+                chimera_smb_slash_back_to_forward(request->create.parent_path,
+                                                  request->create.parent_path_len);
+            } else {
+                request->create.name            = request->create.parent_path;
+                request->create.name_len        = cold_full_path_len;
+                request->create.parent_path_len = 0;
+            }
+        }
+
         request->create.persist_pid = persistent_id;
         chimera_smb_create_process(request);
         return true;
     }
 
     if (!open_file) {
-        if (retry) {
+        /* Retry while the claim asks us to (racing the previous connection's
+         * disconnect), OR while this share's cold-recovery scan is still in
+         * flight: a concurrent first-CREATE kicked the async KV scan, so the
+         * recovered entry may not be in the registry yet.  The reconnect retry
+         * timer re-drives until the scan completes (entry appears) or the budget
+         * lapses (genuinely not found -> OBJECT_NAME_NOT_FOUND). */
+        if (retry ||
+            (status == SMB2_STATUS_OBJECT_NAME_NOT_FOUND &&
+             tree->type == CHIMERA_SMB_TREE_TYPE_SHARE && tree->share &&
+             tree->share->durable_recovering)) {
             return false;
         }
         chimera_smb_complete_request(request, status);
@@ -5308,33 +5509,13 @@ chimera_smb_durable_reconnect_retry_cb(
                            CHIMERA_SMB_DURABLE_RECONNECT_INTERVAL_US);
 } /* chimera_smb_durable_reconnect_retry_cb */
 
-/* Durable-handle reconnect (DH2C / DHnC).  Reclaims a parked open that
- * survived its previous connection and re-homes it into the reconnecting
- * tree, then replies as a normal OPEN of the surviving file. */
+/* Begin (or resume, after a tree revalidation) a durable-handle reclaim: one
+ * attempt, then -- if the handle is racing its previous connection's disconnect
+ * -- park on the short retry timer until it settles or the budget lapses. */
 static void
-chimera_smb_durable_reconnect(struct chimera_smb_request *request)
+chimera_smb_durable_reconnect_begin(struct chimera_smb_request *request)
 {
     struct chimera_server_smb_thread *thread = request->compound->thread;
-    uint32_t                          ctx    = request->create.ctx_present_mask;
-
-    /* Reject malformed reconnect-context combinations:
-     *   - DH2C (3.3.5.9.12) must stand alone: combining it with ANY other
-     *     durable context (DHnQ, DH2Q, or DHnC) is INVALID_PARAMETER.
-     *   - DHnC (3.3.5.9.7) may carry a v1 durable *request* (DHnQ) -- the request
-     *     is simply ignored -- but combining it with a v2 context (DH2Q or DH2C)
-     *     is INVALID_PARAMETER.
-     * So a lone DHnC, a lone DH2C, or DHnC+DHnQ are all valid reconnects. */
-    if ((ctx & CHIMERA_SMB_CREATE_CTX_DH2C) &&
-        (ctx & (CHIMERA_SMB_CREATE_CTX_DHNQ | CHIMERA_SMB_CREATE_CTX_DH2Q |
-                CHIMERA_SMB_CREATE_CTX_DHNC))) {
-        chimera_smb_complete_request(request, SMB2_STATUS_INVALID_PARAMETER);
-        return;
-    }
-    if ((ctx & CHIMERA_SMB_CREATE_CTX_DHNC) &&
-        (ctx & (CHIMERA_SMB_CREATE_CTX_DH2Q | CHIMERA_SMB_CREATE_CTX_DH2C))) {
-        chimera_smb_complete_request(request, SMB2_STATUS_INVALID_PARAMETER);
-        return;
-    }
 
     if (chimera_smb_durable_reconnect_attempt(request)) {
         return;
@@ -5357,6 +5538,53 @@ chimera_smb_durable_reconnect(struct chimera_smb_request *request)
     evpl_add_oneshot_timer(thread->evpl, &request->async.timer,
                            chimera_smb_durable_reconnect_retry_cb,
                            CHIMERA_SMB_DURABLE_RECONNECT_INTERVAL_US);
+} /* chimera_smb_durable_reconnect_begin */
+
+/* Durable-handle reconnect (DH2C / DHnC).  Reclaims a parked open that
+ * survived its previous connection and re-homes it into the reconnecting
+ * tree, then replies as a normal OPEN of the surviving file. */
+static void
+chimera_smb_durable_reconnect(struct chimera_smb_request *request)
+{
+    struct chimera_smb_tree *tree = request->tree;
+    uint32_t                 ctx  = request->create.ctx_present_mask;
+    struct timespec          now;
+
+    /* Reject malformed reconnect-context combinations:
+     *   - DH2C (3.3.5.9.12) must stand alone: combining it with ANY other
+     *     durable context (DHnQ, DH2Q, or DHnC) is INVALID_PARAMETER.
+     *   - DHnC (3.3.5.9.7) may carry a v1 durable *request* (DHnQ) -- the request
+     *     is simply ignored -- but combining it with a v2 context (DH2Q or DH2C)
+     *     is INVALID_PARAMETER.
+     * So a lone DHnC, a lone DH2C, or DHnC+DHnQ are all valid reconnects. */
+    if ((ctx & CHIMERA_SMB_CREATE_CTX_DH2C) &&
+        (ctx & (CHIMERA_SMB_CREATE_CTX_DHNQ | CHIMERA_SMB_CREATE_CTX_DH2Q |
+                CHIMERA_SMB_CREATE_CTX_DHNC))) {
+        chimera_smb_complete_request(request, SMB2_STATUS_INVALID_PARAMETER);
+        return;
+    }
+    if ((ctx & CHIMERA_SMB_CREATE_CTX_DHNC) &&
+        (ctx & (CHIMERA_SMB_CREATE_CTX_DH2Q | CHIMERA_SMB_CREATE_CTX_DH2C))) {
+        chimera_smb_complete_request(request, SMB2_STATUS_INVALID_PARAMETER);
+        return;
+    }
+
+    /* A COLD reclaim needs its registry entry to exist and the share-root fh to
+     * be current: the entry is only rebuilt on the share's first revalidate
+     * (lazy cold recovery), and the cold re-open resolves the recorded path
+     * against tree->fh.  The reconnect dispatch runs BEFORE the fresh-create
+     * revalidate, so route through revalidation here when the fh is stale or the
+     * share has not been recovered yet; otherwise begin immediately. */
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (tree->type == CHIMERA_SMB_TREE_TYPE_SHARE && tree->share &&
+        (chimera_timespec_cmp(&now, &tree->fh_expiration) > 0 ||
+         (tree->share->continuous_availability && !tree->share->durable_recovered))) {
+        request->create.reconnecting = 1;
+        chimera_smb_revalidate_tree(tree, request);
+        return;
+    }
+
+    chimera_smb_durable_reconnect_begin(request);
 } /* chimera_smb_durable_reconnect */
 
 /* Parse an SMB stream-name suffix out of the final path component
@@ -5927,9 +6155,10 @@ chimera_smb_create(struct chimera_smb_request *request)
 
     /* No persistent-handle grant by default; set by the reconnect path (cold
      * reclaim) or chimera_smb_create_persist_prepare for a fresh grant. */
-    request->create.persist_pid = 0;
-    request->create.reconnect   = 0;
-    request->create.replay      = 0;
+    request->create.persist_pid  = 0;
+    request->create.reconnect    = 0;
+    request->create.reconnecting = 0;
+    request->create.replay       = 0;
     /* Default share-conflict status; an AppInstanceId version reject overrides
      * it with STATUS_FILE_FORCED_CLOSED inside gen_open_file. */
     request->create.force_close_status = SMB2_STATUS_SHARING_VIOLATION;

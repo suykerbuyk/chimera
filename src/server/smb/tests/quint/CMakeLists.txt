@@ -118,6 +118,26 @@ set_tests_properties(chimera/server/smb/mbt/durable_probe_memfs PROPERTIES
     LABELS "functional;probe;smb_mbt;memfs"
     TIMEOUT 120)
 
+# Persistent-handle COLD reclaim probe: a genuine in-process restart over the
+# persistent sqlite KV + a persistent linux file backend, exercising the
+# cold-reclaim enforcement matrix (owner authentication, name/share binding,
+# CreateGuid/DHnC handling, conflict reservation and window expiry) with
+# negative controls.  Needs the sqlite KV module, so it is registered only when
+# that backend was built (CHIMERA_HAVE_SQLITE_VFS); it links it explicitly so
+# --as-needed cannot drop the module symbol dlsym resolves at runtime.
+if(TARGET chimera_vfs_sqlite)
+    add_executable(smb2_durable_cold_probe smb2_durable_cold_probe.c)
+    target_include_directories(smb2_durable_cold_probe PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(smb2_durable_cold_probe chimera_server chimera_metrics chimera_vfs_sqlite)
+
+    add_test(NAME chimera/server/smb/mbt/durable_cold_probe_linux
+        COMMAND $<TARGET_FILE:smb2_durable_cold_probe>)
+    set_tests_properties(chimera/server/smb/mbt/durable_cold_probe_linux PROPERTIES
+        ENVIRONMENT "CHIMERA_MBT_ARTIFACTS=smb2_durable_cold_probe_linux"
+        LABELS "functional;probe;smb_mbt;linux"
+        TIMEOUT 120)
+endif()
+
 # Replay / ChannelSequence ground-truth probe: pins the exactly-once layer --
 # the command-sequence window, what makes a CREATE replayable, the four
 # create_guid classification outcomes, and the ChannelSequence accept/reject

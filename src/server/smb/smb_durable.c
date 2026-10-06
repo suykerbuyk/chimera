@@ -26,7 +26,43 @@
  * acquires a bucket lock while holding the registry lock, and the heavyweight
  * VFS teardown in the sweeper runs after the registry lock is dropped, so the
  * global order bucket -> registry -> vfs_state holds with no inversion.
+ *
+ * COLD RECLAIM (server-restart recovery).
+ *
+ * A persistent handle's record is persisted in the share's backend KV and, after
+ * a restart, recovered into a "cold" registry entry (open_file == NULL) by
+ * chimera_smb_durable_recover_entry.  A reconnect (DH2C) then re-opens the file.
+ * Two properties are enforced before the re-open, mirroring the warm path:
+ *
+ *   - Authentication.  The reclaim succeeds only for the same owner that was
+ *     granted the handle.  The enforcement value is the uid (MS-SMB2
+ *     Open.DurableOwner), persisted in the V2 record and compared in
+ *     chimera_smb_durable_claim against the reconnecting session's cred.uid --
+ *     identical to the warm owner check.  CAVEAT: uid is only as strong as the
+ *     identity-to-uid mapping.  A guest/anonymous session, or a many-to-one
+ *     idmap that collapses distinct principals onto one uid, weakens the
+ *     binding; a principal/SID-based binding is the larger cross-protocol
+ *     identity question tracked as Q-SEC-1 / E13, not resolved here.
+ *
+ *   - Name binding.  The record carries the owning share name and the
+ *     share-relative full path; a cold reclaim is refused if the reconnecting
+ *     tree's share differs, and the re-open uses the RECORDED path, never the
+ *     reconnect's name (the caller validates a non-empty reconnect name against
+ *     the record and rejects a mismatch).  A legacy V1 record carries neither,
+ *     so it is marked unverifiable and refused (fail closed).
+ *
+ * DEVIATION (bounded cold-reclaim window).  MS-SMB2 persistent handles never
+ * expire -- they hold their file until an explicit reclaim or close.  A WARM
+ * persistent holder keeps that semantics here (chimera_smb_durable_park sets
+ * never_expires).  A COLD entry instead expires at a bounded window
+ * (min(recorded durable timeout, smb_persistent_cold_reclaim_window); see
+ * chimera_smb_durable_recover_entry and chimera_smb_durable_sweep), so a client
+ * that never returns after a restart cannot pin a file indefinitely.  This is a
+ * deliberate availability-over-strict-conformance choice; the window is
+ * operator-tunable.
  */
+
+#include <strings.h>   /* strncasecmp */
 
 #include "common/thread.h"
 #include "smb_internal.h"
@@ -35,8 +71,34 @@
 #include "vfs/vfs_procs.h"
 #include "vfs/vfs_release.h"
 
+/* Case-insensitive equality of two length-counted SMB names (share or path).
+ * SMB share and path matching is case-insensitive, and the server already folds
+ * case with strncasecmp elsewhere (share lookup uses strcasecmp, the stream-type
+ * check uses strncasecmp); reuse that ASCII fold here rather than a byte-exact
+ * memcmp, so a case-variant reclaim or conflicting open cannot slip past the
+ * share binding, the cold name binding, or the cold reservation.  Bytes >= 0x80
+ * (UTF-8 continuation/lead) are left unfolded, exactly as those call sites do. */
+static inline bool
+chimera_smb_durable_name_eq(
+    const char *a,
+    uint32_t    alen,
+    const char *b,
+    uint32_t    blen)
+{
+    return alen == blen && (alen == 0 || strncasecmp(a, b, alen) == 0);
+} /* chimera_smb_durable_name_eq */
+
 struct chimera_smb_durable_recover_ctx {
     struct chimera_server_smb_shared *shared;
+    /* Continuation run once the (asynchronous) scan completes and every
+     * recovered cold entry is in the registry.  NULL for a fire-and-forget
+     * scan; the durable-reconnect path passes one so the first post-restart
+     * reclaim waits for recovery instead of racing it (the KV is CAP_BLOCKING,
+     * so recover_cb runs on a delegation thread and the registry is not
+     * populated synchronously). */
+    void                              (*done)(
+        void *arg);
+    void                             *done_arg;
 };
 
 SYMBOL_EXPORT void
@@ -110,15 +172,26 @@ chimera_smb_durable_recover_entry(
     struct chimera_smb_durable_entry *entry, *existing;
     uint64_t                          pid = record->persistent_id;
     uint32_t                          name_len;
+    uint32_t                          share_name_len;
+    uint32_t                          full_path_len;
+    uint64_t                          window_ms;
+    int                               cap_ms;
+    struct timespec                   now;
 
     entry = calloc(1, sizeof(*entry));
 
     entry->persistent_id = record->persistent_id;
     entry->session_id    = record->session_id;
+    entry->owner_uid     = record->owner_uid;
     entry->open_file     = NULL;
     entry->parked        = true;
     entry->persistent    = true;
     entry->cold          = true;
+    /* A legacy V1 record carries no owner / share / path, so a cold reclaim of
+     * it can be neither authenticated nor name-bound: mark it unverifiable and
+     * the claim path refuses it (fail closed).  It still reserves its file and
+     * is swept at the window like any other cold entry. */
+    entry->unverifiable = record->legacy ? true : false;
     memcpy(entry->create_guid, record->create_guid, sizeof(entry->create_guid));
     memcpy(entry->client_guid, record->client_guid, sizeof(entry->client_guid));
 
@@ -128,6 +201,47 @@ chimera_smb_durable_recover_entry(
     }
     entry->name_len = name_len;
     memcpy(entry->name, record->name, name_len);
+
+    share_name_len = record->share_name_len;
+    if (share_name_len > sizeof(entry->share_name)) {
+        share_name_len = sizeof(entry->share_name);
+    }
+    entry->share_name_len = share_name_len;
+    memcpy(entry->share_name, record->share_name, share_name_len);
+
+    full_path_len = record->full_path_len;
+    if (full_path_len > sizeof(entry->full_path)) {
+        full_path_len = sizeof(entry->full_path);
+    }
+    entry->full_path_len = full_path_len;
+    memcpy(entry->full_path, record->full_path, full_path_len);
+
+    /* A cold persistent handle holds its file reserved for reclaim for a bounded
+     * window after recovery, then the sweeper releases it -- so a client that
+     * never returns after a restart cannot pin the file forever.  The window is
+     * the recorded durable timeout, capped by the operator knob
+     * smb_persistent_cold_reclaim_window (0 == no cap).  Unlike a WARM persistent
+     * handle (chimera_smb_durable_park sets never_expires), a cold entry DOES
+     * expire -- a deliberate deviation from strict MS-SMB2 never-expire
+     * persistent semantics, documented at the top of this translation unit. */
+    window_ms = record->durable_timeout_ms ? record->durable_timeout_ms
+        : CHIMERA_SMB_DURABLE_TIMEOUT_DEFAULT_MS;
+    cap_ms = shared->config.persistent_cold_reclaim_window;
+    if (cap_ms < 0) {
+        cap_ms = 0;   /* a negative cap is nonsensical; treat as no cap (0) */
+    }
+    if (cap_ms > 0 && window_ms > (uint64_t) cap_ms) {
+        window_ms = (uint64_t) cap_ms;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    entry->never_expires     = false;
+    entry->deadline          = now;
+    entry->deadline.tv_sec  += window_ms / 1000;
+    entry->deadline.tv_nsec += (window_ms % 1000) * 1000000L;
+    if (entry->deadline.tv_nsec >= 1000000000L) {
+        entry->deadline.tv_sec  += 1;
+        entry->deadline.tv_nsec -= 1000000000L;
+    }
 
     evpl_mutex_lock(&shared->durable.lock);
     HASH_FIND(hh, shared->durable.by_pid, &pid, sizeof(pid), existing);
@@ -478,6 +592,58 @@ chimera_smb_durable_parked_hold(
     return hold;
 } /* chimera_smb_durable_parked_hold */
 
+/* A COLD (restart-recovered) persistent handle reserves its file for reclaim,
+ * exactly as a warm persistent holder does -- but a cold entry has no live VFS
+ * open and therefore no file-state claim, so the claim-keyed parked_hold above
+ * (driven by the conflicting open's own claims) cannot see it.  This path-keyed
+ * scan is how a cold reservation blocks a conflicting fresh open: it matches by
+ * (share name, share-relative full path) rather than by a live claim.  A match
+ * still within its reclaim window => block (FILE_NOT_AVAILABLE) until the owner
+ * reclaims it or the window lapses (after which the sweeper releases it and
+ * this returns false).  The registry is small (one entry per outstanding
+ * persistent handle), so the linear scan is cheap. */
+SYMBOL_EXPORT bool
+chimera_smb_durable_cold_reserves(
+    struct chimera_server_smb_shared *shared,
+    const char                       *share_name,
+    uint32_t                          share_name_len,
+    const char                       *full_path,
+    uint32_t                          full_path_len)
+{
+    struct chimera_smb_durable_entry *entry, *tmp;
+    bool                              reserved = false;
+    struct timespec                   now;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+
+    evpl_mutex_lock(&shared->durable.lock);
+
+    HASH_ITER(hh, shared->durable.by_pid, entry, tmp)
+    {
+        if (!entry->cold || !entry->persistent || !entry->parked) {
+            continue;
+        }
+        /* Lapsed its window (sweeper has not run yet): no longer reserves. */
+        if (chimera_timespec_cmp(&now, &entry->deadline) >= 0) {
+            continue;
+        }
+        if (!chimera_smb_durable_name_eq(entry->share_name, entry->share_name_len,
+                                         share_name, share_name_len)) {
+            continue;
+        }
+        if (!chimera_smb_durable_name_eq(entry->full_path, entry->full_path_len,
+                                         full_path, full_path_len)) {
+            continue;
+        }
+        reserved = true;
+        break;
+    }
+
+    evpl_mutex_unlock(&shared->durable.lock);
+
+    return reserved;
+} /* chimera_smb_durable_cold_reserves */
+
 SYMBOL_EXPORT struct chimera_smb_open_file *
 chimera_smb_durable_claim(
     struct chimera_server_smb_shared *shared,
@@ -490,6 +656,12 @@ chimera_smb_durable_claim(
     bool                              has_lease_ctx,
     const uint8_t                    *lease_key,
     bool                              reconnect_persistent,
+    const char                       *recon_path,
+    uint32_t                          recon_path_len,
+    const char                       *tree_share_name,
+    uint32_t                          tree_share_name_len,
+    char                             *r_full_path,
+    uint32_t                         *r_full_path_len,
     bool                             *r_cold,
     bool                             *r_retry,
     uint32_t                         *status)
@@ -499,8 +671,9 @@ chimera_smb_durable_claim(
     bool                              had_lease;
     struct timespec                   now;
 
-    *r_cold  = false;
-    *r_retry = false;
+    *r_cold          = false;
+    *r_retry         = false;
+    *r_full_path_len = 0;
 
     clock_gettime(CLOCK_MONOTONIC, &now);
 
@@ -544,7 +717,18 @@ chimera_smb_durable_claim(
          * write-caching lease breaks), so the reconnect must not find it.
          * The grace-timer sweep reaps the carcass. */
         *status = SMB2_STATUS_OBJECT_NAME_NOT_FOUND;
+    } else if (entry->cold && entry->unverifiable) {
+        /* Recovered from a legacy (V1) record with no owner / share / path: it
+         * can be neither authenticated nor name-bound, so it is not
+         * reclaimable.  Fail closed and non-disclosing. */
+        *status = SMB2_STATUS_OBJECT_NAME_NOT_FOUND;
     } else if (create_guid && memcmp(entry->create_guid, create_guid, 16) != 0) {
+        *status = SMB2_STATUS_OBJECT_NAME_NOT_FOUND;
+    } else if (entry->cold && !create_guid) {
+        /* A cold persistent reclaim must present a matching CreateGuid (DH2C).
+         * DHnC (v1 reconnect) carries none, so it cannot reclaim a persistent
+         * handle recovered after a restart (MS-SMB2 3.3.5.9.12 governs
+         * persistent reclaim by CreateGuid, not the v1 path). */
         *status = SMB2_STATUS_OBJECT_NAME_NOT_FOUND;
     } else if (reconnect_persistent && !entry->persistent) {
         /* MS-SMB2 3.3.5.9.12: the reconnect set SMB2_DHANDLE_FLAG_PERSISTENT but
@@ -579,21 +763,47 @@ chimera_smb_durable_claim(
          * non-lease (oplock) reconnect both ignore the name entirely: the
          * handle's identity is its persistent id, plus the create_guid for v2. */
         *status = SMB2_STATUS_INVALID_PARAMETER;
-    } else if (!entry->cold && entry->owner_uid != owner_uid) {
+    } else if (entry->cold &&
+               !chimera_smb_durable_name_eq(entry->share_name, entry->share_name_len,
+                                            tree_share_name, tree_share_name_len)) {
+        /* The reconnecting tree is connected to a different share than the one
+         * the handle was granted on: not the same durable open.  (by_pid is
+         * global, so without this a cold reclaim could be driven through any
+         * share that happens to be CA.) */
+        *status = SMB2_STATUS_OBJECT_NAME_NOT_FOUND;
+    } else if (entry->owner_uid != owner_uid) {
         /* MS-SMB2 3.3.5.9.7 step 9: the reconnecting session's user must be the
          * same user that owns the durable/resilient open (Open.DurableOwner).  A
-         * reclaim by a different user is denied with STATUS_ACCESS_DENIED.  Cold
-         * (server-restart-recovered) entries carry no in-memory owner, so the
-         * check applies only to warm handles. */
+         * reclaim by a different user is denied with STATUS_ACCESS_DENIED.  This
+         * now runs for COLD (restart-recovered) entries too: recover_entry
+         * populates owner_uid from the persisted V2 record, so a cold reclaim is
+         * authenticated exactly like a warm one.  (uid is the enforcement value;
+         * see the uid-binding caveat at the top of this translation unit.) */
         *status = SMB2_STATUS_ACCESS_DENIED;
     } else if (entry->cold) {
-        /* Recovered-after-restart entry: there is no live open to re-home.
-         * Remove it and tell the caller to re-open the file (cold reclaim);
-         * the reopen path re-registers a fresh warm entry. */
-        HASH_DELETE(hh, shared->durable.by_pid, entry);
-        free(entry);
-        *r_cold = true;
-        *status = SMB2_STATUS_SUCCESS;
+        /* Recovered-after-restart entry: there is no live open to re-home.  The
+         * legacy guard, CreateGuid, client GUID, share and owner are all
+         * verified above.  Bind the NAME here, BEFORE consuming the entry: a
+         * non-empty reconnect name (recon_path_len > 0) must equal the recorded
+         * full path, else the reclaim is being redirected -> INVALID_PARAMETER
+         * and the entry is left intact.  An empty reconnect name (the usual
+         * durable-reconnect form) binds to the recorded path unconditionally.
+         * On success, hand the recorded path back for the caller to re-open
+         * (never the reconnect's name), remove the cold entry, and leave the
+         * on-disk record (which already holds the original owner and path) for
+         * the final close to delete. */
+        if (recon_path_len > 0 &&
+            !chimera_smb_durable_name_eq(recon_path, recon_path_len,
+                                         entry->full_path, entry->full_path_len)) {
+            *status = SMB2_STATUS_INVALID_PARAMETER;
+        } else {
+            memcpy(r_full_path, entry->full_path, entry->full_path_len);
+            *r_full_path_len = entry->full_path_len;
+            HASH_DELETE(hh, shared->durable.by_pid, entry);
+            free(entry);
+            *r_cold = true;
+            *status = SMB2_STATUS_SUCCESS;
+        }
     } else {
         /* Warm reclaim: flip out of the parked state so the sweeper leaves it
         * alone, and hand the surviving open back to the caller to re-home. */
@@ -743,11 +953,15 @@ chimera_smb_durable_sweep(struct chimera_server_smb_thread *thread)
         if (!entry->parked) {
             continue;
         }
-        /* A pure persistent (CA) handle does not expire on the grace timer (it
-         * lives until explicit close or admin action), and cold entries have no
-         * live open to tear down — skip both.  A persistent+resilient handle is
-         * NOT never_expires: its resiliency timeout governs and it IS reaped. */
-        if (entry->never_expires || entry->cold || !entry->open_file) {
+        /* A WARM pure persistent (CA) handle does not expire on the grace timer
+         * (it lives until explicit close or admin action); a warm entry with no
+         * live open is not a thing to reap here.  A COLD (restart-recovered)
+         * entry has no live open but DOES expire at its recovery window, so an
+         * unreclaimed persistent handle cannot pin its file forever (the
+         * deviation documented at the top of this translation unit).  A
+         * persistent+resilient warm handle is NOT never_expires: its resiliency
+         * timeout governs and it IS reaped. */
+        if (!entry->cold && (entry->never_expires || !entry->open_file)) {
             continue;
         }
         if (chimera_timespec_cmp(&now, &entry->deadline) < 0) {
@@ -765,14 +979,22 @@ chimera_smb_durable_sweep(struct chimera_server_smb_thread *thread)
         entry   = expired;
         expired = expired->reap_next;
 
-        chimera_smb_debug("durable: reaping expired handle pid=%lx '%.*s'",
-                          open_file->file_id.pid, open_file->name_len, open_file->name);
+        if (open_file) {
+            chimera_smb_debug("durable: reaping expired handle pid=%lx '%.*s'",
+                              open_file->file_id.pid, open_file->name_len, open_file->name);
 
-        chimera_smb_open_file_drain_locks(thread, open_file);
-        /* Grace-timer reap honors delete-on-close (a DELETE_ON_CLOSE durable
-         * handle whose last close is this expiry unlinks the file). */
-        chimera_smb_durable_release_handle(thread, open_file);
-        chimera_smb_open_file_free(thread, open_file);
+            chimera_smb_open_file_drain_locks(thread, open_file);
+            /* Grace-timer reap honors delete-on-close (a DELETE_ON_CLOSE durable
+             * handle whose last close is this expiry unlinks the file). */
+            chimera_smb_durable_release_handle(thread, open_file);
+            chimera_smb_open_file_free(thread, open_file);
+        } else {
+            /* Cold entry: only registry bookkeeping to release (the file was
+             * never opened in this instance, so there is no VFS state to tear
+             * down).  The on-disk record stays for a later restart's recovery. */
+            chimera_smb_debug("durable: releasing expired cold reservation pid=%lx",
+                              entry->persistent_id);
+        }
 
         free(entry);
     }
@@ -887,13 +1109,30 @@ chimera_smb_durable_serialize(
     uint32_t                                 buf_size,
     const struct chimera_smb_durable_record *record)
 {
-    uint32_t p = 0;
+    uint32_t p              = 0;
+    uint32_t name_len       = record->name_len;
+    uint32_t share_name_len = record->share_name_len;
+    uint32_t full_path_len  = record->full_path_len;
 
-    if (buf_size < CHIMERA_SMB_DURABLE_REC_HDR_LEN + record->name_len) {
+    /* Clamp each variable field to the storage its on-disk slot allows; the
+     * callers already bound these, but never serialize past a field's limit. */
+    if (name_len > SMB_FILENAME_MAX) {
+        name_len = SMB_FILENAME_MAX;
+    }
+    if (share_name_len > CHIMERA_SMB_DURABLE_SHARE_MAX) {
+        share_name_len = CHIMERA_SMB_DURABLE_SHARE_MAX;
+    }
+    if (full_path_len > SMB_PATH_MAX) {
+        full_path_len = SMB_PATH_MAX;
+    }
+
+    if (buf_size < CHIMERA_SMB_DURABLE_REC_HDR_LEN_V2 + name_len +
+        share_name_len + full_path_len) {
         return 0;
     }
 
-    durable_put_le32(buf, &p, CHIMERA_SMB_DURABLE_RECORD_MAGIC);
+    /* Always write the current (V2) format; the deserializer still reads V1. */
+    durable_put_le32(buf, &p, CHIMERA_SMB_DURABLE_RECORD_MAGIC_V2);
     durable_put_le64(buf, &p, record->persistent_id);
     memcpy(buf + p, record->create_guid, 16);
     p += 16;
@@ -904,9 +1143,16 @@ chimera_smb_durable_serialize(
     durable_put_le64(buf, &p, record->durable_timeout_ms);
     durable_put_le32(buf, &p, record->desired_access);
     durable_put_le32(buf, &p, record->share_access);
-    durable_put_le32(buf, &p, record->name_len);
-    memcpy(buf + p, record->name, record->name_len);
-    p += record->name_len;
+    durable_put_le32(buf, &p, record->owner_uid);
+    durable_put_le32(buf, &p, name_len);
+    durable_put_le32(buf, &p, share_name_len);
+    durable_put_le32(buf, &p, full_path_len);
+    memcpy(buf + p, record->name, name_len);
+    p += name_len;
+    memcpy(buf + p, record->share_name, share_name_len);
+    p += share_name_len;
+    memcpy(buf + p, record->full_path, full_path_len);
+    p += full_path_len;
 
     return p;
 } /* chimera_smb_durable_serialize */
@@ -918,12 +1164,29 @@ chimera_smb_durable_deserialize(
     struct chimera_smb_durable_record *record)
 {
     uint32_t p = 4;
+    uint32_t magic;
+    uint32_t hdr_len;
 
-    if (buf_len < CHIMERA_SMB_DURABLE_REC_HDR_LEN ||
-        smb_wire_le32(buf) != CHIMERA_SMB_DURABLE_RECORD_MAGIC) {
+    if (buf_len < 4) {
         return -1;
     }
 
+    magic = smb_wire_le32(buf);
+    if (magic == CHIMERA_SMB_DURABLE_RECORD_MAGIC_V2) {
+        hdr_len = CHIMERA_SMB_DURABLE_REC_HDR_LEN_V2;
+    } else if (magic == CHIMERA_SMB_DURABLE_RECORD_MAGIC_V1) {
+        hdr_len = CHIMERA_SMB_DURABLE_REC_HDR_LEN_V1;
+    } else {
+        return -1;
+    }
+
+    if (buf_len < hdr_len) {
+        return -1;
+    }
+
+    memset(record, 0, sizeof(*record));
+
+    /* Fields common to both formats, in the same order. */
     record->persistent_id = smb_wire_le64(buf + p);
     p                    += 8;
     memcpy(record->create_guid, buf + p, 16);
@@ -940,13 +1203,49 @@ chimera_smb_durable_deserialize(
     p                         += 4;
     record->share_access       = smb_wire_le32(buf + p);
     p                         += 4;
-    record->name_len           = smb_wire_le32(buf + p);
-    p                         += 4;
 
-    if (record->name_len > SMB_FILENAME_MAX || p + record->name_len > buf_len) {
+    if (magic == CHIMERA_SMB_DURABLE_RECORD_MAGIC_V1) {
+        /* Legacy record: leaf name only, no owner / share / full path.  Parse
+        * what is here and mark it unverifiable so cold reclaim refuses it. */
+        record->legacy   = 1;
+        record->name_len = smb_wire_le32(buf + p);
+        p               += 4;
+        if (record->name_len > SMB_FILENAME_MAX || p + record->name_len > buf_len) {
+            return -1;
+        }
+        memcpy(record->name, buf + p, record->name_len);
+        return 0;
+    }
+
+    /* V2: owner_uid then the three payload lengths, then the payloads. */
+    record->owner_uid      = smb_wire_le32(buf + p);
+    p                     += 4;
+    record->name_len       = smb_wire_le32(buf + p);
+    p                     += 4;
+    record->share_name_len = smb_wire_le32(buf + p);
+    p                     += 4;
+    record->full_path_len  = smb_wire_le32(buf + p);
+    p                     += 4;
+
+    /* full_path is rejected at >= SMB_PATH_MAX, not just >: the cold reopen
+     * writes a NUL at parent_path[full_path_len] on a char[SMB_PATH_MAX] buffer
+     * (smb_proc_create.c), so a recorded length of exactly SMB_PATH_MAX would be
+     * a 1-byte out-of-bounds write.  Only full_path gets that appended NUL;
+     * name/share_name are length-counted with no NUL, so their > bound stands. */
+    if (record->name_len > SMB_FILENAME_MAX ||
+        record->share_name_len > CHIMERA_SMB_DURABLE_SHARE_MAX ||
+        record->full_path_len >= SMB_PATH_MAX ||
+        (uint64_t) p + record->name_len + record->share_name_len +
+        record->full_path_len > buf_len) {
         return -1;
     }
+
     memcpy(record->name, buf + p, record->name_len);
+    p += record->name_len;
+    memcpy(record->share_name, buf + p, record->share_name_len);
+    p += record->share_name_len;
+    memcpy(record->full_path, buf + p, record->full_path_len);
+    /* full_path is the last field; p is not read again. */
 
     return 0;
 } /* chimera_smb_durable_deserialize */
@@ -985,8 +1284,21 @@ chimera_smb_durable_recover_complete(
     enum chimera_vfs_error error_code,
     void                  *private_data)
 {
+    struct chimera_smb_durable_recover_ctx *ctx = private_data;
+
+    void                                    (*done)(
+        void *) = ctx->done;
+    void                                   *done_arg = ctx->done_arg;
+
     (void) error_code;
-    free(private_data);
+    free(ctx);
+
+    /* Runs on the calling SMB thread (VFS completions marshal back), so it is
+     * safe to resume request processing here.  Fire the continuation AFTER the
+     * ctx is freed so a re-entrant scan cannot alias it. */
+    if (done) {
+        done(done_arg);
+    }
 } /* chimera_smb_durable_recover_complete */
 
 /* Best-effort, idempotent scan of a share's backend for persisted handle
@@ -998,11 +1310,15 @@ SYMBOL_EXPORT void
 chimera_smb_durable_recover_share(
     struct chimera_server_smb_thread *thread,
     const void                       *fh,
-    int                               fh_len)
+    int                               fh_len,
+    void (                           *done )(void *arg),
+    void                             *done_arg)
 {
     struct chimera_smb_durable_recover_ctx *ctx = calloc(1, sizeof(*ctx));
 
-    ctx->shared = thread->shared;
+    ctx->shared   = thread->shared;
+    ctx->done     = done;
+    ctx->done_arg = done_arg;
 
     chimera_vfs_search_keys_at(thread->vfs_thread, NULL, fh, fh_len,
                                CHIMERA_SMB_DURABLE_KEY_PREFIX,

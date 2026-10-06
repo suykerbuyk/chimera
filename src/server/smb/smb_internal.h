@@ -226,6 +226,14 @@ struct chimera_smb_config {
     int                            num_nic_info;
     int                            soft_fail_bad_req;
     int                            persistent_handles;
+    /* Upper bound, in milliseconds, on how long a COLD (server-restart-
+     * recovered) persistent handle holds its file reserved for reclaim before
+     * the sweeper releases it.  The effective window is
+     * min(record durable_timeout_ms, this cap); 0 means no cap (honor the
+     * recorded timeout).  Bounds a client that never returns after a restart
+     * from pinning a file indefinitely -- a deliberate deviation from strict
+     * MS-SMB2 never-expire persistent semantics (see smb_durable.c). */
+    int                            persistent_cold_reclaim_window;
     /* SMB3 directory leases: when set the server advertises
      * SMB2_GLOBAL_CAP_DIRECTORY_LEASING and grants R/H leases on directory
      * opens (SMB 3.0+, RqLs v2 only).  Off by default. */
@@ -334,8 +342,12 @@ struct chimera_smb_share {
      * cache -- an exclusive/batch oplock or a write/handle lease is downgraded
      * by clearing the W and H caching bits at grant time (3.3.5.9.x). */
     bool                               force_level2_oplock;
-    /* Set once the share's backend has been scanned for persisted handle
-     * records at first use (best-effort, idempotent recovery). */
+    /* Cold-handle recovery state for this share's backend, driven at first use.
+     * `durable_recovering` is set when the (asynchronous) scan is dispatched and
+     * cleared when it completes; `durable_recovered` is set only on completion.
+     * A durable reconnect that arrives while a scan is still in flight retries
+     * (the registry is not yet populated) rather than failing spuriously. */
+    bool                               durable_recovering;
     bool                               durable_recovered;
 };
 
@@ -420,15 +432,32 @@ chimera_smb_set_info_rename_process(
  * + persistent_id; the value is the serialized chimera_smb_durable_record (see
  * below).  Defined here because the CREATE request carries scratch buffers
  * sized by these macros. */
-#define CHIMERA_SMB_DURABLE_KEY_PREFIX     "smbdh"
-#define CHIMERA_SMB_DURABLE_KEY_PREFIX_LEN 5
-#define CHIMERA_SMB_DURABLE_KEY_LEN        (CHIMERA_SMB_DURABLE_KEY_PREFIX_LEN + 8)
-#define CHIMERA_SMB_DURABLE_RECORD_MAGIC   0x31484453  /* 'SDH1' LE */
-/* Fixed header bytes before the variable-length name in a serialized record:
- * magic(4) pid(8) create_guid(16) client_guid(16) session(8) durable_flags(4)
- * timeout(8) desired(4) share(4) name_len(4). */
-#define CHIMERA_SMB_DURABLE_REC_HDR_LEN    (4 + 8 + 16 + 16 + 8 + 4 + 8 + 4 + 4 + 4)
-#define CHIMERA_SMB_DURABLE_VALUE_MAX      (CHIMERA_SMB_DURABLE_REC_HDR_LEN + SMB_FILENAME_MAX)
+#define CHIMERA_SMB_DURABLE_KEY_PREFIX      "smbdh"
+#define CHIMERA_SMB_DURABLE_KEY_PREFIX_LEN  5
+#define CHIMERA_SMB_DURABLE_KEY_LEN         (CHIMERA_SMB_DURABLE_KEY_PREFIX_LEN + 8)
+/* Record format magics.  V1 ('SDH1') stored only the leaf name and carried no
+ * owner / share / full path -- it cannot authenticate or name-bind a reclaim,
+ * so a V1 record recovered after a restart is marked unverifiable and refused
+ * for cold reclaim (fail closed).  V2 ('SDH2') adds owner_uid (MS-SMB2
+ * Open.DurableOwner), the owning share name, and the share-relative full path,
+ * which are what a cold reclaim checks before re-opening.  The serializer
+ * always writes V2; the deserializer accepts both and branches on the magic. */
+#define CHIMERA_SMB_DURABLE_RECORD_MAGIC_V1 0x31484453  /* 'SDH1' LE */
+#define CHIMERA_SMB_DURABLE_RECORD_MAGIC_V2 0x32484453  /* 'SDH2' LE */
+/* Longest share name persisted in a record (sizeof chimera_smb_share.name). */
+#define CHIMERA_SMB_DURABLE_SHARE_MAX       81
+/* Fixed header bytes before the variable-length payload in a serialized record.
+ * V1: magic(4) pid(8) create_guid(16) client_guid(16) session(8)
+ *     durable_flags(4) timeout(8) desired(4) share(4) name_len(4).
+ * V2: the V1 fixed fields through share_access, then owner_uid(4) and the three
+ *     payload lengths name_len(4) share_name_len(4) full_path_len(4); the
+ *     name, share_name and full_path payloads follow in that order. */
+#define CHIMERA_SMB_DURABLE_REC_HDR_LEN_V1  (4 + 8 + 16 + 16 + 8 + 4 + 8 + 4 + 4 + 4)
+#define CHIMERA_SMB_DURABLE_REC_HDR_LEN_V2  (4 + 8 + 16 + 16 + 8 + 4 + 8 + 4 + 4 + 4 + 4 + 4 + 4)
+/* Scratch large enough for the biggest form a record can serialize to (V2 with
+ * a maximal name, share name and full path). */
+#define CHIMERA_SMB_DURABLE_VALUE_MAX       (CHIMERA_SMB_DURABLE_REC_HDR_LEN_V2 + \
+                                             SMB_FILENAME_MAX + CHIMERA_SMB_DURABLE_SHARE_MAX + SMB_PATH_MAX)
 
 struct chimera_smb_request {
     uint32_t                           status;
@@ -610,6 +639,12 @@ struct chimera_smb_request {
             * DesiredAccess / CreateOptions / etc. fields entirely, so the
             * getattr-reply callback must not re-run the ACL access check. */
             uint8_t                         reconnect;
+            /* Set while a durable reconnect is being routed through tree
+             * revalidation first (so lazy cold recovery runs and tree->fh is
+             * fresh before the reclaim attempt); the revalidate callback reads
+             * it to dispatch back to the reconnect path instead of a fresh
+             * create.  Cleared once the reclaim begins. */
+            uint8_t                         reconnecting;
             /* Set by the DH2Q create_guid replay path (MS-SMB2 §3.3.5.9.7): this
              * CREATE re-presents an already-completed create, so the reply must
              * echo the ORIGINAL handle's create_action (stored on the open) and,
@@ -1719,9 +1754,23 @@ struct chimera_smb_durable_entry {
      * blocks conflicting opens with STATUS_FILE_NOT_AVAILABLE indefinitely). */
     bool                              resilient;
     bool                              never_expires;
+    /* Cold (server-restart-recovered) entry recovered from a legacy V1 record:
+     * it has no owner / share / full path, so it can be neither authenticated
+     * nor name-bound -- cold reclaim of it is refused (fail closed). */
+    bool                              unverifiable;
     struct chimera_smb_open_file     *open_file;
     uint32_t                          name_len;
     char                              name[SMB_FILENAME_MAX];
+    /* Share and share-relative full path the handle was granted on.  Populated
+     * for a cold entry from its V2 record (chimera_smb_durable_recover_entry);
+     * a cold reclaim binds to BOTH -- a reconnect through a different share, or
+     * naming a different path, is refused, and the re-open uses full_path, never
+     * the reconnect's name.  (Warm entries do not populate these: a warm reclaim
+     * re-homes the live open rather than re-opening by path.) */
+    uint32_t                          share_name_len;
+    char                              share_name[CHIMERA_SMB_DURABLE_SHARE_MAX];
+    uint32_t                          full_path_len;
+    char                              full_path[SMB_PATH_MAX];
     /* Transient worklist link used by the sweeper after the entry has been
      * removed from the hash; not valid while the entry is in the table. */
     struct chimera_smb_durable_entry *reap_next;
@@ -1744,6 +1793,18 @@ struct chimera_smb_durable_record {
     uint32_t share_access;
     uint32_t name_len;
     char     name[SMB_FILENAME_MAX];
+    /* V2 fields.  owner_uid is the MS-SMB2 Open.DurableOwner (the grant's
+     * cred.uid); share_name identifies the share the handle was granted on; and
+     * full_path is the share-relative, backslash-joined path (no leading
+     * separator) the handle was opened on -- the cold reclaim re-opens THIS
+     * path, never the reconnect's.  All three are zero/empty in a legacy V1
+     * record, which `legacy` marks so the recovery path can refuse it. */
+    uint32_t owner_uid;
+    uint32_t share_name_len;
+    char     share_name[CHIMERA_SMB_DURABLE_SHARE_MAX];
+    uint32_t full_path_len;
+    char     full_path[SMB_PATH_MAX];
+    uint8_t  legacy;        /* set by deserialize for a V1 record */
 };
 
 struct chimera_server_smb_shared {
@@ -1899,9 +1960,35 @@ chimera_smb_durable_claim(
     bool                              has_lease_ctx,
     const uint8_t                    *lease_key,
     bool                              reconnect_persistent,
+    /* The reconnect's composed share-relative path (backslash-joined), for the
+     * cold NAME binding; length 0 means an empty reconnect name (the usual
+     * durable-reconnect form), which binds to the recorded path unconditionally. */
+    const char                       *recon_path,
+    uint32_t                          recon_path_len,
+    /* The reconnecting tree's share name, for the cold share binding. */
+    const char                       *tree_share_name,
+    uint32_t                          tree_share_name_len,
+    /* Caller-provided SMB_PATH_MAX buffer; on a cold success it receives the
+     * recorded share-relative full path the reclaim must re-open (the caller
+     * validates the reconnect name against it and drives the re-open). */
+    char                             *r_full_path,
+    uint32_t                         *r_full_path_len,
     bool                             *r_cold,
     bool                             *r_retry,
     uint32_t                         *status);
+/* True if a COLD (restart-recovered) persistent entry still within its reclaim
+ * window reserves (share_name, full_path) -- a conflicting fresh open of that
+ * path must then fail STATUS_FILE_NOT_AVAILABLE until the owner reclaims it or
+ * the window lapses.  Cold entries hold no live VFS claim, so this path-keyed
+ * check is how they block conflicts (the claim-keyed chimera_smb_durable_parked_hold
+ * sees only warm holders). */
+bool
+chimera_smb_durable_cold_reserves(
+    struct chimera_server_smb_shared *shared,
+    const char                       *share_name,
+    uint32_t                          share_name_len,
+    const char                       *full_path,
+    uint32_t                          full_path_len);
 
 /* Classification of a DH2Q create_guid replay against the durable registry. */
 enum chimera_smb_guid_replay_result {
@@ -1985,7 +2072,9 @@ void
 chimera_smb_durable_recover_share(
     struct chimera_server_smb_thread *thread,
     const void                       *fh,
-    int                               fh_len);
+    int                               fh_len,
+    void (                           *done )(void *arg),
+    void                             *done_arg);
 
 /* Add a cold (recovered-from-backend, not-yet-reopened) entry from a record
  * read off the backend at startup.  Idempotent on persistent_id. */

@@ -129,6 +129,7 @@ the canonical place to set them.
 | `kv_module` | string | - | Key-value module used to persist server state. |
 | `state_dir` | string | `<prefix>/share/state` | Directory for persisted NFS/SMB state. |
 | `smb_persistent_handles` | bool | `false` | Enable SMB durable/persistent handles (needed for Continuous Availability). |
+| `smb_persistent_cold_reclaim_window` | int (ms) | `300000` | Upper bound on how long a **cold** (server-restart-recovered) persistent handle holds its file reserved for reclaim before it is released; the effective window is `min(the handle's recorded durable timeout, this)`. `0` disables the cap (honor the recorded timeout). Bounds a client that never returns after a restart from pinning a file indefinitely — a deliberate deviation from strict MS-SMB2 never-expire persistent semantics (warm persistent handles are unaffected). |
 | `smb_named_streams` | bool | `false` | Enable SMB named streams (alternate data streams). Honored only on backends that support them, and advertised to clients as `FILE_NAMED_STREAMS` in `FileFsAttributeInformation` only when both hold. |
 | `smb_encryption` | string/int | `"off"` | SMB3 transport encryption: `"off"`/`"disabled"` (0), `"enabled"`/`"on"` (1), or `"required"` (2). |
 | `smb_acl_inherited_canonicalize` | bool | `true` | Canonicalize inherited ACLs on SMB. |

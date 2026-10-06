@@ -90,6 +90,15 @@ chimera_server_config_get_smb_persistent_handles(
     const struct chimera_server_config *config);
 
 void
+chimera_server_config_set_smb_persistent_cold_reclaim_window(
+    struct chimera_server_config *config,
+    int                           window_ms);
+
+int
+chimera_server_config_get_smb_persistent_cold_reclaim_window(
+    const struct chimera_server_config *config);
+
+void
 chimera_server_config_set_smb_directory_leases(
     struct chimera_server_config *config,
     int                           enable);
