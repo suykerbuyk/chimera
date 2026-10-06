@@ -72,8 +72,17 @@ add_executable(phase0_contexts_test phase0_contexts_test.c)
 target_link_libraries(phase0_contexts_test chimera_server chimera_smb)
 target_include_directories(phase0_contexts_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
+# This binary also carries the durable-handle cold-reclaim security gates
+# (owner refusal, share-name binding, composite-name/legacy-V1 refusal,
+# DHnC/CreateGuid handling, and the cold-reservation block + window).  They are
+# security regression tests that must gate every change, and the test is a
+# fast, self-contained in-memory unit (no I/O, no privilege), so place it in
+# the quick tier -- bracketing the single registration rather than flipping the
+# whole directory, exactly as the parked-CREATE cap unit does below.
+set(CHIMERA_TEST_TIER "quick")
 add_test(NAME chimera/server/smb/phase0_contexts_test
     COMMAND ${CMAKE_CURRENT_BINARY_DIR}/phase0_contexts_test)
+set(CHIMERA_TEST_TIER "extended")
 
 # Security-descriptor native-SID round trip: the SD decoder and
 # emitter driven directly, with and without an identity authority.
