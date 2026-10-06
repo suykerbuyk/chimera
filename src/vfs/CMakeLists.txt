@@ -101,6 +101,11 @@ endfunction()
 
 set(CHIMERA_VFS_BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR})
 
+# The Linux-only 4K block-media layer.
+if (CHIMERA_LINUX)
+    add_subdirectory(media)
+endif()
+
 add_subdirectory(memfs)
 add_subdirectory(memkv)
 
