@@ -67,3 +67,7 @@ install(DIRECTORY ./
 if(NOT DISABLE_TESTS)
     add_subdirectory(tests)
 endif()
+
+# The conformance harness and its in-memory fixture (libraries, plus their
+# self-test under DISABLE_TESTS).  The harness ships with the contract (D12).
+add_subdirectory(conformance)
