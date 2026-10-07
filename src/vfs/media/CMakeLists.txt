@@ -64,9 +64,11 @@ install(DIRECTORY ./
         DESTINATION include/chimera/vfs/media
         FILES_MATCHING PATTERN "*.h"
         PATTERN tests EXCLUDE
-        PATTERN loopback EXCLUDE)
+        PATTERN loopback EXCLUDE
+        PATTERN crashsim EXCLUDE)
 
 add_subdirectory(loopback)
+add_subdirectory(crashsim)
 
 if(NOT DISABLE_TESTS)
     add_subdirectory(tests)
