@@ -316,6 +316,18 @@ ctest:
       # amd64 only: the arm64 runners are not reliable enough to gate on.  The
       # qb ctest_* tasks are amd64-only to match, so an arm64 entry here would
       # just fail to schedule.  Restore both together.
+      #
+      # CHIM-242 gates two upstream extended-tier regressions that arrived
+      # with the 2026-10-07 sync (sync-code-20261007).  Upstream's merge queue
+      # runs only the quick tier; its extended workflow is red on main with
+      # the same tests, so they can land there green and fail this train.
+      # Named exclusions with the reason beside them, removed by the fix:
+      #   smbtorture: smb2.compound, smb2.replay.channel_sequence and
+      #     smb2.replay.replay_commands on the linux and io_uring backends
+      #     (compound.related3 gets INVALID_DEVICE_REQUEST); memfs passes.
+      #   rest: libevpl's own io_uring TCP self-tests, broken by the libevpl
+      #     bump 8a3db7c7 -> 8da8acff (recv_bundle EINVAL, then timeouts).
+      # Same shape as the CHIM-197 nfstest_alloc gate below.
       - MODE: [ release, debug ]
         ARCH: [ amd64 ]
         GROUP: [ pynfs ]
@@ -323,7 +335,7 @@ ctest:
       - MODE: [ release, debug ]
         ARCH: [ amd64 ]
         GROUP: [ smbtorture ]
-        CTEST_FILTER: [ "-L '^smbtorture$'" ]
+        CTEST_FILTER: [ "-L '^smbtorture$' -E 'smbtorture_smb2_(compound|replay_channel_sequence|replay_replay_commands)_(linux|io_uring)$'" ]
       - MODE: [ release, debug ]
         ARCH: [ amd64 ]
         GROUP: [ wpts ]
@@ -331,7 +343,7 @@ ctest:
       - MODE: [ release, debug ]
         ARCH: [ amd64 ]
         GROUP: [ rest ]
-        CTEST_FILTER: [ "-LE '^pynfs$|^smbtorture$|^wpts$|^kvm$'" ]
+        CTEST_FILTER: [ "-LE '^pynfs$|^smbtorture$|^wpts$|^kvm$' -E 'libevpl/io_uring/(hello_world_stream_tcp|hello_world_connected_msg_tcp|ping_pong_stream_tcp|ping_pong_msg_tcp|bulk_msg_tcp|bulk_stream_tcp)$'" ]
   script:
     - ${RUN_QB} -a ${ARCH} -v ctest_${MODE} -V CTEST_FILTER="${CTEST_FILTER}" &> ctest_${MODE}_${GROUP}_${ARCH}.log
   after_script:

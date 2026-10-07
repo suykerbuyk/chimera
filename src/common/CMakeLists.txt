@@ -25,3 +25,6 @@ endif()
 install(TARGETS chimera_common chimera_crypto DESTINATION lib)
 file(GLOB COMMON_HEADERS "${CMAKE_CURRENT_SOURCE_DIR}/*.h")
 install(FILES ${COMMON_HEADERS} DESTINATION include/common)
+
+# Exports its data rather than importing it (common/export.h).
+target_compile_definitions(chimera_common PRIVATE CHIMERA_COMMON_BUILD)

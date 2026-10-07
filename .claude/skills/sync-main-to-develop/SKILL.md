@@ -26,6 +26,20 @@ The checks below, and a build, are the evidence.
 
 Create a todo per step. Do not skip a step because the merge was clean.
 
+0. **Resolve the sync ticket before touching git.** The branch name,
+   every follow-up commit prefix and steps 9 and 10 all need a `CHIM-<n>` key.
+   - The request names a ticket: use it.
+   - The request names none: ask, with AskUserQuestion, whether to create
+     one.  Do not guess a key, reuse a previous sync's ticket, or start
+     the branch without one.
+   - Answer is yes: create a CHIM **Story** titled `code drop <YYYY-MM-DD>`
+     with the exact fields in reference.md ("Creating the sync ticket"):
+     assignee Alain, Team Titans, the current Titans sprint, 1 story
+     point, parent NG-684, component Unsure.  Read the key back and use it
+     for the rest of the sync.  Remember that the skill created it: step
+     10 fills its description from the MR body.
+   - Answer is no: stop and ask for the key to use.
+
 1. **Tag the upstream snapshot.** Lightweight tag on the upstream commit,
    pushed to `origin` only (never `arenaud16`):
    ```bash
@@ -78,17 +92,27 @@ Create a todo per step. Do not skip a step because the merge was clean.
    Re-running one leg: `qb-ci.sh --no-builder --only <leg>`.  See
    reference.md.
 
-9. **Update the Jira tickets the sync resolves.** For every CHIM ticket
-   whose upstream PR landed in this range (the merge message's "Jira
-   coverage" paragraph), add a comment naming the upstream commits, the
-   sync tag, the merge commit and the branch/MR, and link it to the sync
-   ticket with a `Relates` issue link.  Then write the sync ticket's own
-   description.  Details and the comment shape in reference.md.
+9. **Open the MR.** Push the branch, then `glab mr create` against
+   `develop`: title = the merge commit subject, label `Sync origin/main`,
+   body composed in a file in the shape reference.md gives ("Opening the
+   MR").  Keep that file: step 10 reuses it.
+
+10. **Update the Jira tickets.** For every CHIM ticket whose upstream PR
+    landed in this range (the merge message's "Jira coverage" paragraph),
+    add a comment naming the upstream commits, the sync tag, the merge
+    commit and the MR, and link it to the sync ticket with a `Relates`
+    issue link.  Then the sync ticket's description:
+    - step 0 created the ticket: the description is the MR body from
+      step 9, verbatim, under one line linking the MR;
+    - the ticket was given: the CHIM-214 shape in reference.md.
+    Details and the comment shape in reference.md.
 
 ## Red Flags
 
 | Thought | Reality |
 |---|---|
+| "No ticket was given, I'll branch now and fill the key in later" | The key is in the branch name and every commit. Ask first (step 0). |
+| "The last sync's ticket is still open, reuse it" | One ticket per code drop. Create a new one. |
 | "The merge was clean, so it's fine" | Every break so far was a clean auto-merge. Run the checks. |
 | "Only N files conflicted, small sync" | Conflict count is unrelated to breakage. A header that *moves* never conflicts. |
 | "The checks passed, skip the build" | The checks encode known failures only. The build finds the new ones. |

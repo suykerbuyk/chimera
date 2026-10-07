@@ -92,9 +92,11 @@ find /tmp/chimera-stage/opt/quantum/chimera/include -type f | sort
 head -5 /tmp/chimera-stage/opt/quantum/chimera/include/chimera/oteltracing.h
 ```
 
-Expect 20 SDK headers (18 plus `vfs_access.h`, which joined in the
-2026-09-16 sync, plus `vfs_mode.h` from the 2026-09-28 sync -- recount when
-upstream adds one) plus the three external ones, and `#define OTEL_TRACING 0`. Then
+Expect 21 SDK headers (18 plus `vfs_access.h`, which joined in the
+2026-09-16 sync, `vfs_mode.h` from the 2026-09-28 sync and
+`vfs_sdk_export.h` from the 2026-10-07 sync -- recount when upstream adds
+one; `comm -3` the staged directory against `src/vfs/sdk/` so a dropped
+header shows up) plus the three external ones, and `#define OTEL_TRACING 0`. Then
 compile a probe that includes only `"vfs/sdk/chimera_vfs_sdk.h"` with
 `-I<stage>/include/chimera -I<stage>/include`, and run
 `qtm_build/verify_test_includes.sh <stage>/<prefix>` for the test package's
@@ -333,6 +335,94 @@ Compose in a file, then `git commit -F`. Include:
 - What was resolved and why, for any non-obvious resolution
 - `Signed-off-by: Alain Renaud <alain.renaud@quantum.com>`
 
+## Creating the sync ticket
+
+Each code drop has its own CHIM ticket; the key goes into the branch name
+(`CHIM-<n>-code_drop_<YYYYMMDD>`), the follow-up commit prefixes and the
+MR.  Up to CHIM-227 these were Sub-Tasks under CHIM-179; from 2026-10-07
+they are **Stories under the NG epic NG-684** ("Chimera: keeping our code
+in sync with github repo"), sized at 1 point and placed in the current
+Titans sprint so they show up on the board.
+
+Only create it after the user said yes to the step-0 question.  One
+`createJiraIssue` call (site symform.jira.com, cloudId
+`700f30c9-fa7b-4e4d-8ea2-bb76ff998c3d`):
+
+| Parameter | Value |
+|---|---|
+| `projectKey` | `CHIM` |
+| `issueTypeName` | `Story` |
+| `summary` | `code drop <YYYY-MM-DD>` (today's date) |
+| `description` | one line for now: "Sync origin/main into develop (tag sync-code-<YYYYMMDD>)"; step 10 replaces it with the MR body |
+| `assignee_account_id` | `557058:e1be4d17-4541-4eb7-9dee-9f3a3f35572f` (Alain Renaud) |
+| `additional_fields.parent` | `{"key": "NG-684"}` |
+| `additional_fields.customfield_14100` | `"890ae327-8765-40ac-ba14-69fb7869cbd6"` (Team = Titans; bare id string) |
+| `additional_fields.customfield_10661` | numeric id of the active Titans sprint (see below) |
+| `additional_fields.customfield_10013` | `1` (Story Points) |
+| `additional_fields.components` | `[{"id": "25353"}]` (Unsure) |
+
+Finding the active sprint id: `searchJiraIssuesUsingJql` with
+`project = CHIM AND sprint in openSprints()` and fields
+`["customfield_10661"]`; take the entry with `"state": "active"` and
+`"boardId": 4234` from any returned issue (16137 = Titans Sprint 14,
+2026-10-06 to 2026-10-27).  Closed sprints are listed on the same field,
+so match on state, not position.
+
+Read the new issue back with `getJiraIssue` (fields `parent`,
+`customfield_10661`, `customfield_10013`, `customfield_14100`) before
+using the key: a silently dropped field is cheaper to fix now than after
+the branch is pushed.
+
+## Opening the MR
+
+After the cluster runs are green.  `glab` is installed and authenticated
+against gitlab.mdh.quantum.com:
+
+```bash
+glab mr create --repo chimera/chimera --source-branch <branch> \
+    --target-branch develop --title "<merge commit subject>" \
+    --label "Sync origin/main" --assignee arenaud --reviewer arenaud \
+    --description-file mr-body.md --yes
+```
+
+`--assignee` and `--reviewer` take GitLab usernames (`arenaud`), not
+`@me`; `--yes` skips the confirmation prompt, which has no terminal here.
+
+Compose `mr-body.md` in the scratchpad and keep it: the sync ticket's
+description is built from it.  Its shape (MR !114 is the model):
+
+1. Opening paragraph: upstream snapshot sha and tag, previous tag and
+   sha, commit count, and in two or three sentences what the bulk of the
+   drop is.  The merge commit message holds the grouped list; do not
+   repeat it.
+2. Submodule moves and conflicts: what moved, what conflicted, what
+   auto-merged and the two things always confirmed (`add_subdirectory
+   (qtm_build)` last; downstream config flags kept).
+3. Commits develop carried ahead of upstream and whether they matched by
+   patch-id, when there were any.
+4. `## Module SDK`: SDK version, `vfs_request.h` and struct-size verdict,
+   whether modules must be rebuilt, packaged layout from the staged
+   install (header count, `OTEL_TRACING` pin).
+5. `## Downstream impact`: snfs, packaging, configs, builders, the skill
+   commits on the branch.
+6. `## Jira`: the tickets whose upstream form this drop carries, with PR
+   numbers.
+7. `## Verification`: local build and tests, `qb-ci.sh` legs with every
+   re-run explained and attributed, the `rocky9` alias.
+
+## Sync ticket description
+
+Two cases, decided by step 0:
+
+- **The skill created the ticket** (step 0, answer yes).  The description
+  is one line `**MR:** [!<n>](<url>)` followed by `mr-body.md` verbatim:
+  `editJiraIssue` with `fields.description` as Markdown.  The ticket and
+  the MR then say the same thing, and a reviewer of either sees the
+  whole sync.  Do not paraphrase or shorten it for Jira.
+- **The ticket was given.**  Write the CHIM-214 shape:
+  snapshot/tag/branch/MR, what upstream brings, downstream changes, the
+  verification done, follow-ups, and the list of tickets it resolves.
+
 ## Jira tickets the sync resolves
 
 Upstream-first fixes are tracked twice: a CHIM ticket here and a PR on
@@ -361,9 +451,8 @@ Then, for each ticket, with the Atlassian tools (site symform.jira.com):
 - Leave the status alone until the MR merges; the ticket moves to Done
   then, with the MR link.
 
-Finally give the sync ticket a description in the CHIM-214 shape:
-snapshot/tag/branch/MR, what upstream brings, downstream changes, the
-verification done, follow-ups, and the list of tickets it resolves.
+Finally give the sync ticket its description, per "Sync ticket
+description" above.
 
 Partial coverage counts too: a ticket whose scope upstream only partly
 delivered (CHIM-190 got the REST docs at the 2026-10-02 sync, not the

@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include "vfs_sdk_export.h"
+
 /*
  * Chimera VFS module SDK: the request contract.
  *
@@ -118,7 +120,8 @@ struct chimera_vfs_mount_options {
 #define CHIMERA_VFS_OP_CLAIM_RELEASE            43
 #define CHIMERA_VFS_OP_READ_PLUS                44
 #define CHIMERA_VFS_OP_WRITE_SAME               45
-#define CHIMERA_VFS_OP_NUM                      46
+#define CHIMERA_VFS_OP_RENAME_STREAM            46
+#define CHIMERA_VFS_OP_NUM                      47
 
 #define CHIMERA_VFS_OPEN_CREATE                 (1U << 0)
 #define CHIMERA_VFS_OPEN_PATH                   (1U << 1)
@@ -1468,6 +1471,17 @@ struct chimera_vfs_request {
             struct chimera_vfs_attrs        r_post_attr;
         } remove_stream;
 
+        struct {
+            struct chimera_vfs_open_handle *handle;       /* base file handle */
+            const char                     *name;         /* current stream name */
+            uint32_t                        namelen;
+            const char                     *new_name;     /* name it takes */
+            uint32_t                        new_namelen;
+            uint32_t                        flags;        /* CHIMERA_VFS_RENAME_STREAM_* */
+            struct chimera_vfs_attrs        r_pre_attr;
+            struct chimera_vfs_attrs        r_post_attr;
+        } rename_stream;
+
         /* pNFS: a layout-sourcing backend (CHIMERA_VFS_CAP_LAYOUT_SOURCE)
          * describes where the file's data physically lives.  The NFS server
          * encodes the returned segments/devices into a flex-files or block
@@ -1492,6 +1506,6 @@ struct chimera_vfs_request {
 * delegation to the owning thread. The core frees it when the request is
 * recycled, after the protocol callback returns. Returns NULL on allocation
 * failure. Unlike plugin_data, this storage may also hold large replies. */
-void * chimera_vfs_request_alloc_memory(
+CHIMERA_VFS_SDK_EXPORT void * chimera_vfs_request_alloc_memory(
     struct chimera_vfs_request *request,
     size_t                      size);

@@ -58,6 +58,23 @@ chimera_smb_is_error_status(unsigned int status)
            status != SMB2_STATUS_NOTIFY_ENUM_DIR;
 } /* chimera_smb_is_error_status */
 
+static inline int
+chimera_smb_query_info_partial(const struct chimera_smb_request *request)
+{
+    if (request->smb2_hdr.command != SMB2_QUERY_INFO ||
+        request->status != SMB2_STATUS_BUFFER_OVERFLOW ||
+        request->query_info.info_type == SMB2_INFO_SECURITY) {
+        return 0;
+    }
+
+    if (request->query_info.info_type == SMB2_INFO_FILE &&
+        request->query_info.info_class == SMB2_FILE_FULL_EA_INFO) {
+        return request->query_info.ea_out_len > 0;
+    }
+
+    return request->query_info.output_length > 0;
+} /* chimera_smb_query_info_partial */
+
 /*
  * Establish the server's ServerGuid (MS-SMB2 2.2.4 / 3.3.5.4).  The ServerGuid
  * must uniquely identify this server AND stay stable across restarts so that
@@ -639,11 +656,17 @@ chimera_smb_compound_reply(struct chimera_smb_compound *compound)
          * MaxOutputResponse (chimera_smb_qar_finalize does exactly that for
          * FSCTL_QUERY_ALLOCATED_RANGES) has that work silently discarded.
          *
+         * A QUERY_INFO whose reply does not fit OutputBufferLength is the same
+         * again (MS-SMB2 3.3.5.20.1/2): the part that fits is returned with
+         * BUFFER_OVERFLOW -- for FileFullEaInformation, the entries that fit,
+         * and the client resumes from the next one.
+         *
          * All other errors get the generic SMB2 ERROR Response. */
         if (chimera_smb_is_error_status(request->status) &&
             !(request->smb2_hdr.command == SMB2_IOCTL &&
               (request->ioctl.cc_limit_response ||
-               request->status == SMB2_STATUS_BUFFER_OVERFLOW))) {
+               request->status == SMB2_STATUS_BUFFER_OVERFLOW)) &&
+            !chimera_smb_query_info_partial(request)) {
             if (request->status == SMB2_STATUS_BUFFER_TOO_SMALL &&
                 request->smb2_hdr.command == SMB2_QUERY_INFO) {
                 /* MS-SMB2 2.2.2 / 3.3.4.4: a QUERY_INFO that fails
@@ -2296,6 +2319,23 @@ chimera_smb_server_handle_smb1(
 
     if (!matched) {
         chimera_smb_error("Received SMB1 NEGOTIATE with no SMB2 dialect, and we don't support SMB1");
+        chimera_smb_request_free(thread, request);
+        evpl_close(evpl, conn->bind);
+        return;
+    }
+
+    /* The multi-protocol NEGOTIATE spends the connection's one implicit credit,
+     * MessageId 0, and the client's first SMB2 request follows at MessageId 1
+     * (MS-SMB2 3.3.5.3.1).  Consume it here as the SMB2 path does for every
+     * request.  Left granted, it pins the sequence window's base at 0 for the
+     * life of the connection, so the window can never slide and the request at
+     * MessageId CHIMERA_SMB_MAX_CREDITS is rejected and the connection dropped:
+     * the Windows client, which opens every connection this way, lost its
+     * connection after about 8192 requests.  A second SMB1 NEGOTIATE on the
+     * same connection finds MessageId 0 already used and is refused the same
+     * way. */
+    if (chimera_smb_seq_window_consume(conn, 0, 1) != 0) {
+        chimera_smb_error("SMB1 NEGOTIATE with MessageId 0 already consumed; closing connection");
         chimera_smb_request_free(thread, request);
         evpl_close(evpl, conn->bind);
         return;

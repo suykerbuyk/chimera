@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: LGPL-2.1-only
 
 #pragma once
+
+#include "common/export.h"
 #include "common/thread.h"
 #include <stdint.h>
 #ifdef _WIN32
@@ -67,7 +69,7 @@ struct chimera_vfs_thread_metrics {
  * handle->file_state (see that field).  Uses the file_state's own back-pointer
  * to the owning state, so the open-cache teardown can release it without
  * threading the state through.  No-op safe to call with a NULL argument. */
-void chimera_vfs_file_state_release(
+SYMBOL_EXPORT void chimera_vfs_file_state_release(
     struct chimera_vfs_file_state *file);
 
 struct chimera_vfs_find_result {
@@ -103,6 +105,32 @@ struct chimera_vfs_mount {
     struct chimera_vfs_mount_attrs attrs;
     struct chimera_vfs_mount      *prev;
     struct chimera_vfs_mount      *next;
+
+    /* Where the mount sits in the namespace.  path is the normalized
+     * namespace path with no leading or trailing '/' ("" for the mount at
+     * "/").  A mount other than the root covers the directory named
+     * cover_name in the directory whose handle is cover_parent_fh -- the
+     * mount point -- exactly as a Linux mount covers a dentry: a lookup of
+     * that name there lands on this mount's root, and ".." from this mount's
+     * root lands on cover_parent_fh.  cover_parent_fh_len is 0 for the root
+     * mount and for a detached mount, which has no namespace position at all
+     * and is reachable only by its handles. */
+    int                            detached;
+    /* The built-in rootfs: always mounted at "/", beneath whatever is
+     * mounted over it (see vfs_rootfs.h). */
+    int                            builtin;
+    uint8_t                        cover_parent_fh[CHIMERA_VFS_FH_SIZE];
+    int                            cover_parent_fh_len;
+    uint8_t                        cover_fh[CHIMERA_VFS_FH_SIZE];   /* the covered directory */
+    int                            cover_fh_len;
+    char                          *cover_name;
+    int                            cover_namelen;
+    uint64_t                       cover_hash;
+
+    /* The mount root's attributes as of mount time, with no pointer-valued
+     * attributes, for the directory entry that names the mount point when a
+     * fresher copy is not cached (see chimera_vfs_readdir). */
+    struct chimera_vfs_attrs       root_attrs;
 
     /* The first CHIMERA_VFS_MOUNT_ID_SIZE (16) bytes of root_fh is the mount_id,
      * which is itself a 128-bit hash. The remaining bytes are the fh_fragment.
@@ -147,6 +175,10 @@ struct chimera_vfs_close_thread {
      * flight at that moment without waiting for global quiescence. */
     uint64_t                   closes_issued;
     uint64_t                   closes_completed;
+    /* When the shutdown drain began, and whether a stalled drain has already
+     * logged what it is waiting on (see chimera_vfs_close_thread_wake_shutdown). */
+    uint64_t                   shutdown_started;
+    int                        shutdown_stall_logged;
     struct evpl_doorbell       doorbell;
     struct evpl_timer          timer;
     evpl_mutex_t               lock;
@@ -234,7 +266,7 @@ struct chimera_vfs_module_cfg {
     char config_data[4096];
 };
 
-struct chimera_vfs *
+SYMBOL_EXPORT struct chimera_vfs *
 chimera_vfs_init(
     int                                  num_sync_delegation_threads,
     int                                  num_async_delegation_threads,
@@ -247,14 +279,14 @@ chimera_vfs_init(
     int                                  num_rcu_reclaim_threads,
     struct prometheus_metrics           *metrics);
 
-void
+SYMBOL_EXPORT void
 chimera_vfs_destroy(
     struct chimera_vfs *vfs);
 
 /* Select the TCP transport flavor used for outbound (client) connections.
  * Defaults to CHIMERA_TCP_FLAVOR_PLAIN; honored by VFS modules that open
  * their own TCP connections (e.g. the NFS client). */
-void
+SYMBOL_EXPORT void
 chimera_vfs_set_tcp_flavor(
     struct chimera_vfs     *vfs,
     enum chimera_tcp_flavor flavor);
@@ -263,7 +295,7 @@ chimera_vfs_set_tcp_flavor(
  * delegations / SMB2 leases / SMB oplocks enabled).  When set, the VFS
  * remove/rename paths resolve a by-name victim to its FH so a caching holder
  * is recalled before the namespace change; when clear the lookup is skipped. */
-void
+SYMBOL_EXPORT void
 chimera_vfs_set_caching_enabled(
     struct chimera_vfs *vfs,
     int                 enabled);
@@ -271,23 +303,27 @@ chimera_vfs_set_caching_enabled(
 /* Bound on how long umount waits for a mount's open handles to be dropped
  * before giving up with EBUSY, in milliseconds.  Without a bound a client
  * holding a file open would wedge the umount indefinitely. */
-void
+SYMBOL_EXPORT void
 chimera_vfs_set_umount_timeout(
     struct chimera_vfs *vfs,
     int                 timeout_ms);
 
-/* Get the root pseudo-filesystem's file handle */
-void
+/* Get the handle of the namespace root: the root of the mount at "/", which
+ * is the built-in rootfs unless a mount has been placed there.  It changes
+ * when a mount at "/" is added or removed, so callers resolving namespace
+ * paths should fetch it per use rather than cache it. */
+SYMBOL_EXPORT void
 chimera_vfs_get_root_fh(
-    uint8_t  *fh,
-    uint32_t *fh_len);
+    struct chimera_vfs *vfs,
+    uint8_t            *fh,
+    uint32_t           *fh_len);
 
-struct chimera_vfs_thread *
+SYMBOL_EXPORT struct chimera_vfs_thread *
 chimera_vfs_thread_init(
     struct evpl        *evpl,
     struct chimera_vfs *vfs);
 
-void
+SYMBOL_EXPORT void
 chimera_vfs_thread_destroy(
     struct chimera_vfs_thread *thread);
 
@@ -297,12 +333,12 @@ chimera_vfs_register(
     struct chimera_vfs_module *module,
     const char                *cfgdata);
 
-void
+SYMBOL_EXPORT void
 chimera_vfs_thread_drain(
     struct chimera_vfs_thread *thread);
 
 
-int
+SYMBOL_EXPORT int
 chimera_vfs_add_user(
     struct chimera_vfs *vfs,
     const char         *username,
@@ -315,12 +351,12 @@ chimera_vfs_add_user(
     const uint32_t     *gids,
     int                 pinned);
 
-int
+SYMBOL_EXPORT int
 chimera_vfs_remove_user(
     struct chimera_vfs *vfs,
     const char         *username);
 
-int
+SYMBOL_EXPORT int
 chimera_vfs_add_group(
     struct chimera_vfs *vfs,
     const char         *groupname,
@@ -328,17 +364,17 @@ chimera_vfs_add_group(
     uint32_t            gid,
     int                 pinned);
 
-int
+SYMBOL_EXPORT int
 chimera_vfs_remove_group(
     struct chimera_vfs *vfs,
     const char         *groupname);
 
-const struct chimera_vfs_user *
+SYMBOL_EXPORT const struct chimera_vfs_user *
 chimera_vfs_lookup_user_by_name(
     struct chimera_vfs *vfs,
     const char         *username);
 
-int
+SYMBOL_EXPORT int
 chimera_vfs_user_is_member(
     struct chimera_vfs *vfs,
     uint32_t            uid,
@@ -355,27 +391,27 @@ chimera_vfs_user_is_member(
  * conventions.  All four are RCU-safe and must be called from a VFS-registered
  * thread.
  */
-int
+SYMBOL_EXPORT int
 chimera_vfs_identity_uid_to_sid(
     struct chimera_vfs *vfs,
     uint32_t            uid,
     char               *buf,
     int                 buflen);
 
-int
+SYMBOL_EXPORT int
 chimera_vfs_identity_sid_to_uid(
     struct chimera_vfs *vfs,
     const char         *sid,
     uint32_t           *uid);
 
-int
+SYMBOL_EXPORT int
 chimera_vfs_identity_gid_to_sid(
     struct chimera_vfs *vfs,
     uint32_t            gid,
     char               *buf,
     int                 buflen);
 
-int
+SYMBOL_EXPORT int
 chimera_vfs_identity_sid_to_gid(
     struct chimera_vfs *vfs,
     const char         *sid,
@@ -386,11 +422,11 @@ typedef int (*chimera_vfs_user_iterate_cb)(
     const struct chimera_vfs_user *user,
     void                          *data);
 
-void
+SYMBOL_EXPORT void
 chimera_vfs_iterate_builtin_users(
     struct chimera_vfs         *vfs,
     chimera_vfs_user_iterate_cb callback,
     void                       *data);
-void
+SYMBOL_EXPORT void
 chimera_vfs_watchdog(
     struct chimera_vfs_thread *thread);

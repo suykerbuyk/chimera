@@ -9,6 +9,24 @@
 #include "vfs/vfs_notify.h"
 #include "vfs/vfs_claim.h"
 
+/* Map a VFS error from a WRITE to the SMB2 status the client expects instead
+ * of collapsing every failure to INTERNAL_ERROR, which Windows reports as "an
+ * internal error occurred" and hides the cause.  A write the access gate
+ * refuses is ACCESS_DENIED, a full filesystem DISK_FULL. */
+static inline uint32_t
+chimera_smb_write_error_status(enum chimera_vfs_error error_code)
+{
+    switch (error_code) {
+        case CHIMERA_VFS_OK:     return SMB2_STATUS_SUCCESS;
+        case CHIMERA_VFS_EACCES:
+        case CHIMERA_VFS_EPERM:  return SMB2_STATUS_ACCESS_DENIED;
+        case CHIMERA_VFS_ENOSPC:
+        case CHIMERA_VFS_EDQUOT: return SMB2_STATUS_DISK_FULL;
+        case CHIMERA_VFS_EROFS:  return SMB2_STATUS_MEDIA_WRITE_PROTECTED;
+        default:                 return SMB2_STATUS_INTERNAL_ERROR;
+    } /* switch */
+} /* chimera_smb_write_error_status */
+
 /* A write-time-sticky handle needs the pre-write mtime back from the VFS so the
  * write callback can restore it; otherwise no pre-attrs are requested. */
 static inline uint64_t
@@ -18,10 +36,21 @@ chimera_smb_write_pre_attr_mask(const struct chimera_smb_open_file *open_file)
            ? CHIMERA_VFS_ATTR_MTIME : 0;
 } /* chimera_smb_write_pre_attr_mask */
 
-/* Completion for the mtime-restore setattr issued after a write through a
- * write-time-sticky handle.  The write itself already succeeded; a failed
- * restore leaves a slightly-advanced write time but is not worth failing the
- * write over, so we always report success. */
+/* The first write through a handle asks for the file's DOS attributes after
+ * the write, so the callback can set ARCHIVE if it is clear. */
+static inline uint64_t
+chimera_smb_write_post_attr_mask(const struct chimera_smb_open_file *open_file)
+{
+    return (open_file->flags & (CHIMERA_SMB_OPEN_FILE_ARCHIVE_NOTED |
+                                CHIMERA_SMB_OPEN_FILE_FLAG_STREAM))
+           ? 0 : CHIMERA_VFS_ATTR_DOS_ATTRIBUTES;
+} /* chimera_smb_write_post_attr_mask */
+
+/* Completion for the setattr issued after a write to restore the mtime of a
+ * write-time-sticky handle and/or set ARCHIVE.  The write itself already
+ * succeeded; a failed setattr leaves a slightly-advanced write time or a clear
+ * ARCHIVE bit but is not worth failing the write over, so we always report
+ * success. */
 static void
 chimera_smb_write_sticky_restore_callback(
     enum chimera_vfs_error    error_code,
@@ -68,17 +97,27 @@ chimera_smb_write_callback(
          * dir-lease content break is deferred to close (the open is flagged
          * MODIFIED for chimera_smb_close to emit it).  MS-SMB2;
          * dirlease.v2_request. */
+        /* A write to a named stream changes that stream only:
+        * FILE_ACTION_MODIFIED_STREAM on "<file>:<stream>". */
+        char     nname[CHIMERA_SMB_STREAM_NOTIFY_NAME_MAX];
+        uint32_t nlen   = chimera_smb_open_file_notify_name(request->write.open_file, nname);
+        uint32_t action = CHIMERA_VFS_NOTIFY_STREAM_WRITE | CHIMERA_VFS_NOTIFY_STREAM_SIZE;
+
+        if (!(request->write.open_file->flags & CHIMERA_SMB_OPEN_FILE_FLAG_STREAM)) {
+            action |= CHIMERA_VFS_NOTIFY_FILE_MODIFIED;
+        }
         chimera_vfs_notify_emit_nobreak(thread->shared->vfs->vfs_notify,
                                         request->write.open_file->parent_fh,
                                         request->write.open_file->parent_fh_len,
-                                        CHIMERA_VFS_NOTIFY_FILE_MODIFIED |
-                                        CHIMERA_VFS_NOTIFY_STREAM_WRITE |
-                                        CHIMERA_VFS_NOTIFY_STREAM_SIZE,
-                                        request->write.open_file->name,
-                                        request->write.open_file->name_len,
+                                        action,
+                                        nname,
+                                        nlen,
                                         NULL, 0);
         request->write.open_file->flags |= CHIMERA_SMB_OPEN_FILE_FLAG_MODIFIED;
     }
+
+    request->write.restore_attrs.va_req_mask = 0;
+    request->write.restore_attrs.va_set_mask = 0;
 
     /* A handle that explicitly set its write time has "taken control" of it:
      * the backend bumped mtime as a side effect of this write, so restore it to
@@ -86,11 +125,27 @@ chimera_smb_write_callback(
     if (!error_code &&
         (request->write.open_file->flags & CHIMERA_SMB_OPEN_FILE_WRITE_TIME_STICKY) &&
         (pre_attr->va_set_mask & CHIMERA_VFS_ATTR_MTIME)) {
+        request->write.restore_attrs.va_set_mask |= CHIMERA_VFS_ATTR_MTIME;
+        request->write.restore_attrs.va_mtime     = pre_attr->va_mtime;
+    }
 
-        request->write.restore_attrs.va_req_mask = 0;
-        request->write.restore_attrs.va_set_mask = CHIMERA_VFS_ATTR_MTIME;
-        request->write.restore_attrs.va_mtime    = pre_attr->va_mtime;
+    /* Writing a data file marks it for backup (MS-FSA 2.1.4.17): set ARCHIVE
+     * if the first write through this handle found it clear (IFSTest
+     * UpdateOnCloseTest, ArchiveAttributeTest). */
+    if (!error_code &&
+        !(request->write.open_file->flags & CHIMERA_SMB_OPEN_FILE_ARCHIVE_NOTED)) {
+        request->write.open_file->flags |= CHIMERA_SMB_OPEN_FILE_ARCHIVE_NOTED;
+        if (post_attr && (post_attr->va_set_mask & CHIMERA_VFS_ATTR_DOS_ATTRIBUTES) &&
+            !(post_attr->va_dos_attributes &
+              (SMB2_FILE_ATTRIBUTE_ARCHIVE | SMB2_FILE_ATTRIBUTE_DIRECTORY))) {
+            request->write.restore_attrs.va_set_mask      |= CHIMERA_VFS_ATTR_DOS_ATTRIBUTES;
+            request->write.restore_attrs.va_dos_attributes =
+                (post_attr->va_dos_attributes & ~SMB2_FILE_ATTRIBUTE_NORMAL) |
+                SMB2_FILE_ATTRIBUTE_ARCHIVE;
+        }
+    }
 
+    if (request->write.restore_attrs.va_set_mask) {
         chimera_vfs_setattr(thread->vfs_thread,
                             &request->session_handle->session->cred,
                             request->write.open_file->handle,
@@ -103,7 +158,7 @@ chimera_smb_write_callback(
     }
 
     chimera_smb_open_file_release(private_data, request->write.open_file);
-    chimera_smb_complete_request(private_data, error_code ? SMB2_STATUS_INTERNAL_ERROR : SMB2_STATUS_SUCCESS);
+    chimera_smb_complete_request(private_data, chimera_smb_write_error_status(error_code));
 } /* chimera_smb_write_callback */
 
 static void
@@ -162,7 +217,7 @@ chimera_smb_rdma_read_callback(
             request->write.length,
             !!(request->write.flags & SMB2_WRITEFLAG_WRITE_THROUGH),
             chimera_smb_write_pre_attr_mask(request->write.open_file),
-            0,
+            chimera_smb_write_post_attr_mask(request->write.open_file),
             request->write.iov,
             request->write.niov,
             &io_owner,
@@ -408,7 +463,7 @@ chimera_smb_write(struct chimera_smb_request *request)
             request->write.length,
             !!(request->write.flags & SMB2_WRITEFLAG_WRITE_THROUGH),
             chimera_smb_write_pre_attr_mask(request->write.open_file),
-            0,
+            chimera_smb_write_post_attr_mask(request->write.open_file),
             request->write.iov,
             request->write.niov,
             &io_owner,

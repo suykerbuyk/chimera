@@ -189,18 +189,27 @@ Each entry of `data_servers`:
 | `backing_path` | string | required | Chimera VFS path (an `nfs`-module mount) the MDS uses to create backing files on the DS. |
 | `version` | int/string | `3` | NFS version clients use to reach the DS: `3`, `4`, `"4.0"`, or `"4.1"`. |
 
-#### `server.vfs` - loading external VFS plugins
+#### `server.vfs` - loading VFS modules
 
-Built-in modules (`memfs`, `linux`, `diskfs`, `io_uring`, ...) need no
-registration. A VFS module shipped as a separate shared object (e.g. `cairn`)
-is registered here, keyed by module name, before it can be used in `mounts`:
+Every VFS backend is a plugin that chimera loads at runtime; none is linked
+into the server.  A module is loaded by name from the module directory, which
+is the directory `libchimera_vfs` itself was loaded from (the backends are
+built and installed beside it as `libchimera_vfs_<name>.so`), or
+`$CHIMERA_VFS_MODULE_DIR` when that is set.
+
+The server loads `nfs`, `memfs`, and on Linux `linux` and `io_uring` by
+default.  Any other module (e.g. `diskfs`, `cairn`, `smb`, or an out-of-tree
+module) is registered here, keyed by module name, before it can be used in
+`mounts`:
 
 ```json
 "server": {
     "vfs": {
         "cairn": {
-            "path": "/usr/lib/chimera/libvfs_cairn.so",
             "config": { "path": "/var/lib/chimera/cairn" }
+        },
+        "vendorfs": {
+            "path": "/opt/vendor/lib/vfs_vendorfs.so"
         }
     }
 }
@@ -208,7 +217,7 @@ is registered here, keyed by module name, before it can be used in `mounts`:
 
 | Key | Type | Description |
 |---|---|---|
-| `path` | string | Filesystem path to the module's `.so`. |
+| `path` | string | Optional path to the module's `.so`, for a module outside the module directory. |
 | `config` | object | Module-specific options passed to the module at init (see [VFS module options](#vfs-module-options)). |
 
 ### `filesystems`
@@ -236,10 +245,27 @@ key, so give them different names here.
 
 ### `mounts`
 
-An object keyed by mount name. Each mount instantiates a VFS backend that
-becomes visible in the Chimera namespace at `/<name>`. A mount that fails stops
-the daemon at startup. It does not come up with exports, shares or buckets over
-a missing root.
+An object keyed by mount path. Each mount instantiates a VFS backend and
+places it in the Chimera namespace at that path, the way `mount(8)` does on
+Linux. A mount that fails stops the daemon at startup. It does not come up with
+exports, shares or buckets over a missing root.
+
+- A key without slashes (`"data"`) is the path `/data`; a key may also be a
+  nested path (`"/projects/archive"`) or `"/"` itself.
+- A mount at `"/"` is the namespace root. Without one, Chimera provides an
+  empty, read-only root that holds only the directories the configured mount
+  paths need, creating them as mounts are made and removing them as mounts go.
+- Any other mount goes on a directory that must already exist -- in the root
+  filesystem, or inside another mount -- except where its path runs through
+  that built-in root, whose directories are made for it. A mount inside
+  another mount (`"/data"` and `"/data/scratch"`) is how a filesystem is
+  grafted into another's tree.
+- Mounts are made in the order the file lists them, as `/etc/fstab`'s are: a
+  mount inside another comes after it, and a mount at `"/"` covers what was
+  mounted before it.
+- As on Linux, `..` from a mount's root leads to the directory holding its
+  mount point, and a mount point cannot be removed or renamed, nor its
+  filesystem unmounted while other mounts sit inside it.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
@@ -637,8 +663,8 @@ Each entry of `devices`:
 | `signature` | object | - | SIMPLE-volume signature: `{ "offset": int, "bytes": "<hex>" }` (block layout). |
 | `scsi` | object | - | SCSI designator: `{ "designator_type": "naa"\|"eui64"\|"t10", "code_set": "binary"\|"ascii", "id": "<hex>", "pr_key": int }` (SCSI layout). |
 
-The `nfs` and `root` modules take no `config` object; the `nfs` module is
-configured through mount `options` instead.
+The `nfs` module takes no `config` object; it is configured through mount
+`options` instead.
 
 ---
 

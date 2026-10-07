@@ -133,6 +133,52 @@ virtual filesystems; they do not implement POSIX semantics for arbitrary
 Windows host files. Fork-based stress programs, kernel mounts, network
 namespaces, and external Unix Samba tools remain Unix test paths.
 
+### Windows SMB client
+
+`src/server/smb/tests/windows_client/windows_smb_client_test.py` drives a
+native daemon with the real Windows SMB client on the same machine. One
+daemon serves each requested backend (memfs, diskfs, cairn) as a share, and
+the script maps each with `net use /TCPPORT` and runs file-level checks
+through the ordinary Win32 APIs, robocopy and icacls. Port 445 belongs to the
+kernel's own SMB server and cannot be freed without a reboot, so the test
+needs a client that can reach an alternate port: Windows 11 24H2 or Windows
+Server 2025. It exits 77 (skipped) on older clients, including Server 2022.
+
+```powershell
+python src/server/smb/tests/windows_client/windows_smb_client_test.py `
+  build/bin/chimera.exe memfs diskfs cairn --daemon-log daemon.log
+```
+
+`--daemon-debug` starts the daemon with `-d`, which dumps every SMB request.
+If the daemon fails to stop, the script prints every thread's stack with `cdb`
+from the Windows SDK before killing it. CI runs it in the `smb-client` job of
+the Windows workflow against the Release build: on Server 2025 for x64 and on
+Windows 11 for ARM64.
+
+### IFSTest
+
+`src/server/smb/tests/windows_client/ifstest/` runs Microsoft's IFS test
+(IFSTest, from the Windows HLK) through the same client against each backend.
+`fetch_kit.ps1` downloads the IFSTest packages from Microsoft and prints the
+directory holding `ifstest.exe`; nothing from the HLK is kept in the
+repository or in CI caches. `ifstest_chimera.py` maps each backend and runs
+IFSTest against it, writing one log per backend, and `ifstest_check.py`
+judges those logs against `ifstest_expected.csv`, the tests known not to pass
+on each backend and why. A failure not listed there fails the check; a listed
+test that starts passing is reported so it can be taken off the list.
+
+```powershell
+$kit = & src/server/smb/tests/windows_client/ifstest/fetch_kit.ps1
+python src/server/smb/tests/windows_client/ifstest/ifstest_chimera.py `
+  build/bin/chimera.exe $kit ifstest-logs 1500 memfs diskfs cairn
+python src/server/smb/tests/windows_client/ifstest/ifstest_check.py `
+  ifstest-logs src/server/smb/tests/windows_client/ifstest/ifstest_expected.csv `
+  memfs diskfs cairn
+```
+
+A run takes about 25 minutes per backend, so CI runs it only at the extended
+tier, in the `ifstest` job of the Windows workflow (Server 2025, x64).
+
 ## Platform choices
 
 * Native threads, synchronization, scalar atomics, timers and secure randomness
@@ -156,10 +202,13 @@ namespaces, and external Unix Samba tools remain Unix test paths.
   native password verification. MIT Kerberos/GSSAPI defaults off, and
   requests requiring that provider fail explicitly. NSS, Winbind, and an
   SSPI/Active Directory provider are not part of this port.
-* Chimera libraries are static archives on Windows, with built-in backend
-  registration. This preserves one copy of shared state across the cyclic
-  VFS/server dependency graph. Loading external VFS modules through
-  `module_path` is not supported by this build.
+* Chimera libraries are DLLs on Windows, as they are shared objects on Linux,
+  and VFS backends are loaded at runtime from `chimera_vfs_<name>.dll` beside
+  `chimera_vfs.dll` (or `$CHIMERA_VFS_MODULE_DIR`, or a `module_path`). A DLL
+  must name the DLL every import comes from, so the libraries form a strict
+  hierarchy with no cycles, and data crossing a DLL boundary is declared
+  through `common/export.h`. An out-of-tree backend links the import
+  libraries `chimera_vfs.lib` and `chimera_common.lib`.
 * The public client API uses `chimera_off_t`, `chimera_dev_t`,
   `chimera_dirpos_t`, and `chimera_posix_stat_t` so file offsets, device IDs, directory
   positions, and metadata remain
