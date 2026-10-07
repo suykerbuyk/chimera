@@ -78,6 +78,44 @@ mk_oplock(
     r->level = level;
 } /* mk_oplock */
 
+/* Mount the linux passthrough backend for a cold-reclaim share, honoring the
+ * skip contract.  The linux backend requires a name_to_handle_at-capable
+ * (non-tmpfs) filesystem and CAP_DAC_READ_SEARCH; when either is absent
+ * chimera_server_mount returns the unavailability errno synchronously (it drives
+ * the mount on a private evpl and returns the backend's status).  Mirror the
+ * NFS/S3 cold siblings exactly (nfs3_mbt_common.h:1478-1514,
+ * s3_mbt_common.h:749-782): {ENOTSUP,EPERM,ENXIO} -> SKIP, any other non-zero ->
+ * hard fail.  _exit (not exit) is load-bearing: atexit(evpl_cleanup) aborts if a
+ * server/evpl context is still live, which would SIGABRT over the skip. */
+static void
+cold_mount_or_skip(
+    struct smb2_env *env,
+    const char      *share,
+    const char      *dir)
+{
+    int mrc = chimera_server_mount(env->server, share, "linux", dir, NULL);
+
+    if (mrc == CHIMERA_VFS_ENOTSUP) {
+        fprintf(stderr, "SKIP: linux backend needs a name_to_handle_at-capable "
+                "scratch fs; %s is not one (set CHIMERA_MBT_SCRATCH)\n", dir);
+        _exit(77);
+    }
+    if (mrc == CHIMERA_VFS_EPERM) {
+        fprintf(stderr, "SKIP: linux backend needs CAP_DAC_READ_SEARCH "
+                "(open_by_handle_at); this process is unprivileged\n");
+        _exit(77);
+    }
+    if (mrc == CHIMERA_VFS_ENXIO) {
+        fprintf(stderr, "SKIP: linux backend unavailable in this process "
+                "(module init failed, e.g. io_uring_setup ENOSYS)\n");
+        _exit(77);
+    }
+    if (mrc != 0) {
+        fprintf(stderr, "mount linux at %s failed: status=%d\n", dir, mrc);
+        _exit(1);
+    }
+} /* cold_mount_or_skip */
+
 /* Register the second user, and (re-)establish the two persistent, continuously
  * available linux-backed shares.  Called after the initial bring-up and again
  * after each restart (chimera_server_destroy drops users, mounts and shares;
@@ -99,9 +137,9 @@ cold_env_services(struct smb2_env *env)
     mkdir(d1, 0700);   /* idempotent: survives the restart */
     mkdir(d2, 0700);
 
-    chimera_server_mount(env->server, "share", "linux", d1, NULL);
+    cold_mount_or_skip(env, "share", d1);
     chimera_server_create_share(env->server, "share", "share", 1 /* CA */);
-    chimera_server_mount(env->server, "share2", "linux", d2, NULL);
+    cold_mount_or_skip(env, "share2", d2);
     chimera_server_create_share(env->server, "share2", "share2", 1 /* CA */);
 } /* cold_env_services */
 

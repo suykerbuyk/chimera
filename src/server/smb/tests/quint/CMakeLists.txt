@@ -135,7 +135,8 @@ if(TARGET chimera_vfs_sqlite)
     set_tests_properties(chimera/server/smb/mbt/durable_cold_probe_linux PROPERTIES
         ENVIRONMENT "CHIMERA_MBT_ARTIFACTS=smb2_durable_cold_probe_linux"
         LABELS "functional;probe;smb_mbt;linux"
-        TIMEOUT 120)
+        TIMEOUT 120
+        SKIP_RETURN_CODE 77)
 endif()
 
 # Replay / ChannelSequence ground-truth probe: pins the exactly-once layer --
