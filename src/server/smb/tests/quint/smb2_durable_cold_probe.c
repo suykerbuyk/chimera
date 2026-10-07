@@ -195,7 +195,7 @@ main(
     struct smb2_durable_req         dur;
     struct smb2_create_out          o, ow, r;
     struct smb2_conn               *a, *b1, *b2, *bs2;
-    uint32_t                        st, n;
+    uint32_t                        st, n = 0;
     uint8_t                         rdbuf[32];
     uint64_t                        deadline;
 
