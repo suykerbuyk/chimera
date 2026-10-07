@@ -100,15 +100,20 @@ test_roundtrip(void)
     tu_format(space);
     a = tu_open(space);
 
-    facade_obj_write_durable(a, id, pat, sizeof(pat), tu_on_epoch, &ew);
+    tu_write0(a, id, pat, sizeof(pat), &ew);
     TCHECK(ew.done && ew.st == FACADE_OK, "durable write failed");
 
     tu_close(a);
     a = tu_open(space);
 
     o = facade_obj_find(a, id);
-    TCHECK(o != NULL && o->nextents == 1, "object missing after reopen");
-    read_block(space, o->ext[0].phys_block, blk);
+    TCHECK(o != NULL, "object missing after reopen");
+    {
+        chimera_media_block_t phys;
+
+        TCHECK(tu_obj_phys0(a, id, &phys), "object extent missing after reopen");
+        read_block(space, phys, blk);
+    }
     TCHECK(memcmp(blk, pat, sizeof(pat)) == 0, "object bytes differ after reopen");
 
     tu_close(a);
@@ -194,7 +199,7 @@ test_teardown_race(void)
     /* Stall the fixture: the first write of the durable-write chain (the
      * clean=0 dirty-mark superblock write) is queued PENDING. */
     facade_test_media_stall_writes(space, 1);
-    facade_obj_write_durable(a, id, pat, sizeof(pat), tu_on_epoch, &ew);
+    tu_write0(a, id, pat, sizeof(pat), &ew);
     TCHECK(!ew.done, "write should be stalled, not yet complete");
     TCHECK(facade_test_media_pending_count(space) > 0, "expected a pending write");
 
@@ -249,8 +254,7 @@ test_block0_serialization(void)
     /* A durable object write starts with a clean=0 dirty-mark (a block-0 write).
      * It MUST defer behind the in-flight extension, not start a second block-0
      * write -- the F1 single-writer invariant. */
-    facade_obj_write_durable(a, id, pat, sizeof(pat),
-                             tu_on_epoch, &ew);
+    tu_write0(a, id, pat, sizeof(pat), &ew);
     TCHECK(facade_test_media_pending_count(space) == 1,
            "mark_dirty must not race block 0: pending=%d",
            facade_test_media_pending_count(space));
@@ -272,8 +276,13 @@ test_block0_serialization(void)
     a     = tu_open(space);
 
     o = facade_obj_find(a, id);
-    TCHECK(o != NULL && o->nextents == 1, "object lost across crash (block-0 race?)");
-    read_block(space, o->ext[0].phys_block, rb);
+    TCHECK(o != NULL, "object lost across crash (block-0 race?)");
+    {
+        chimera_media_block_t phys;
+
+        TCHECK(tu_obj_phys0(a, id, &phys), "object extent lost across crash");
+        read_block(space, phys, rb);
+    }
     TCHECK(memcmp(rb, pat, sizeof(pat)) == 0, "object bytes differ after crash");
 
     TCHECK(tu_draw_start(&d2, a) == FACADE_OK && d2.got == 1, "post-crash draw");
@@ -306,17 +315,29 @@ test_write_failure_rollback(void)
     tu_format(space);
     a = tu_open(space);
 
+    /* object-ops-v1 splits OBJ_CREATE from OBJ_WRITE: create the (empty) object
+     * first, then fail its first durable write mid-transaction. */
+    facade_obj_create_entry(a, id, NULL);
     free_before = facade_alloc_free_blocks(a);
 
     /* Fail the OBJ record write (txn records are ALLOC@log+0, OBJ@log+1,
-     * COMMIT@log+2): the object entry was already put and a data block
-     * allocated, so this exercises both rollback branches. */
+     * COMMIT@log+2): a data block was allocated and the extent map mutated, so
+     * this exercises the block-return and map-restore rollback branches. */
     facade_test_media_fail_write_lba(space, a->log_block + 1);
 
-    facade_obj_write_durable(a, id, pat, sizeof(pat), tu_on_epoch, &ew);
+    tu_write0(a, id, pat, sizeof(pat), &ew);
     TCHECK(ew.done && ew.st != FACADE_OK, "write over a failing OBJ record must fail");
-    TCHECK(facade_obj_find(a, id) == NULL,
-           "a failed write must leave no phantom object");
+    {
+        struct facade_obj   *o = facade_obj_find(a, id);
+        struct facade_extent ext;
+
+        TCHECK(o != NULL, "the created object must survive a failed write");
+        TCHECK(o->state == CHIMERA_SC_OBJ_OPEN && o->size == 0,
+               "a failed write must roll the object back to its pre-write state");
+        TCHECK(!facade_extent_map_lookup(o->map, 0, &ext) ||
+               ext.kind == CHIMERA_SC_SEG_HOLE,
+               "a failed write must leave no phantom extent");
+    }
     TCHECK(facade_alloc_free_blocks(a) == free_before,
            "a failed write must return its allocated block (%llu != %llu)",
            (unsigned long long) facade_alloc_free_blocks(a),
@@ -370,19 +391,22 @@ write_obj_rec(
     uint64_t                    phys)
 {
     uint8_t                    blk[CHIMERA_MEDIA_BLOCK_SIZE];
-    uint8_t                    payload[sizeof(struct facade_lr_obj)
+    uint8_t                    payload[sizeof(struct facade_obj_rec)
                                        + sizeof(struct facade_ckpt_objext)];
-    struct facade_lr_obj      *orec = (struct facade_lr_obj *) payload;
+    struct facade_obj_rec     *orec = (struct facade_obj_rec *) payload;
     struct facade_ckpt_objext *xr   = (struct facade_ckpt_objext *) (payload + sizeof(*orec));
 
     memset(payload, 0, sizeof(payload));
     memcpy(orec->obj_id, id, 16);
     orec->flags       = 0;
+    orec->state       = CHIMERA_SC_OBJ_OPEN;
+    orec->size        = CHIMERA_MEDIA_BLOCK_SIZE;
     orec->nextents    = 1;
     xr->logical_block = 0;
     xr->phys_block    = phys;
     xr->nblocks       = 1;
     xr->kind          = CHIMERA_SC_SEG_DATA;
+    xr->owned         = 1;
     build_rec(blk, FACADE_LR_OBJ, seq, txn, payload, (uint32_t) sizeof(payload));
     write_block(space, lba, blk);
 } /* write_obj_rec */
@@ -429,9 +453,9 @@ test_recover_skips_uncommitted_midprefix(void)
     data_last = a->data_last;
 
     /* txn1: a real durable write (records at log_block + 0,1,2; sets clean=0). */
-    facade_obj_write_durable(a, id1, patA, sizeof(patA), tu_on_epoch, &ew);
+    tu_write0(a, id1, patA, sizeof(patA), &ew);
     TCHECK(ew.done && ew.st == FACADE_OK, "txn1 write");
-    x1 = facade_obj_find(a, id1)->ext[0].phys_block;   /* = data_last - 1 (tail cut) */
+    TCHECK(tu_obj_phys0(a, id1, &x1), "txn1 object extent");   /* = data_last - 1 (tail cut) */
     x3 = data_last - 2;                                 /* a distinct free block */
     TCHECK(x3 != x1 && x3 >= a->data_first, "distinct free block for txn3");
 
@@ -456,7 +480,12 @@ test_recover_skips_uncommitted_midprefix(void)
     a     = tu_open(space);
 
     TCHECK(facade_obj_find(a, id1) != NULL, "committed txn1 object must survive");
-    read_block(space, facade_obj_find(a, id1)->ext[0].phys_block, rb);
+    {
+        chimera_media_block_t phys;
+
+        TCHECK(tu_obj_phys0(a, id1, &phys), "txn1 object extent");
+        read_block(space, phys, rb);
+    }
     TCHECK(memcmp(rb, patA, sizeof(patA)) == 0, "txn1 bytes");
     TCHECK(facade_obj_find(a, id2) == NULL,
            "UNcommitted mid-prefix txn must be skipped");
@@ -496,7 +525,7 @@ test_recover_after_intrawrite_compaction(void)
            (unsigned long long) a->log_nblocks);
 
     /* Pre-compaction object: its records fill the log toward the wrap point. */
-    facade_obj_write_durable(a, id_pre, patP, sizeof(patP), tu_on_epoch, &ew);
+    tu_write0(a, id_pre, patP, sizeof(patP), &ew);
     TCHECK(ew.done && ew.st == FACADE_OK, "pre-compaction write");
 
     ckpt_gen_before = a->ckpt_generation;
@@ -505,7 +534,7 @@ test_recover_after_intrawrite_compaction(void)
      * (folding id_pre into the checkpoint), then appends its own records to the
      * reset log. */
     ew.done = 0;
-    facade_obj_write_durable(a, id_trig, patT, sizeof(patT), tu_on_epoch, &ew);
+    tu_write0(a, id_trig, patT, sizeof(patT), &ew);
     TCHECK(ew.done && ew.st == FACADE_OK, "triggering write");
     TCHECK(a->ckpt_generation > ckpt_gen_before,
            "the triggering write must force a compaction");
@@ -527,18 +556,18 @@ test_recover_after_intrawrite_compaction(void)
            (unsigned long long) plg_before);
 
     {
-        struct facade_obj *o = facade_obj_find(a, id_trig);
+        chimera_media_block_t phys;
 
-        TCHECK(o != NULL && o->nextents == 1,
+        TCHECK(tu_obj_phys0(a, id_trig, &phys),
                "post-compaction durable object LOST (clean=1 window, HA-3)");
-        read_block(space, o->ext[0].phys_block, rb);
+        read_block(space, phys, rb);
         TCHECK(memcmp(rb, patT, sizeof(patT)) == 0, "triggering object bytes");
     }
     {
-        struct facade_obj *o = facade_obj_find(a, id_pre);
+        chimera_media_block_t phys;
 
-        TCHECK(o != NULL && o->nextents == 1, "pre-compaction object lost");
-        read_block(space, o->ext[0].phys_block, rb);
+        TCHECK(tu_obj_phys0(a, id_pre, &phys), "pre-compaction object lost");
+        read_block(space, phys, rb);
         TCHECK(memcmp(rb, patP, sizeof(patP)) == 0, "pre-compaction object bytes");
     }
 

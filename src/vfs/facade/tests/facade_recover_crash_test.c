@@ -34,7 +34,9 @@
 #include "loopback/media_loopback.h"
 
 #include "facade_internal.h"   /* white-box: struct facade_alloc, facade_media_read */
+#include "facade_extent.h"
 #include "facade_log.h"
+#include "facade_object.h"
 
 #define ONE_GIB (1ULL << 30)
 #define BS      CHIMERA_MEDIA_BLOCK_SIZE
@@ -212,7 +214,11 @@ ts_write(
 {
     struct epoch_w w = { 0, FACADE_E_IO, 0 };
 
-    facade_obj_write_durable(t->alloc, id, data, len, on_epoch, &w);
+    if (!facade_obj_find(t->alloc, id)) {
+        facade_obj_create_entry(t->alloc, id, NULL);
+    }
+    facade_obj_write(t->alloc, id, 0, data, len, CHIMERA_SC_WRITE_DURABLE,
+                     on_epoch, &w);
     pump(t->evpl, &w.done);
     CHECK(w.st == FACADE_OK);
     return w.epoch;
@@ -226,22 +232,101 @@ ts_read_obj(
     uint8_t      *out,
     uint32_t      len)
 {
-    struct facade_obj *o = facade_obj_find(t->alloc, id);
-    struct evpl_iovec  iov;
-    int                done = 0;
-    int                n;
+    struct facade_obj   *o = facade_obj_find(t->alloc, id);
+    struct facade_extent ext;
+    struct evpl_iovec    iov;
+    int                  done = 0;
+    int                  n;
 
-    if (!o || o->nextents == 0) {
+    if (!o || !facade_extent_map_lookup(o->map, 0, &ext) ||
+        ext.kind == CHIMERA_SC_SEG_HOLE) {
         return 0;
     }
     n = evpl_iovec_alloc(t->evpl, BS, BS, 1, 0, &iov);
     CHECK(n == 1);
-    t->provider->read(t->space, &iov, 1, o->ext[0].phys_block, 1, on_mclose, &done);
+    t->provider->read(t->space, &iov, 1, ext.phys_block, 1, on_mclose, &done);
     pump(t->evpl, &done);
     memcpy(out, evpl_iovec_data(&iov), len);
     evpl_iovec_release(t->evpl, &iov);
     return 1;
 } /* ts_read_obj */
+
+/* A park-aware id draw: on the async crash-sim fixture the first draw after an
+ * open parks (id_next == id_floor until the floor-extension FUA lands), so the
+ * resume re-issues it when the extension completes under the evpl loop. */
+struct ts_draw {
+    struct facade_alloc      *a;
+    struct chimera_sc_obj_id *id;
+    int                       done;
+    int                       ok;
+};
+
+static void
+ts_draw_resume(void *arg)
+{
+    struct ts_draw    *d  = arg;
+    enum facade_status st = facade_objid_next(d->a, d->id, ts_draw_resume, d);
+
+    if (st == FACADE_OK) {
+        d->done = 1; d->ok = 1;
+    } else if (st != FACADE_AGAIN) {
+        d->done = 1; d->ok = 0;
+    }
+} /* ts_draw_resume */
+
+static void
+ts_seal(
+    struct ts    *t,
+    const uint8_t id[16])
+{
+    struct epoch_w w = { 0, FACADE_E_IO, 0 };
+
+    facade_obj_seal(t->alloc, id, on_epoch, &w);
+    pump(t->evpl, &w.done);
+    CHECK(w.st == FACADE_OK);
+} /* ts_seal */
+
+/* Clone a working version of sealed_id into *wid (drawn here), durably. */
+static void
+ts_clone(
+    struct ts                *t,
+    const uint8_t             sealed_id[16],
+    struct chimera_sc_obj_id *wid)
+{
+    struct epoch_w     w = { 0, FACADE_E_IO, 0 };
+    struct ts_draw     d = { t->alloc, wid, 0, 0 };
+    enum facade_status st;
+
+    st = facade_objid_next(t->alloc, wid, ts_draw_resume, &d);
+    if (st == FACADE_OK) {
+        d.done = 1; d.ok = 1;
+    } else {
+        CHECK(st == FACADE_AGAIN);
+        pump(t->evpl, &d.done);   /* the floor extension lands, the resume re-draws */
+    }
+    CHECK(d.ok);
+
+    facade_obj_clone_working(t->alloc, sealed_id, wid, on_epoch, &w);
+    pump(t->evpl, &w.done);
+    CHECK(w.st == FACADE_OK);
+} /* ts_clone */
+
+/* Write `len` bytes at a byte offset (for the working-version COW write). */
+static void
+ts_write_at(
+    struct ts    *t,
+    const uint8_t id[16],
+    uint64_t      offset,
+    const void   *data,
+    uint32_t      len)
+{
+    struct epoch_w w = { 0, FACADE_E_IO, 0 };
+
+    facade_obj_write(t->alloc, id, offset, data, len, CHIMERA_SC_WRITE_DURABLE,
+                     on_epoch, &w);
+    pump(t->evpl, &w.done);
+    CHECK(w.st == FACADE_OK);
+} /* ts_write_at */
 
 /* Deterministically destroy a log record by overwriting its block with a zeroed
  * (magic == 0) block, FUA so it is durable.  (crash-sim corrupt() flips random
@@ -459,6 +544,56 @@ main(void)
         CHECK(t.alloc->power_loss_generation == g1);
         CHECK(ts_read_obj(&t, id, rb, sizeof(pat)) == 1);
         CHECK(memcmp(rb, pat, sizeof(pat)) == 0);
+        ts_close_media(&t);
+    }
+
+    /* Case 5: a SEALED object and a HELD working-version clone survive a crash
+     * and recovery (the plan's seal + held-clone crash-survival coverage; the
+     * other cases exercise only plain writes).  Keep-biased so nothing is lost
+     * for the wrong reason -- the durable records+checkpoint carry the state. */
+    {
+        uint8_t                  sid[16], patS[64], patW[64], rb[64];
+        struct chimera_sc_obj_id wid;
+        struct facade_obj       *w;
+
+        mkid(sid, 0xE1);
+        fillpat(patS, sizeof(patS), 0x71);
+        fillpat(patW, sizeof(patW), 0x93);
+
+        ts_open_media(&t, dir, 5, 1, 0, 0);   /* keep-biased */
+        ts_format(&t);
+        ts_open(&t);
+
+        ts_write(&t, sid, patS, sizeof(patS));   /* origin data, durable */
+        ts_seal(&t, sid);                        /* OPEN -> SEALED, durable */
+
+        ts_clone(&t, sid, &wid);                 /* metadata-only working version */
+        /* Make the working version HELD (a durable record state), then give it
+         * its own copy-on-write durable write at offset 0. */
+        w = facade_obj_find(t.alloc, wid.b);
+        CHECK(w != NULL);
+        w->flags |= FACADE_OBJ_HELD;
+        ts_write_at(&t, wid.b, 0, patW, sizeof(patW));
+
+        ts_crash_recover(&t);
+        ts_reopen(&t);
+
+        /* The sealed origin survived: state SEALED, bytes intact. */
+        {
+            struct facade_obj *s = facade_obj_find(t.alloc, sid);
+
+            CHECK(s != NULL && s->state == CHIMERA_SC_OBJ_SEALED);
+        }
+        CHECK(ts_read_obj(&t, sid, rb, sizeof(patS)) == 1);
+        CHECK(memcmp(rb, patS, sizeof(patS)) == 0);
+
+        /* The held working version survived: HELD flag kept, its COW bytes
+         * intact, and the origin is unchanged (COW did not touch it). */
+        w = facade_obj_find(t.alloc, wid.b);
+        CHECK(w != NULL && (w->flags & FACADE_OBJ_HELD));
+        CHECK(ts_read_obj(&t, wid.b, rb, sizeof(patW)) == 1);
+        CHECK(memcmp(rb, patW, sizeof(patW)) == 0);
+
         ts_close_media(&t);
     }
 

@@ -25,16 +25,17 @@
 #include "media_types.h"
 
 struct rec_entry {
-    uint32_t             type;
-    uint64_t             seq;
-    uint64_t             txn;
-    /* payload (only the fields the applied types need) */
-    uint64_t             start; /* ALLOC/FREE */
-    uint64_t             nblocks; /* ALLOC/FREE */
-    uint8_t              id[16]; /* OBJ */
-    uint32_t             flags; /* OBJ */
-    uint32_t             nextents; /* OBJ */
-    struct facade_objext ext[FACADE_OBJ_MAX_EXT];
+    uint32_t                  type;
+    uint64_t                  seq;
+    uint64_t                  txn;
+    /* ALLOC/FREE payload */
+    uint64_t                  start;
+    uint64_t                  nblocks;
+    /* OBJ payload: the full durable object record header + its extents (the
+     * fixed array is sized for the per-object cap; a record claiming more is
+     * rejected, stopping the prefix). */
+    struct facade_obj_rec     obj_hdr;
+    struct facade_ckpt_objext obj_ext[FACADE_OBJ_MAX_EXT];
 };
 
 struct facade_recover_ctx {
@@ -105,31 +106,22 @@ facade_recover_parse(
             break;
         }
         case FACADE_LR_OBJ: {
-            struct facade_lr_obj orec;
-            uint32_t             k;
-            const uint8_t       *xp;
+            uint32_t       k;
+            const uint8_t *xp;
 
-            if (hdr.len < sizeof(orec)) {
+            if (hdr.len < sizeof(e->obj_hdr)) {
                 return 0;
             }
-            memcpy(&orec, payload, sizeof(orec));
-            if (orec.nextents > FACADE_OBJ_MAX_EXT ||
-                hdr.len < sizeof(orec) + orec.nextents * sizeof(struct facade_ckpt_objext)) {
+            memcpy(&e->obj_hdr, payload, sizeof(e->obj_hdr));
+            if (e->obj_hdr.nextents > FACADE_OBJ_MAX_EXT ||
+                hdr.len < sizeof(e->obj_hdr)
+                + (uint64_t) e->obj_hdr.nextents * sizeof(struct facade_ckpt_objext)) {
                 return 0;
             }
-            memcpy(e->id, orec.obj_id, 16);
-            e->flags    = orec.flags;
-            e->nextents = orec.nextents;
-            xp          = payload + sizeof(orec);
-            for (k = 0; k < orec.nextents; k++) {
-                struct facade_ckpt_objext xr;
-
-                memcpy(&xr, xp, sizeof(xr));
-                xp                     += sizeof(xr);
-                e->ext[k].logical_block = xr.logical_block;
-                e->ext[k].phys_block    = xr.phys_block;
-                e->ext[k].nblocks       = xr.nblocks;
-                e->ext[k].kind          = xr.kind;
+            xp = payload + sizeof(e->obj_hdr);
+            for (k = 0; k < e->obj_hdr.nextents; k++) {
+                memcpy(&e->obj_ext[k], xp, sizeof(e->obj_ext[k]));
+                xp += sizeof(e->obj_ext[k]);
             }
             break;
         }
@@ -217,7 +209,7 @@ facade_recover_apply(struct facade_recover_ctx *c)
                 facade_free_add(a, e->start, e->nblocks);
                 break;
             case FACADE_LR_OBJ:
-                if (!facade_obj_put(a, e->id, e->flags, e->ext, e->nextents)) {
+                if (!facade_obj_put_rec(a, &e->obj_hdr, e->obj_ext)) {
                     facade_recover_finish(c, FACADE_E_IO);
                     return;
                 }

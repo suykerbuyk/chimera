@@ -42,14 +42,17 @@ struct chimera_media_space;
 struct facade_alloc;
 
 enum facade_status {
-    FACADE_OK         = 0,
-    FACADE_E_NO_SPACE = 1, /* allocation could not be satisfied (contract NO_SPACE) */
-    FACADE_E_IO       = 2, /* media failure, or a corrupt/absent superblock */
-    FACADE_E_INVAL    = 3, /* malformed request */
-    FACADE_AGAIN      = 4, /* id draw parked; the resume callback will fire */
-    FACADE_E_SHUTDOWN = 5, /* allocator is being torn down; the op is cancelled */
-    FACADE_E_FORMAT   = 6, /* recognized superblock, unsupported format version
-                            * (L41): refused clearly, never read as blank */
+    FACADE_OK          = 0,
+    FACADE_E_NO_SPACE  = 1, /* allocation could not be satisfied (contract NO_SPACE) */
+    FACADE_E_IO        = 2, /* media failure, or a corrupt/absent superblock */
+    FACADE_E_INVAL     = 3, /* malformed request */
+    FACADE_AGAIN       = 4, /* id draw parked; the resume callback will fire */
+    FACADE_E_SHUTDOWN  = 5, /* allocator is being torn down; the op is cancelled */
+    FACADE_E_FORMAT    = 6, /* recognized superblock, unsupported format version
+                             * (L41): refused clearly, never read as blank */
+    FACADE_E_STATE     = 7, /* the object's state forbids the op (4.2): a write to
+                             * a sealed object, a clone of a non-sealed object */
+    FACADE_E_NOT_FOUND = 8, /* no such object id (released or never created) */
 };
 
 /* Durability of an allocation relative to the allocator's durable epoch (D5,

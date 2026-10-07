@@ -43,7 +43,15 @@ extern "C" {
 #define FACADE_SUPER_MAGIC    0x434F4C4C41434146ULL
 /* "FACCKPT2" as a little-endian u64. */
 #define FACADE_CKPT_MAGIC     0x32545049434341F0ULL
-#define FACADE_FORMAT_VERSION 2u
+/*
+ * v3 (object-ops-v1): the durable object record carries the full object state
+ * (open/sealed), logical size, change counter, stamps and retention, and each
+ * extent carries an `owned` bit (0 = borrowed from a clone origin), so the 4.2
+ * states, 5.1 metadata and the D2 working-version clone survive a crash.  A v2
+ * image (free set + object table of {id,flags,extents} only) is refused, not
+ * read as blank (facade_alloc_open -> FACADE_E_FORMAT).
+ */
+#define FACADE_FORMAT_VERSION 3u
 
 #define FACADE_SUPER_BLOCK    0u /* superblock lba */
 #define FACADE_SUPER_SIZE     CHIMERA_MEDIA_BLOCK_SIZE /* one block */
@@ -94,10 +102,28 @@ struct facade_ckpt_ext {
     uint64_t nblocks; /* run length, in blocks */
 };
 
-/* One on-media object record header; followed by nextents facade_ckpt_objext. */
-struct facade_ckpt_obj {
+/*
+ * One on-media object record header; followed by nextents facade_ckpt_objext.
+ * The checkpoint and the durability log share this shape (the log OBJ record is
+ * this header + its extents); it carries everything OBJ_STAT reports and every
+ * state the 4.2 machine and the D2 clone must survive a crash with.  u64s first,
+ * then u32s, so there is no implicit padding on the single-host LP64 image.
+ */
+struct facade_obj_rec {
     uint8_t  obj_id[16];
-    uint32_t flags;    /* hold flag etc. (FACADE_OBJ_*) */
+    uint64_t size;               /* logical byte length (5.1) */
+    uint64_t change;             /* advances on every data/metadata change (5.1) */
+    uint64_t policy_set;         /* stamps (D7/D13) */
+    uint64_t qd_owner;
+    uint64_t qd_group;
+    uint64_t qd_project;
+    uint64_t owner_principal;
+    uint64_t retention_until_ns; /* D8 */
+    uint32_t flags;              /* FACADE_OBJ_* */
+    uint32_t state;              /* enum chimera_sc_obj_state (OPEN/SEALED) */
+    uint32_t qd_valid;           /* CHIMERA_SC_QD_* */
+    uint32_t origin;             /* enum chimera_sc_origin */
+    uint32_t retention_mode;     /* CHIMERA_SC_RETENTION_* */
     uint32_t nextents;
 };
 
@@ -107,7 +133,7 @@ struct facade_ckpt_objext {
     uint64_t phys_block;
     uint64_t nblocks;
     uint32_t kind;     /* CHIMERA_SC_SEG_DATA / _UNWRITTEN */
-    uint32_t reserved; /* must be zero */
+    uint32_t owned;    /* 1 = this object allocated the blocks; 0 = borrowed (clone) */
 };
 
 /* Object-record flags. */

@@ -40,7 +40,7 @@ struct facade_alloc;
 enum facade_lr_type {
     FACADE_LR_ALLOC  = 1, /* a run of blocks was allocated (removed from free) */
     FACADE_LR_FREE   = 2, /* a run of blocks was freed (returned to free) */
-    FACADE_LR_OBJ    = 3, /* an object record: id -> flags + extents */
+    FACADE_LR_OBJ    = 3, /* an object record: full facade_obj_rec + extents */
     FACADE_LR_COMMIT = 4, /* closes a transaction */
 };
 
@@ -65,12 +65,9 @@ struct facade_lr_alloc {
     uint64_t nblocks;
 };
 
-/* OBJ payload header; followed by nextents struct facade_ckpt_objext. */
-struct facade_lr_obj {
-    uint8_t  obj_id[16];
-    uint32_t flags;
-    uint32_t nextents;
-};
+/* The OBJ payload is a struct facade_obj_rec (facade_super.h) followed by its
+* nextents struct facade_ckpt_objext -- the same shape the checkpoint stores, so
+* an object's durable record is identical in the log and in the checkpoint. */
 
 /* COMMIT payload. */
 struct facade_lr_commit {
@@ -78,23 +75,17 @@ struct facade_lr_commit {
     uint64_t nrecords;
 };
 
-/*
- * Durable object write (the contract OBJ_WRITE at DURABLE, for the slice: a
- * single extent at logical offset 0).  Allocates ceil(len / 4 KiB) data blocks,
- * writes the data with force-unit-access, then logs {ALLOC, OBJ, COMMIT} and
- * flushes, updating the (durable) object table.  Honors G1 (compact at the txn
- * boundary before allocating) and G2 (COMMIT durable only after the data FUA).
- * The object entry named by id must already exist (OBJ_CREATE).  Reports the
- * power-loss generation through cb once the write is durable.
- */
+/* Build one log record into a zeroed 4 KiB block (header two-CRC, payload).
+ * Exposed so the generalized transaction machinery (facade_object.c) builds
+ * ALLOC/FREE/OBJ/COMMIT records with it. */
 void
-facade_obj_write_durable(
-    struct facade_alloc *alloc,
-    const uint8_t        id[16],
-    const void          *data,
-    uint32_t             len,
-    facade_epoch_cb_t    cb,
-    void                *private_data);
+facade_lr_build(
+    void               *block,
+    enum facade_lr_type type,
+    uint64_t            seq,
+    uint64_t            txn,
+    const void         *payload,
+    uint32_t            len);
 
 /* facade_recover.c: replay the contiguous durable prefix of the log over the
  * loaded checkpoint baseline (called by facade_alloc_open when clean == 0).

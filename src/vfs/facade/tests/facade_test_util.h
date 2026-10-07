@@ -16,6 +16,9 @@
 #include <string.h>
 
 #include "facade_alloc.h"
+#include "facade_extent.h"
+#include "facade_internal.h"   /* white-box: facade_obj_find / facade_obj_create_entry */
+#include "facade_object.h"
 #include "facade_objid.h"
 #include "facade_test_media.h"
 
@@ -225,6 +228,46 @@ tu_draw_start(
     }
     return st;
 } /* tu_draw_start */
+
+/*
+ * A durable single-block write at offset 0, creating the object entry if absent
+ * (object-ops-v1 split create from write; this mirrors the slice's auto-create
+ * so the inherited media-log tests keep driving one call).  The in-RAM fixture
+ * completes inline, so the epoch result is set by return.
+ */
+static inline void
+tu_write0(
+    struct facade_alloc *a,
+    const uint8_t        id[16],
+    const void          *data,
+    uint32_t             len,
+    struct tu_epoch_w   *w)
+{
+    if (!facade_obj_find(a, id)) {
+        facade_obj_create_entry(a, id, NULL);
+    }
+    w->st   = FACADE_E_IO;
+    w->done = 0;
+    facade_obj_write(a, id, 0, data, len, CHIMERA_SC_WRITE_DURABLE, tu_on_epoch, w);
+} // tu_write0
+
+/* Physical block backing an object's logical block 0, or a miss. */
+static inline int
+tu_obj_phys0(
+    struct facade_alloc   *a,
+    const uint8_t          id[16],
+    chimera_media_block_t *r_phys)
+{
+    struct facade_obj   *o = facade_obj_find(a, id);
+    struct facade_extent ext;
+
+    if (!o || !facade_extent_map_lookup(o->map, 0, &ext) ||
+        ext.kind == CHIMERA_SC_SEG_HOLE) {
+        return 0;
+    }
+    *r_phys = ext.phys_block + (0 - ext.logical_block);
+    return 1;
+} // tu_obj_phys0
 
 /* The 64-bit sequence half of an id (low 8 bytes); the high 8 are the nonce. */
 static inline uint64_t

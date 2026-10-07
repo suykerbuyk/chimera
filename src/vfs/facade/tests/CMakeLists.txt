@@ -19,7 +19,8 @@ target_include_directories(facade_test_media PUBLIC
 # Exit-criteria tests over the fixture.  Compiled -UNDEBUG so assert() stays
 # live; load-bearing invariants also use TCHECK(), which survives NDEBUG.
 foreach(_t facade_alloc_test facade_objid_test facade_enospc_test
-           facade_objid_race_test facade_objid_teardown_test)
+           facade_objid_race_test facade_objid_teardown_test
+           facade_object_ops_test)
     add_executable(${_t} ${_t}.c)
     target_include_directories(${_t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     if(MSVC)

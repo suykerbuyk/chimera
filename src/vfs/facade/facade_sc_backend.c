@@ -21,8 +21,24 @@
 
 #include "common/macros.h"
 #include "facade_internal.h"   /* struct facade_alloc, facade_obj_*, facade_media_read */
-#include "facade_log.h"        /* facade_obj_write_durable */
+#include "facade_log.h"
+#include "facade_object.h"     /* the full 6.1 object surface */
 #include "facade_sc_backend.h"
+
+/* Map a facade status to the contract error the op returns. */
+static uint32_t
+fsb_status(enum facade_status st)
+{
+    switch (st) {
+        case FACADE_OK:          return CHIMERA_SC_OK;
+        case FACADE_E_NO_SPACE:  return CHIMERA_SC_E_NO_SPACE;
+        case FACADE_E_STATE:     return CHIMERA_SC_E_STATE;
+        case FACADE_E_NOT_FOUND: return CHIMERA_SC_E_NOT_FOUND;
+        case FACADE_E_INVAL:     return CHIMERA_SC_E_INVALID;
+        case FACADE_E_SHUTDOWN:  return CHIMERA_SC_E_FENCED;
+        default:                 return CHIMERA_SC_E_IO;
+    } /* switch */
+} /* fsb_status */
 
 #define FSB_LEASE_NS      10000000000ULL
 
@@ -70,15 +86,16 @@ struct fsb_op {
     struct fsb_state          *s;
     struct chimera_sc_request *req;
     void                      *buf;   /* OBJ_READ temp block */
+    struct chimera_sc_obj_id   nid;   /* OBJ_CLONE_WORKING: the drawn new id */
 };
 
 /* ---- ATTACH ---- */
 
+/* After the (re)open and the epoch-held GC: fill the attach reply and complete. */
 static void
-fsb_attach_open_done(
-    enum facade_status   status,
-    struct facade_alloc *alloc,
-    void                *priv)
+fsb_attach_finish(
+    enum facade_status st,
+    void              *priv)
 {
     struct fsb_op                 *op  = priv;
     struct fsb_state              *s   = op->s;
@@ -86,19 +103,11 @@ fsb_attach_open_done(
     struct chimera_sc_attach_args *a   = &req->attach;
 
     free(op);
-
-    if (status != FACADE_OK) {
-        /* A recognized-but-unsupported on-media format maps to a version
-         * refusal; anything else is a media failure. */
-        req->status = (status == FACADE_E_FORMAT) ? CHIMERA_SC_E_VERSION
-                                                  : CHIMERA_SC_E_IO;
+    if (st != FACADE_OK) {
+        req->status = CHIMERA_SC_E_IO;
         req->complete(req);
         return;
     }
-
-    s->alloc      = alloc;
-    s->node       = req->caller.node;
-    s->node_epoch = ++s->next_epoch;   /* re-attach revokes the old epoch */
 
     /* The epoch is a lease (6.5, D10): grant it a monotonic deadline.  S14 ties
      * r_lease_ns to the moment the caller dispatched and says the backend never
@@ -110,7 +119,7 @@ fsb_attach_open_done(
     a->r_npclasses        = 0;
     a->r_fence_epoch      = s->node_epoch;
     a->r_lease_ns         = FSB_LEASE_NS;
-    a->r_durability_epoch = facade_alloc_power_loss_generation(alloc);
+    a->r_durability_epoch = facade_alloc_power_loss_generation(s->alloc);
     memset(&a->r_limits, 0, sizeof(a->r_limits));
     a->r_limits.max_txn_ops   = 8;
     a->r_limits.max_key_len   = 64;
@@ -119,6 +128,37 @@ fsb_attach_open_done(
     a->r_limits.lease_ns      = FSB_LEASE_NS;
     req->status               = CHIMERA_SC_OK;
     req->complete(req);
+} /* fsb_attach_finish */
+
+static void
+fsb_attach_open_done(
+    enum facade_status   status,
+    struct facade_alloc *alloc,
+    void                *priv)
+{
+    struct fsb_op             *op  = priv;
+    struct fsb_state          *s   = op->s;
+    struct chimera_sc_request *req = op->req;
+
+    if (status != FACADE_OK) {
+        /* A recognized-but-unsupported on-media format maps to a version
+         * refusal; anything else is a media failure. */
+        free(op);
+        req->status = (status == FACADE_E_FORMAT) ? CHIMERA_SC_E_VERSION
+                                                  : CHIMERA_SC_E_IO;
+        req->complete(req);
+        return;
+    }
+
+    s->alloc      = alloc;
+    s->node       = req->caller.node;
+    s->node_epoch = ++s->next_epoch;   /* re-attach revokes the old epoch */
+
+    /* A new epoch ends the previous one: release every OPEN && !HELD
+     * (epoch-held) object recovery may have resurrected -- a never-referenced,
+     * unheld working version does not survive an epoch change (only sealed/held
+     * objects do).  Made durable by a forced compaction inside the release. */
+    facade_obj_release_epoch_held(s->alloc, fsb_attach_finish, op);
 } /* fsb_attach_open_done */
 
 static void
@@ -226,25 +266,42 @@ fsb_fence(
 /* ---- DETACH ---- */
 
 static void
+fsb_detach_released(
+    enum facade_status st,
+    void              *priv)
+{
+    struct fsb_op             *op  = priv;
+    struct fsb_state          *s   = op->s;
+    struct chimera_sc_request *req = op->req;
+
+    free(op);
+    /* The epoch ends regardless of the release result; clearing node_epoch makes
+     * every later op gate to E_FENCED. */
+    s->node_epoch        = 0;
+    s->epoch_deadline_ns = 0;
+    req->status          = (st == FACADE_OK) ? CHIMERA_SC_OK : CHIMERA_SC_E_IO;
+    req->complete(req);
+} /* fsb_detach_released */
+
+static void
 fsb_detach(
     struct fsb_state          *s,
     struct chimera_sc_request *req)
 {
-    /* End the caller's own epoch (the gate proved it is live).  Clearing
-     * node_epoch and the deadline makes every later op gate to E_FENCED.
-     *
-     * The contract also says DETACH releases the node's epoch-held objects
-     * (sc_request.h:271-272): its lease-scoped, never-referenced working
-     * versions (OBJ_CLONE_WORKING), the object-lifecycle state object-ops-v1
-     * will own.  That is a DISTINCT concept from the S13 namespace HOLD flag
-     * (FACADE_OBJ_HELD) this slice already carries, which is a durable record
-     * state, not epoch-scoped.  This slice holds no lease-scoped object state,
-     * so there is nothing to release here; object-ops-v1 adds the release when
-     * it adds the state. */
-    s->node_epoch        = 0;
-    s->epoch_deadline_ns = 0;
-    req->status          = CHIMERA_SC_OK;
-    req->complete(req);
+    /* End the caller's own epoch (the gate proved it is live) and release its
+     * epoch-held objects (sc_request.h:271-272): the lease-scoped,
+     * never-referenced working versions (OBJ_CLONE_WORKING) and fresh opens --
+     * every OPEN && !HELD object.  This is DISTINCT from the S13 namespace HOLD
+     * flag (FACADE_OBJ_HELD), which is a durable record state, not epoch-scoped,
+     * and survives.  The release is made durable (forced compaction) before the
+     * epoch is cleared and the DETACH completes. */
+    {
+        struct fsb_op *op = calloc(1, sizeof(*op));
+
+        op->s   = s;
+        op->req = req;
+        facade_obj_release_epoch_held(s->alloc, fsb_detach_released, op);
+    }
 } /* fsb_detach */
 
 /* ---- OBJ_CREATE ---- */
@@ -262,8 +319,9 @@ fsb_create_resume(void *arg)
         return;   /* re-parked; a later resume completes it */
     }
     if (st == FACADE_OK) {
-        facade_obj_put(op->s->alloc, req->obj_create.r_id.b, 0, NULL, 0);
-        req->status = CHIMERA_SC_OK;
+        req->status = facade_obj_create_entry(op->s->alloc, req->obj_create.r_id.b,
+                                              &req->obj_create.stamps)
+                      ? CHIMERA_SC_OK : CHIMERA_SC_E_NO_SPACE;
     } else {
         req->status = CHIMERA_SC_E_IO;
     }
@@ -287,11 +345,9 @@ fsb_obj_create(
         return;   /* parked; fsb_create_resume completes it */
     }
     if (st == FACADE_OK) {
-        if (!facade_obj_put(s->alloc, req->obj_create.r_id.b, 0, NULL, 0)) {
-            req->status = CHIMERA_SC_E_NO_SPACE;
-        } else {
-            req->status = CHIMERA_SC_OK;
-        }
+        req->status = facade_obj_create_entry(s->alloc, req->obj_create.r_id.b,
+                                              &req->obj_create.stamps)
+                      ? CHIMERA_SC_OK : CHIMERA_SC_E_NO_SPACE;
     } else {
         req->status = CHIMERA_SC_E_IO;
     }
@@ -354,13 +410,14 @@ fsb_write_done(
     free(op);
 
     if (st != FACADE_OK) {
-        req->status = (st == FACADE_E_NO_SPACE) ? CHIMERA_SC_E_NO_SPACE
-                      : (st == FACADE_E_SHUTDOWN) ? CHIMERA_SC_E_FENCED
-                      : CHIMERA_SC_E_IO;
+        req->status = fsb_status(st);
         req->complete(req);
         return;
     }
-    w->r_level            = CHIMERA_SC_WRITE_DURABLE;   /* the level actually achieved */
+    /* The prototype writes through: a BUFFERED request is also made durable, so
+     * the level actually achieved is DURABLE (contract D5: a backend may report a
+     * stronger level than requested). */
+    w->r_level            = CHIMERA_SC_WRITE_DURABLE;
     w->r_durability_epoch = generation;
     req->status           = CHIMERA_SC_OK;
     req->complete(req);
@@ -376,31 +433,25 @@ fsb_obj_write(
     const void                       *data;
     uint32_t                          len;
 
-    if (!facade_obj_find(s->alloc, w->id.b)) {
-        req->status = CHIMERA_SC_E_NOT_FOUND;
-        req->complete(req);
-        return;
-    }
-    /* The slice writes a single extent at logical offset 0 (object-ops-v1 adds
-     * arbitrary offsets, sub-block read-modify-write and the BUFFERED level). */
-    if (w->offset != 0 || w->level != CHIMERA_SC_WRITE_DURABLE) {
-        req->status = CHIMERA_SC_E_NOT_SUPPORTED;
-        req->complete(req);
-        return;
-    }
-    len = w->niov > 0 ? evpl_iovec_length(&w->iov[0]) : 0;
-    if (len > CHIMERA_MEDIA_BLOCK_SIZE) {
+    if (w->level != CHIMERA_SC_WRITE_BUFFERED && w->level != CHIMERA_SC_WRITE_DURABLE) {
         req->status = CHIMERA_SC_E_INVALID;
         req->complete(req);
         return;
     }
-    data        = len ? evpl_iovec_data(&w->iov[0]) : NULL;
+    len = w->niov > 0 ? evpl_iovec_length(&w->iov[0]) : 0;
+    if (len == 0 || len > CHIMERA_MEDIA_BLOCK_SIZE) {
+        req->status = CHIMERA_SC_E_INVALID;   /* max_io is one block */
+        req->complete(req);
+        return;
+    }
+    data        = evpl_iovec_data(&w->iov[0]);
     w->r_length = len;
 
     op      = calloc(1, sizeof(*op));
     op->s   = s;
     op->req = req;
-    facade_obj_write_durable(s->alloc, w->id.b, data, len, fsb_write_done, op);
+    facade_obj_write(s->alloc, w->id.b, w->offset, data, len, w->level,
+                     fsb_write_done, op);
 } /* fsb_obj_write */
 
 /* ---- OBJ_READ ---- */
@@ -408,37 +459,28 @@ fsb_obj_write(
 static void
 fsb_read_done(
     enum facade_status st,
+    uint32_t           length,
+    uint64_t           obj_size,
     void              *priv)
 {
     struct fsb_op                   *op  = priv;
     struct chimera_sc_request       *req = op->req;
     struct chimera_sc_obj_read_args *r   = &req->obj_read;
-    struct facade_obj               *o;
-    uint32_t                         want;
     int                              n;
 
     if (st != FACADE_OK) {
         free(op->buf);
         free(op);
-        req->status = CHIMERA_SC_E_IO;
+        req->status = fsb_status(st);
         req->complete(req);
         return;
     }
 
-    o    = facade_obj_find(op->s->alloc, r->id.b);
-    want = (uint32_t) r->extent.length;
-    if (o && o->nextents > 0) {
-        uint32_t span = (uint32_t) (o->ext[0].nblocks << CHIMERA_MEDIA_BLOCK_SHIFT);
-        if (want > span) {
-            want = span;
-        }
-    }
-
     r->r_niov   = 0;
     r->r_length = 0;
-    r->r_eof    = 1;
-    if (want > 0 && r->niov > 0) {
-        n = evpl_iovec_alloc(op->s->evpl, want, 8, 1, 0, &r->iov[0]);
+    r->r_eof    = (r->extent.offset + length >= obj_size) ? 1u : 0u;
+    if (length > 0 && r->niov > 0) {
+        n = evpl_iovec_alloc(op->s->evpl, length, 8, 1, 0, &r->iov[0]);
         if (n != 1) {
             free(op->buf);
             free(op);
@@ -446,9 +488,9 @@ fsb_read_done(
             req->complete(req);
             return;
         }
-        memcpy(evpl_iovec_data(&r->iov[0]), op->buf, want);
+        memcpy(evpl_iovec_data(&r->iov[0]), op->buf, length);
         r->r_niov   = 1;
-        r->r_length = want;
+        r->r_length = length;
     }
     free(op->buf);
     free(op);
@@ -462,29 +504,266 @@ fsb_obj_read(
     struct chimera_sc_request *req)
 {
     struct chimera_sc_obj_read_args *r = &req->obj_read;
-    struct facade_obj               *o = facade_obj_find(s->alloc, r->id.b);
     struct fsb_op                   *op;
+    uint32_t                         want = (uint32_t) r->extent.length;
 
-    if (!o) {
+    if (!facade_obj_find(s->alloc, r->id.b)) {
         req->status = CHIMERA_SC_E_NOT_FOUND;
         req->complete(req);
         return;
     }
-    if (r->extent.offset != 0 || o->nextents == 0) {
-        /* Slice: a single extent at logical 0 (object-ops-v1 adds the rest). */
-        req->status = CHIMERA_SC_E_NOT_SUPPORTED;
-        req->complete(req);
-        return;
+    if (want > CHIMERA_MEDIA_BLOCK_SIZE) {
+        want = CHIMERA_MEDIA_BLOCK_SIZE;   /* max_io is one block */
     }
-
     op      = calloc(1, sizeof(*op));
     op->s   = s;
     op->req = req;
     op->buf = calloc(1, CHIMERA_MEDIA_BLOCK_SIZE);
     FACADE_CHECK(op->buf != NULL, "oom obj-read buffer");
-    facade_media_read(s->alloc, op->buf, o->ext[0].phys_block, 1,
-                      fsb_read_done, op);
+    facade_obj_read(s->alloc, r->id.b, r->extent.offset, want, op->buf,
+                    fsb_read_done, op);
 } /* fsb_obj_read */
+
+/* ---- OBJ_SEAL ---- */
+
+static void
+fsb_seal_done(
+    enum facade_status st,
+    uint64_t           generation,
+    void              *priv)
+{
+    struct fsb_op             *op  = priv;
+    struct chimera_sc_request *req = op->req;
+
+    (void) generation;
+    free(op);
+    req->status = fsb_status(st);
+    req->complete(req);
+} /* fsb_seal_done */
+
+static void
+fsb_obj_seal(
+    struct fsb_state          *s,
+    struct chimera_sc_request *req)
+{
+    struct fsb_op *op = calloc(1, sizeof(*op));
+
+    op->s   = s;
+    op->req = req;
+    facade_obj_seal(s->alloc, req->obj_seal.id.b, fsb_seal_done, op);
+} /* fsb_obj_seal */
+
+/* ---- OBJ_FLUSH ---- */
+
+static void
+fsb_flush_done(
+    enum facade_status st,
+    uint64_t           generation,
+    void              *priv)
+{
+    struct fsb_op             *op  = priv;
+    struct chimera_sc_request *req = op->req;
+
+    free(op);
+    if (st == FACADE_OK) {
+        req->obj_flush.r_durability_epoch = generation;
+    }
+    req->status = fsb_status(st);
+    req->complete(req);
+} /* fsb_flush_done */
+
+static void
+fsb_obj_flush(
+    struct fsb_state          *s,
+    struct chimera_sc_request *req)
+{
+    struct fsb_op *op = calloc(1, sizeof(*op));
+
+    op->s   = s;
+    op->req = req;
+    facade_obj_flush(s->alloc, req->obj_flush.id.b, fsb_flush_done, op);
+} /* fsb_obj_flush */
+
+/* ---- OBJ_TRUNCATE / OBJ_ALLOCATE / OBJ_PUNCH (obj_space) ---- */
+
+static void
+fsb_space_done(
+    enum facade_status st,
+    uint64_t           generation,
+    void              *priv)
+{
+    struct fsb_op             *op  = priv;
+    struct chimera_sc_request *req = op->req;
+
+    free(op);
+    if (st == FACADE_OK) {
+        req->obj_space.r_level            = CHIMERA_SC_WRITE_DURABLE;
+        req->obj_space.r_durability_epoch = generation;
+    }
+    req->status = fsb_status(st);
+    req->complete(req);
+} /* fsb_space_done */
+
+static void
+fsb_obj_space(
+    struct fsb_state          *s,
+    struct chimera_sc_request *req)
+{
+    struct chimera_sc_obj_space_args *sp = &req->obj_space;
+    struct fsb_op                    *op = calloc(1, sizeof(*op));
+
+    op->s   = s;
+    op->req = req;
+    switch (req->opcode) {
+        case CHIMERA_SC_OP_OBJ_TRUNCATE:
+            facade_obj_truncate(s->alloc, sp->id.b, sp->extent.offset,
+                                fsb_space_done, op);
+            break;
+        case CHIMERA_SC_OP_OBJ_ALLOCATE:
+            facade_obj_allocate(s->alloc, sp->id.b, sp->extent.offset,
+                                sp->extent.length, fsb_space_done, op);
+            break;
+        case CHIMERA_SC_OP_OBJ_PUNCH:
+            facade_obj_punch(s->alloc, sp->id.b, sp->extent.offset,
+                             sp->extent.length, fsb_space_done, op);
+            break;
+        default:
+            free(op);
+            req->status = CHIMERA_SC_E_NOT_SUPPORTED;
+            req->complete(req);
+            break;
+    } /* switch */
+} /* fsb_obj_space */
+
+/* ---- OBJ_STAT ---- */
+
+static void
+fsb_obj_stat(
+    struct fsb_state          *s,
+    struct chimera_sc_request *req)
+{
+    req->status = facade_obj_stat(s->alloc, req->obj_stat.id.b, &req->obj_stat.r_meta)
+        == 0 ? CHIMERA_SC_OK : CHIMERA_SC_E_NOT_FOUND;
+    req->complete(req);
+} /* fsb_obj_stat */
+
+/* ---- OBJ_MAP ---- */
+
+static void
+fsb_obj_map(
+    struct fsb_state          *s,
+    struct chimera_sc_request *req)
+{
+    struct chimera_sc_obj_map_args *m = &req->obj_map;
+
+    if (facade_obj_map(s->alloc, m->id.b, m->extent.offset, m->extent.length,
+                       m->segs, m->segs_cap, &m->r_nsegs, &m->r_more) == 0) {
+        req->status = CHIMERA_SC_OK;
+    } else {
+        req->status = CHIMERA_SC_E_NOT_FOUND;
+    }
+    req->complete(req);
+} /* fsb_obj_map */
+
+/* ---- OBJ_CLONE_WORKING (D2) ---- */
+
+static void
+fsb_clone_done(
+    enum facade_status st,
+    uint64_t           generation,
+    void              *priv)
+{
+    struct fsb_op             *op  = priv;
+    struct chimera_sc_request *req = op->req;
+
+    (void) generation;
+    if (st == FACADE_OK) {
+        req->obj_clone_working.r_id = op->nid;
+    }
+    req->status = fsb_status(st);
+    free(op);
+    req->complete(req);
+} /* fsb_clone_done */
+
+static void
+fsb_clone_issue(struct fsb_op *op)
+{
+    struct chimera_sc_request *req = op->req;
+
+    facade_obj_clone_working(op->s->alloc, req->obj_clone_working.sealed_id.b,
+                             &op->nid, fsb_clone_done, op);
+} /* fsb_clone_issue */
+
+static void
+fsb_clone_resume(void *arg)
+{
+    struct fsb_op     *op = arg;
+    enum facade_status st;
+
+    st = facade_objid_next(op->s->alloc, &op->nid, fsb_clone_resume, op);
+    if (st == FACADE_AGAIN) {
+        return;
+    }
+    if (st != FACADE_OK) {
+        struct chimera_sc_request *req = op->req;
+
+        free(op);
+        req->status = CHIMERA_SC_E_IO;
+        req->complete(req);
+        return;
+    }
+    fsb_clone_issue(op);
+} /* fsb_clone_resume */
+
+static void
+fsb_obj_clone_working(
+    struct fsb_state          *s,
+    struct chimera_sc_request *req)
+{
+    struct fsb_op     *op = calloc(1, sizeof(*op));
+    enum facade_status st;
+
+    op->s   = s;
+    op->req = req;
+    st      = facade_objid_next(s->alloc, &op->nid, fsb_clone_resume, op);
+    if (st == FACADE_AGAIN) {
+        return;   /* parked; fsb_clone_resume issues the clone */
+    }
+    if (st != FACADE_OK) {
+        free(op);
+        req->status = CHIMERA_SC_E_IO;
+        req->complete(req);
+        return;
+    }
+    fsb_clone_issue(op);
+} /* fsb_obj_clone_working */
+
+/* ---- OBJ_DISCARD ---- */
+
+static void
+fsb_discard_done(
+    enum facade_status st,
+    void              *priv)
+{
+    struct fsb_op             *op  = priv;
+    struct chimera_sc_request *req = op->req;
+
+    free(op);
+    req->status = fsb_status(st);
+    req->complete(req);
+} /* fsb_discard_done */
+
+static void
+fsb_obj_discard(
+    struct fsb_state          *s,
+    struct chimera_sc_request *req)
+{
+    struct fsb_op *op = calloc(1, sizeof(*op));
+
+    op->s   = s;
+    op->req = req;
+    facade_obj_discard(s->alloc, req->obj_discard.id.b, fsb_discard_done, op);
+} /* fsb_obj_discard */
 
 /* ---- dispatch ---- */
 
@@ -526,6 +805,29 @@ fsb_dispatch(
             break;
         case CHIMERA_SC_OP_OBJ_READ:
             fsb_obj_read(s, req);
+            break;
+        case CHIMERA_SC_OP_OBJ_FLUSH:
+            fsb_obj_flush(s, req);
+            break;
+        case CHIMERA_SC_OP_OBJ_SEAL:
+            fsb_obj_seal(s, req);
+            break;
+        case CHIMERA_SC_OP_OBJ_TRUNCATE:
+        case CHIMERA_SC_OP_OBJ_ALLOCATE:
+        case CHIMERA_SC_OP_OBJ_PUNCH:
+            fsb_obj_space(s, req);
+            break;
+        case CHIMERA_SC_OP_OBJ_STAT:
+            fsb_obj_stat(s, req);
+            break;
+        case CHIMERA_SC_OP_OBJ_MAP:
+            fsb_obj_map(s, req);
+            break;
+        case CHIMERA_SC_OP_OBJ_CLONE_WORKING:
+            fsb_obj_clone_working(s, req);
+            break;
+        case CHIMERA_SC_OP_OBJ_DISCARD:
+            fsb_obj_discard(s, req);
             break;
         default:
             req->status = CHIMERA_SC_E_NOT_SUPPORTED;

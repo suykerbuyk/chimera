@@ -249,41 +249,206 @@ facade_obj_find(
     return NULL;
 } /* facade_obj_find */
 
-SYMBOL_EXPORT struct facade_obj *
-facade_obj_put(
-    struct facade_alloc        *a,
-    const uint8_t               id[16],
-    uint32_t                    flags,
-    const struct facade_objext *ext,
-    uint32_t                    nextents)
+/* Find a free slot and initialise an empty, unused entry; NULL if the budget is
+ * exhausted.  The caller fills the scalars and the map. */
+static struct facade_obj *
+facade_obj_alloc_slot(struct facade_alloc *a)
 {
-    struct facade_obj *o = facade_obj_find(a, id);
-    uint32_t           i;
+    uint32_t i;
 
-    FACADE_CHECK(nextents <= FACADE_OBJ_MAX_EXT, "object extent overflow");
+    for (i = 0; i < FACADE_OBJ_BUDGET; i++) {
+        if (!a->objs[i].used) {
+            struct facade_obj *o = &a->objs[i];
 
-    if (!o) {
-        for (i = 0; i < FACADE_OBJ_BUDGET; i++) {
-            if (!a->objs[i].used) {
-                o = &a->objs[i];
-                break;
-            }
+            memset(o, 0, sizeof(*o));
+            o->used = 1;
+            o->map  = facade_extent_map_create();
+            a->nobjs++;
+            return o;
         }
-        if (!o) {
-            return NULL;   /* object budget exhausted */
-        }
-        memset(o, 0, sizeof(*o));
-        o->used = 1;
-        memcpy(o->id, id, 16);
-        a->nobjs++;
     }
-    o->flags    = flags;
-    o->nextents = nextents;
-    for (i = 0; i < nextents; i++) {
-        o->ext[i] = ext[i];
+    return NULL;
+} /* facade_obj_alloc_slot */
+
+SYMBOL_EXPORT struct facade_obj *
+facade_obj_create_entry(
+    struct facade_alloc            *a,
+    const uint8_t                   id[16],
+    const struct chimera_sc_stamps *stamps)
+{
+    struct facade_obj *o;
+
+    FACADE_CHECK(facade_obj_find(a, id) == NULL, "object id already present");
+    o = facade_obj_alloc_slot(a);
+    if (!o) {
+        return NULL;
+    }
+    memcpy(o->id, id, 16);
+    o->state = CHIMERA_SC_OBJ_OPEN;
+    o->size  = 0;
+    o->flags = 0;
+    if (stamps) {
+        o->stamps = *stamps;
     }
     return o;
-} /* facade_obj_put */
+} /* facade_obj_create_entry */
+
+SYMBOL_EXPORT void
+facade_obj_serialize_hdr(
+    const struct facade_obj *o,
+    struct facade_obj_rec   *hdr)
+{
+    memset(hdr, 0, sizeof(*hdr));
+    memcpy(hdr->obj_id, o->id, 16);
+    hdr->size               = o->size;
+    hdr->change             = o->change;
+    hdr->policy_set         = o->stamps.policy_set;
+    hdr->qd_owner           = o->stamps.quota_domains.owner;
+    hdr->qd_group           = o->stamps.quota_domains.group;
+    hdr->qd_project         = o->stamps.quota_domains.project;
+    hdr->owner_principal    = o->stamps.owner_principal;
+    hdr->retention_until_ns = o->retention_until_ns;
+    hdr->flags              = o->flags;
+    hdr->state              = o->state;
+    hdr->qd_valid           = o->stamps.quota_domains.valid;
+    hdr->origin             = o->stamps.origin;
+    hdr->retention_mode     = o->retention_mode;
+    hdr->nextents           = facade_extent_map_count(o->map);
+} /* facade_obj_serialize_hdr */
+
+SYMBOL_EXPORT struct facade_obj *
+facade_obj_put_rec(
+    struct facade_alloc             *a,
+    const struct facade_obj_rec     *hdr,
+    const struct facade_ckpt_objext *exts)
+{
+    struct facade_obj *o = facade_obj_find(a, hdr->obj_id);
+    uint32_t           k;
+
+    if (hdr->nextents > FACADE_OBJ_MAX_EXT) {
+        return NULL;
+    }
+    if (o) {
+        /* Replace: drop the old map, rebuild from the record. */
+        facade_extent_map_destroy(o->map);
+        o->map = facade_extent_map_create();
+    } else {
+        o = facade_obj_alloc_slot(a);
+        if (!o) {
+            return NULL;
+        }
+        memcpy(o->id, hdr->obj_id, 16);
+    }
+    o->flags                        = hdr->flags;
+    o->state                        = hdr->state;
+    o->size                         = hdr->size;
+    o->change                       = hdr->change;
+    o->stamps.policy_set            = hdr->policy_set;
+    o->stamps.quota_domains.owner   = hdr->qd_owner;
+    o->stamps.quota_domains.group   = hdr->qd_group;
+    o->stamps.quota_domains.project = hdr->qd_project;
+    o->stamps.quota_domains.valid   = hdr->qd_valid;
+    o->stamps.owner_principal       = hdr->owner_principal;
+    o->stamps.origin                = hdr->origin;
+    o->retention_until_ns           = hdr->retention_until_ns;
+    o->retention_mode               = hdr->retention_mode;
+    for (k = 0; k < hdr->nextents; k++) {
+        if (exts[k].nblocks == 0 ||
+            (exts[k].kind != CHIMERA_SC_SEG_DATA &&
+             exts[k].kind != CHIMERA_SC_SEG_UNWRITTEN) ||
+            exts[k].nblocks > UINT32_MAX) {
+            return NULL;   /* self-inconsistent record */
+        }
+        facade_extent_map_insert(o->map, exts[k].logical_block,
+                                 (uint32_t) exts[k].nblocks, exts[k].phys_block,
+                                 exts[k].kind, exts[k].owned ? 1u : 0u, NULL, NULL);
+    }
+    return o;
+} /* facade_obj_put_rec */
+
+SYMBOL_EXPORT void
+facade_obj_remove(
+    struct facade_alloc *a,
+    struct facade_obj   *o)
+{
+    FACADE_CHECK(o->used, "remove of an unused object slot");
+    facade_extent_map_destroy(o->map);
+    o->map  = NULL;
+    o->used = 0;
+    a->nobjs--;
+} /* facade_obj_remove */
+
+SYMBOL_EXPORT uint32_t
+facade_obj_slot_count(const struct facade_alloc *a)
+{
+    (void) a;
+    return FACADE_OBJ_BUDGET;
+} /* facade_obj_slot_count */
+
+SYMBOL_EXPORT struct facade_obj *
+facade_obj_at(
+    struct facade_alloc *a,
+    uint32_t             slot)
+{
+    struct facade_obj *o = &a->objs[slot];
+
+    return o->used ? o : NULL;
+} /* facade_obj_at */
+
+/* ------------------------------------------------------------------ */
+/* durable-object-transaction FIFO (real concurrency)                 */
+/* ------------------------------------------------------------------ */
+
+SYMBOL_EXPORT void
+facade_txn_acquire(
+    struct facade_alloc *a,
+    void (              *start )(void *arg),
+    void                *arg)
+{
+    if (!a->txn_busy) {
+        a->txn_busy = 1;
+        start(arg);
+        return;
+    }
+    {
+        struct facade_txn_waiter *w = calloc(1, sizeof(*w));
+
+        FACADE_CHECK(w != NULL, "oom txn waiter");
+        w->start = start;
+        w->arg   = arg;
+        if (a->txn_tail) {
+            a->txn_tail->next = w;
+        } else {
+            a->txn_head = w;
+        }
+        a->txn_tail = w;
+    }
+} /* facade_txn_acquire */
+
+SYMBOL_EXPORT void
+facade_txn_release(struct facade_alloc *a)
+{
+    struct facade_txn_waiter *w = a->txn_head;
+
+    FACADE_CHECK(a->txn_busy, "txn_release without a held slot");
+    if (!w) {
+        a->txn_busy = 0;
+        return;
+    }
+    a->txn_head = w->next;
+    if (!a->txn_head) {
+        a->txn_tail = NULL;
+    }
+    /* Keep txn_busy set: the slot passes directly to the next starter. */
+    {
+        void  (*start)(
+            void *) = w->start;
+        void *arg = w->arg;
+
+        free(w);
+        start(arg);
+    }
+} /* facade_txn_release */
 
 /* ------------------------------------------------------------------ */
 /* construction / teardown                                            */
@@ -328,12 +493,28 @@ facade_alloc_new(
 static void
 facade_alloc_destroy(struct facade_alloc *a)
 {
-    struct facade_waiter *w = a->waiters;
+    struct facade_waiter     *w = a->waiters;
+    struct facade_txn_waiter *tw;
+    uint32_t                  i;
 
     while (w) {
         struct facade_waiter *nx = w->next;
         free(w);
         w = nx;
+    }
+    /* A txn starter still queued at teardown is dropped (its caller is torn down
+     * with the allocator); this only happens on an abrupt abandon with work
+     * parked, which the tests do not do, but free the nodes regardless. */
+    tw = a->txn_head;
+    while (tw) {
+        struct facade_txn_waiter *nx = tw->next;
+        free(tw);
+        tw = nx;
+    }
+    for (i = 0; i < FACADE_OBJ_BUDGET; i++) {
+        if (a->objs[i].used) {
+            facade_extent_map_destroy(a->objs[i].map);
+        }
     }
     rb_tree_destroy(&a->free_by_start, facade_free_node_destroy, NULL);
     free(a->objs);
@@ -587,6 +768,34 @@ facade_media_flush(
 /* checkpoint (de)serialization                                       */
 /* ------------------------------------------------------------------ */
 
+/* facade_extent_map_foreach callback: serialize one extent into *pp and advance
+ * it (the checkpoint and the log OBJ record share this on-media objext shape). */
+static void
+facade_ckpt_write_objext(
+    const struct facade_extent *rec,
+    void                       *private_data)
+{
+    uint8_t                 **pp = private_data;
+    struct facade_ckpt_objext xr;
+
+    memset(&xr, 0, sizeof(xr));
+    xr.logical_block = rec->logical_block;
+    xr.phys_block    = rec->phys_block;
+    xr.nblocks       = rec->nblocks;
+    xr.kind          = rec->kind;
+    xr.owned         = rec->owned;
+    memcpy(*pp, &xr, sizeof(xr));
+    *pp += sizeof(xr);
+} /* facade_ckpt_write_objext */
+
+SYMBOL_EXPORT void
+facade_ckpt_serialize_objext(
+    const struct facade_extent_map *map,
+    uint8_t                       **pp)
+{
+    facade_extent_map_foreach(map, facade_ckpt_write_objext, pp);
+} /* facade_ckpt_serialize_objext */
+
 uint64_t
 facade_ckpt_serialize(
     struct facade_alloc *a,
@@ -611,8 +820,9 @@ facade_ckpt_serialize(
         + nfree * sizeof(struct facade_ckpt_ext);
     for (i = 0; i < FACADE_OBJ_BUDGET; i++) {
         if (a->objs[i].used) {
-            bytes += sizeof(struct facade_ckpt_obj)
-                + a->objs[i].nextents * sizeof(struct facade_ckpt_objext);
+            bytes += sizeof(struct facade_obj_rec)
+                + facade_extent_map_count(a->objs[i].map)
+                * sizeof(struct facade_ckpt_objext);
         }
     }
 
@@ -646,29 +856,17 @@ facade_ckpt_serialize(
     }
 
     for (i = 0; i < FACADE_OBJ_BUDGET; i++) {
-        struct facade_obj     *o = &a->objs[i];
-        struct facade_ckpt_obj orec;
-        uint32_t               k;
+        struct facade_obj    *o = &a->objs[i];
+        struct facade_obj_rec orec;
 
         if (!o->used) {
             continue;
         }
-        memset(&orec, 0, sizeof(orec));
-        memcpy(orec.obj_id, o->id, 16);
-        orec.flags    = o->flags;
-        orec.nextents = o->nextents;
+        facade_obj_serialize_hdr(o, &orec);
         memcpy(p, &orec, sizeof(orec));
         p += sizeof(orec);
-        for (k = 0; k < o->nextents; k++) {
-            struct facade_ckpt_objext xr;
-            memset(&xr, 0, sizeof(xr));
-            xr.logical_block = o->ext[k].logical_block;
-            xr.phys_block    = o->ext[k].phys_block;
-            xr.nblocks       = o->ext[k].nblocks;
-            xr.kind          = o->ext[k].kind;
-            memcpy(p, &xr, sizeof(xr));
-            p += sizeof(xr);
-        }
+        /* Extents follow the header, serialized from the map in logical order. */
+        facade_extent_map_foreach(o->map, facade_ckpt_write_objext, &p);
     }
 
     hdr->crc32 = facade_crc32(buf, (uint32_t) (blocks << CHIMERA_MEDIA_BLOCK_SHIFT));
@@ -715,9 +913,9 @@ facade_ckpt_load(
     }
 
     for (i = 0; i < hdr->n_objs; i++) {
-        struct facade_ckpt_obj orec;
-        struct facade_objext   ext[FACADE_OBJ_MAX_EXT];
-        uint32_t               k;
+        struct facade_obj_rec     orec;
+        struct facade_ckpt_objext ext[FACADE_OBJ_MAX_EXT] = { { 0 } };
+        uint32_t                  k;
 
         if (a->nobjs >= FACADE_OBJ_BUDGET || p + sizeof(orec) > end) {
             return -1;
@@ -728,19 +926,13 @@ facade_ckpt_load(
             return -1;
         }
         for (k = 0; k < orec.nextents; k++) {
-            struct facade_ckpt_objext xr;
-
-            if (p + sizeof(xr) > end) {
+            if (p + sizeof(ext[k]) > end) {
                 return -1;
             }
-            memcpy(&xr, p, sizeof(xr));
-            p                   += sizeof(xr);
-            ext[k].logical_block = xr.logical_block;
-            ext[k].phys_block    = xr.phys_block;
-            ext[k].nblocks       = xr.nblocks;
-            ext[k].kind          = xr.kind;
+            memcpy(&ext[k], p, sizeof(ext[k]));
+            p += sizeof(ext[k]);
         }
-        if (!facade_obj_put(a, orec.obj_id, orec.flags, ext, orec.nextents)) {
+        if (!facade_obj_put_rec(a, &orec, ext)) {
             return -1;
         }
     }
@@ -777,7 +969,7 @@ facade_compute_geometry(struct facade_alloc *a)
     }
     free_bytes = sizeof(struct facade_ckpt_hdr)
         + (a->nblocks / 2 + 1) * sizeof(struct facade_ckpt_ext);
-    obj_bytes = obj_budget * (sizeof(struct facade_ckpt_obj)
+    obj_bytes = obj_budget * (sizeof(struct facade_obj_rec)
                               + FACADE_OBJ_MAX_EXT * sizeof(struct facade_ckpt_objext));
     ckpt_bytes = free_bytes + obj_bytes;
 

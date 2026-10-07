@@ -27,6 +27,7 @@ struct facade_ext_rec {
     uint64_t              nblocks;
     chimera_media_block_t phys_block;
     uint32_t              kind;    /* CHIMERA_SC_SEG_DATA | CHIMERA_SC_SEG_UNWRITTEN */
+    uint32_t              owned;   /* 1 = this object's blocks; 0 = borrowed (clone) */
 };
 
 struct facade_extent_map {
@@ -47,7 +48,8 @@ facade_ext_rec_new(
     uint64_t              logical_block,
     uint64_t              nblocks,
     chimera_media_block_t phys_block,
-    uint32_t              kind)
+    uint32_t              kind,
+    uint32_t              owned)
 {
     struct facade_ext_rec *r = malloc(sizeof(*r));
 
@@ -56,6 +58,7 @@ facade_ext_rec_new(
     r->nblocks       = nblocks;
     r->phys_block    = phys_block;
     r->kind          = kind;
+    r->owned         = owned;
     return r;
 } /* facade_ext_rec_new */
 
@@ -79,7 +82,9 @@ facade_extent_map_destroy(struct facade_extent_map *m)
     free(m);
 } /* facade_extent_map_destroy */
 
-/* Report the physical blocks under [from, to) of record r to on_freed. */
+/* Report the physical blocks under [from, to) of record r to on_freed.  Only an
+ * OWNED record is reported: a borrowed range (owned == 0) belongs to a clone
+ * origin and is dropped from the map without being freed (D2 copy-on-write). */
 static void
 facade_report_freed(
     const struct facade_ext_rec *r,
@@ -88,7 +93,7 @@ facade_report_freed(
     facade_freed_cb_t            on_freed,
     void                        *private_data)
 {
-    if (on_freed && to > from) {
+    if (on_freed && r->owned && to > from) {
         on_freed(r->phys_block + (from - r->logical_block),
                  (uint32_t) (to - from), private_data);
     }
@@ -123,7 +128,7 @@ facade_clear_range(
             /* The record encloses the range: split into head + tail. */
             tail = facade_ext_rec_new(end, rend - end,
                                       r->phys_block + (end - r->logical_block),
-                                      r->kind);
+                                      r->kind, r->owned);
             r->nblocks = lb - r->logical_block;
             rb_tree_insert(&m->tree, logical_block, tail);
             return;
@@ -173,6 +178,7 @@ facade_extent_map_insert(
     uint32_t                  nblocks,
     chimera_media_block_t     phys,
     uint32_t                  kind,
+    uint32_t                  owned,
     facade_freed_cb_t         on_freed,
     void                     *private_data)
 {
@@ -185,7 +191,7 @@ facade_extent_map_insert(
     facade_clear_range(m, logical_block, logical_block + nblocks,
                        on_freed, private_data);
 
-    r = facade_ext_rec_new(logical_block, nblocks, phys, kind);
+    r = facade_ext_rec_new(logical_block, nblocks, phys, kind, owned);
     rb_tree_insert(&m->tree, logical_block, r);
 } /* facade_extent_map_insert */
 
@@ -220,6 +226,7 @@ facade_extent_map_lookup(
         r_ext->nblocks       = (uint32_t) r->nblocks;
         r_ext->kind          = r->kind;
         r_ext->phys_block    = r->phys_block;
+        r_ext->owned         = r->owned;
         return 1;
     }
 
@@ -235,8 +242,122 @@ facade_extent_map_lookup(
                            : (uint32_t) (hole_end - hole_start);
     r_ext->kind       = CHIMERA_SC_SEG_HOLE;
     r_ext->phys_block = 0;
+    r_ext->owned      = 0;
     return 0;
 } /* facade_extent_map_lookup */
+
+/* In-order walk of the stored records (no holes), via facade_free_next-style
+ * rb successor traversal. */
+static struct facade_ext_rec *
+facade_ext_first(const struct facade_extent_map *m)
+{
+    struct facade_ext_rec *r;
+
+    rb_tree_first(&m->tree, r);
+    return r;
+} /* facade_ext_first */
+
+static struct facade_ext_rec *
+facade_ext_next(
+    const struct facade_extent_map *m,
+    struct facade_ext_rec          *e)
+{
+    const struct rb_node *nil = &m->tree.nil;
+    struct rb_node       *n   = &e->node;
+    struct rb_node       *p;
+
+    if (n->right != nil) {
+        n = n->right;
+        while (n->left != nil) {
+            n = n->left;
+        }
+        return container_of(n, struct facade_ext_rec, node);
+    }
+    p = n->parent;
+    while (p && p != nil && n == p->right) {
+        n = p;
+        p = p->parent;
+    }
+    return (!p || p == nil) ? NULL : container_of(p, struct facade_ext_rec, node);
+} /* facade_ext_next */
+
+SYMBOL_EXPORT struct facade_extent_map *
+facade_extent_map_clone(
+    const struct facade_extent_map *src,
+    int                             force_borrow)
+{
+    struct facade_extent_map *dst = facade_extent_map_create();
+    struct facade_ext_rec    *r;
+
+    for (r = facade_ext_first(src); r; r = facade_ext_next(src, r)) {
+        struct facade_ext_rec *c =
+            facade_ext_rec_new(r->logical_block, r->nblocks, r->phys_block,
+                               r->kind, force_borrow ? 0u : r->owned);
+
+        rb_tree_insert(&dst->tree, logical_block, c);
+    }
+    return dst;
+} /* facade_extent_map_clone */
+
+SYMBOL_EXPORT void
+facade_extent_map_foreach(
+    const struct facade_extent_map *m,
+    facade_extent_each_cb_t         cb,
+    void                           *private_data)
+{
+    struct facade_ext_rec *r;
+
+    for (r = facade_ext_first(m); r; r = facade_ext_next(m, r)) {
+        struct facade_extent e;
+
+        e.logical_block = r->logical_block;
+        e.nblocks       = (uint32_t) r->nblocks;
+        e.kind          = r->kind;
+        e.phys_block    = r->phys_block;
+        e.owned         = r->owned;
+        cb(&e, private_data);
+    }
+} /* facade_extent_map_foreach */
+
+SYMBOL_EXPORT uint32_t
+facade_extent_map_count(const struct facade_extent_map *m)
+{
+    struct facade_ext_rec *r;
+    uint32_t               n = 0;
+
+    for (r = facade_ext_first(m); r; r = facade_ext_next(m, r)) {
+        n++;
+    }
+    return n;
+} /* facade_extent_map_count */
+
+SYMBOL_EXPORT uint64_t
+facade_extent_map_owned_blocks(const struct facade_extent_map *m)
+{
+    struct facade_ext_rec *r;
+    uint64_t               n = 0;
+
+    for (r = facade_ext_first(m); r; r = facade_ext_next(m, r)) {
+        if (r->owned) {
+            n += r->nblocks;
+        }
+    }
+    return n;
+} /* facade_extent_map_owned_blocks */
+
+SYMBOL_EXPORT uint64_t
+facade_extent_map_max_logical(const struct facade_extent_map *m)
+{
+    struct facade_ext_rec *r;
+    uint64_t               max = 0;
+
+    for (r = facade_ext_first(m); r; r = facade_ext_next(m, r)) {
+        if (r->logical_block + r->nblocks > max) {
+            max = r->logical_block + r->nblocks;
+        }
+    }
+    return max;
+} /* facade_extent_map_max_logical */
 
 SYMBOL_EXPORT uint32_t
 facade_extent_map_segments(

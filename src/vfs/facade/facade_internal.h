@@ -21,8 +21,10 @@
 #include "common/rbtree.h"
 
 #include "facade_alloc.h"
+#include "facade_extent.h"
 #include "facade_objid.h"
 #include "facade_super.h"
+#include "sc_types.h"   /* struct chimera_sc_stamps */
 
 #ifdef __cplusplus
 extern "C" {
@@ -37,10 +39,15 @@ extern "C" {
 #define FACADE_ID_RESERVE  1024ULL
 
 /* Prototype object-table budget: the maximum live objects and the maximum
- * extents per object the checkpoint is sized for.  object-ops-v1 generalizes
- * both (and swaps the flat extent array for facade_extent_map). */
+ * extents per object the checkpoint, the log OBJ record and recovery are all
+ * sized for.  The full object surface (arbitrary-offset writes, allocate, punch)
+ * fragments an object's map, so object-ops-v1 raised the per-object extent cap
+ * from the slice's 8; one log OBJ record is still one 4 KiB block
+ * (sizeof(facade_lr_hdr) + sizeof(facade_obj_rec) + CAP * sizeof(objext) <=
+ * 4096), and an op that would exceed the cap is refused NO_SPACE-shaped rather
+ * than corrupting the map. */
 #define FACADE_OBJ_BUDGET  256u
-#define FACADE_OBJ_MAX_EXT 8u
+#define FACADE_OBJ_MAX_EXT 64u
 
 /* Invariant guard that survives NDEBUG (unlike assert): used for caller-side
  * violations that must never reach a release build silently (e.g. a
@@ -68,22 +75,27 @@ struct facade_waiter {
     struct facade_waiter *next;
 };
 
-/* One extent of an in-memory object-table entry (mirrors facade_ckpt_objext). */
-struct facade_objext {
-    uint64_t              logical_block;
-    chimera_media_block_t phys_block;
-    uint64_t              nblocks;
-    uint32_t              kind;    /* CHIMERA_SC_SEG_DATA / _UNWRITTEN */
-};
-
-/* An in-memory object-table entry: the durable object record (id -> hold flag
- * + extents).  Persisted in the checkpoint and (incrementally) in the log. */
+/*
+ * An in-memory object-table entry: the durable object record.  The extent map
+ * (facade_extent_map) is the authority for the object's logical->physical
+ * mapping, holes-by-absence and the owned/borrowed bit; the flat
+ * facade_ckpt_objext list is only the serialization form (checkpoint + log OBJ
+ * record).  The scalars (state, size, change, stamps, retention, hold flag) are
+ * everything OBJ_STAT reports and everything the 4.2 state machine and the D2
+ * clone must survive a crash with.  Persisted in the A/B checkpoint and
+ * (incrementally, per durable transaction) in the log.
+ */
 struct facade_obj {
-    int                  used;
-    uint8_t              id[16];
-    uint32_t             flags;    /* FACADE_OBJ_* */
-    uint32_t             nextents;
-    struct facade_objext ext[FACADE_OBJ_MAX_EXT];
+    int                       used;
+    uint8_t                   id[16];
+    uint32_t                  flags;    /* FACADE_OBJ_* */
+    uint32_t                  state;    /* enum chimera_sc_obj_state (OPEN/SEALED) */
+    uint64_t                  size;     /* logical byte length */
+    uint64_t                  change;   /* advances on every data/metadata change */
+    struct chimera_sc_stamps  stamps;
+    uint64_t                  retention_until_ns;
+    uint32_t                  retention_mode;
+    struct facade_extent_map *map;      /* logical->physical authority (NULL only when unused) */
 };
 
 struct facade_alloc {
@@ -151,30 +163,51 @@ struct facade_alloc {
      * so a deferred completion never dereferences freed memory.  shutting_down
      * makes a resumed id draw or a late op fail cleanly on a dying allocator.
      */
-    int         mw_busy;                                /* a block-0 write is in flight */
-    int         ext_pending;                            /* extension requested while busy */
+    int                       mw_busy;                  /* a block-0 write is in flight */
+    int                       ext_pending;              /* extension requested while busy */
     /* A compaction (flush/close) requested while a block-0 id-floor extension is
      * in flight is deferred here and run by mw_complete(), so the two never write
      * block 0 concurrently (F1).  The caller awaits every other op, so at most
      * one compaction is ever queued. */
-    int         compact_pending;
-    facade_cb_t compact_cb;
-    void       *compact_priv;
+    int                       compact_pending;
+    facade_cb_t               compact_cb;
+    void                     *compact_priv;
     /* A dirty-mark (clean=0 block-0 write) requested while the block-0 slot is
      * busy is deferred here and issued by mw_complete(), so the clean=0 write
      * never races an id-floor extension on block 0 (F1). */
-    int         dirty_mark_pending;
-    facade_cb_t dirty_cb;
-    void       *dirty_priv;
-    int         shutting_down;                          /* teardown: draws fail, no new ext */
-    int         destroy_after;                          /* free when the last op completes */
-    int         inflight;                               /* log/data/ckpt media ops in flight */
-    int         cb_depth;                               /* nested media completions on the stack
+    int                       dirty_mark_pending;
+    facade_cb_t               dirty_cb;
+    void                     *dirty_priv;
+    int                       shutting_down;            /* teardown: draws fail, no new ext */
+    int                       destroy_after;            /* free when the last op completes */
+    int                       inflight;                 /* log/data/ckpt media ops in flight */
+    int                       cb_depth;                 /* nested media completions on the stack
                                                          * (a provider that completes inline nests
                                                          * them); only the outermost tears down */
 
+    /*
+     * Durable-object-transaction FIFO (object-ops-v1, real concurrency).  Many
+     * requests are in flight per thread; every durable object transaction (a
+     * write/seal/clone/size-change's log append sequence, or an object release's
+     * forced compaction) runs one at a time through this slot, so two in-flight
+     * writers can never race the log cursor or a forced compaction.  The slice's
+     * single-slot "only one queued" asserts could not express that.  A txn that
+     * finds the slot busy enqueues a starter; txn_release() runs the next.
+     */
+    int                       txn_busy;
+    struct facade_txn_waiter *txn_head;
+    struct facade_txn_waiter *txn_tail;
+
     /* one metadata block (superblock) buffer, reused for in-flight writes */
-    void       *super_buf;
+    void                     *super_buf;
+};
+
+/* A pending durable-object-transaction starter, queued behind txn_busy. */
+struct facade_txn_waiter {
+    void                      (*start)(
+        void *arg);
+    void                     *arg;
+    struct facade_txn_waiter *next;
 };
 
 /* facade_super.c */
@@ -217,21 +250,75 @@ facade_free_add(
     chimera_media_block_t start,
     uint64_t              nblocks);
 
-/* facade_alloc.c: object-table helpers (used by facade_log.c and recovery). */
+/* facade_alloc.c: object-table helpers (used by facade_log.c, facade_object.c
+ * and recovery). */
 struct facade_obj *
 facade_obj_find(
     struct facade_alloc *alloc,
     const uint8_t        id[16]);
 
-/* Upsert an object record (create-or-replace id -> flags + the given extents).
- * Returns the entry, or NULL if the object budget is exhausted. */
+/* Create a fresh OPEN object entry (empty extent map) with the given id and
+ * stamps.  Returns the entry, or NULL if the object budget is exhausted. */
 struct facade_obj *
-facade_obj_put(
-    struct facade_alloc        *alloc,
-    const uint8_t               id[16],
-    uint32_t                    flags,
-    const struct facade_objext *ext,
-    uint32_t                    nextents);
+facade_obj_create_entry(
+    struct facade_alloc            *alloc,
+    const uint8_t                   id[16],
+    const struct chimera_sc_stamps *stamps);
+
+/* Reconstruct an object from an on-media record header + its extents (recovery
+ * and checkpoint load): create-or-replace id -> the full durable record, with a
+ * fresh extent map built from exts.  Returns the entry, or NULL on budget
+ * exhaustion / a self-inconsistent record. */
+struct facade_obj *
+facade_obj_put_rec(
+    struct facade_alloc             *alloc,
+    const struct facade_obj_rec     *hdr,
+    const struct facade_ckpt_objext *exts);
+
+/* Serialize an object entry's scalar metadata into an on-media record header
+ * (the caller serializes the extents from o->map via facade_extent_map_foreach). */
+void
+facade_obj_serialize_hdr(
+    const struct facade_obj *o,
+    struct facade_obj_rec   *hdr);
+
+/* Remove an object entry: destroy its extent map and mark the slot free.  Does
+ * NOT free its physical blocks (the caller returns owned blocks to the free set
+ * first, so an in-flight release controls ordering). */
+void
+facade_obj_remove(
+    struct facade_alloc *alloc,
+    struct facade_obj   *o);
+
+/* Object-table iteration (epoch-held release scans it). */
+uint32_t
+facade_obj_slot_count(
+    const struct facade_alloc *alloc);
+struct facade_obj *
+facade_obj_at(
+    struct facade_alloc *alloc,
+    uint32_t             slot);
+
+/* Durable-object-transaction FIFO (facade_alloc.c).  acquire runs start(arg)
+ * now if the slot is free, else queues it; release runs the next queued starter
+ * (or clears the slot).  Every durable object transaction brackets itself with
+ * these so only one runs at a time (real concurrency). */
+void
+facade_txn_acquire(
+    struct facade_alloc *alloc,
+    void (              *start )(void *arg),
+    void                *arg);
+void
+facade_txn_release(
+    struct facade_alloc *alloc);
+
+/* facade_alloc.c: serialize a map's extents (facade_ckpt_objext records) into
+ * *pp, advancing it.  Shared by the checkpoint and the log OBJ record so an
+ * object's durable record is byte-identical in both. */
+void
+facade_ckpt_serialize_objext(
+    const struct facade_extent_map *map,
+    uint8_t                       **pp);
 
 /* facade_alloc.c: pack the active (de)serialization of the free set + object
  * table into a checkpoint-slot buffer; returns the number of blocks used. */

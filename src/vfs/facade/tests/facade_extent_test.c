@@ -85,11 +85,11 @@ main(void)
     uint32_t                  nsegs, more;
 
     /* A = [0,8) -> phys 1000. */
-    facade_extent_map_insert(m, 0, 8, 1000, CHIMERA_SC_SEG_DATA, on_freed, &l);
+    facade_extent_map_insert(m, 0, 8, 1000, CHIMERA_SC_SEG_DATA, 1, on_freed, &l);
     TCHECK(l.count == 0, "no overlap yet");
 
     /* B = [4,12) -> phys 2000 (tail overlap of A). */
-    facade_extent_map_insert(m, 4, 8, 2000, CHIMERA_SC_SEG_DATA, on_freed, &l);
+    facade_extent_map_insert(m, 4, 8, 2000, CHIMERA_SC_SEG_DATA, 1, on_freed, &l);
 
     /* A's [4,8) (phys 1004..1008) must be the only freed range. */
     TCHECK(l.count == 1, "exactly one freed range, got %d", l.count);
@@ -104,7 +104,7 @@ main(void)
 
     /* C = [2,4) -> phys 3000, strictly inside A's surviving head [0,4). */
     l.count = 0;
-    facade_extent_map_insert(m, 2, 2, 3000, CHIMERA_SC_SEG_DATA, on_freed, &l);
+    facade_extent_map_insert(m, 2, 2, 3000, CHIMERA_SC_SEG_DATA, 1, on_freed, &l);
     TCHECK(l.count == 1 && l.ent[0].phys == 1002 && l.ent[0].n == 2,
            "interior overlap should free exactly A[2,4) phys 1002 n 2");
     TCHECK(phys_at(m, 0) == 1000 && phys_at(m, 1) == 1001, "A[0,2) intact");
@@ -114,7 +114,7 @@ main(void)
     assert_hole(m, 100);
 
     /* UNWRITTEN reservation at [20,24). */
-    facade_extent_map_insert(m, 20, 4, 4000, CHIMERA_SC_SEG_UNWRITTEN, NULL, NULL);
+    facade_extent_map_insert(m, 20, 4, 4000, CHIMERA_SC_SEG_UNWRITTEN, 1, NULL, NULL);
     {
         struct facade_extent ext;
         TCHECK(facade_extent_map_lookup(m, 21, &ext) == 1 &&
