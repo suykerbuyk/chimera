@@ -15,6 +15,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "evpl/evpl.h"
 
@@ -23,7 +24,15 @@
 #include "facade_log.h"        /* facade_obj_write_durable */
 #include "facade_sc_backend.h"
 
-#define FSB_LEASE_NS 10000000000ULL
+#define FSB_LEASE_NS      10000000000ULL
+
+/* The prototype declares no optional capabilities (contract O5, declared at
+ * ATTACH per D12): no spokes, no protection classes, no group recall, no escrow
+ * quota (sc_types.h:167-170).  Mandatory behaviour is never a capability, so a
+ * zero set is the honest declaration for this backend, not a stub -- the
+ * degenerate RECALL/RECALL_WAIT the O5 position still mandates belong to a later
+ * unit, not here. */
+#define FSB_DECLARED_CAPS 0ULL
 
 struct fsb_state {
     const struct chimera_media_provider         *provider;
@@ -33,10 +42,27 @@ struct fsb_state {
     struct evpl                                 *evpl;       /* set at thread_init */
     uint64_t                                     next_epoch;
     struct chimera_sc_node_id                    node;
-    uint64_t                                     node_epoch;
+    uint64_t                                     node_epoch;        /* 0 = no live lease */
+    uint64_t                                     epoch_deadline_ns; /* monotonic expiry of node_epoch */
+    uint64_t                                     (*now_ns)(
+        void *arg);
+    void                                        *now_arg;
     int                                          down;       /* crashed; recover() pending */
     const struct chimera_sc_upcalls             *upcalls;
 };
+
+/* Default lease clock: the host CLOCK_MONOTONIC, used when the bind injects no
+ * clock seam.  A test overrides it through facade_sc_bind to advance time
+ * deterministically. */
+static uint64_t
+fsb_real_now_ns(void *arg)
+{
+    struct timespec ts;
+
+    (void) arg;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t) ts.tv_sec * 1000000000ULL + (uint64_t) ts.tv_nsec;
+} /* fsb_real_now_ns */
 
 /* ---- per-async-op contexts ---- */
 
@@ -74,7 +100,13 @@ fsb_attach_open_done(
     s->node       = req->caller.node;
     s->node_epoch = ++s->next_epoch;   /* re-attach revokes the old epoch */
 
-    a->r_caps             = 0;
+    /* The epoch is a lease (6.5, D10): grant it a monotonic deadline.  S14 ties
+     * r_lease_ns to the moment the caller dispatched and says the backend never
+     * expires sooner than r_lease_ns after it completed the request, so the
+     * deadline is set here, at completion, not at dispatch. */
+    s->epoch_deadline_ns = s->now_ns(s->now_arg) + FSB_LEASE_NS;
+
+    a->r_caps             = FSB_DECLARED_CAPS;
     a->r_npclasses        = 0;
     a->r_fence_epoch      = s->node_epoch;
     a->r_lease_ns         = FSB_LEASE_NS;
@@ -105,6 +137,13 @@ fsb_attach(
         req->complete(req);
         return;
     }
+    if (req->caller.fence_epoch != 0) {
+        /* ATTACH carries epoch 0 (contract 6.5); a nonzero epoch is a malformed
+         * request, not a fencing failure. */
+        req->status = CHIMERA_SC_E_INVALID;
+        req->complete(req);
+        return;
+    }
     if (chimera_sc_version_negotiate(&a->want, &have, &a->r_version) != 0) {
         req->status = CHIMERA_SC_E_VERSION;
         req->complete(req);
@@ -124,14 +163,89 @@ fsb_attach(
     facade_alloc_open(s->provider, s->space, fsb_attach_open_done, op);
 } /* fsb_attach */
 
+/* The single gate every non-ATTACH op passes.  One predicate covers all three
+ * ways an epoch is not usable, each -> CHIMERA_SC_E_FENCED at the call site:
+ *   - revoked / stale value: caller.fence_epoch != the live node_epoch (a
+ *     re-ATTACH, a DETACH or a FENCE-of-self has moved or cleared it);
+ *   - wrong node: the caller is not the node that holds the epoch (today a
+ *     different node carrying a coincidentally-equal epoch would slip through);
+ *   - expired: the monotonic lease deadline has passed (D10: the backend
+ *     expires an epoch when its lease runs out). */
 static int
 fsb_epoch_ok(
     struct fsb_state                *s,
     const struct chimera_sc_request *req)
 {
     return !s->down && s->alloc && s->node_epoch != 0 &&
-           req->caller.fence_epoch == s->node_epoch;
+           req->caller.fence_epoch == s->node_epoch &&
+           memcmp(&req->caller.node, &s->node, sizeof(s->node)) == 0 &&
+           s->now_ns(s->now_arg) < s->epoch_deadline_ns;
 } /* fsb_epoch_ok */
+
+/* ---- RENEW ---- */
+
+static void
+fsb_renew(
+    struct fsb_state          *s,
+    struct chimera_sc_request *req)
+{
+    /* The gate already proved the epoch is live, matching and unexpired, so
+     * RENEW only replaces the remaining lease with a fresh one (S14: RENEW
+     * replaces, it does not add).  A revoked or expired epoch never reaches
+     * here -- it is CHIMERA_SC_E_FENCED at the gate -- which is exactly the
+     * contract's "a lease is never revived." */
+    s->epoch_deadline_ns  = s->now_ns(s->now_arg) + FSB_LEASE_NS;
+    req->renew.r_lease_ns = FSB_LEASE_NS;
+    req->status           = CHIMERA_SC_OK;
+    req->complete(req);
+} /* fsb_renew */
+
+/* ---- FENCE (single-node subset) ---- */
+
+static void
+fsb_fence(
+    struct fsb_state          *s,
+    struct chimera_sc_request *req)
+{
+    /* The gate proved the caller holds a live epoch (FENCE requires one, else
+     * E_FENCED).  Single-node subset (sc_request.h:258-266): fencing the
+     * caller's own node is E_INVALID -- a node ends its own epoch with DETACH --
+     * and fencing any OTHER node id completes OK at once, because in the
+     * single-node prototype no other node holds a live epoch, so FENCE's "a node
+     * with no live epoch completes OK" postcondition already holds.  Revoking a
+     * different, LIVE node's epoch and draining its in-flight ops is multi-node
+     * fencing (E8), out of scope. */
+    if (memcmp(&req->fence.node, &s->node, sizeof(s->node)) == 0) {
+        req->status = CHIMERA_SC_E_INVALID;
+    } else {
+        req->status = CHIMERA_SC_OK;
+    }
+    req->complete(req);
+} /* fsb_fence */
+
+/* ---- DETACH ---- */
+
+static void
+fsb_detach(
+    struct fsb_state          *s,
+    struct chimera_sc_request *req)
+{
+    /* End the caller's own epoch (the gate proved it is live).  Clearing
+     * node_epoch and the deadline makes every later op gate to E_FENCED.
+     *
+     * The contract also says DETACH releases the node's epoch-held objects
+     * (sc_request.h:271-272): its lease-scoped, never-referenced working
+     * versions (OBJ_CLONE_WORKING), the object-lifecycle state object-ops-v1
+     * will own.  That is a DISTINCT concept from the S13 namespace HOLD flag
+     * (FACADE_OBJ_HELD) this slice already carries, which is a durable record
+     * state, not epoch-scoped.  This slice holds no lease-scoped object state,
+     * so there is nothing to release here; object-ops-v1 adds the release when
+     * it adds the state. */
+    s->node_epoch        = 0;
+    s->epoch_deadline_ns = 0;
+    req->status          = CHIMERA_SC_OK;
+    req->complete(req);
+} /* fsb_detach */
 
 /* ---- OBJ_CREATE ---- */
 
@@ -392,6 +506,15 @@ fsb_dispatch(
     }
 
     switch (req->opcode) {
+        case CHIMERA_SC_OP_RENEW:
+            fsb_renew(s, req);
+            break;
+        case CHIMERA_SC_OP_FENCE:
+            fsb_fence(s, req);
+            break;
+        case CHIMERA_SC_OP_DETACH:
+            fsb_detach(s, req);
+            break;
         case CHIMERA_SC_OP_OBJ_CREATE:
             fsb_obj_create(s, req);
             break;
@@ -434,6 +557,8 @@ fsb_init(
     s->control    = bind->control;
     s->space      = bind->space;
     s->next_epoch = 100;
+    s->now_ns     = bind->now_ns ? bind->now_ns : fsb_real_now_ns;
+    s->now_arg    = bind->now_arg;
     return s;
 } /* fsb_init */
 
@@ -514,6 +639,21 @@ fsb_recover(void *backend_private)
     s->down = 0;
     return rc;
 } /* fsb_recover */
+
+SYMBOL_EXPORT void
+facade_sc_bind_init(
+    struct facade_sc_bind                       *b,
+    const struct chimera_media_provider         *provider,
+    const struct chimera_media_crashsim_control *control,
+    struct chimera_media_space                  *space)
+{
+    /* Zero the whole struct so the optional clock seam reads NULL (fsb_init
+     * then installs the CLOCK_MONOTONIC default); set the required fields. */
+    memset(b, 0, sizeof(*b));
+    b->provider = provider;
+    b->control  = control;
+    b->space    = space;
+} /* facade_sc_bind_init */
 
 SYMBOL_EXPORT void
 facade_sc_fixture_init(

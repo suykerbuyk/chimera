@@ -139,9 +139,7 @@ main(void)
     pump(evpl, &fw.done);
     CHECK(fw.st == FACADE_OK);
 
-    bind.provider = provider;
-    bind.control  = control;
-    bind.space    = ow.space;
+    facade_sc_bind_init(&bind, provider, control, ow.space);
     facade_sc_fixture_init(&fx, &bind);
 
     result = chimera_sc_conformance_run_one(&fx, &tcase, evpl);
