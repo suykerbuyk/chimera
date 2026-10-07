@@ -60,8 +60,8 @@ chimera_client_config_init(void)
 
     /* The passthrough backends below are Linux-only (see src/vfs/CMakeLists.txt)
      * and are not built elsewhere, so do not ask the VFS to load them there --
-     * a missing module symbol is fatal at init.  Indices follow num_modules so
-     * the list stays contiguous whichever ones are present. */
+     * a module that cannot be loaded is fatal at init.  Indices follow
+     * num_modules so the list stays contiguous whichever ones are present. */
 #ifdef __linux__
     strncpy(config->modules[config->num_modules].module_name, "linux",
             sizeof(config->modules[config->num_modules].module_name));
@@ -231,7 +231,6 @@ chimera_client_init(
     chimera_vfs_set_umount_timeout(client->vfs, config->umount_timeout_ms);
 
     /* Initialize the root file handle after VFS is initialized */
-    chimera_vfs_get_root_fh(client->root_fh, &client->root_fh_len);
 
     return client;
 } /* chimera_client_init */

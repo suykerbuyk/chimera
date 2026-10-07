@@ -47,6 +47,13 @@ struct info_case {
     uint32_t    size;      /* expected OutputBufferLength, 0 = variable */
 };
 
+#define ST_NO_MORE_EAS           0x80000012u
+#define ST_NONEXISTENT_EA_ENTRY  0xC0000051u
+#define ST_NO_EAS_ON_FILE        0xC0000052u
+#define SL_RESTART_SCAN_T        0x00000001u
+#define SL_RETURN_SINGLE_ENTRY_T 0x00000002u
+#define SL_INDEX_SPECIFIED_T     0x00000004u
+
 /* *INDENT-OFF* */
 static const struct info_case file_classes[] = {
     { "FileBasicInformation",         SMB2_FILE_BASIC_INFO_T,        40 },
@@ -128,12 +135,16 @@ probe_query_sweep(
             CHECK(st == ST_SUCCESS && len == ic->size,
                   "%s: %s -> 0x%08x (%u bytes, want %u)", what, ic->name, st,
                   len, ic->size);
+        } else if (ic->cls == SMB2_FILE_FULL_EA_INFO_T) {
+            /* An object with no EAs answers STATUS_NO_EAS_ON_FILE, as NTFS
+             * does (MS-FSA 2.1.5.12.12); the EA section below reads a list. */
+            CHECK(st == ST_NO_EAS_ON_FILE, "%s: %s -> 0x%08x (want "
+                  "NO_EAS_ON_FILE)", what, ic->name, st);
         } else {
             /* A variable-length class may legitimately answer with nothing --
-             * an empty EA list, or a directory's (absent) data stream -- so
-             * the sweep only requires that the class is answered.  The EA and
-             * stream sections below check non-empty results with real
-             * content. */
+             * a directory's (absent) data stream -- so the sweep only requires
+             * that the class is answered.  The stream section below checks
+             * non-empty results with real content. */
             CHECK(st == ST_SUCCESS, "%s: %s -> 0x%08x (%u bytes)", what,
                   ic->name, st, len);
         }
@@ -174,17 +185,20 @@ probe_query_sweep(
 #define FSA_PERSISTENT_ACLS            0x00000008
 #define FSA_SUPPORTS_SPARSE_FILES      0x00000040
 #define FSA_SUPPORTS_REPARSE_POINTS    0x00000080
+#define FSA_SUPPORTS_OBJECT_IDS        0x00010000
 #define FSA_NAMED_STREAMS              0x00040000
 #define FSA_SUPPORTS_BLOCK_REFCOUNTING 0x08000000
 
-/* memfs stores rich ACLs, punches holes, reflinks and keeps named streams, so
- * with the knob on it advertises everything chimera can derive. */
+/* memfs stores rich ACLs, punches holes, reflinks, keeps xattrs (where object
+ * IDs live) and named streams, so with the knob on it advertises everything
+ * chimera can derive. */
 #define FSA_MEMFS_STREAMS_ON           (FSA_CASE_SENSITIVE_SEARCH |      \
                                         FSA_CASE_PRESERVED_NAMES |       \
                                         FSA_UNICODE_ON_DISK |            \
                                         FSA_PERSISTENT_ACLS |            \
                                         FSA_SUPPORTS_SPARSE_FILES |      \
                                         FSA_SUPPORTS_REPARSE_POINTS |    \
+                                        FSA_SUPPORTS_OBJECT_IDS |        \
                                         FSA_NAMED_STREAMS |              \
                                         FSA_SUPPORTS_BLOCK_REFCOUNTING)
 
@@ -278,6 +292,197 @@ ea_put(
     return off + (last ? need : adv);
 } /* ea_put */
 
+/* A FileFullEaInformation query with the scan flags, EaIndex, and EA list the
+ * generic helper leaves at zero.  Unlike it, this one returns the data that
+ * came back with a BUFFER_OVERFLOW, since a partial EA list is the point. */
+static uint32_t
+query_ea(
+    struct smb2_conn *c,
+    const uint8_t     file_id[16],
+    uint32_t          flags,
+    uint32_t          index,
+    const uint8_t    *list,
+    uint32_t          list_len,
+    uint32_t          out_buf_len,
+    uint8_t          *out,
+    uint32_t          out_cap,
+    uint32_t         *out_len)
+{
+    int      b    = smb2c_begin(c, SMB2_QUERY_INFO, 0);
+    uint8_t *body = c->sbuf + b;
+    uint32_t st;
+
+    p16(body, 0, 41);
+    body[2] = SMB2_INFO_FILE_T;
+    body[3] = SMB2_FILE_FULL_EA_INFO_T;
+    p32(body, 4, out_buf_len);
+    p16(body, 8, list_len ? (uint16_t) (SMB2_HDR_SIZE + 40) : 0);
+    p16(body, 10, 0);
+    p32(body, 12, list_len);
+    p32(body, 16, index);              /* AdditionalInformation = EaIndex */
+    p32(body, 20, flags);
+    memcpy(body + 24, file_id, 16);
+    if (list_len) {
+        memcpy(body + 40, list, list_len);
+    }
+
+    st       = smb2c_xfer(c, 40 + (int) list_len);
+    *out_len = 0;
+    if (st == ST_SUCCESS || st == ST_BUFFER_OVERFLOW) {
+        const uint8_t *rb   = c->rbuf + 4 + SMB2_HDR_SIZE;
+        uint16_t       doff = g16(rb, 2);
+        uint32_t       dlen = g32(rb, 4);
+
+        if (dlen > out_cap) {
+            dlen = out_cap;
+        }
+        memcpy(out, c->rbuf + 4 + doff, dlen);
+        *out_len = dlen;
+    }
+    return st;
+} /* query_ea */
+
+/* Count the entries of a FILE_FULL_EA_INFORMATION chain and copy out the name
+ * and value length of the one at position want (0-based). */
+static int
+ea_walk(
+    const uint8_t *out,
+    uint32_t       len,
+    int            want,
+    char          *name,
+    uint32_t      *vlen)
+{
+    uint32_t off = 0;
+    int      n   = 0;
+
+    name[0] = '\0';
+    while (off + 8 <= len) {
+        uint32_t next = g32(out, (int) off);
+        uint8_t  nlen = out[off + 5];
+
+        if (off + 8 + nlen + 1 > len) {
+            break;
+        }
+        if (n == want) {
+            memcpy(name, out + off + 8, nlen);
+            name[nlen] = '\0';
+            *vlen      = g16(out, (int) off + 6);
+        }
+        n++;
+        if (next == 0) {
+            break;
+        }
+        off += next;
+    }
+    return n;
+} /* ea_walk */
+
+/* The scan state MS-FSA keeps per open (Open.NextEaEntry), the client's EaIndex
+ * and EA list, and the overflow rules -- the parts of NtQueryEaFile IFSTest's
+ * EaInformation group drives.  The file holds USER.ONE and USER.TWO on entry;
+ * a third EA is set in lower case to see it come back upper-cased. */
+static void
+probe_ea_scan(
+    struct smb2_conn *c,
+    const uint8_t     file_id[16])
+{
+    uint8_t  in[128], out[1024];
+    char     name[64], first[64], second[64];
+    uint32_t st, len, vlen = 0;
+    int      n;
+
+    n  = ea_put(in, 0, "lower.three", "3", 1);
+    st = smb2_set_info(c, SMB2_INFO_FILE_T, SMB2_FILE_FULL_EA_INFO_T,
+                       file_id, in, (uint32_t) n);
+    CHECK(st == ST_SUCCESS, "SET a lower-case EA name -> 0x%08x", st);
+
+    st = query_ea(c, file_id, SL_RESTART_SCAN_T, 0, NULL, 0, sizeof(out),
+                  out, sizeof(out), &len);
+    n = ea_walk(out, len, 2, name, &vlen);
+    CHECK(st == ST_SUCCESS && n == 3, "a restarted scan returns all three "
+          "EAs (0x%08x, %d entries)", st, n);
+    CHECK(strcmp(name, "LOWER.THREE") == 0, "  ... in the order set, and "
+          "upper-cased as NTFS returns them (3rd is \"%s\")", name);
+
+    /* With every entry returned, the scan has nothing left. */
+    st = query_ea(c, file_id, 0, 0, NULL, 0, sizeof(out), out, sizeof(out),
+                  &len);
+    CHECK(st == ST_NO_MORE_EAS, "a scan continued past the end -> "
+          "NO_MORE_EAS (0x%08x)", st);
+
+    /* One entry at a time, each query resuming where the last stopped. */
+    st = query_ea(c, file_id, SL_RESTART_SCAN_T | SL_RETURN_SINGLE_ENTRY_T, 0,
+                  NULL, 0, sizeof(out), out, sizeof(out), &len);
+    n = ea_walk(out, len, 0, first, &vlen);
+    CHECK(st == ST_SUCCESS && n == 1, "SL_RETURN_SINGLE_ENTRY returns one "
+          "entry (0x%08x, %d)", st, n);
+    st = query_ea(c, file_id, SL_RETURN_SINGLE_ENTRY_T, 0, NULL, 0,
+                  sizeof(out), out, sizeof(out), &len);
+    n = ea_walk(out, len, 0, second, &vlen);
+    CHECK(st == ST_SUCCESS && n == 1 && strcmp(first, second) != 0,
+          "  ... and the next query resumes at the next one (\"%s\" then "
+          "\"%s\")", first, second);
+
+    /* EaIndex is 1-based, the end is one past the last, and beyond that the
+     * entry does not exist. */
+    st = query_ea(c, file_id, SL_INDEX_SPECIFIED_T | SL_RETURN_SINGLE_ENTRY_T,
+                  2, NULL, 0, sizeof(out), out, sizeof(out), &len);
+    n = ea_walk(out, len, 0, name, &vlen);
+    CHECK(st == ST_SUCCESS && n == 1 && strcmp(name, second) == 0,
+          "EaIndex 2 returns the second entry (0x%08x, \"%s\")", st, name);
+    st = query_ea(c, file_id, SL_INDEX_SPECIFIED_T, 4, NULL, 0, sizeof(out),
+                  out, sizeof(out), &len);
+    CHECK(st == ST_NO_MORE_EAS, "EaIndex one past the last -> NO_MORE_EAS "
+          "(0x%08x)", st);
+    st = query_ea(c, file_id, SL_INDEX_SPECIFIED_T, 5, NULL, 0, sizeof(out),
+                  out, sizeof(out), &len);
+    CHECK(st == ST_NONEXISTENT_EA_ENTRY, "EaIndex beyond that -> "
+          "NONEXISTENT_EA_ENTRY (0x%08x)", st);
+    st = query_ea(c, file_id, SL_INDEX_SPECIFIED_T, 0, NULL, 0, sizeof(out),
+                  out, sizeof(out), &len);
+    CHECK(st == ST_NONEXISTENT_EA_ENTRY, "EaIndex 0 -> NONEXISTENT_EA_ENTRY "
+          "(0x%08x)", st);
+
+    /* A buffer that holds the first entry but not the rest gets that entry
+     * and BUFFER_OVERFLOW; one too small for any entry, BUFFER_TOO_SMALL. */
+    st = query_ea(c, file_id, SL_RESTART_SCAN_T, 0, NULL, 0, 28, out,
+                  sizeof(out), &len);
+    n = ea_walk(out, len, 0, name, &vlen);
+    CHECK(st == ST_BUFFER_OVERFLOW && n == 1, "a buffer with room for one "
+          "entry -> BUFFER_OVERFLOW with that entry (0x%08x, %d entries, %u "
+          "bytes)", st, n, len);
+    st = query_ea(c, file_id, SL_RESTART_SCAN_T, 0, NULL, 0, 12, out,
+                  sizeof(out), &len);
+    CHECK(st == ST_BUFFER_TOO_SMALL, "a buffer with room for no entry -> "
+          "BUFFER_TOO_SMALL (0x%08x)", st);
+
+    /* An EA list names the entries to return, in its own order, matched
+     * without regard to case; one the file lacks comes back empty. */
+    memset(in, 0, sizeof(in));
+    p32(in, 0, 16);                    /* FILE_GET_EA_INFORMATION: next */
+    in[4] = 8;
+    memcpy(in + 5, "user.two", 9);
+    p32(in, 16, 0);
+    in[20] = 7;
+    memcpy(in + 21, "MISSING", 8);
+    n  = 29;
+    st = query_ea(c, file_id, 0, 0, in, (uint32_t) n, sizeof(out), out,
+                  sizeof(out), &len);
+    CHECK(st == ST_SUCCESS && ea_walk(out, len, 0, name, &vlen) == 2 &&
+          strcmp(name, "USER.TWO") == 0 && vlen == 6,
+          "an EA list returns the named EA first (0x%08x, \"%s\", %u bytes)",
+          st, name, vlen);
+    ea_walk(out, len, 1, name, &vlen);
+    CHECK(strcmp(name, "MISSING") == 0 && vlen == 0,
+          "  ... and an absent one with no value (\"%s\", %u bytes)", name,
+          vlen);
+
+    n  = ea_put(in, 0, "lower.three", "", 1);
+    st = smb2_set_info(c, SMB2_INFO_FILE_T, SMB2_FILE_FULL_EA_INFO_T,
+                       file_id, in, (uint32_t) n);
+    CHECK(st == ST_SUCCESS, "cleanup: delete the lower-case EA -> 0x%08x", st);
+} /* probe_ea_scan */
+
 static void
 probe_ea(struct smb2_conn *c)
 {
@@ -293,12 +498,12 @@ probe_ea(struct smb2_conn *c)
                      MBT_FILE_SHARE_RWD, NULL, &co);
     CHECK(st == ST_SUCCESS, "setup: CREATE ea.bin -> 0x%08x", st);
 
-    /* An empty EA list is the honest starting state. */
+    /* A fresh file has no EAs, which NTFS reports as STATUS_NO_EAS_ON_FILE
+     * rather than as an empty list. */
     st = smb2_query_info(c, SMB2_INFO_FILE_T, SMB2_FILE_FULL_EA_INFO_T,
                          co.file_id, 0, out, sizeof(out), &len);
-    CHECK(st == ST_SUCCESS && len == 0,
-          "FullEaInformation on a fresh file is empty (0x%08x, %u bytes)", st,
-          len);
+    CHECK(st == ST_NO_EAS_ON_FILE,
+          "FullEaInformation on a fresh file -> NO_EAS_ON_FILE (0x%08x)", st);
 
     /* Two EAs in one SET, which is what exercises the chaining. */
     memset(in, 0, sizeof(in));
@@ -356,6 +561,8 @@ probe_ea(struct smb2_conn *c)
     }
     CHECK(found_one, "  ... USER.ONE round-trips with its value");
     CHECK(found_two, "  ... USER.TWO round-trips with its value");
+
+    probe_ea_scan(c, co.file_id);
 
     /* An EA name carrying reserved punctuation is refused (Samba's
      * is_invalid_windows_ea_name rule). */
@@ -510,6 +717,192 @@ probe_agreement(struct smb2_conn *c)
 } /* probe_agreement */
 
 /* ---- SET_INFO round trips ----------------------------------------------- */
+
+/* ---- NTFS file semantics IFSTest checks ---------------------------------
+ *
+ * Behaviours a Windows client sees from NTFS that a POSIX backend does not give
+ * for free: AllocationSize in whole clusters following the MS-FSA allocation
+ * rules, DeletePending as a property of the file, ARCHIVE set by a write, and a
+ * rename that never replaces a directory. */
+static uint64_t
+std_alloc(
+    struct smb2_conn *c,
+    const uint8_t     file_id[16],
+    uint64_t         *eof)
+{
+    uint8_t out[64];
+
+    if (!query_ok(c, SMB2_INFO_FILE_T, SMB2_FILE_STANDARD_INFO_T, file_id,
+                  out, sizeof(out), "StandardInformation")) {
+        *eof = 0;
+        return 0;
+    }
+    *eof = g64(out, 8);
+    return g64(out, 0);
+} /* std_alloc */
+
+static uint32_t
+set_alloc(
+    struct smb2_conn *c,
+    const uint8_t     file_id[16],
+    uint64_t          alloc)
+{
+    uint8_t buf[8];
+
+    p64(buf, 0, alloc);
+    return smb2_set_info(c, SMB2_INFO_FILE_T, SMB2_FILE_ALLOCATION_INFO_T,
+                         file_id, buf, sizeof(buf));
+} /* set_alloc */
+
+static void
+probe_ntfs_semantics(struct smb2_conn *c)
+{
+    static uint8_t         payload[60000];
+    struct smb2_create_out a, b, d1, d2;
+    uint8_t                out[64], basic[40];
+    uint64_t               alloc, eof, mtime;
+    uint32_t               st, count = 0;
+
+    printf("# --- NTFS file semantics ---\n");
+
+    /* AllocationSize (MS-FSA 2.1.5.15.1 / 2.1.5.15.5): the end of file in
+     * whole 4 KiB clusters whatever the backend allocates, an AllocationSize
+     * set below EOF truncates to it, one above EOF is kept as a reservation,
+     * and a truncation of the end of file gives clusters back only when the
+     * handle closes. */
+    st = smb2_create(c, "alloc.bin", MBT_FILE_OVERWRITE_IF, MBT_FILE_ALL_ACCESS,
+                     MBT_FILE_SHARE_RWD, NULL, &a);
+    CHECK(st == ST_SUCCESS, "setup: CREATE alloc.bin -> 0x%08x", st);
+    st = smb2_write(c, a.file_id, 0, payload, sizeof(payload), &count);
+    CHECK(st == ST_SUCCESS, "setup: WRITE 60000 bytes -> 0x%08x", st);
+    alloc = std_alloc(c, a.file_id, &eof);
+    CHECK(alloc == 0xF000, "60000 bytes are allocated in clusters (0x%llx, "
+          "want 0xF000)", (unsigned long long) alloc);
+    st    = set_alloc(c, a.file_id, 0x2000);
+    alloc = std_alloc(c, a.file_id, &eof);
+    CHECK(st == ST_SUCCESS && alloc == 0x2000 && eof == 0x2000,
+          "AllocationSize below EOF truncates to it (0x%08x, alloc 0x%llx, "
+          "eof 0x%llx)", st, (unsigned long long) alloc,
+          (unsigned long long) eof);
+    st    = set_alloc(c, a.file_id, 0x11001);
+    alloc = std_alloc(c, a.file_id, &eof);
+    CHECK(st == ST_SUCCESS && alloc == 0x12000 && eof == 0x2000,
+          "AllocationSize above EOF reserves whole clusters (0x%08x, alloc "
+          "0x%llx, eof 0x%llx)", st, (unsigned long long) alloc,
+          (unsigned long long) eof);
+    st    = smb2_set_eof(c, a.file_id, 0x11800);
+    alloc = std_alloc(c, a.file_id, &eof);
+    CHECK(st == ST_SUCCESS && alloc == 0x12000,
+          "an EOF inside the reservation keeps it (alloc 0x%llx)",
+          (unsigned long long) alloc);
+    st    = smb2_set_eof(c, a.file_id, 0x800);
+    alloc = std_alloc(c, a.file_id, &eof);
+    CHECK(st == ST_SUCCESS && alloc == 0x12000 && eof == 0x800,
+          "a truncation keeps the clusters while the handle is open, as NTFS "
+          "frees them at cleanup (alloc 0x%llx, eof 0x%llx)",
+          (unsigned long long) alloc, (unsigned long long) eof);
+    smb2_close(c, a.file_id);
+    st = smb2_create(c, "alloc.bin", MBT_FILE_OPEN, MBT_FILE_ALL_ACCESS,
+                     MBT_FILE_SHARE_RWD, NULL, &a);
+    CHECK(st == ST_SUCCESS, "setup: reopen alloc.bin -> 0x%08x", st);
+    alloc = std_alloc(c, a.file_id, &eof);
+    CHECK(alloc == 0x1000, "  ... and the close gives them back (alloc 0x%llx)",
+          (unsigned long long) alloc);
+
+    /* DeletePending is the file's (MS-FSA Open.Link.IsDeleted): a disposition
+     * set through one handle shows through another. */
+    st = smb2_create(c, "alloc.bin", MBT_FILE_OPEN, MBT_FILE_ALL_ACCESS,
+                     MBT_FILE_SHARE_RWD, NULL, &b);
+    CHECK(st == ST_SUCCESS, "setup: second open of alloc.bin -> 0x%08x", st);
+    st = smb2_set_disposition(c, a.file_id, 1);
+    CHECK(st == ST_SUCCESS, "SET disposition on the first handle -> 0x%08x",
+          st);
+    if (query_ok(c, SMB2_INFO_FILE_T, SMB2_FILE_STANDARD_INFO_T, b.file_id,
+                 out, sizeof(out), "StandardInformation (second handle)")) {
+        CHECK(out[20] == 1, "  ... the second handle reports DeletePending "
+              "(%u)", out[20]);
+    }
+    smb2_close(c, a.file_id);
+    smb2_close(c, b.file_id);
+
+    /* A write marks a data file ARCHIVE (MS-FSA 2.1.4.17), even after the
+     * client cleared it. */
+    st = smb2_create(c, "archive.bin", MBT_FILE_OVERWRITE_IF,
+                     MBT_FILE_ALL_ACCESS, MBT_FILE_SHARE_RWD, NULL, &a);
+    CHECK(st == ST_SUCCESS, "setup: CREATE archive.bin -> 0x%08x", st);
+    memset(basic, 0, sizeof(basic));
+    p32(basic, 32, 0x2);               /* HIDDEN, ARCHIVE clear */
+    st = smb2_set_info(c, SMB2_INFO_FILE_T, SMB2_FILE_BASIC_INFO_T, a.file_id,
+                       basic, sizeof(basic));
+    CHECK(st == ST_SUCCESS, "SET attributes HIDDEN only -> 0x%08x", st);
+    mtime = query_ok(c, SMB2_INFO_FILE_T, SMB2_FILE_BASIC_INFO_T, a.file_id,
+                     out, sizeof(out), "BasicInformation") ? g64(out, 16) : 0;
+    st = smb2_write(c, a.file_id, 0, payload, 16, &count);
+    CHECK(st == ST_SUCCESS, "setup: WRITE 16 bytes -> 0x%08x", st);
+    if (query_ok(c, SMB2_INFO_FILE_T, SMB2_FILE_BASIC_INFO_T, a.file_id,
+                 out, sizeof(out), "BasicInformation")) {
+        CHECK(g32(out, 32) == 0x22, "a write sets ARCHIVE (attributes 0x%x, "
+              "want 0x22)", g32(out, 32));
+        /* Setting only the attributes does not take control of the write
+         * time: the write still advances it. */
+        CHECK(g64(out, 16) > mtime, "  ... and advances the write time after "
+              "an attributes-only set");
+    }
+
+    /* An access time set explicitly through a handle survives reads through
+     * it (MS-FSA Open.UserSetAccessTime). */
+    memset(basic, 0, sizeof(basic));
+    p64(basic, 8, 100000000);          /* LastAccessTime: 10s after 1601 */
+    st = smb2_set_info(c, SMB2_INFO_FILE_T, SMB2_FILE_BASIC_INFO_T, a.file_id,
+                       basic, sizeof(basic));
+    CHECK(st == ST_SUCCESS, "SET an old LastAccessTime -> 0x%08x", st);
+    st = smb2_read(c, a.file_id, 0, 16, out, &count);
+    CHECK(st == ST_SUCCESS, "setup: READ 16 bytes -> 0x%08x", st);
+    if (query_ok(c, SMB2_INFO_FILE_T, SMB2_FILE_BASIC_INFO_T, a.file_id,
+                 out, sizeof(out), "BasicInformation")) {
+        CHECK(g64(out, 8) == 100000000, "  ... a read keeps it (0x%llx)",
+              (unsigned long long) g64(out, 8));
+    }
+
+    /* A read-only file can be superseded, though not overwritten. */
+    memset(basic, 0, sizeof(basic));
+    p32(basic, 32, MBT_FILE_ATTRIBUTE_READONLY);
+    st = smb2_set_info(c, SMB2_INFO_FILE_T, SMB2_FILE_BASIC_INFO_T, a.file_id,
+                       basic, sizeof(basic));
+    CHECK(st == ST_SUCCESS, "SET READONLY -> 0x%08x", st);
+    smb2_close(c, a.file_id);
+    st = smb2_create(c, "archive.bin", MBT_FILE_OVERWRITE, MBT_FILE_READ_ACCESS,
+                     MBT_FILE_SHARE_RWD, NULL, &a);
+    CHECK(st == ST_ACCESS_DENIED, "OVERWRITE of a read-only file -> "
+          "ACCESS_DENIED (0x%08x)", st);
+    if (st == ST_SUCCESS) {
+        smb2_close(c, a.file_id);
+    }
+    st = smb2_create(c, "archive.bin", MBT_FILE_SUPERSEDE, MBT_FILE_READ_ACCESS,
+                     MBT_FILE_SHARE_RWD, NULL, &a);
+    CHECK(st == ST_SUCCESS, "SUPERSEDE of a read-only file -> SUCCESS "
+          "(0x%08x)", st);
+    if (st == ST_SUCCESS) {
+        smb2_close(c, a.file_id);
+    }
+
+    /* A rename never replaces a directory, even with ReplaceIfExists
+     * (MS-FSA 2.1.5.15.12). */
+    st = smb2_create_opts(c, "rendir1", MBT_FILE_OPEN_IF, MBT_FILE_ALL_ACCESS,
+                          MBT_FILE_SHARE_RWD, MBT_FILE_DIRECTORY_FILE, NULL, &d1);
+    CHECK(st == ST_SUCCESS, "setup: CREATE rendir1 -> 0x%08x", st);
+    st = smb2_create_opts(c, "rendir2", MBT_FILE_OPEN_IF, MBT_FILE_ALL_ACCESS,
+                          MBT_FILE_SHARE_RWD, MBT_FILE_DIRECTORY_FILE, NULL, &d2);
+    CHECK(st == ST_SUCCESS, "setup: CREATE rendir2 -> 0x%08x", st);
+    smb2_close(c, d2.file_id);
+    st = smb2_rename(c, d1.file_id, "rendir2", 0);
+    CHECK(st == ST_OBJECT_NAME_COLLISION, "a directory renamed onto another "
+          "without ReplaceIfExists -> OBJECT_NAME_COLLISION (0x%08x)", st);
+    st = smb2_rename(c, d1.file_id, "rendir2", 1);
+    CHECK(st == ST_ACCESS_DENIED, "  ... and with it -> ACCESS_DENIED "
+          "(0x%08x)", st);
+    smb2_close(c, d1.file_id);
+} /* probe_ntfs_semantics */
 
 static void
 probe_set_info(struct smb2_conn *c)
@@ -1060,6 +1453,28 @@ probe_security_sids(struct smb2_conn *c)
         }
     }
 
+    /* A BUILTIN alias has no gid, but Windows keeps it as a file's group when
+     * given it (IFSTest SetGroupSecurityTest sets BUILTIN\Administrators), so
+     * it is kept as the group's native SID; the gid is untouched. */
+    nlen = smb2_sd_build(built, sizeof(built), NULL, "S-1-5-32-544", NULL, 0);
+
+    if (nlen > 0) {
+        st = smb2_set_info_addl(c, SMB2_INFO_SECURITY_T, 0, co.file_id,
+                                SEC_GROUP, built, (uint32_t) nlen);
+        CHECK(st == ST_SUCCESS, "SET SECURITY(group BUILTIN\\Administrators) "
+              "-> 0x%08x", st);
+
+        st = smb2_query_info(c, SMB2_INFO_SECURITY_T, 0, co.file_id,
+                             SEC_OWNER | SEC_GROUP, sd, sizeof(sd), &len);
+
+        if (st == ST_SUCCESS && smb2_sd_parse(sd, len, &d) == 0) {
+            CHECK(strcmp(d.group, "S-1-5-32-544") == 0,
+                  "  ... the BUILTIN group is kept (%s)", d.group);
+        } else {
+            CHECK(0, "  ... QUERY after the group SET -> 0x%08x", st);
+        }
+    }
+
     smb2_close(c, co.file_id);
 } /* probe_security_sids */
 
@@ -1381,6 +1796,67 @@ probe_query_directory(struct smb2_conn *c)
 
 /* ---- refusals ----------------------------------------------------------- */
 
+/* FileAttributes of a file just created with FileAttributes = NORMAL. */
+static uint32_t
+created_file_attributes(
+    struct smb2_conn *c,
+    const char       *name,
+    uint32_t          file_attributes,
+    uint32_t         *st)
+{
+    struct smb2_create_out co;
+    uint8_t                basic[64];
+    uint32_t               len = 0, attrs = 0;
+
+    *st = smb2_create_attrs(c, name, MBT_FILE_CREATE, MBT_FILE_ALL_ACCESS,
+                            MBT_FILE_SHARE_RWD, file_attributes, &co);
+    if (*st != ST_SUCCESS) {
+        return 0;
+    }
+    if (smb2_query_info(c, SMB2_INFO_FILE_T, SMB2_FILE_BASIC_INFO_T, co.file_id, 0,
+                        basic, sizeof(basic), &len) == ST_SUCCESS && len >= 36) {
+        /* FILE_BASIC_INFORMATION: 4 timestamps (32) then FileAttributes(4). */
+        attrs = g32(basic, 32);
+    }
+    smb2_close(c, co.file_id);
+    return attrs;
+} /* created_file_attributes */
+
+/* A CREATE's DOS attributes come from its own FileAttributes and nothing
+ * else.  The request slot is pooled, and the create path ORs ARCHIVE into the
+ * slot's set_attr; when the field was not reset, a plain create reused the
+ * previous CREATE's READONLY bit, so a new file came out read-only and every
+ * later write open of it was refused (found with the Windows client).
+ * Alternate the two kinds of create so each normal one follows a READONLY one
+ * on whatever slot the server hands out. */
+static void
+probe_create_attributes_not_inherited(struct smb2_conn *c)
+{
+    char     name[32];
+    uint32_t st, attrs;
+    int      leaked = 0, ro_seen = 0;
+
+    for (int i = 0; i < 8; i++) {
+        snprintf(name, sizeof(name), "attr-ro-%d.bin", i);
+        attrs = created_file_attributes(c, name, MBT_FILE_ATTRIBUTE_READONLY, &st);
+        if (st == ST_SUCCESS && (attrs & MBT_FILE_ATTRIBUTE_READONLY)) {
+            ro_seen++;
+        }
+
+        snprintf(name, sizeof(name), "attr-plain-%d.bin", i);
+        attrs = created_file_attributes(c, name, MBT_FILE_ATTRIBUTE_NORMAL, &st);
+        CHECK(st == ST_SUCCESS, "CREATE %s (FileAttributes NORMAL) -> 0x%08x", name, st);
+        if (attrs & MBT_FILE_ATTRIBUTE_READONLY) {
+            leaked++;
+        }
+    }
+
+    CHECK(ro_seen == 8, "a CREATE with FileAttributes READONLY makes a read-only file "
+          "(%d of 8)", ro_seen);
+    CHECK(leaked == 0, "a CREATE with FileAttributes NORMAL never inherits READONLY "
+          "from an earlier CREATE (%d of 8 did)", leaked);
+} /* probe_create_attributes_not_inherited */
+
 static void
 probe_refusals(struct smb2_conn *c)
 {
@@ -1484,6 +1960,7 @@ main(
 
     probe_agreement(c);
     probe_set_info(c);
+    probe_ntfs_semantics(c);
     probe_ea(c);
     probe_streams(c);
     probe_link(c);
@@ -1491,6 +1968,7 @@ main(
     probe_security_sids(c);
     probe_query_directory(c);
     probe_refusals(c);
+    probe_create_attributes_not_inherited(c);
 
     smb2_env_stop(&env);
 

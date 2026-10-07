@@ -130,6 +130,7 @@
 #define SMB2_STATUS_NO_EAS_ON_FILE                    0xC0000052
 #define SMB2_STATUS_EA_CORRUPT_ERROR                  0xC0000053
 #define SMB2_STATUS_FILE_LOCK_CONFLICT                0xC0000054
+#define SMB2_STATUS_NO_MORE_EAS                       0x80000012
 #define SMB2_STATUS_INVALID_EA_NAME                   0x80000013
 #define SMB2_STATUS_EA_LIST_INCONSISTENT              0x80000014
 #define SMB2_STATUS_LOCK_NOT_GRANTED                  0xC0000055
@@ -554,6 +555,12 @@
 #define SMB2_STATUS_FILE_IS_OFFLINE                   0xC0000267
 #define SMB2_STATUS_VOLUME_DISMOUNTED                 0xC000026E
 #define SMB2_STATUS_NOT_A_REPARSE_POINT               0xC0000275
+#define SMB2_STATUS_IO_REPARSE_TAG_INVALID            0xC0000276
+#define SMB2_STATUS_IO_REPARSE_TAG_MISMATCH           0xC0000277
+#define SMB2_STATUS_IO_REPARSE_DATA_INVALID           0xC0000278
+#define SMB2_STATUS_IO_REPARSE_TAG_NOT_HANDLED        0xC0000279
+#define SMB2_STATUS_REPARSE_ATTRIBUTE_CONFLICT        0xC00002B2
+#define SMB2_STATUS_OBJECTID_NOT_FOUND                0xC00002F0
 #define SMB2_STATUS_SERVER_UNAVAILABLE                0xC0000466
 #define SMB2_STATUS_FILE_NOT_AVAILABLE                0xC0000467
 
@@ -836,6 +843,9 @@ typedef uint8_t smb2_guid[SMB2_GUID_SIZE];
 #define FILE_ACTION_MODIFIED                        0x00000003
 #define FILE_ACTION_RENAMED_OLD_NAME                0x00000004
 #define FILE_ACTION_RENAMED_NEW_NAME                0x00000005
+#define FILE_ACTION_ADDED_STREAM                    0x00000006
+#define FILE_ACTION_REMOVED_STREAM                  0x00000007
+#define FILE_ACTION_MODIFIED_STREAM                 0x00000008
 
 /* Notify-related status */
 #define SMB2_STATUS_NOTIFY_CLEANUP                  0x0000010B
@@ -1049,10 +1059,18 @@ typedef uint8_t smb2_guid[SMB2_GUID_SIZE];
 #define SMB2_FSCTL_DFS_GET_REFERRALS                0x00060194
 #define SMB2_FSCTL_SET_REPARSE_POINT                0x000900A4
 #define SMB2_FSCTL_GET_REPARSE_POINT                0x000900A8
+#define SMB2_FSCTL_DELETE_REPARSE_POINT             0x000900AC
+#define SMB2_FSCTL_GET_RETRIEVAL_POINTERS           0x00090073
+#define SMB2_FSCTL_SET_OBJECT_ID                    0x00090098
+#define SMB2_FSCTL_GET_OBJECT_ID                    0x0009009C
+#define SMB2_FSCTL_DELETE_OBJECT_ID                 0x000900A0
+#define SMB2_FSCTL_SET_OBJECT_ID_EXTENDED           0x000900BC
 #define SMB2_FSCTL_VALIDATE_NEGOTIATE_INFO          0x00140204
 #define SMB2_FSCTL_TRANSCEIVE_PIPE                  0x0011C017
 #define SMB2_FSCTL_QUERY_NETWORK_INTERFACE_INFO     0x001401FC
 #define SMB2_FSCTL_SET_SPARSE                       0x000900C4
+#define SMB2_FSCTL_GET_COMPRESSION                  0x0009003C
+#define SMB2_FSCTL_SET_COMPRESSION                  0x0009C040
 #define SMB2_FSCTL_SET_ZERO_DATA                    0x000980C8
 #define SMB2_FSCTL_QUERY_ALLOCATED_RANGES           0x000940CF
 #define SMB2_FSCTL_SRV_REQUEST_RESUME_KEY           0x00140078
@@ -1094,6 +1112,14 @@ typedef uint8_t smb2_guid[SMB2_GUID_SIZE];
 
 #define SMB2_IO_REPARSE_TAG_NFS                     0x80000014
 #define SMB2_IO_REPARSE_TAG_SYMLINK                 0xA000000C
+#define SMB2_IO_REPARSE_TAG_MOUNT_POINT             0xA0000003
+/* Bit 31 marks a Microsoft tag (MS-FSCC 2.1.2.1); any other tag carries a GUID
+ * in a 24-byte REPARSE_GUID_DATA_BUFFER header rather than the 8-byte
+ * REPARSE_DATA_BUFFER header. */
+#define SMB2_IO_REPARSE_TAG_IS_MICROSOFT(tag) (((tag) & 0x80000000u) != 0)
+#define SMB2_REPARSE_DATA_HEADER_SIZE               8
+#define SMB2_REPARSE_GUID_DATA_HEADER_SIZE          24
+#define SMB2_REPARSE_BUFFER_MAX                     16384
 /* SymbolicLinkErrorResponse SymLinkErrorTag (MS-SMB2 2.2.2.2.1): 'SYML'. */
 #define SMB2_SYMLINK_ERROR_TAG                      0x4C4D5953
 /* SYMBOLIC_LINK_REPARSE_BUFFER Flags (MS-FSCC 2.1.2.4). */
@@ -1186,6 +1212,7 @@ typedef uint8_t smb2_guid[SMB2_GUID_SIZE];
 #define SMB2_FS_ATTR_SUPPORTS_REPARSE_POINTS        0x00000080
 /* MS-FSCC calls this one FILE_NAMED_STREAMS -- no SUPPORTS infix, unlike its
  * neighbours. */
+#define SMB2_FS_ATTR_SUPPORTS_OBJECT_IDS            0x00010000
 #define SMB2_FS_ATTR_NAMED_STREAMS                  0x00040000
 #define SMB2_FS_ATTR_SUPPORTS_BLOCK_REFCOUNTING     0x08000000
 

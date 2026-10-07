@@ -5,6 +5,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <string.h>
 #include <stdbool.h>
 #include <stdatomic.h>
 #include "common/thread.h"
@@ -89,6 +90,21 @@ struct chimera_smb_file_id {
  * resolved zombie and a replay falls through to a fresh open
  * (smb2.replay.dhv2-pending2*-vs-{lease,oplock}-{sane,windows}). */
 #define CHIMERA_SMB_OPEN_FILE_PENDING_ORPHANED     0x00000800
+/* A write through this handle has already marked the file ARCHIVE (MS-FSA
+ * 2.1.4.17: modifying a data file sets FILE_ATTRIBUTE_ARCHIVE), so its later
+ * writes need not ask the backend for the DOS attributes again. */
+#define CHIMERA_SMB_OPEN_FILE_ARCHIVE_NOTED        0x00001000
+/* The client explicitly set the LastAccessTime on this handle; reads through
+ * it must not advance it (MS-FSA Open.UserSetAccessTime).  The value set is
+ * kept in sticky_atime and put back after a read the backend stamped. */
+#define CHIMERA_SMB_OPEN_FILE_ACCESS_TIME_STICKY   0x00002000
+/* An EndOfFile set through this handle truncated the file and left its old
+ * allocation reserved; the close releases it (NTFS frees truncated clusters at
+ * cleanup). */
+#define CHIMERA_SMB_OPEN_FILE_TRUNCATED            0x00004000
+/* Opened with FILE_OPEN_FOR_BACKUP_INTENT: the open may set and delete object
+ * IDs (MS-FSA Open.HasRestoreAccess). */
+#define CHIMERA_SMB_OPEN_FILE_BACKUP_INTENT        0x00008000
 
 /* Bits identifying which CREATE contexts a client supplied on the open. Mirrored
  * from request->create.ctx_present_mask into the open file so later phases
@@ -167,6 +183,12 @@ struct chimera_smb_open_file {
     uint32_t                         name_len;
     uint32_t                         flags;
     uint64_t                         position;
+    /* Open.NextEaEntry (MS-FSA 2.1.5.12.12): the user.* EA index, 0-based, a
+     * FileFullEaInformation scan without SL_RESTART_SCAN resumes from. */
+    uint32_t                         next_ea_index;
+    /* The LastAccessTime last set explicitly through this handle (valid while
+     * CHIMERA_SMB_OPEN_FILE_ACCESS_TIME_STICKY is set). */
+    struct timespec                  sticky_atime;
     uint32_t                         parent_fh_len;
     uint32_t                         refcnt;
     /* MS-SMB2 §3.3.5.2.10 channel-sequence tracking.  channel_sequence holds
@@ -299,6 +321,27 @@ struct chimera_smb_open_file {
     uint16_t                         integrity_algo;
     uint32_t                         integrity_flags;
 };
+
+#define CHIMERA_SMB_STREAM_NOTIFY_NAME_MAX (2 * SMB_FILENAME_MAX + 2)
+
+/* The name a change notification reports for an event on this open: the
+ * file's own, or "<file>:<stream>" for a named stream, as NTFS reports it.
+ * Returns its length; buf holds at least CHIMERA_SMB_STREAM_NOTIFY_NAME_MAX. */
+static inline uint32_t
+chimera_smb_open_file_notify_name(
+    const struct chimera_smb_open_file *open_file,
+    char                               *buf)
+{
+    uint32_t n = open_file->name_len;
+
+    memcpy(buf, open_file->name, n);
+    if ((open_file->flags & CHIMERA_SMB_OPEN_FILE_FLAG_STREAM) && open_file->stream_name_len) {
+        buf[n++] = ':';
+        memcpy(buf + n, open_file->stream_name, open_file->stream_name_len);
+        n += open_file->stream_name_len;
+    }
+    return n;
+} /* chimera_smb_open_file_notify_name */
 
 #define CHIMERA_SMB_OPEN_FILE_BUCKETS     256
 #define CHIMERA_SMB_OPEN_FILE_BUCKET_MASK (CHIMERA_SMB_OPEN_FILE_BUCKETS - 1)

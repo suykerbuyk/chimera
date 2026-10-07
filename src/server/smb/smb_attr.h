@@ -41,11 +41,12 @@
                                      SMB2_FILE_ATTRIBUTE_SYSTEM |   \
                                      SMB2_FILE_ATTRIBUTE_ARCHIVE)
 
-/* Persisted DOS bits reported back to clients.  SPARSE is reportable but is
- * excluded from SMB_DOS_ATTR_SETTABLE because it is managed via
- * FSCTL_SET_SPARSE, not FileBasicInformation. */
+/* Persisted DOS bits reported back to clients.  SPARSE and REPARSE_POINT are
+* reportable but excluded from SMB_DOS_ATTR_SETTABLE: they are managed through
+* FSCTL_SET_SPARSE and the reparse-point FSCTLs, not FileBasicInformation. */
 #define SMB_DOS_ATTR_REPORTABLE     (SMB_DOS_ATTR_SETTABLE | \
-                                     SMB2_FILE_ATTRIBUTE_SPARSE_FILE)
+                                     SMB2_FILE_ATTRIBUTE_SPARSE_FILE | \
+                                     SMB2_FILE_ATTRIBUTE_REPARSE_POINT)
 
 /* Masks for each information class */
 #define SMB_ATTR_MASK_BASIC         ( \
@@ -143,7 +144,8 @@ chimera_smb_named_streams_enabled(
  *
  * FILE_NAMED_STREAMS follows chimera_smb_named_streams_enabled, the gate
  * FileStreamInformation applies, so the client is never told about streams
- * the server would then refuse.
+ * the server would then refuse.  FILE_SUPPORTS_OBJECT_IDS follows
+ * CHIMERA_VFS_CAP_XATTR, where object IDs are kept.
  *
  * FILE_PERSISTENT_ACLS gates on CHIMERA_VFS_CAP_ACL_NATIVE, which means
  * lossless ACL storage, so a mode-only backend such as the linux passthrough
@@ -179,6 +181,11 @@ chimera_smb_fs_attributes(
 
     if (chimera_smb_named_streams_enabled(capabilities, named_streams)) {
         attrs |= SMB2_FS_ATTR_NAMED_STREAMS;
+    }
+
+    /* Object IDs are kept as xattrs (smb_proc_object_id.c). */
+    if (capabilities & CHIMERA_VFS_CAP_XATTR) {
+        attrs |= SMB2_FS_ATTR_SUPPORTS_OBJECT_IDS;
     }
 
     return attrs;
@@ -255,6 +262,43 @@ chimera_smb_marshal_basic_attrs(
     smb_attr->smb_attr_mask |= SMB_ATTR_ATTRIBUTES;
 } /* chimera_smb_marshal_basic_attrs */
 
+/* Bytes in one allocation unit, as FileFsSizeInformation and
+ * FileFsFullSizeInformation report it (8 sectors of 512 bytes). */
+#define CHIMERA_SMB_CLUSTER_SIZE 4096ULL
+
+static inline uint64_t
+chimera_smb_round_cluster(uint64_t bytes)
+{
+    return (bytes + CHIMERA_SMB_CLUSTER_SIZE - 1) & ~(CHIMERA_SMB_CLUSTER_SIZE - 1);
+} /* chimera_smb_round_cluster */
+
+/* AllocationSize as a Windows file system reports it (MS-FSA 2.1.5.15.1 /
+ * 2.1.5.15.5): a whole number of the clusters the volume advertises, covering
+ * the end of file and any AllocationSize reservation past it.  A non-sparse
+ * file is allocated through EOF whether or not it was written, so its backend
+ * usage -- memfs counts 64 KiB chunks, diskfs keeps blocks a truncation left
+ * behind -- does not enter into it.  A sparse file reports what the backend
+ * actually holds, capped at what the non-sparse rule would give. */
+static inline uint64_t
+chimera_smb_alloc_size(const struct chimera_vfs_attrs *attr)
+{
+    uint64_t want = attr->va_size;
+    uint64_t used;
+
+    if ((attr->va_set_mask & CHIMERA_VFS_ATTR_ALLOC_SIZE) &&
+        attr->va_alloc_size > want) {
+        want = attr->va_alloc_size;
+    }
+    want = chimera_smb_round_cluster(want);
+
+    if ((attr->va_set_mask & CHIMERA_VFS_ATTR_DOS_ATTRIBUTES) &&
+        (attr->va_dos_attributes & SMB2_FILE_ATTRIBUTE_SPARSE_FILE)) {
+        used = chimera_smb_round_cluster(attr->va_space_used);
+        return used < want ? used : want;
+    }
+    return want;
+} /* chimera_smb_alloc_size */
+
 static inline void
 chimera_smb_marshal_standard_attrs(
     const struct chimera_vfs_attrs *attr,
@@ -270,7 +314,7 @@ chimera_smb_marshal_standard_attrs(
         smb_attr->smb_alloc_size = 0;
         smb_attr->smb_size       = 0;
     } else {
-        smb_attr->smb_alloc_size = attr->va_space_used;
+        smb_attr->smb_alloc_size = chimera_smb_alloc_size(attr);
         smb_attr->smb_size       = attr->va_size;
     }
     smb_attr->smb_attr_mask |= SMB_ATTR_ALLOC_SIZE;
@@ -467,7 +511,7 @@ chimera_smb_marshal_network_open_info(
     /* A directory's data stream has no size; report 0/0 like FileStandardInformation
      * (MS-FSCC 2.4.40), not the backend's internal directory size. */
     smb_attr->smb_alloc_size = ((attr->va_mode & S_IFMT) == S_IFDIR) ?
-        0 : attr->va_space_used;
+        0 : chimera_smb_alloc_size(attr);
     smb_attr->smb_attr_mask |= SMB_ATTR_ALLOC_SIZE;
 
     smb_attr->smb_size = ((attr->va_mode & S_IFMT) == S_IFDIR) ?
@@ -689,8 +733,16 @@ chimera_smb_append_standard_info(
     evpl_iovec_cursor_append_uint64(cursor, attrs->smb_alloc_size);
     evpl_iovec_cursor_append_uint64(cursor, attrs->smb_size);
     evpl_iovec_cursor_append_uint32(cursor, attrs->smb_link_count);
-    evpl_iovec_cursor_append_uint8(cursor, !!(open_file->flags & CHIMERA_SMB_OPEN_FILE_FLAG_DELETE_ON_CLOSE));
-    evpl_iovec_cursor_append_uint8(cursor, attrs->smb_attributes & SMB2_FILE_ATTRIBUTE_DIRECTORY);
+    /* DeletePending belongs to the file, not the handle (MS-FSA
+     * Open.Link.IsDeleted): a disposition set through one open is seen through
+     * every other open of the file (IFSTest DispositionInformationTest).  A
+     * named-stream open's pending delete removes only that stream, so it is
+     * reported on that handle alone. */
+    evpl_iovec_cursor_append_uint8(cursor,
+                                   (open_file->flags & CHIMERA_SMB_OPEN_FILE_FLAG_DELETE_ON_CLOSE) ||
+                                   (!(open_file->flags & CHIMERA_SMB_OPEN_FILE_FLAG_STREAM) &&
+                                    chimera_vfs_state_is_delete_pending(open_file->share_file_state)));
+    evpl_iovec_cursor_append_uint8(cursor, !!(attrs->smb_attributes & SMB2_FILE_ATTRIBUTE_DIRECTORY));
     evpl_iovec_cursor_append_uint16(cursor, 0); /* Reserved */
 } /* chimera_smb_append_standard_info */
 

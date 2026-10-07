@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include "common/export.h"
+
 #include <stdlib.h>
 #include <time.h>
 #ifdef _WIN32
@@ -158,6 +160,11 @@ chimera_vfs_find_result_free(
  * resolution is not, because umount's own closes run against exactly such a
  * mount and still have to find the filesystem their handle belongs to.
  */
+void
+chimera_vfs_mount_retire(
+    struct chimera_vfs       *vfs,
+    struct chimera_vfs_mount *mount);
+
 static inline struct chimera_vfs_module *
 chimera_vfs_resolve_mount(
     struct chimera_vfs_thread *thread,
@@ -667,6 +674,7 @@ chimera_vfs_op_is_mutating(const struct chimera_vfs_request *request)
         case CHIMERA_VFS_OP_SET_XATTR:
         case CHIMERA_VFS_OP_REMOVE_XATTR:
         case CHIMERA_VFS_OP_REMOVE_STREAM:
+        case CHIMERA_VFS_OP_RENAME_STREAM:
         case CHIMERA_VFS_OP_COPY_RANGE:
         case CHIMERA_VFS_OP_CLONE_RANGE:
         case CHIMERA_VFS_OP_MOVE_RANGE:
@@ -718,7 +726,7 @@ chimera_vfs_mount_is_readonly(const struct chimera_vfs_request *request)
 /* vfs_notify.c: swap in the sync-coherence completion gate on namespace
  * mutations when sync watchers exist (see vfs_notify.h).  Declared here
  * rather than pulling vfs_notify.h into every dispatch consumer. */
-void
+SYMBOL_EXPORT void
 chimera_vfs_notify_gate_install(
     struct chimera_vfs_request *request);
 

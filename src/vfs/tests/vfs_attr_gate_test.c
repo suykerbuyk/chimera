@@ -19,7 +19,11 @@
 
 #include <stdio.h>
 #include <string.h>
+#ifdef _WIN32
+#include "common/platform.h"
+#else /* ifdef _WIN32 */
 #include <unistd.h>
+#endif /* ifdef _WIN32 */
 #undef NDEBUG
 #include <assert.h>
 
@@ -450,7 +454,7 @@ main(
     wait_done(&ctx);
     assert(ctx.status == CHIMERA_VFS_OK);
 
-    chimera_vfs_get_root_fh(root_fh, &root_fh_len);
+    chimera_vfs_get_root_fh(ctx.vfs_thread->vfs, root_fh, &root_fh_len);
     chimera_vfs_lookup(ctx.vfs_thread, &creds[ACTOR_ROOT], root_fh, root_fh_len,
                        "test", 4,
                        CHIMERA_VFS_ATTR_FH | CHIMERA_VFS_ATTR_MASK_STAT, 0,

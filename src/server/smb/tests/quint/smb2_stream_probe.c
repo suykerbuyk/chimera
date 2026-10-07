@@ -196,6 +196,159 @@ probe_stream_lifecycle(struct smb2_conn *c)
     smb2_close(c, base.file_id);
 } /* probe_stream_lifecycle */
 
+/* Renaming a stream (MS-FSA 2.1.5.15.12.1): the target ":name[:$DATA]" names
+ * another stream of the same file, so the stream is renamed in place -- the
+ * base file keeps its name -- and a stream of the target name is replaced only
+ * with ReplaceIfExists and only while empty. */
+static void
+probe_stream_rename(struct smb2_conn *c)
+{
+    struct smb2_create_out base, s1, s2, reopen;
+    uint8_t                rd[16];
+    uint32_t               st, cnt = 0, rlen = 0;
+
+    printf("# --- stream rename ---\n");
+
+    st = smb2_create(c, "sren.bin", MBT_FILE_OVERWRITE_IF, MBT_FILE_ALL_ACCESS,
+                     MBT_FILE_SHARE_RWD, NULL, &base);
+    CHECK(st == ST_SUCCESS, "CREATE sren.bin -> 0x%08x", st);
+    if (st != ST_SUCCESS) {
+        return;
+    }
+    smb2_close(c, base.file_id);
+
+    st = smb2_create(c, "sren.bin:one", MBT_FILE_OVERWRITE_IF, MBT_FILE_ALL_ACCESS,
+                     MBT_FILE_SHARE_RWD, NULL, &s1);
+    CHECK(st == ST_SUCCESS, "CREATE sren.bin:one -> 0x%08x", st);
+    if (st != ST_SUCCESS) {
+        return;
+    }
+    smb2_write(c, s1.file_id, 0, "ONE", 3, &cnt);
+
+    st = smb2_rename(c, s1.file_id, ":two:$DATA", 0);
+    CHECK(st == ST_SUCCESS, "rename :one -> :two:$DATA -> 0x%08x", st);
+    st = smb2_read(c, s1.file_id, 0, sizeof(rd), rd, &rlen);
+    CHECK(st == ST_SUCCESS && rlen == 3, "  ... the open handle still reads it "
+          "(0x%08x, %u)", st, rlen);
+    smb2_close(c, s1.file_id);
+
+    st = smb2_create(c, "sren.bin:two", MBT_FILE_OPEN, MBT_FILE_ALL_ACCESS,
+                     MBT_FILE_SHARE_RWD, NULL, &reopen);
+    CHECK(st == ST_SUCCESS, "  ... sren.bin:two opens -> 0x%08x", st);
+    if (st == ST_SUCCESS) {
+        smb2_close(c, reopen.file_id);
+    }
+    st = smb2_create(c, "sren.bin:one", MBT_FILE_OPEN, MBT_FILE_ALL_ACCESS,
+                     MBT_FILE_SHARE_RWD, NULL, &reopen);
+    CHECK(st == ST_OBJECT_NAME_NOT_FOUND, "  ... and :one is gone (0x%08x)", st);
+    if (st == ST_SUCCESS) {
+        smb2_close(c, reopen.file_id);
+    }
+    st = smb2_create(c, "sren.bin", MBT_FILE_OPEN, MBT_FILE_ALL_ACCESS,
+                     MBT_FILE_SHARE_RWD, NULL, &reopen);
+    CHECK(st == ST_SUCCESS, "  ... the base file kept its name (0x%08x)", st);
+    if (st == ST_SUCCESS) {
+        smb2_close(c, reopen.file_id);
+    }
+
+    /* An empty stream named as the target. */
+    st = smb2_create(c, "sren.bin:three", MBT_FILE_OVERWRITE_IF, MBT_FILE_ALL_ACCESS,
+                     MBT_FILE_SHARE_RWD, NULL, &s2);
+    CHECK(st == ST_SUCCESS, "CREATE sren.bin:three -> 0x%08x", st);
+    if (st == ST_SUCCESS) {
+        smb2_close(c, s2.file_id);
+    }
+    st = smb2_create(c, "sren.bin:two", MBT_FILE_OPEN, MBT_FILE_ALL_ACCESS,
+                     MBT_FILE_SHARE_RWD, NULL, &s1);
+    if (st != ST_SUCCESS) {
+        return;
+    }
+    st = smb2_rename(c, s1.file_id, ":three", 0);
+    CHECK(st == ST_OBJECT_NAME_COLLISION, "rename onto an existing stream "
+          "without ReplaceIfExists -> OBJECT_NAME_COLLISION (0x%08x)", st);
+    st = smb2_rename(c, s1.file_id, ":three", 1);
+    CHECK(st == ST_SUCCESS, "  ... with it, onto an empty one -> 0x%08x", st);
+    st = smb2_rename(c, s1.file_id, ":x:$INDEX_ALLOCATION", 0);
+    CHECK(st != ST_SUCCESS, "a data stream cannot take another stream type "
+          "(0x%08x)", st);
+    smb2_close(c, s1.file_id);
+
+    /* Renaming the file's unnamed data stream moves its data to the named
+     * stream and leaves the file an empty unnamed one; renaming a named
+     * stream onto the (empty) unnamed one moves it back. */
+    st = smb2_create(c, "sren.bin", MBT_FILE_OPEN, MBT_FILE_ALL_ACCESS,
+                     MBT_FILE_SHARE_RWD, NULL, &base);
+    if (st != ST_SUCCESS) {
+        return;
+    }
+    smb2_write(c, base.file_id, 0, "MAIN", 4, &cnt);
+    st = smb2_rename(c, base.file_id, ":moved", 0);
+    CHECK(st == ST_SUCCESS, "rename ::$DATA -> :moved -> 0x%08x", st);
+    st = smb2_read(c, base.file_id, 0, sizeof(rd), rd, &rlen);
+    CHECK(rlen == 0, "  ... the file's unnamed stream is now empty (0x%08x, %u)",
+          st, rlen);
+    smb2_close(c, base.file_id);
+    st = smb2_create(c, "sren.bin:moved", MBT_FILE_OPEN, MBT_FILE_ALL_ACCESS,
+                     MBT_FILE_SHARE_RWD, NULL, &s1);
+    CHECK(st == ST_SUCCESS, "  ... and :moved holds its data (0x%08x)", st);
+    if (st != ST_SUCCESS) {
+        return;
+    }
+    st = smb2_read(c, s1.file_id, 0, sizeof(rd), rd, &rlen);
+    CHECK(st == ST_SUCCESS && rlen == 4 && memcmp(rd, "MAIN", 4) == 0,
+          "  ... (0x%08x, %u bytes)", st, rlen);
+    st = smb2_rename(c, s1.file_id, "::$DATA", 0);
+    CHECK(st == ST_SUCCESS, "rename :moved -> ::$DATA -> 0x%08x", st);
+    smb2_close(c, s1.file_id);
+    st = smb2_create(c, "sren.bin", MBT_FILE_OPEN, MBT_FILE_ALL_ACCESS,
+                     MBT_FILE_SHARE_RWD, NULL, &base);
+    if (st == ST_SUCCESS) {
+        st = smb2_read(c, base.file_id, 0, sizeof(rd), rd, &rlen);
+        CHECK(st == ST_SUCCESS && rlen == 4 && memcmp(rd, "MAIN", 4) == 0,
+              "  ... the file's data is back (0x%08x, %u bytes)", st, rlen);
+        smb2_close(c, base.file_id);
+    }
+} /* probe_stream_rename */
+
+/* A named stream of a directory is a data stream: it opens, reads and writes
+ * like a file's, and reports itself as one (no DIRECTORY attribute, its own
+ * size) rather than as the directory carrying it. */
+static void
+probe_dir_stream(struct smb2_conn *c)
+{
+    struct smb2_create_out d, s1;
+    uint8_t                rd[16], out[64];
+    uint32_t               st, cnt = 0, rlen = 0, len = 0;
+
+    printf("# --- directory stream ---\n");
+
+    st = smb2_create_opts(c, "dstream", MBT_FILE_OPEN_IF, MBT_FILE_ALL_ACCESS,
+                          MBT_FILE_SHARE_RWD, MBT_FILE_DIRECTORY_FILE, NULL, &d);
+    CHECK(st == ST_SUCCESS, "CREATE directory dstream -> 0x%08x", st);
+    if (st != ST_SUCCESS) {
+        return;
+    }
+    smb2_close(c, d.file_id);
+
+    st = smb2_create_opts(c, "dstream:data", MBT_FILE_OPEN_IF, MBT_FILE_ALL_ACCESS,
+                          MBT_FILE_SHARE_RWD, 0, NULL, &s1);
+    CHECK(st == ST_SUCCESS, "CREATE dstream:data -> 0x%08x", st);
+    if (st != ST_SUCCESS) {
+        return;
+    }
+    st = smb2_write(c, s1.file_id, 0, "DIRDATA", 7, &cnt);
+    CHECK(st == ST_SUCCESS && cnt == 7, "WRITE 7 bytes to dstream:data -> 0x%08x", st);
+    st = smb2_read(c, s1.file_id, 0, sizeof(rd), rd, &rlen);
+    CHECK(st == ST_SUCCESS && rlen == 7 && memcmp(rd, "DIRDATA", 7) == 0,
+          "  ... and READ it back (0x%08x, %u)", st, rlen);
+    st = smb2_query_info(c, SMB2_INFO_FILE_T, SMB2_FILE_STANDARD_INFO_T, s1.file_id,
+                         0, out, sizeof(out), &len);
+    CHECK(st == ST_SUCCESS && g64(out, 8) == 7 && out[21] == 0,
+          "  ... FileStandardInformation: EOF 7, not a directory (0x%08x, eof "
+          "%llu, dir %u)", st, (unsigned long long) g64(out, 8), out[21]);
+    smb2_close(c, s1.file_id);
+} /* probe_dir_stream */
+
 int
 main(
     int   argc,
@@ -219,6 +372,8 @@ main(
     printf("# dialect=0x%04x\n", c->dialect);
 
     probe_stream_lifecycle(c);
+    probe_stream_rename(c);
+    probe_dir_stream(c);
 
     smb2_env_stop(&env);
 
