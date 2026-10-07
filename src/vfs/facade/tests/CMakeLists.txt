@@ -62,9 +62,12 @@ set_tests_properties(chimera/vfs/facade/facade_loopback_test PROPERTIES
     LABELS "facade_mbt"
     TIMEOUT 300)
 
-# Crash recovery over the crash-sim + loopback providers, and the power-loss
-# durability conformance obligation via the facade backend.
-foreach(_t facade_recover_crash_test facade_conformance_durability_test)
+# Crash recovery over the crash-sim + loopback providers, the real conformance
+# suites (power-loss durability, namespace, error obligations) via the facade
+# backend, and attach / version negotiation / epoch lease / renew / fence /
+# detach via the facade backend (facade_attach_test).
+foreach(_t facade_recover_crash_test facade_conformance_durability_test
+           facade_attach_test)
     add_executable(${_t} ${_t}.c)
     target_include_directories(${_t} PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
@@ -85,6 +88,9 @@ endforeach()
 target_link_libraries(facade_recover_crash_test
     chimera_facade chimera_media_crashsim chimera_media_loopback evpl)
 target_link_libraries(facade_conformance_durability_test
+    chimera_facade_sc_backend chimera_sc_conformance
+    chimera_media_crashsim chimera_media_loopback evpl)
+target_link_libraries(facade_attach_test
     chimera_facade_sc_backend chimera_sc_conformance
     chimera_media_crashsim chimera_media_loopback evpl)
 
