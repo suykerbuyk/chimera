@@ -236,8 +236,12 @@ static_analysis:
   rules: *rules_fast
   parallel:
     matrix:
+      # amd64 only: the chimera-dev image this job runs in is amd64-only (its
+      # packages.lock has no arm64 closure and no arm64 build infra exists to
+      # generate one), so an arm64 entry here would have no image to schedule
+      # into.  Restore arm64 here if chimera-dev regains an arm64 build.
       - MODE: [ release, debug ]
-        ARCH: [ arm64, amd64 ]
+        ARCH: [ amd64 ]
   script:
     - >
       if ! ${RUN_QB} -a ${ARCH} -v static_analysis_${MODE} ; then

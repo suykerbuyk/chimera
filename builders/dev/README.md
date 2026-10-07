@@ -83,6 +83,10 @@ amd64-only); an arm64 build would install arm64 package versions that are not in
 `packages.lock` and so would fail the gate wholesale. Re-bumping on arm64 would
 produce a different lock.
 
+Because of this, `chimera-dev` is built **amd64-only** (`qb.yaml` declares
+`architecture: [ amd64 ]`): `packages.lock` carries no arm64 closure and no arm64
+build infra exists to generate one.
+
 ### What is and is not locked
 
 **Locked (apt+base, `ENABLE_DOCA=0`):** the base image and every `apt-get install`

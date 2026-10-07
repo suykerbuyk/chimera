@@ -319,7 +319,7 @@ tasks:
   # Chimera-dev container
   chimera-dev:
     type: build_container
-    architecture: [ amd64, arm64 ]
+    architecture: [ amd64 ]
     dockerfile: builders/dev/Dockerfile
     registry_path: chimera-dev
     context: builders/dev
@@ -394,9 +394,10 @@ tasks:
   # reliable enough to gate on, and an intermittent failure there costs more
   # triage than the second architecture was buying.  The matching ARCH lists in
   # .gitlab-ci.yml (the `ctest` and `ctest_quint` jobs) are amd64 only for the
-  # same reason; restore the two together.  static_analysis_* keeps arm64 --
-  # it builds and analyses rather than running tests, so the flakiness does not
-  # reach it, and it is the only remaining arm64 compile check.
+  # same reason; restore the two together.  static_analysis_* is amd64-only too:
+  # it runs inside the chimera-dev image, which is now amd64-only (its
+  # packages.lock has no arm64 closure and no arm64 build infra exists), so it
+  # cannot build on arm64 at all -- no arm64 compile check remains.
   # Every leg from here down packs the tree with `context_exclude: [ .git ]`,
   # as do the packaging build_* tasks above.  The .git directory (~120 MiB of
   # packs plus the submodule stores) was nearly 90% of the compressed
@@ -925,7 +926,7 @@ tasks:
 
   static_analysis_release:
     type: run_container
-    architecture: [ amd64, arm64 ]
+    architecture: [ amd64 ]
     image: chimera-dev
     context: .
     context_exclude: [ .git ]
@@ -962,7 +963,7 @@ tasks:
 
   static_analysis_release_report:
     type: run_container
-    architecture: [ amd64, arm64 ]
+    architecture: [ amd64 ]
     image: chimera-dev
     context: .
     context_exclude: [ .git ]
@@ -993,7 +994,7 @@ tasks:
 
   static_analysis_debug:
     type: run_container
-    architecture: [ amd64, arm64 ]
+    architecture: [ amd64 ]
     image: chimera-dev
     context: .
     context_exclude: [ .git ]
@@ -1014,7 +1015,7 @@ tasks:
 
   static_analysis_debug_report:
     type: run_container
-    architecture: [ amd64, arm64 ]
+    architecture: [ amd64 ]
     image: chimera-dev
     context: .
     context_exclude: [ .git ]
