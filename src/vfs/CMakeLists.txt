@@ -69,6 +69,7 @@ install(FILES
 
 add_subdirectory(contract)
 add_subdirectory(media)
+add_subdirectory(facade)
 add_subdirectory(root)
 add_subdirectory(memfs)
 add_subdirectory(memkv)
