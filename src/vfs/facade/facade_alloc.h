@@ -48,6 +48,8 @@ enum facade_status {
     FACADE_E_INVAL    = 3, /* malformed request */
     FACADE_AGAIN      = 4, /* id draw parked; the resume callback will fire */
     FACADE_E_SHUTDOWN = 5, /* allocator is being torn down; the op is cancelled */
+    FACADE_E_FORMAT   = 6, /* recognized superblock, unsupported format version
+                            * (L41): refused clearly, never read as blank */
 };
 
 /* Durability of an allocation relative to the allocator's durable epoch (D5,
@@ -152,6 +154,13 @@ facade_alloc_total_blocks(
 /* The highest epoch whose allocations are durable on media. */
 uint64_t
 facade_alloc_durable_epoch(
+    const struct facade_alloc *alloc);
+
+/* The persisted power-loss generation (contract durability epoch, compared for
+ * equality only): it changes when a crash recovery may have lost buffered data.
+ * Equal across a clean reopen; different after an unclean recovery. */
+uint64_t
+facade_alloc_power_loss_generation(
     const struct facade_alloc *alloc);
 
 /* Is the allocation tagged with epoch durable yet? */

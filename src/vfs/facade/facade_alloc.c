@@ -3,21 +3,22 @@
 // SPDX-License-Identifier: MIT
 
 /*
- * Backend-facade block allocator.  See facade_alloc.h for the interface and
- * the threading / media-vtable rules.
+ * Backend-facade block allocator, object table, and A/B checkpoint.  See
+ * facade_alloc.h for the interface and facade_super.h for the on-media format.
  *
- * Free space is an offset-keyed red-black tree of free extents plus a running
- * free-block count (O(1) NO_SPACE).  Allocation is best-fit, cut from the tail
- * of the chosen extent so the tree key (start) never moves.  The authoritative
- * free set is in memory; it is condensed to the on-media checkpoint at a clean
- * persist (flush/close) and reloaded at open.  Crash replay of allocations made
- * since the last checkpoint is out of scope (media-log-and-recovery).
+ * media-log-and-recovery extends block-allocator-and-identity: the checkpoint
+ * now holds the free set AND a durable object table, it ping-pongs between two
+ * slots (A/B) for crash-atomic compaction, and the superblock carries the log
+ * geometry, the active-slot selector, the clean/dirty mark and the persisted
+ * power-loss generation.  The durability log (facade_log.c) and crash recovery
+ * (facade_recover.c) layer on top.
  *
- * Every media access goes through the provider vtable.  The allocator builds
- * the struct evpl_iovec for its own metadata blocks over its own buffers (data
- * + length only) and never calls a libevpl function, so this library links no
- * evpl.  An iovec passed to an async op lives in that op's heap context until
- * its completion fires.
+ * Every media access goes through the provider vtable (facade_media_* helpers);
+ * the core links no libevpl (it references struct evpl_iovec only as the vtable
+ * buffer type).  An allocator is bound to the media space's evpl thread; each
+ * async op is a self-contained state machine the caller awaits, so at most one
+ * op is in flight (plus the deliberate teardown-race path, handled by deferring
+ * the free until inflight drops to zero).
  */
 
 #include <limits.h>
@@ -27,7 +28,7 @@
 #include "evpl/evpl.h"   /* struct evpl_iovec (type only; not linked) */
 
 #include "facade_internal.h"
-#include "facade_extent.h"
+#include "facade_log.h"
 #include "media_provider.h"
 
 /* ------------------------------------------------------------------ */
@@ -43,15 +44,6 @@ facade_free_node_destroy(
     free(container_of(node, struct facade_free_ext, node));
 } /* facade_free_node_destroy */
 
-/* In-order successor in the free tree.
- *
- * This open-codes the traversal of common/rbtree.h's rb_tree_next_element
- * instead of calling it, with one difference: the parent-chain walk guards the
- * parent pointer for NULL (p && ...).  In a valid tree a node's parent is the
- * nil sentinel, never NULL, so the guard never changes behaviour -- but it lets
- * scan-build analyse the best-fit and serialize loops fully, instead of
- * tripping a false null-dereference inside the shared inline (which this unit
- * must not edit).  No analyzer suppression is needed. */
 static struct facade_free_ext *
 facade_free_next(
     struct facade_alloc    *a,
@@ -76,7 +68,6 @@ facade_free_next(
     return (!p || p == nil) ? NULL : container_of(p, struct facade_free_ext, node);
 } /* facade_free_next */
 
-/* Coalescing insert of [start, start+nblocks) into the free tree. */
 static void
 facade_free_insert(
     struct facade_alloc *a,
@@ -87,8 +78,6 @@ facade_free_insert(
     struct facade_free_ext *nx = NULL;
     struct facade_free_ext *e;
 
-    /* An extent starting exactly where this one ends, and the extent at or
-     * before this start. */
     rb_tree_query_exact(&a->free_by_start, start + nblocks, start, nx);
     rb_tree_query_floor(&a->free_by_start, start, start, pv);
 
@@ -96,7 +85,6 @@ facade_free_insert(
                  "double-free or overlap");
 
     if (pv && pv->start + pv->nblocks == start) {
-        /* Merge into the predecessor; its start key is unchanged. */
         pv->nblocks += nblocks;
         if (nx) {
             pv->nblocks += nx->nblocks;
@@ -104,7 +92,6 @@ facade_free_insert(
             free(nx);
         }
     } else if (nx) {
-        /* Extend the successor downward: its start key changes, so reinsert. */
         rb_tree_remove(&a->free_by_start, &nx->node);
         nx->start    = start;
         nx->nblocks += nblocks;
@@ -117,6 +104,43 @@ facade_free_insert(
         rb_tree_insert(&a->free_by_start, start, e);
     }
 } /* facade_free_insert */
+
+int
+facade_free_remove(
+    struct facade_alloc  *a,
+    chimera_media_block_t start,
+    uint64_t              nblocks)
+{
+    struct facade_free_ext *e;
+    uint64_t                estart, eend;
+
+    rb_tree_query_floor(&a->free_by_start, start, start, e);
+    if (!e || e->start > start || e->start + e->nblocks < start + nblocks) {
+        return -1;   /* range is not wholly free: inconsistent log record */
+    }
+    estart = e->start;
+    eend   = e->start + e->nblocks;
+    rb_tree_remove(&a->free_by_start, &e->node);
+    free(e);
+    if (estart < start) {
+        facade_free_insert(a, estart, start - estart);
+    }
+    if (start + nblocks < eend) {
+        facade_free_insert(a, start + nblocks, eend - (start + nblocks));
+    }
+    a->free_blocks -= nblocks;
+    return 0;
+} /* facade_free_remove */
+
+void
+facade_free_add(
+    struct facade_alloc  *a,
+    chimera_media_block_t start,
+    uint64_t              nblocks)
+{
+    facade_free_insert(a, start, nblocks);
+    a->free_blocks += nblocks;
+} /* facade_free_add */
 
 SYMBOL_EXPORT enum facade_status
 facade_alloc_blocks(
@@ -136,8 +160,6 @@ facade_alloc_blocks(
         return FACADE_E_NO_SPACE;
     }
 
-    /* Best-fit: smallest free run that fits.  A single pass; an exact match
-     * ends it early. */
     rb_tree_first(&a->free_by_start, e);
     while (e) {
         if (e->nblocks >= nblocks && (!best || e->nblocks < best->nblocks)) {
@@ -150,7 +172,6 @@ facade_alloc_blocks(
     }
 
     if (!best) {
-        /* Enough free blocks in total, but no single contiguous run. */
         return FACADE_E_NO_SPACE;
     }
 
@@ -203,6 +224,67 @@ facade_alloc_durable_epoch(const struct facade_alloc *a)
     return a->durable_epoch;
 } /* facade_alloc_durable_epoch */
 
+SYMBOL_EXPORT uint64_t
+facade_alloc_power_loss_generation(const struct facade_alloc *a)
+{
+    return a->power_loss_generation;
+} /* facade_alloc_power_loss_generation */
+
+/* ------------------------------------------------------------------ */
+/* object table                                                       */
+/* ------------------------------------------------------------------ */
+
+SYMBOL_EXPORT struct facade_obj *
+facade_obj_find(
+    struct facade_alloc *a,
+    const uint8_t        id[16])
+{
+    uint32_t i;
+
+    for (i = 0; i < FACADE_OBJ_BUDGET; i++) {
+        if (a->objs[i].used && memcmp(a->objs[i].id, id, 16) == 0) {
+            return &a->objs[i];
+        }
+    }
+    return NULL;
+} /* facade_obj_find */
+
+SYMBOL_EXPORT struct facade_obj *
+facade_obj_put(
+    struct facade_alloc        *a,
+    const uint8_t               id[16],
+    uint32_t                    flags,
+    const struct facade_objext *ext,
+    uint32_t                    nextents)
+{
+    struct facade_obj *o = facade_obj_find(a, id);
+    uint32_t           i;
+
+    FACADE_CHECK(nextents <= FACADE_OBJ_MAX_EXT, "object extent overflow");
+
+    if (!o) {
+        for (i = 0; i < FACADE_OBJ_BUDGET; i++) {
+            if (!a->objs[i].used) {
+                o = &a->objs[i];
+                break;
+            }
+        }
+        if (!o) {
+            return NULL;   /* object budget exhausted */
+        }
+        memset(o, 0, sizeof(*o));
+        o->used = 1;
+        memcpy(o->id, id, 16);
+        a->nobjs++;
+    }
+    o->flags    = flags;
+    o->nextents = nextents;
+    for (i = 0; i < nextents; i++) {
+        o->ext[i] = ext[i];
+    }
+    return o;
+} /* facade_obj_put */
+
 /* ------------------------------------------------------------------ */
 /* construction / teardown                                            */
 /* ------------------------------------------------------------------ */
@@ -230,7 +312,10 @@ facade_alloc_new(
     a->provider  = provider;
     a->space     = space;
     a->super_buf = calloc(1, FACADE_SUPER_SIZE);
-    if (!a->super_buf) {
+    a->objs      = calloc(FACADE_OBJ_BUDGET, sizeof(*a->objs));
+    if (!a->super_buf || !a->objs) {
+        free(a->super_buf);
+        free(a->objs);
         free(a);
         return NULL;
     }
@@ -251,360 +336,719 @@ facade_alloc_destroy(struct facade_alloc *a)
         w = nx;
     }
     rb_tree_destroy(&a->free_by_start, facade_free_node_destroy, NULL);
+    free(a->objs);
     free(a->super_buf);
     free(a);
 } /* facade_alloc_destroy */
 
-struct facade_persist_ctx {
-    struct facade_alloc       *alloc;
-    struct evpl_iovec          iov;
-    void                      *ckpt_buf;
-    uint64_t                   ckpt_total;    /* checkpoint blocks to write */
-    uint64_t                   ckpt_written;
-    uint64_t                   epoch;         /* the epoch this persist makes durable */
-    int                        do_release;    /* close: destroy the allocator after */
-    facade_cb_t                cb;            /* format / close status (nullable) */
-    facade_epoch_cb_t          ecb;           /* flush epoch (nullable) */
-    void                      *priv;
-    struct facade_persist_ctx *next;          /* FIFO link while queued */
-};
-
-static void facade_persist_run(
-    struct facade_alloc       *a,
-    struct facade_persist_ctx *c);
-
-/* Tear the allocator down: fail any queued persists, resume parked draws (they
- * fail cleanly because shutting_down is set), then free.  Called only when no
- * block-0 write is in flight. */
+/* Tear the allocator down: resume parked draws (they fail cleanly because
+ * shutting_down is set), then free.  Called only when no media op is in flight. */
 static void
 facade_alloc_teardown(struct facade_alloc *a)
 {
-    struct facade_persist_ctx *c;
-
     a->shutting_down = 1;
-
-    while (a->persist_head) {
-        c               = a->persist_head;
-        a->persist_head = c->next;
-        if (c->cb) {
-            c->cb(FACADE_E_SHUTDOWN, c->priv);
-        }
-        if (c->ecb) {
-            c->ecb(FACADE_E_SHUTDOWN, a->durable_epoch, c->priv);
-        }
-        free(c->ckpt_buf);
-        free(c);
-    }
-    a->persist_tail = NULL;
-
     facade_objid_drain_waiters(a);
     facade_alloc_destroy(a);
 } /* facade_alloc_teardown */
 
-/* The in-flight block-0 write has completed: release the slot and start the
- * next waiting op (a queued persist first, then a coalesced extension), or tear
- * the allocator down if a close/abandon arrived while the write was in flight. */
+static void
+facade_maybe_teardown(struct facade_alloc *a)
+{
+    /* Defer while any media completion is still on the stack (an inline-completing
+     * provider nests them): only the outermost completion may free the allocator. */
+    if (a->cb_depth == 0 && a->destroy_after && !a->mw_busy && a->inflight == 0) {
+        facade_alloc_teardown(a);
+    }
+} /* facade_maybe_teardown */
+
+static void facade_mark_dirty_issue(
+    struct facade_alloc *a,
+    facade_cb_t          cb,
+    void                *private_data);
+
+/* The in-flight block-0 write (id-floor extension) has completed. */
 void
 facade_mw_complete(struct facade_alloc *a)
 {
-    struct facade_persist_ctx *c;
-
     a->mw_busy = 0;
 
     if (a->destroy_after) {
-        facade_alloc_teardown(a);
-        return;
-    }
-    if (a->persist_head) {
-        c               = a->persist_head;
-        a->persist_head = c->next;
-        if (!a->persist_head) {
-            a->persist_tail = NULL;
-        }
-        facade_persist_run(a, c);
+        facade_maybe_teardown(a);
         return;
     }
     if (a->ext_pending) {
         a->ext_pending = 0;
         facade_objid_start_extension(a);
+        return;
+    }
+    if (a->dirty_mark_pending) {
+        facade_cb_t cb = a->dirty_cb;
+        void       *cp = a->dirty_priv;
+
+        a->dirty_mark_pending = 0;
+        a->dirty_cb           = NULL;
+        a->dirty_priv         = NULL;
+        facade_mark_dirty_issue(a, cb, cp);   /* the slot is free now */
+        return;
+    }
+    if (a->compact_pending) {
+        facade_cb_t cb = a->compact_cb;
+        void       *cp = a->compact_priv;
+
+        a->compact_pending = 0;
+        a->compact_cb      = NULL;
+        a->compact_priv    = NULL;
+        facade_compact(a, cb, cp);   /* the slot is free now (mw_busy == 0) */
     }
 } /* facade_mw_complete */
 
-/* ------------------------------------------------------------------ */
-/* free-set serialization                                             */
-/* ------------------------------------------------------------------ */
-
-/* Serialize the free tree into a freshly-allocated block-aligned buffer.
- * Returns the number of blocks to write, sets *r_buf (NULL if none) and
- * *r_count (extent count). */
-static uint64_t
-facade_serialize_free(
-    struct facade_alloc *a,
-    void               **r_buf,
-    uint64_t            *r_count)
+void
+facade_inflight_begin(struct facade_alloc *a)
 {
-    struct facade_free_ext *e;
-    struct facade_ckpt_ext *rec;
-    uint64_t                count = 0;
-    uint64_t                bytes, blocks;
-    void                   *buf;
+    a->inflight++;
+} /* facade_inflight_begin */
 
-    rb_tree_first(&a->free_by_start, e);
-    while (e) {
-        count++;
-        e = facade_free_next(a, e);
+void
+facade_inflight_end(struct facade_alloc *a)
+{
+    FACADE_CHECK(a->inflight > 0, "inflight underflow");
+    a->inflight--;
+} /* facade_inflight_end */
+
+/* ------------------------------------------------------------------ */
+/* chunked media helpers                                              */
+/* ------------------------------------------------------------------ */
+
+struct facade_io {
+    struct facade_alloc *a;
+    char                *buf;        /* read dest / write src (we only read data+length) */
+    uint64_t             lba;
+    uint64_t             nblocks;
+    uint64_t             done;       /* blocks completed */
+    uint64_t             chunk;      /* blocks in the chunk just issued */
+    int                  is_write;
+    int                  fua;
+    struct evpl_iovec    iov;
+    facade_cb_t          cb;
+    void                *priv;
+};
+
+static void facade_io_cb(
+    enum chimera_media_error st,
+    void                    *priv);
+
+static void
+facade_io_step(struct facade_io *io)
+{
+    struct facade_alloc *a      = io->a;
+    uint64_t             remain = io->nblocks - io->done;
+    uint64_t             n      = remain < a->max_io_blocks ? remain : a->max_io_blocks;
+
+    io->chunk = n;
+    memset(&io->iov, 0, sizeof(io->iov));
+    io->iov.data   = io->buf + (io->done << CHIMERA_MEDIA_BLOCK_SHIFT);
+    io->iov.length = (unsigned int) (n << CHIMERA_MEDIA_BLOCK_SHIFT);
+
+    facade_inflight_begin(a);
+    if (io->is_write) {
+        a->provider->write(a->space, &io->iov, 1, io->lba + io->done,
+                           (uint32_t) n, io->fua, facade_io_cb, io);
+    } else {
+        a->provider->read(a->space, &io->iov, 1, io->lba + io->done,
+                          (uint32_t) n, facade_io_cb, io);
     }
+} /* facade_io_step */
 
-    bytes  = count * sizeof(struct facade_ckpt_ext);
-    blocks = (bytes + CHIMERA_MEDIA_BLOCK_SIZE - 1) >> CHIMERA_MEDIA_BLOCK_SHIFT;
-    FACADE_CHECK(blocks <= a->ckpt_nblocks, "checkpoint region overflow");
+static void
+facade_io_cb(
+    enum chimera_media_error st,
+    void                    *priv)
+{
+    struct facade_io    *io = priv;
+    struct facade_alloc *a  = io->a;
+    facade_cb_t          cb;
+    void                *cbpriv;
 
-    buf = NULL;
-    if (blocks) {
-        buf = calloc(blocks, CHIMERA_MEDIA_BLOCK_SIZE);
-        FACADE_CHECK(buf != NULL, "oom checkpoint buffer");
-        rec = buf;
-        rb_tree_first(&a->free_by_start, e);
-        while (e) {
-            rec->start   = e->start;
-            rec->nblocks = e->nblocks;
-            rec++;
-            e = facade_free_next(a, e);
+    a->cb_depth++;
+    facade_inflight_end(a);
+
+    if (st != CHIMERA_MEDIA_OK) {
+        cb     = io->cb;
+        cbpriv = io->priv;
+        free(io);
+        cb(FACADE_E_IO, cbpriv);
+    } else {
+        io->done += io->chunk;
+        if (io->done < io->nblocks) {
+            facade_io_step(io);   /* nested completion (inline provider); depth guards it */
+        } else {
+            cb     = io->cb;
+            cbpriv = io->priv;
+            free(io);
+            cb(FACADE_OK, cbpriv);
         }
     }
 
-    *r_buf   = buf;
-    *r_count = count;
-    return blocks;
-} /* facade_serialize_free */
-
-/* ------------------------------------------------------------------ */
-/* persist state machine (format / flush / close)                     */
-/* ------------------------------------------------------------------ */
-
-static void facade_persist_write_ckpt(
-    struct facade_persist_ctx *c);
-static void facade_persist_ckpt_done(
-    enum chimera_media_error st,
-    void                    *priv);
-static void facade_persist_write_super(
-    struct facade_persist_ctx *c);
-static void facade_persist_super_done(
-    enum chimera_media_error st,
-    void                    *priv);
-static void facade_persist_flush_done(
-    enum chimera_media_error st,
-    void                    *priv);
+    a->cb_depth--;
+    facade_maybe_teardown(a);
+} /* facade_io_cb */
 
 static void
-facade_persist_finish(
-    struct facade_persist_ctx *c,
-    enum facade_status         status)
-{
-    struct facade_alloc *a       = c->alloc;
-    facade_cb_t          cb      = c->cb;
-    facade_epoch_cb_t    ecb     = c->ecb;
-    void                *priv    = c->priv;
-    int                  release = c->do_release;
-    uint64_t             de;
-
-    if (status == FACADE_OK) {
-        if (c->epoch > a->durable_epoch) {
-            a->durable_epoch = c->epoch;
-        }
-    }
-    de = a->durable_epoch;
-
-    free(c->ckpt_buf);
-    free(c);
-
-    /* Report the result, then hand the metadata slot back.  A close/format
-     * defers the actual free to mw_complete() via destroy_after, so no
-     * in-flight write ever lands on freed memory. */
-    if (cb) {
-        cb(status, priv);
-    }
-    if (ecb) {
-        ecb(status, de, priv);
-    }
-    if (release) {
-        a->destroy_after = 1;
-    }
-    facade_mw_complete(a);
-} /* facade_persist_finish */
-
-/* Run a persist now (the metadata slot is ours): snapshot the free set, claim
- * an epoch, and drive the write(checkpoint) -> write(super, fua) -> flush
- * chain.  Takes the slot via mw_busy. */
-static void
-facade_persist_run(
-    struct facade_alloc       *a,
-    struct facade_persist_ctx *c)
-{
-    uint64_t count;
-
-    a->mw_busy = 1;
-
-    c->ckpt_total = facade_serialize_free(a, &c->ckpt_buf, &count);
-    a->ckpt_count = count;
-    a->clean      = 1;
-
-    /* Allocations issued before now are the ones this persist makes durable;
-     * later allocations get the next epoch and are not in the snapshot. */
-    c->epoch     = a->cur_epoch;
-    a->cur_epoch = c->epoch + 1;
-
-    facade_persist_write_ckpt(c);
-} /* facade_persist_run */
-
-/* Submit a persist: run it if the metadata slot is free, else queue it behind
- * the in-flight write (FIFO). */
-static void
-facade_persist_submit(
+facade_io_start(
     struct facade_alloc *a,
-    int                  do_release,
+    void                *buf,
+    uint64_t             lba,
+    uint64_t             nblocks,
+    int                  is_write,
+    int                  fua,
     facade_cb_t          cb,
-    facade_epoch_cb_t    ecb,
     void                *priv)
 {
-    struct facade_persist_ctx *c = calloc(1, sizeof(*c));
+    struct facade_io *io = calloc(1, sizeof(*io));
 
-    FACADE_CHECK(c != NULL, "oom persist ctx");
-    FACADE_CHECK(!a->shutting_down && !a->destroy_after,
-                 "persist submitted after close/abandon");
-    c->alloc      = a;
-    c->do_release = do_release;
-    c->cb         = cb;
-    c->ecb        = ecb;
-    c->priv       = priv;
-    c->next       = NULL;
+    FACADE_CHECK(io != NULL, "oom media io ctx");
+    io->a        = a;
+    io->buf      = buf;
+    io->lba      = lba;
+    io->nblocks  = nblocks;
+    io->is_write = is_write;
+    io->fua      = fua;
+    io->cb       = cb;
+    io->priv     = priv;
+    facade_io_step(io);
+} /* facade_io_start */
 
-    if (a->mw_busy) {
-        if (a->persist_tail) {
-            a->persist_tail->next = c;
-        } else {
-            a->persist_head = c;
+void
+facade_media_write(
+    struct facade_alloc *a,
+    const void          *buf,
+    uint64_t             lba,
+    uint64_t             nblocks,
+    int                  fua,
+    facade_cb_t          cb,
+    void                *private_data)
+{
+    facade_io_start(a, (void *) (uintptr_t) buf, lba, nblocks, 1, fua, cb, private_data);
+} /* facade_media_write */
+
+SYMBOL_EXPORT void
+facade_media_read(
+    struct facade_alloc *a,
+    void                *buf,
+    uint64_t             lba,
+    uint64_t             nblocks,
+    facade_cb_t          cb,
+    void                *private_data)
+{
+    facade_io_start(a, buf, lba, nblocks, 0, 0, cb, private_data);
+} /* facade_media_read */
+
+struct facade_flush_ctx {
+    struct facade_alloc *a;
+    facade_cb_t          cb;
+    void                *priv;
+};
+
+static void
+facade_flush_cb(
+    enum chimera_media_error st,
+    void                    *priv)
+{
+    struct facade_flush_ctx *c  = priv;
+    struct facade_alloc     *a  = c->a;
+    facade_cb_t              cb = c->cb;
+    void                    *cp = c->priv;
+
+    a->cb_depth++;
+    facade_inflight_end(a);
+    free(c);
+    cb(st == CHIMERA_MEDIA_OK ? FACADE_OK : FACADE_E_IO, cp);
+    a->cb_depth--;
+    facade_maybe_teardown(a);
+} /* facade_flush_cb */
+
+void
+facade_media_flush(
+    struct facade_alloc *a,
+    facade_cb_t          cb,
+    void                *private_data)
+{
+    struct facade_flush_ctx *c = calloc(1, sizeof(*c));
+
+    FACADE_CHECK(c != NULL, "oom flush ctx");
+    c->a    = a;
+    c->cb   = cb;
+    c->priv = private_data;
+    facade_inflight_begin(a);
+    a->provider->flush(a->space, facade_flush_cb, c);
+} /* facade_media_flush */
+
+/* ------------------------------------------------------------------ */
+/* checkpoint (de)serialization                                       */
+/* ------------------------------------------------------------------ */
+
+uint64_t
+facade_ckpt_serialize(
+    struct facade_alloc *a,
+    uint64_t             generation,
+    uint64_t             checkpoint_seq,
+    void               **r_buf)
+{
+    struct facade_free_ext *fe;
+    struct facade_ckpt_hdr *hdr;
+    uint64_t                nfree = 0, bytes, blocks;
+    uint32_t                i;
+    uint8_t                *p;
+    void                   *buf;
+
+    rb_tree_first(&a->free_by_start, fe);
+    while (fe) {
+        nfree++;
+        fe = facade_free_next(a, fe);
+    }
+
+    bytes = sizeof(struct facade_ckpt_hdr)
+        + nfree * sizeof(struct facade_ckpt_ext);
+    for (i = 0; i < FACADE_OBJ_BUDGET; i++) {
+        if (a->objs[i].used) {
+            bytes += sizeof(struct facade_ckpt_obj)
+                + a->objs[i].nextents * sizeof(struct facade_ckpt_objext);
         }
-        a->persist_tail = c;
-        return;
     }
-    facade_persist_run(a, c);
-} /* facade_persist_submit */
+
+    blocks = (bytes + CHIMERA_MEDIA_BLOCK_SIZE - 1) >> CHIMERA_MEDIA_BLOCK_SHIFT;
+    if (blocks == 0) {
+        blocks = 1;
+    }
+    FACADE_CHECK(blocks <= a->ckpt_nblocks, "checkpoint slot overflow");
+
+    buf = calloc(blocks, CHIMERA_MEDIA_BLOCK_SIZE);
+    FACADE_CHECK(buf != NULL, "oom checkpoint buffer");
+
+    hdr                 = buf;
+    hdr->magic          = FACADE_CKPT_MAGIC;
+    hdr->generation     = generation;
+    hdr->checkpoint_seq = checkpoint_seq;
+    hdr->n_free_ext     = nfree;
+    hdr->n_objs         = a->nobjs;
+    hdr->content_blocks = blocks;
+    hdr->reserved       = 0;
+    hdr->crc32          = 0;
+
+    p = (uint8_t *) buf + sizeof(struct facade_ckpt_hdr);
+
+    rb_tree_first(&a->free_by_start, fe);
+    while (fe) {
+        struct facade_ckpt_ext rec = { fe->start, fe->nblocks };
+        memcpy(p, &rec, sizeof(rec));
+        p += sizeof(rec);
+        fe = facade_free_next(a, fe);
+    }
+
+    for (i = 0; i < FACADE_OBJ_BUDGET; i++) {
+        struct facade_obj     *o = &a->objs[i];
+        struct facade_ckpt_obj orec;
+        uint32_t               k;
+
+        if (!o->used) {
+            continue;
+        }
+        memset(&orec, 0, sizeof(orec));
+        memcpy(orec.obj_id, o->id, 16);
+        orec.flags    = o->flags;
+        orec.nextents = o->nextents;
+        memcpy(p, &orec, sizeof(orec));
+        p += sizeof(orec);
+        for (k = 0; k < o->nextents; k++) {
+            struct facade_ckpt_objext xr;
+            memset(&xr, 0, sizeof(xr));
+            xr.logical_block = o->ext[k].logical_block;
+            xr.phys_block    = o->ext[k].phys_block;
+            xr.nblocks       = o->ext[k].nblocks;
+            xr.kind          = o->ext[k].kind;
+            memcpy(p, &xr, sizeof(xr));
+            p += sizeof(xr);
+        }
+    }
+
+    hdr->crc32 = facade_crc32(buf, (uint32_t) (blocks << CHIMERA_MEDIA_BLOCK_SHIFT));
+
+    *r_buf = buf;
+    return blocks;
+} /* facade_ckpt_serialize */
+
+/* Parse a checkpoint slot already read into buf (content_blocks * 4 KiB) whose
+ * header was validated.  Rebuilds the free set and object table.  Returns 0 on
+ * success, -1 on a self-inconsistent record (rejected, not aborted). */
+static int
+facade_ckpt_load(
+    struct facade_alloc          *a,
+    const void                   *buf,
+    uint64_t                      content_blocks,
+    const struct facade_ckpt_hdr *hdr)
+{
+    const uint8_t *p   = (const uint8_t *) buf + sizeof(struct facade_ckpt_hdr);
+    const uint8_t *end = (const uint8_t *) buf + (content_blocks << CHIMERA_MEDIA_BLOCK_SHIFT);
+    uint64_t       i;
+    uint64_t       prev_end = a->data_first;
+
+    a->free_blocks = 0;
+    a->nobjs       = 0;
+    memset(a->objs, 0, FACADE_OBJ_BUDGET * sizeof(*a->objs));
+
+    for (i = 0; i < hdr->n_free_ext; i++) {
+        struct facade_ckpt_ext rec;
+
+        if (p + sizeof(rec) > end) {
+            return -1;
+        }
+        memcpy(&rec, p, sizeof(rec));
+        p += sizeof(rec);
+        if (rec.nblocks == 0 || rec.start < prev_end ||
+            rec.start >= a->data_last ||
+            rec.nblocks > a->data_last - rec.start) {
+            return -1;
+        }
+        facade_free_insert(a, rec.start, rec.nblocks);
+        a->free_blocks += rec.nblocks;
+        prev_end        = rec.start + rec.nblocks;
+    }
+
+    for (i = 0; i < hdr->n_objs; i++) {
+        struct facade_ckpt_obj orec;
+        struct facade_objext   ext[FACADE_OBJ_MAX_EXT];
+        uint32_t               k;
+
+        if (a->nobjs >= FACADE_OBJ_BUDGET || p + sizeof(orec) > end) {
+            return -1;
+        }
+        memcpy(&orec, p, sizeof(orec));
+        p += sizeof(orec);
+        if (orec.nextents > FACADE_OBJ_MAX_EXT) {
+            return -1;
+        }
+        for (k = 0; k < orec.nextents; k++) {
+            struct facade_ckpt_objext xr;
+
+            if (p + sizeof(xr) > end) {
+                return -1;
+            }
+            memcpy(&xr, p, sizeof(xr));
+            p                   += sizeof(xr);
+            ext[k].logical_block = xr.logical_block;
+            ext[k].phys_block    = xr.phys_block;
+            ext[k].nblocks       = xr.nblocks;
+            ext[k].kind          = xr.kind;
+        }
+        if (!facade_obj_put(a, orec.obj_id, orec.flags, ext, orec.nextents)) {
+            return -1;
+        }
+    }
+    return 0;
+} /* facade_ckpt_load */
+
+/* ------------------------------------------------------------------ */
+/* geometry                                                           */
+/* ------------------------------------------------------------------ */
 
 static void
-facade_persist_write_ckpt(struct facade_persist_ctx *c)
+facade_compute_geometry(struct facade_alloc *a)
 {
-    struct facade_alloc *a = c->alloc;
-    uint64_t             remain, n;
+    struct chimera_media_space_info info;
+    uint64_t                        obj_budget, free_bytes, obj_bytes, ckpt_bytes;
 
-    if (c->ckpt_written >= c->ckpt_total) {
-        facade_persist_write_super(c);
-        return;
+    a->provider->info(a->space, &info);
+    a->nblocks       = info.nblocks;
+    a->max_io_blocks = info.max_io_blocks ? info.max_io_blocks : 1u;
+    if (a->max_io_blocks > (UINT_MAX >> CHIMERA_MEDIA_BLOCK_SHIFT)) {
+        a->max_io_blocks = UINT_MAX >> CHIMERA_MEDIA_BLOCK_SHIFT;
     }
-    remain = c->ckpt_total - c->ckpt_written;
-    n      = remain < a->max_io_blocks ? remain : a->max_io_blocks;
 
-    memset(&c->iov, 0, sizeof(c->iov));
-    c->iov.data   = (char *) c->ckpt_buf + (c->ckpt_written << CHIMERA_MEDIA_BLOCK_SHIFT);
-    c->iov.length = (unsigned int) (n << CHIMERA_MEDIA_BLOCK_SHIFT);
+    /* Each checkpoint slot holds a header, the worst-case free-set
+     * fragmentation (<= nblocks/2 + 1 extents), and the object area sized for a
+     * budget that scales down on a small space so a tiny prototype still leaves
+     * a data region. */
+    obj_budget = FACADE_OBJ_BUDGET;
+    if (obj_budget > a->nblocks / 16) {
+        obj_budget = a->nblocks / 16;
+    }
+    if (obj_budget == 0) {
+        obj_budget = 1;
+    }
+    free_bytes = sizeof(struct facade_ckpt_hdr)
+        + (a->nblocks / 2 + 1) * sizeof(struct facade_ckpt_ext);
+    obj_bytes = obj_budget * (sizeof(struct facade_ckpt_obj)
+                              + FACADE_OBJ_MAX_EXT * sizeof(struct facade_ckpt_objext));
+    ckpt_bytes = free_bytes + obj_bytes;
 
-    a->provider->write(a->space, &c->iov, 1,
-                       a->ckpt_block + c->ckpt_written, (uint32_t) n,
-                       0 /* durable via the later flush */,
-                       facade_persist_ckpt_done, c);
-} /* facade_persist_write_ckpt */
+    a->ckpt_nblocks = (ckpt_bytes + CHIMERA_MEDIA_BLOCK_SIZE - 1) >> CHIMERA_MEDIA_BLOCK_SHIFT;
+    if (a->ckpt_nblocks == 0) {
+        a->ckpt_nblocks = 1;
+    }
+
+    /* Log region: a modest span, small enough that a prototype test can fill it
+     * to force a compaction, large enough for ordinary bursts. */
+    a->log_nblocks = a->nblocks / 16;
+    if (a->log_nblocks > 64) {
+        a->log_nblocks = 64;
+    }
+    if (a->log_nblocks < 4) {
+        a->log_nblocks = 4;   /* floor: a durable object txn is 3 records */
+    }
+
+    a->ckpt_a_block = FACADE_SUPER_BLOCK + 1;
+    a->ckpt_b_block = a->ckpt_a_block + a->ckpt_nblocks;
+    a->log_block    = a->ckpt_b_block + a->ckpt_nblocks;
+    a->data_first   = a->log_block + a->log_nblocks;
+    a->data_last    = a->nblocks;
+} /* facade_compute_geometry */
+
+/* ------------------------------------------------------------------ */
+/* mark-dirty / compaction                                            */
+/* ------------------------------------------------------------------ */
+
+struct facade_cb_ctx {
+    struct facade_alloc *a;
+    facade_cb_t          cb;
+    void                *priv;
+};
 
 static void
-facade_persist_ckpt_done(
-    enum chimera_media_error st,
-    void                    *priv)
+facade_mark_dirty_done(
+    enum facade_status st,
+    void              *priv)
 {
-    struct facade_persist_ctx *c = priv;
-    uint64_t                   remain, n;
+    struct facade_cb_ctx *c  = priv;
+    struct facade_alloc  *a  = c->a;
+    facade_cb_t           cb = c->cb;
+    void                 *cp = c->priv;
 
-    if (st != CHIMERA_MEDIA_OK) {
-        facade_persist_finish(c, FACADE_E_IO);
-        return;
+    if (st == FACADE_OK) {
+        a->dirty_armed = 1;
     }
-    remain           = c->ckpt_total - c->ckpt_written;
-    n                = remain < c->alloc->max_io_blocks ? remain : c->alloc->max_io_blocks;
-    c->ckpt_written += n;
-    facade_persist_write_ckpt(c);
-} /* facade_persist_ckpt_done */
+    free(c);
+    /* Continue the caller first (a forced compaction it triggers will defer
+     * behind the still-held block-0 slot), then release the slot and run the
+     * next deferred block-0 op. */
+    cb(st, cp);
+    facade_mw_complete(a);
+} /* facade_mark_dirty_done */
 
+/* Issue the clean=0 superblock write, holding the single block-0 slot (mw_busy)
+ * for its duration so it can never race an id-floor extension or a compaction
+ * super write on block 0 (F1). */
 static void
-facade_persist_write_super(struct facade_persist_ctx *c)
+facade_mark_dirty_issue(
+    struct facade_alloc *a,
+    facade_cb_t          cb,
+    void                *private_data)
 {
-    struct facade_alloc *a = c->alloc;
+    struct facade_cb_ctx *c = calloc(1, sizeof(*c));
 
+    FACADE_CHECK(c != NULL, "oom mark-dirty ctx");
+    c->a    = a;
+    c->cb   = cb;
+    c->priv = private_data;
+
+    a->mw_busy = 1;
+    a->clean   = 0;
     facade_super_pack(a, a->super_buf);
+    facade_media_write(a, a->super_buf, FACADE_SUPER_BLOCK, 1, CHIMERA_MEDIA_WRITE_FUA,
+                       facade_mark_dirty_done, c);
+} /* facade_mark_dirty_issue */
 
-    memset(&c->iov, 0, sizeof(c->iov));
-    c->iov.data   = a->super_buf;
-    c->iov.length = FACADE_SUPER_SIZE;
-
-    a->provider->write(a->space, &c->iov, 1, FACADE_SUPER_BLOCK, 1,
-                       CHIMERA_MEDIA_WRITE_FUA, facade_persist_super_done, c);
-} /* facade_persist_write_super */
-
-static void
-facade_persist_super_done(
-    enum chimera_media_error st,
-    void                    *priv)
+void
+facade_mark_dirty(
+    struct facade_alloc *a,
+    facade_cb_t          cb,
+    void                *private_data)
 {
-    struct facade_persist_ctx *c = priv;
-
-    if (st != CHIMERA_MEDIA_OK) {
-        facade_persist_finish(c, FACADE_E_IO);
+    if (a->dirty_armed) {
+        cb(FACADE_OK, private_data);
         return;
     }
-    c->alloc->provider->flush(c->alloc->space, facade_persist_flush_done, c);
-} /* facade_persist_super_done */
+    /* Serialize the block-0 write behind any in-flight block-0 op. */
+    if (a->mw_busy) {
+        FACADE_CHECK(!a->dirty_mark_pending, "a dirty-mark is already queued");
+        a->dirty_mark_pending = 1;
+        a->dirty_cb           = cb;
+        a->dirty_priv         = private_data;
+        return;
+    }
+    facade_mark_dirty_issue(a, cb, private_data);
+} /* facade_mark_dirty */
+
+struct facade_compact_ctx {
+    struct facade_alloc *a;
+    facade_cb_t          cb;
+    void                *priv;
+    void                *buf;
+    uint32_t             target;     /* slot being written (0=A, 1=B) */
+    uint64_t             new_gen;
+    uint64_t             new_ckpt_seq;
+    int                  flipped;    /* in-memory active_ckpt advanced to target */
+    uint32_t             old_active; /* prior active_ckpt, to restore on flip failure */
+    uint64_t             old_gen;
+    uint64_t             old_ckpt_seq;
+};
 
 static void
-facade_persist_flush_done(
-    enum chimera_media_error st,
-    void                    *priv)
+facade_compact_finish(
+    struct facade_compact_ctx *c,
+    enum facade_status         st)
 {
-    struct facade_persist_ctx *c = priv;
+    struct facade_alloc *a  = c->a;
+    facade_cb_t          cb = c->cb;
+    void                *cp = c->priv;
 
-    facade_persist_finish(c, st == CHIMERA_MEDIA_OK ? FACADE_OK : FACADE_E_IO);
-} /* facade_persist_flush_done */
+    /* A failed super flip must not leave the in-memory active-slot pointer
+     * diverged from the durable superblock (LOW): restore it so a later
+     * compaction does not overwrite the still-valid old slot. */
+    if (st != FACADE_OK && c->flipped) {
+        a->active_ckpt     = c->old_active;
+        a->ckpt_generation = c->old_gen;
+        a->checkpoint_seq  = c->old_ckpt_seq;
+        a->clean           = 0;   /* the flip did not commit; stay dirty */
+    }
+
+    free(c->buf);
+    free(c);
+    cb(st, cp);
+    /* Release the block-0 slot and run the next deferred block-0 op. */
+    facade_mw_complete(a);
+} /* facade_compact_finish */
+
+static void
+facade_compact_flush_done(
+    enum facade_status st,
+    void              *priv)
+{
+    struct facade_compact_ctx *c = priv;
+    struct facade_alloc       *a = c->a;
+
+    if (st == FACADE_OK) {
+        /* The flip is durable: reset the log and re-arm the dirty window. */
+        a->log_next      = 0;
+        a->dirty_armed   = 0;
+        a->next_seq      = a->durable_seq + 1;
+        a->durable_epoch = a->cur_epoch;
+    }
+    facade_compact_finish(c, st);
+} /* facade_compact_flush_done */
+
+static void
+facade_compact_super_done(
+    enum facade_status st,
+    void              *priv)
+{
+    struct facade_compact_ctx *c = priv;
+
+    if (st != FACADE_OK) {
+        facade_compact_finish(c, st);
+        return;
+    }
+    facade_media_flush(c->a, facade_compact_flush_done, c);
+} /* facade_compact_super_done */
+
+static void
+facade_compact_slot_done(
+    enum facade_status st,
+    void              *priv)
+{
+    struct facade_compact_ctx *c = priv;
+    struct facade_alloc       *a = c->a;
+
+    if (st != FACADE_OK) {
+        facade_compact_finish(c, st);
+        return;
+    }
+    /* The inactive slot is durable: flip the superblock (FUA) to name it.  Save
+     * the prior pointer so a failed flip can be rolled back (LOW). */
+    c->old_active      = a->active_ckpt;
+    c->old_gen         = a->ckpt_generation;
+    c->old_ckpt_seq    = a->checkpoint_seq;
+    c->flipped         = 1;
+    a->active_ckpt     = c->target;
+    a->ckpt_generation = c->new_gen;
+    a->checkpoint_seq  = c->new_ckpt_seq;
+    a->clean           = 1;
+    facade_super_pack(a, a->super_buf);
+    facade_media_write(a, a->super_buf, FACADE_SUPER_BLOCK, 1, CHIMERA_MEDIA_WRITE_FUA,
+                       facade_compact_super_done, c);
+} /* facade_compact_slot_done */
+
+void
+facade_compact(
+    struct facade_alloc *a,
+    facade_cb_t          cb,
+    void                *private_data)
+{
+    struct facade_compact_ctx *c;
+    uint64_t                   blocks, target_block;
+
+    /* Serialize behind an in-flight id-floor extension (block-0 write): defer so
+     * the two never write block 0 concurrently (F1).  Run by mw_complete(). */
+    if (a->mw_busy) {
+        FACADE_CHECK(!a->compact_pending, "a compaction is already queued");
+        a->compact_pending = 1;
+        a->compact_cb      = cb;
+        a->compact_priv    = private_data;
+        return;
+    }
+
+    FACADE_CHECK(a->next_seq == a->durable_seq + 1,
+                 "compaction must run at a transaction boundary (G1)");
+
+    /* Hold the single block-0 slot for the whole compaction (its super flip is a
+     * block-0 write), so no id-floor extension can race it (F1).  Released in
+     * facade_compact_finish via mw_complete(). */
+    a->mw_busy = 1;
+
+    c = calloc(1, sizeof(*c));
+    FACADE_CHECK(c != NULL, "oom compact ctx");
+    c->a            = a;
+    c->cb           = cb;
+    c->priv         = private_data;
+    c->target       = 1u - a->active_ckpt;
+    c->new_gen      = a->ckpt_generation + 1;
+    c->new_ckpt_seq = a->durable_seq;
+
+    blocks       = facade_ckpt_serialize(a, c->new_gen, c->new_ckpt_seq, &c->buf);
+    target_block = c->target == 0 ? a->ckpt_a_block : a->ckpt_b_block;
+
+    facade_media_write(a, c->buf, target_block, blocks, CHIMERA_MEDIA_WRITE_FUA,
+                       facade_compact_slot_done, c);
+} /* facade_compact */
 
 /* ------------------------------------------------------------------ */
 /* format                                                             */
 /* ------------------------------------------------------------------ */
 
-/* Compute the metadata/data carve from the space geometry. */
+struct facade_format_ctx {
+    struct facade_alloc *a;
+    facade_cb_t          cb;
+    void                *priv;
+};
+
 static void
-facade_compute_geometry(struct facade_alloc *a)
+facade_format_done(
+    enum facade_status st,
+    void              *priv)
 {
-    struct chimera_media_space_info info;
-    uint64_t                        ckpt_bytes, ckpt_nblocks;
+    struct facade_format_ctx *f  = priv;
+    struct facade_alloc      *a  = f->a;
+    facade_cb_t               cb = f->cb;
+    void                     *cp = f->priv;
 
-    a->provider->info(a->space, &info);
-    a->nblocks       = info.nblocks;
-    a->max_io_blocks = info.max_io_blocks ? info.max_io_blocks : 1u;
-    /* Clamp so a chunk length (n << block-shift) fits the iovec's 32-bit
-     * length field; only a provider advertising an implausibly huge
-     * max_io could hit this. */
-    if (a->max_io_blocks > (UINT_MAX >> CHIMERA_MEDIA_BLOCK_SHIFT)) {
-        a->max_io_blocks = UINT_MAX >> CHIMERA_MEDIA_BLOCK_SHIFT;
-    }
-
-    /* Checkpoint sized for the worst-case fragmentation of the whole space
-     * (<= nblocks/2 + 1 free extents), so a clean persist never overflows it. */
-    ckpt_bytes   = (a->nblocks / 2 + 1) * sizeof(struct facade_ckpt_ext);
-    ckpt_nblocks = (ckpt_bytes + CHIMERA_MEDIA_BLOCK_SIZE - 1) >> CHIMERA_MEDIA_BLOCK_SHIFT;
-    if (ckpt_nblocks == 0) {
-        ckpt_nblocks = 1;
-    }
-
-    a->ckpt_block   = FACADE_SUPER_BLOCK + 1;
-    a->ckpt_nblocks = ckpt_nblocks;
-    a->data_first   = a->ckpt_block + a->ckpt_nblocks;
-    a->data_last    = a->nblocks;
-} /* facade_compute_geometry */
+    free(f);
+    /* Format hands back no handle: release the scratch allocator.  Defer the
+     * free to the enclosing media completion's teardown check (destroy_after),
+     * so this callback -- which runs inside that completion -- never frees `a`
+     * out from under it. */
+    a->shutting_down = 1;
+    a->destroy_after = 1;
+    cb(st, cp);
+} /* facade_format_done */
 
 SYMBOL_EXPORT void
 facade_alloc_format(
@@ -627,67 +1071,176 @@ facade_alloc_format(
     facade_compute_geometry(a);
     FACADE_CHECK(a->data_first < a->data_last, "media space too small to format");
 
-    /* Whole data region free. */
     facade_free_insert(a, a->data_first, a->data_last - a->data_first);
     a->free_blocks = a->data_last - a->data_first;
 
-    /* Identity: random instance nonce, floor seeded a reserve ahead of 0. */
     a->id_nonce = facade_random_u64();
     a->id_next  = 0;
     a->id_floor = FACADE_ID_RESERVE;
 
-    /* Format hands back no handle: persist, then release the scratch
-     * allocator.  The caller gets a usable handle from facade_alloc_open. */
-    facade_persist_submit(a, 1 /* release */, cb, NULL, private_data);
+    a->power_loss_generation = 1;
+    a->active_ckpt           = 1;   /* so the first compact writes slot A and flips to it */
+    a->ckpt_generation       = 0;
+    a->checkpoint_seq        = 0;
+    a->durable_seq           = 0;
+    a->next_seq              = 1;
+    a->log_next              = 0;
+    a->clean                 = 1;
+    a->dirty_armed           = 0;
+
+    /* Lay down the initial checkpoint (slot A) + superblock, then release the
+     * scratch allocator -- the caller gets a usable handle from facade_alloc_open. */
+    {
+        struct facade_format_ctx *f = calloc(1, sizeof(*f));
+
+        FACADE_CHECK(f != NULL, "oom format ctx");
+        f->a    = a;
+        f->cb   = cb;
+        f->priv = private_data;
+        facade_compact(a, facade_format_done, f);
+    }
 } /* facade_alloc_format */
 
 /* ------------------------------------------------------------------ */
-/* open                                                               */
+/* open + recovery entry                                              */
 /* ------------------------------------------------------------------ */
 
 struct facade_open_ctx {
-    struct facade_alloc *alloc;
-    struct evpl_iovec    iov;
+    struct facade_alloc *a;
     facade_open_cb_t     cb;
     void                *priv;
-    void                *ckpt_buf;
-    uint64_t             ckpt_total;   /* checkpoint blocks to read */
-    uint64_t             ckpt_read;
+    void                *hdr_buf;        /* 1 block, slot header */
+    void                *ckpt_buf;       /* content_blocks blocks */
+    uint64_t             content_blocks;
+    uint64_t             slot_block;
 };
-
-static void facade_open_read_ckpt(
-    struct facade_open_ctx *c);
-static void facade_open_ckpt_done(
-    enum chimera_media_error st,
-    void                    *priv);
-static void facade_open_finish(
-    struct facade_open_ctx *c);
 
 static void
 facade_open_fail(
     struct facade_open_ctx *c,
     enum facade_status      status)
 {
-    facade_open_cb_t cb   = c->cb;
-    void            *priv = c->priv;
+    struct facade_alloc *a    = c->a;
+    facade_open_cb_t     cb   = c->cb;
+    void                *priv = c->priv;
 
-    facade_alloc_destroy(c->alloc);
+    free(c->hdr_buf);
     free(c->ckpt_buf);
     free(c);
     cb(status, NULL, priv);
+    /* Discard the scratch allocator.  Defer the free to the enclosing media
+     * completion's teardown check (destroy_after), so we never free `a` inside
+     * its own callback. */
+    a->shutting_down = 1;
+    a->destroy_after = 1;
+    facade_maybe_teardown(a);
 } /* facade_open_fail */
 
 static void
-facade_open_super_done(
-    enum chimera_media_error st,
-    void                    *priv)
+facade_open_finish(struct facade_open_ctx *c)
+{
+    struct facade_alloc *a    = c->a;
+    facade_open_cb_t     cb   = c->cb;
+    void                *priv = c->priv;
+
+    free(c->hdr_buf);
+    free(c->ckpt_buf);
+    free(c);
+    cb(FACADE_OK, a, priv);
+} /* facade_open_finish */
+
+static void
+facade_open_recovered(
+    enum facade_status st,
+    void              *priv)
 {
     struct facade_open_ctx *c = priv;
-    struct facade_alloc    *a = c->alloc;
+
+    if (st != FACADE_OK) {
+        facade_open_fail(c, st);
+        return;
+    }
+    facade_open_finish(c);
+} /* facade_open_recovered */
+
+static void
+facade_open_body_done(
+    enum facade_status st,
+    void              *priv)
+{
+    struct facade_open_ctx *c = priv;
+    struct facade_alloc    *a = c->a;
+    struct facade_ckpt_hdr  hdr;
+    uint32_t                stored, calc;
+
+    if (st != FACADE_OK) {
+        facade_open_fail(c, FACADE_E_IO);
+        return;
+    }
+
+    memcpy(&hdr, c->ckpt_buf, sizeof(hdr));
+    stored                                          = hdr.crc32;
+    ((struct facade_ckpt_hdr *) c->ckpt_buf)->crc32 = 0;
+    calc                                            = facade_crc32(c->ckpt_buf,
+                                                                   (uint32_t) (c->content_blocks <<
+                                                                               CHIMERA_MEDIA_BLOCK_SHIFT));
+    if (hdr.magic != FACADE_CKPT_MAGIC || calc != stored) {
+        facade_open_fail(c, FACADE_E_IO);
+        return;
+    }
+
+    a->ckpt_generation = hdr.generation;
+    if (facade_ckpt_load(a, c->ckpt_buf, c->content_blocks, &hdr) != 0) {
+        facade_open_fail(c, FACADE_E_IO);
+        return;
+    }
+
+    if (a->clean) {
+        facade_open_finish(c);
+        return;
+    }
+    /* Unclean prior shutdown: replay the log, then (inside replay) bump the
+     * power-loss generation and write a fresh clean checkpoint. */
+    facade_recover_replay(a, facade_open_recovered, c);
+} /* facade_open_body_done */
+
+static void
+facade_open_hdr_done(
+    enum facade_status st,
+    void              *priv)
+{
+    struct facade_open_ctx *c = priv;
+    struct facade_alloc    *a = c->a;
+    struct facade_ckpt_hdr  hdr;
+
+    if (st != FACADE_OK) {
+        facade_open_fail(c, FACADE_E_IO);
+        return;
+    }
+    memcpy(&hdr, c->hdr_buf, sizeof(hdr));
+    if (hdr.magic != FACADE_CKPT_MAGIC || hdr.content_blocks == 0 ||
+        hdr.content_blocks > a->ckpt_nblocks) {
+        facade_open_fail(c, FACADE_E_IO);
+        return;
+    }
+    c->content_blocks = hdr.content_blocks;
+    c->ckpt_buf       = calloc(c->content_blocks, CHIMERA_MEDIA_BLOCK_SIZE);
+    FACADE_CHECK(c->ckpt_buf != NULL, "oom checkpoint read buffer");
+    facade_media_read(a, c->ckpt_buf, c->slot_block, c->content_blocks,
+                      facade_open_body_done, c);
+} /* facade_open_hdr_done */
+
+static void
+facade_open_super_done(
+    enum facade_status st,
+    void              *priv)
+{
+    struct facade_open_ctx *c = priv;
+    struct facade_alloc    *a = c->a;
     struct facade_super     s;
     uint32_t                stored, calc;
 
-    if (st != CHIMERA_MEDIA_OK) {
+    if (st != FACADE_OK) {
         facade_open_fail(c, FACADE_E_IO);
         return;
     }
@@ -697,127 +1250,54 @@ facade_open_super_done(
     ((struct facade_super *) a->super_buf)->crc32 = 0;
     calc                                          = facade_crc32(a->super_buf, FACADE_SUPER_SIZE);
 
-    if (s.magic != FACADE_SUPER_MAGIC || s.version != FACADE_FORMAT_VERSION ||
-        s.block_size != CHIMERA_MEDIA_BLOCK_SIZE || calc != stored) {
+    if (s.magic != FACADE_SUPER_MAGIC || calc != stored) {
+        /* Absent, zeroed or corrupt -- not a recognized format. */
+        facade_open_fail(c, FACADE_E_IO);
+        return;
+    }
+    if (s.version != FACADE_FORMAT_VERSION || s.block_size != CHIMERA_MEDIA_BLOCK_SIZE) {
+        /* Recognized superblock, unsupported format: refuse clearly (L41). */
+        facade_open_fail(c, FACADE_E_FORMAT);
+        return;
+    }
+
+    /* Geometry sanity before trusting any offset (a->nblocks is the live size). */
+    if (s.ckpt_a_block != FACADE_SUPER_BLOCK + 1 ||
+        s.ckpt_b_block != s.ckpt_a_block + s.ckpt_nblocks ||
+        s.ckpt_nblocks == 0 ||
+        s.log_block != s.ckpt_b_block + s.ckpt_nblocks ||
+        s.data_first != s.log_block + s.log_nblocks ||
+        s.data_first >= s.data_last || s.data_last > a->nblocks ||
+        s.active_ckpt > 1) {
         facade_open_fail(c, FACADE_E_IO);
         return;
     }
 
-    /* Geometry sanity (F3): reject a CRC-valid but self-inconsistent superblock
-     * before trusting any of its offsets.  a->nblocks was set from the live
-     * space geometry at open; the superblock may not claim more. */
-    if (s.ckpt_block != FACADE_SUPER_BLOCK + 1 || s.ckpt_nblocks == 0 ||
-        s.data_first != s.ckpt_block + s.ckpt_nblocks ||
-        s.data_first >= s.data_last || s.data_last > a->nblocks) {
-        facade_open_fail(c, FACADE_E_IO);
-        return;
-    }
+    a->nblocks               = s.nblocks;
+    a->data_first            = s.data_first;
+    a->data_last             = s.data_last;
+    a->ckpt_a_block          = s.ckpt_a_block;
+    a->ckpt_b_block          = s.ckpt_b_block;
+    a->ckpt_nblocks          = s.ckpt_nblocks;
+    a->log_block             = s.log_block;
+    a->log_nblocks           = s.log_nblocks;
+    a->active_ckpt           = s.active_ckpt;
+    a->checkpoint_seq        = s.checkpoint_seq;
+    a->power_loss_generation = s.power_loss_generation;
+    a->id_nonce              = s.id_nonce;
+    a->id_floor              = s.id_floor;
+    a->id_next               = s.id_floor;   /* resume at the durable floor (no reuse) */
+    a->clean                 = s.clean;
+    a->dirty_armed           = (s.clean == 0);
+    a->durable_seq           = s.checkpoint_seq;
+    a->next_seq              = s.checkpoint_seq + 1;
+    a->log_next              = 0;
 
-    a->nblocks      = s.nblocks;
-    a->data_first   = s.data_first;
-    a->data_last    = s.data_last;
-    a->ckpt_block   = s.ckpt_block;
-    a->ckpt_nblocks = s.ckpt_nblocks;
-    a->id_nonce     = s.id_nonce;
-    a->id_floor     = s.id_floor;
-    a->id_next      = s.id_floor;   /* resume at the durable floor (no reuse) */
-    a->ckpt_count   = s.ckpt_count;
-    a->clean        = s.clean;
-
-    c->ckpt_total = (s.ckpt_count * sizeof(struct facade_ckpt_ext)
-                     + CHIMERA_MEDIA_BLOCK_SIZE - 1) >> CHIMERA_MEDIA_BLOCK_SHIFT;
-
-    /* The checkpoint must fit the region the superblock reserved for it (F3). */
-    if (c->ckpt_total > a->ckpt_nblocks) {
-        facade_open_fail(c, FACADE_E_IO);
-        return;
-    }
-
-    if (c->ckpt_total == 0) {
-        facade_open_finish(c);
-        return;
-    }
-
-    c->ckpt_buf = calloc(c->ckpt_total, CHIMERA_MEDIA_BLOCK_SIZE);
-    FACADE_CHECK(c->ckpt_buf != NULL, "oom checkpoint read buffer");
-    facade_open_read_ckpt(c);
+    c->slot_block = (a->active_ckpt == 0) ? a->ckpt_a_block : a->ckpt_b_block;
+    c->hdr_buf    = calloc(1, CHIMERA_MEDIA_BLOCK_SIZE);
+    FACADE_CHECK(c->hdr_buf != NULL, "oom checkpoint header buffer");
+    facade_media_read(a, c->hdr_buf, c->slot_block, 1, facade_open_hdr_done, c);
 } /* facade_open_super_done */
-
-static void
-facade_open_read_ckpt(struct facade_open_ctx *c)
-{
-    struct facade_alloc *a = c->alloc;
-    uint64_t             remain, n;
-
-    if (c->ckpt_read >= c->ckpt_total) {
-        facade_open_finish(c);
-        return;
-    }
-    remain = c->ckpt_total - c->ckpt_read;
-    n      = remain < a->max_io_blocks ? remain : a->max_io_blocks;
-
-    memset(&c->iov, 0, sizeof(c->iov));
-    c->iov.data   = (char *) c->ckpt_buf + (c->ckpt_read << CHIMERA_MEDIA_BLOCK_SHIFT);
-    c->iov.length = (unsigned int) (n << CHIMERA_MEDIA_BLOCK_SHIFT);
-
-    a->provider->read(a->space, &c->iov, 1,
-                      a->ckpt_block + c->ckpt_read, (uint32_t) n,
-                      facade_open_ckpt_done, c);
-} /* facade_open_read_ckpt */
-
-static void
-facade_open_ckpt_done(
-    enum chimera_media_error st,
-    void                    *priv)
-{
-    struct facade_open_ctx *c = priv;
-    uint64_t                remain, n;
-
-    if (st != CHIMERA_MEDIA_OK) {
-        facade_open_fail(c, FACADE_E_IO);
-        return;
-    }
-    remain        = c->ckpt_total - c->ckpt_read;
-    n             = remain < c->alloc->max_io_blocks ? remain : c->alloc->max_io_blocks;
-    c->ckpt_read += n;
-    facade_open_read_ckpt(c);
-} /* facade_open_ckpt_done */
-
-static void
-facade_open_finish(struct facade_open_ctx *c)
-{
-    struct facade_alloc          *a    = c->alloc;
-    const struct facade_ckpt_ext *rec  = c->ckpt_buf;
-    facade_open_cb_t              cb   = c->cb;
-    void                         *priv = c->priv;
-    uint64_t                      i, prev_end = a->data_first;
-
-    /*
-     * Validate each loaded free extent before trusting it (F3): in range, and
-     * strictly ascending and non-overlapping (serialize writes them that way).
-     * A CRC-valid but crafted/corrupt checkpoint is rejected cleanly here
-     * rather than tripping the double-free abort inside facade_free_insert.
-     */
-    a->free_blocks = 0;
-    for (i = 0; i < a->ckpt_count; i++) {
-        if (rec[i].nblocks == 0 ||
-            rec[i].start < prev_end ||
-            rec[i].start >= a->data_last ||
-            rec[i].nblocks > a->data_last - rec[i].start) {
-            facade_open_fail(c, FACADE_E_IO);
-            return;
-        }
-        prev_end = rec[i].start + rec[i].nblocks;
-    }
-    for (i = 0; i < a->ckpt_count; i++) {
-        facade_free_insert(a, rec[i].start, rec[i].nblocks);
-        a->free_blocks += rec[i].nblocks;
-    }
-
-    free(c->ckpt_buf);
-    free(c);
-    cb(FACADE_OK, a, priv);
-} /* facade_open_finish */
 
 SYMBOL_EXPORT void
 facade_alloc_open(
@@ -835,14 +1315,8 @@ facade_alloc_open(
         cb(FACADE_E_IO, NULL, private_data);
         return;
     }
-    /* max_io_blocks chunks the checkpoint read; nblocks is the live space size,
-     * the upper bound the superblock's geometry is validated against (F3).  The
-     * rest of the geometry comes from the superblock. */
     provider->info(space, &info);
     a->max_io_blocks = info.max_io_blocks ? info.max_io_blocks : 1u;
-    /* Clamp so a chunk length (n << block-shift) fits the iovec's 32-bit
-     * length field; only a provider advertising an implausibly huge
-     * max_io could hit this. */
     if (a->max_io_blocks > (UINT_MAX >> CHIMERA_MEDIA_BLOCK_SHIFT)) {
         a->max_io_blocks = UINT_MAX >> CHIMERA_MEDIA_BLOCK_SHIFT;
     }
@@ -850,20 +1324,38 @@ facade_alloc_open(
 
     c = calloc(1, sizeof(*c));
     FACADE_CHECK(c != NULL, "oom open ctx");
-    c->alloc = a;
-    c->cb    = cb;
-    c->priv  = private_data;
+    c->a    = a;
+    c->cb   = cb;
+    c->priv = private_data;
 
-    memset(&c->iov, 0, sizeof(c->iov));
-    c->iov.data   = a->super_buf;
-    c->iov.length = FACADE_SUPER_SIZE;
-    provider->read(space, &c->iov, 1, FACADE_SUPER_BLOCK, 1,
-                   facade_open_super_done, c);
+    facade_media_read(a, a->super_buf, FACADE_SUPER_BLOCK, 1,
+                      facade_open_super_done, c);
 } /* facade_alloc_open */
 
 /* ------------------------------------------------------------------ */
-/* flush / close                                                      */
+/* flush / close / abandon                                            */
 /* ------------------------------------------------------------------ */
+
+struct facade_flush_epoch_ctx {
+    struct facade_alloc *a;
+    facade_epoch_cb_t    cb;
+    void                *priv;
+};
+
+static void
+facade_flush_compact_done(
+    enum facade_status st,
+    void              *priv)
+{
+    struct facade_flush_epoch_ctx *c  = priv;
+    struct facade_alloc           *a  = c->a;
+    facade_epoch_cb_t              cb = c->cb;
+    void                          *cp = c->priv;
+    uint64_t                       de = a->durable_epoch;
+
+    free(c);
+    cb(st, de, cp);
+} /* facade_flush_compact_done */
 
 SYMBOL_EXPORT void
 facade_alloc_flush(
@@ -871,8 +1363,38 @@ facade_alloc_flush(
     facade_epoch_cb_t    cb,
     void                *private_data)
 {
-    facade_persist_submit(a, 0 /* keep */, NULL, cb, private_data);
+    struct facade_flush_epoch_ctx *c = calloc(1, sizeof(*c));
+
+    FACADE_CHECK(c != NULL, "oom flush ctx");
+    c->a    = a;
+    c->cb   = cb;
+    c->priv = private_data;
+    facade_compact(a, facade_flush_compact_done, c);
 } /* facade_alloc_flush */
+
+struct facade_close_ctx {
+    struct facade_alloc *a;
+    facade_cb_t          cb;
+    void                *priv;
+};
+
+static void
+facade_close_compact_done(
+    enum facade_status st,
+    void              *priv)
+{
+    struct facade_close_ctx *c  = priv;
+    struct facade_alloc     *a  = c->a;
+    facade_cb_t              cb = c->cb;
+    void                    *cp = c->priv;
+
+    free(c);
+    /* Defer the free to the enclosing completion's teardown check, so we do not
+     * free `a` inside its own media callback. */
+    a->shutting_down = 1;
+    a->destroy_after = 1;
+    cb(st, cp);
+} /* facade_close_compact_done */
 
 SYMBOL_EXPORT void
 facade_alloc_close(
@@ -880,17 +1402,24 @@ facade_alloc_close(
     facade_cb_t          cb,
     void                *private_data)
 {
-    facade_persist_submit(a, 1 /* release */, cb, NULL, private_data);
+    struct facade_close_ctx *c = calloc(1, sizeof(*c));
+
+    FACADE_CHECK(c != NULL, "oom close ctx");
+    c->a    = a;
+    c->cb   = cb;
+    c->priv = private_data;
+    facade_compact(a, facade_close_compact_done, c);
 } /* facade_alloc_close */
 
 SYMBOL_EXPORT void
 facade_alloc_abandon(struct facade_alloc *a)
 {
-    /* Drop without persisting.  If a block-0 write is in flight, defer the free
-     * to mw_complete() so the deferred completion never lands on freed memory
-     * (F2); otherwise tear down now.  Either way media keeps only what prior fua
-     * writes/flushes made durable -- in particular the id floor. */
-    if (a->mw_busy) {
+    /* Drop without persisting.  If a media op is in flight, mark for teardown and
+     * stop new work; the last completion frees the allocator (F2).  Media keeps
+     * only what prior fua writes/flushes made durable -- in particular the id
+     * floor and the last clean checkpoint. */
+    a->shutting_down = 1;
+    if (a->mw_busy || a->inflight > 0) {
         a->destroy_after = 1;
         return;
     }
