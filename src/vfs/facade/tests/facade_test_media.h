@@ -78,6 +78,14 @@ void
 facade_test_media_release_all(
     struct chimera_media_space *space);
 
+/* One-shot media-write error injection: the next write to block `lba` completes
+ * with CHIMERA_MEDIA_E_IO and applies nothing (then the arming clears).  For
+ * exercising mid-transaction failure/rollback paths. */
+void
+facade_test_media_fail_write_lba(
+    struct chimera_media_space *space,
+    uint64_t                    lba);
+
 #ifdef __cplusplus
 }
 #endif /* ifdef __cplusplus */

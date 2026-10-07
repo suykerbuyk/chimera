@@ -45,6 +45,8 @@ struct chimera_media_space {
     int                stall;
     struct tm_pending *q_head;
     struct tm_pending *q_tail;
+    int                fail_lba_set;   /* one-shot write-error injection */
+    uint64_t           fail_lba;
 };
 
 static struct tm_backing g_backings[TM_MAX_BACKINGS];
@@ -261,6 +263,12 @@ tm_write(
         return;
     }
 
+    if (space->fail_lba_set && lba == space->fail_lba) {
+        space->fail_lba_set = 0;   /* one-shot: apply nothing, report E_IO */
+        cb(CHIMERA_MEDIA_E_IO, private_data);
+        return;
+    }
+
     op          = calloc(1, sizeof(*op));
     op->cb      = cb;
     op->priv    = private_data;
@@ -438,3 +446,12 @@ facade_test_media_release_all(struct chimera_media_space *space)
         tm_release_head(space);
     }
 } /* facade_test_media_release_all */
+
+SYMBOL_EXPORT void
+facade_test_media_fail_write_lba(
+    struct chimera_media_space *space,
+    uint64_t                    lba)
+{
+    space->fail_lba_set = 1;
+    space->fail_lba     = lba;
+} /* facade_test_media_fail_write_lba */
