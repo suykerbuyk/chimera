@@ -152,6 +152,13 @@ chimera_s3_parse_copy_source(
     ctx->src_key_len = chimera_s3_url_decode(ctx->src_key,
                                              slash + 1, key_len);
 
+    /* Confinement (SEC-5): refuse a ".", "..", or empty segment in the decoded
+     * copy-source key before it is looked up relative to the source bucket.  The
+     * caller maps a -1 here to InvalidArgument (400). */
+    if (chimera_s3_key_has_bad_segment(ctx->src_key, ctx->src_key_len)) {
+        return -1;
+    }
+
     return 0;
 } /* chimera_s3_parse_copy_source */
 

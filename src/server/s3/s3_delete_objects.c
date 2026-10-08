@@ -482,6 +482,18 @@ chimera_s3_del_drive(struct chimera_s3_request *request)
         int                             dirpathlen, name_len, i;
         const char                     *slash = NULL;
 
+        /* Confinement (SEC-5): refuse a ".", "..", or empty segment.  The body
+         * keys are XML-unescaped (not percent-encoded), so check the exact bytes
+         * the lookup below consumes.  Record a per-key InvalidArgument <Error>
+         * and move on -- one bad key does not fail the whole batch. */
+        if (chimera_s3_key_has_bad_segment(key, key_len)) {
+            e->deleted  = 0;
+            e->err_code = "InvalidArgument";
+            e->err_msg  = "The key contains an invalid path segment.";
+            request->del.cur++;
+            continue;
+        }
+
         for (i = key_len - 1; i >= 0; i--) {
             if (key[i] == '/') {
                 slash = key + i;
