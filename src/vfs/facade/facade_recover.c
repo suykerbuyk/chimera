@@ -36,6 +36,13 @@ struct rec_entry {
      * rejected, stopping the prefix). */
     struct facade_obj_rec     obj_hdr;
     struct facade_ckpt_objext obj_ext[FACADE_OBJ_MAX_EXT];
+    /* NS payload (namespace-record-store): owned heap copies, freed in finish. */
+    uint32_t                  ns_op;
+    uint64_t                  ns_rev;
+    uint8_t                  *ns_key;
+    uint32_t                  ns_klen;
+    uint8_t                  *ns_val;
+    uint32_t                  ns_vlen;
 };
 
 struct facade_recover_ctx {
@@ -125,6 +132,33 @@ facade_recover_parse(
             }
             break;
         }
+        case FACADE_LR_NS: {
+            struct facade_lr_ns nh;
+
+            if (hdr.len < sizeof(nh)) {
+                return 0;
+            }
+            memcpy(&nh, payload, sizeof(nh));
+            if (nh.key_len > FACADE_NS_MAX_KEY || nh.val_len > FACADE_NS_MAX_VALUE ||
+                hdr.len < sizeof(nh) + (uint64_t) nh.key_len + nh.val_len) {
+                return 0;
+            }
+            e->ns_op   = nh.op;
+            e->ns_rev  = nh.revision;
+            e->ns_klen = nh.key_len;
+            e->ns_vlen = nh.val_len;
+            if (nh.key_len) {
+                e->ns_key = malloc(nh.key_len);
+                FACADE_CHECK(e->ns_key != NULL, "oom recover ns key");
+                memcpy(e->ns_key, payload + sizeof(nh), nh.key_len);
+            }
+            if (nh.val_len) {
+                e->ns_val = malloc(nh.val_len);
+                FACADE_CHECK(e->ns_val != NULL, "oom recover ns val");
+                memcpy(e->ns_val, payload + sizeof(nh) + nh.key_len, nh.val_len);
+            }
+            break;
+        }
         case FACADE_LR_COMMIT:
             break;   /* no fields needed beyond seq/txn */
         default:
@@ -140,7 +174,12 @@ facade_recover_finish(
 {
     facade_cb_t cb = c->cb;
     void       *cp = c->priv;
+    uint64_t    i;
 
+    for (i = 0; i < c->nrecs; i++) {
+        free(c->recs[i].ns_key);
+        free(c->recs[i].ns_val);
+    }
     free(c->blk);
     free(c->recs);
     free(c);
@@ -212,6 +251,17 @@ facade_recover_apply(struct facade_recover_ctx *c)
                 if (!facade_obj_put_rec(a, &e->obj_hdr, e->obj_ext)) {
                     facade_recover_finish(c, FACADE_E_IO);
                     return;
+                }
+                break;
+            case FACADE_LR_NS:
+                if (e->ns_op == FACADE_LR_NS_PUT) {
+                    if (facade_ns_apply_put(a, e->ns_key, e->ns_klen,
+                                            e->ns_val, e->ns_vlen, e->ns_rev) != 0) {
+                        facade_recover_finish(c, FACADE_E_IO);
+                        return;
+                    }
+                } else {
+                    facade_ns_apply_delete(a, e->ns_key, e->ns_klen);
                 }
                 break;
             default:

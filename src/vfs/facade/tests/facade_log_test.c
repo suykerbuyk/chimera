@@ -515,18 +515,22 @@ test_recover_after_intrawrite_compaction(void)
         patT[i] = (uint8_t) (i ^ 0x3Cu);
     }
 
-    /* A small space => a small log (log_nblocks == 4), so the 2nd durable write
-     * forces a compaction mid-write. */
+    /* A small space => a small log, so a durable write soon forces a compaction
+     * mid-write.  The log floor is sized for the namespace transaction cap, so
+     * fill the log with pre-compaction writes until the next write cannot fit;
+     * that next (triggering) write then compacts first, for any floor. */
     facade_test_media_reset();
     space = tu_media_open("iwc", 256u << 10);   /* 64 blocks */
     tu_format(space);
     a = tu_open(space);
-    TCHECK(a->log_nblocks <= 8, "test needs a small log, got %llu",
-           (unsigned long long) a->log_nblocks);
 
-    /* Pre-compaction object: its records fill the log toward the wrap point. */
-    tu_write0(a, id_pre, patP, sizeof(patP), &ew);
-    TCHECK(ew.done && ew.st == FACADE_OK, "pre-compaction write");
+    /* Pre-compaction object: its records fill the log toward the wrap point.  A
+     * durable object write is at most 4 records (ALLOC+FREE+OBJ+COMMIT). */
+    while (a->log_next + 4u <= a->log_nblocks) {
+        ew.done = 0;
+        tu_write0(a, id_pre, patP, sizeof(patP), &ew);
+        TCHECK(ew.done && ew.st == FACADE_OK, "pre-compaction fill write");
+    }
 
     ckpt_gen_before = a->ckpt_generation;
 

@@ -14,7 +14,8 @@ add_library(chimera_facade ${CHIMERA_LIBRARY_TYPE}
     facade_extent.c
     facade_log.c
     facade_object.c
-    facade_recover.c)
+    facade_recover.c
+    facade_ns.c)
 
 # Consumers get the facade headers, the media interface, and the storage
 # contract types the facade speaks (object ids, extents, segments).

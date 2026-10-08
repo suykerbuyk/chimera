@@ -51,7 +51,15 @@ extern "C" {
  * image (free set + object table of {id,flags,extents} only) is refused, not
  * read as blank (facade_alloc_open -> FACADE_E_FORMAT).
  */
-#define FACADE_FORMAT_VERSION 3u
+/*
+ * v4 (namespace-record-store): the checkpoint gains a namespace-record section
+ * (first-class key-ordered records with revisions) after the object section, and
+ * the durable object record carries a minimal 0<->1 binding refcount, so a
+ * compare-and-set namespace transaction and the never-both-referenced-and-held
+ * invariant survive a crash.  A v3 image (object table without refs, no NS
+ * section) is refused, not read as blank (facade_alloc_open -> FACADE_E_FORMAT).
+ */
+#define FACADE_FORMAT_VERSION 4u
 
 #define FACADE_SUPER_BLOCK    0u /* superblock lba */
 #define FACADE_SUPER_SIZE     CHIMERA_MEDIA_BLOCK_SIZE /* one block */
@@ -91,7 +99,8 @@ struct facade_ckpt_hdr {
     uint64_t checkpoint_seq; /* log seq this checkpoint reflects */
     uint64_t n_free_ext;     /* free-extent records that follow */
     uint64_t n_objs;         /* object records that follow the free records */
-    uint64_t content_blocks; /* blocks the header + both sections occupy (CRC span) */
+    uint64_t n_ns;           /* namespace records that follow the object records (v4) */
+    uint64_t content_blocks; /* blocks the header + all sections occupy (CRC span) */
     uint32_t crc32;          /* whole-slot CRC (over content_blocks), this field zeroed */
     uint32_t reserved;       /* must be zero */
 };
@@ -125,6 +134,20 @@ struct facade_obj_rec {
     uint32_t origin;             /* enum chimera_sc_origin */
     uint32_t retention_mode;     /* CHIMERA_SC_RETENTION_* */
     uint32_t nextents;
+    uint32_t refs;               /* minimal binding refcount, 0 or 1 (v4) */
+    uint32_t reserved;           /* must be zero; keeps the u32 count even (no padding) */
+};
+
+/*
+ * One on-media namespace record (v4): the checkpoint and the FACADE_LR_NS log
+ * record share this header shape, followed by key_len key bytes then val_len
+ * value bytes, so a record is byte-identical in the log and in the checkpoint.
+ * Keys and values are opaque (LAY-1, LAY-3); the backend never interprets them.
+ */
+struct facade_ns_ckpt_rec {
+    uint64_t revision;
+    uint32_t key_len;
+    uint32_t val_len;
 };
 
 /* One extent of an object record (checkpoint and log share this shape). */

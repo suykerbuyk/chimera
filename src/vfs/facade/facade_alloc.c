@@ -314,6 +314,8 @@ facade_obj_serialize_hdr(
     hdr->origin             = o->stamps.origin;
     hdr->retention_mode     = o->retention_mode;
     hdr->nextents           = facade_extent_map_count(o->map);
+    hdr->refs               = o->refs;
+    hdr->reserved           = 0;
 } /* facade_obj_serialize_hdr */
 
 SYMBOL_EXPORT struct facade_obj *
@@ -352,6 +354,7 @@ facade_obj_put_rec(
     o->stamps.origin                = hdr->origin;
     o->retention_until_ns           = hdr->retention_until_ns;
     o->retention_mode               = hdr->retention_mode;
+    o->refs                         = hdr->refs;
     for (k = 0; k < hdr->nextents; k++) {
         if (exts[k].nblocks == 0 ||
             (exts[k].kind != CHIMERA_SC_SEG_DATA &&
@@ -516,6 +519,7 @@ facade_alloc_destroy(struct facade_alloc *a)
             facade_extent_map_destroy(a->objs[i].map);
         }
     }
+    facade_ns_destroy_all(a);
     rb_tree_destroy(&a->free_by_start, facade_free_node_destroy, NULL);
     free(a->objs);
     free(a->super_buf);
@@ -825,6 +829,7 @@ facade_ckpt_serialize(
                 * sizeof(struct facade_ckpt_objext);
         }
     }
+    bytes += facade_ns_ckpt_bytes(a);   /* namespace section (v4) */
 
     blocks = (bytes + CHIMERA_MEDIA_BLOCK_SIZE - 1) >> CHIMERA_MEDIA_BLOCK_SHIFT;
     if (blocks == 0) {
@@ -841,6 +846,7 @@ facade_ckpt_serialize(
     hdr->checkpoint_seq = checkpoint_seq;
     hdr->n_free_ext     = nfree;
     hdr->n_objs         = a->nobjs;
+    hdr->n_ns           = a->nns;
     hdr->content_blocks = blocks;
     hdr->reserved       = 0;
     hdr->crc32          = 0;
@@ -869,6 +875,9 @@ facade_ckpt_serialize(
         facade_extent_map_foreach(o->map, facade_ckpt_write_objext, &p);
     }
 
+    /* Namespace-record section follows the object section (v4). */
+    facade_ns_ckpt_serialize(a, &p);
+
     hdr->crc32 = facade_crc32(buf, (uint32_t) (blocks << CHIMERA_MEDIA_BLOCK_SHIFT));
 
     *r_buf = buf;
@@ -893,6 +902,7 @@ facade_ckpt_load(
     a->free_blocks = 0;
     a->nobjs       = 0;
     memset(a->objs, 0, FACADE_OBJ_BUDGET * sizeof(*a->objs));
+    facade_ns_destroy_all(a);   /* rebuilt from the NS section below */
 
     for (i = 0; i < hdr->n_free_ext; i++) {
         struct facade_ckpt_ext rec;
@@ -936,6 +946,11 @@ facade_ckpt_load(
             return -1;
         }
     }
+
+    /* Namespace-record section follows the object section (v4). */
+    if (facade_ns_ckpt_load(a, &p, end, hdr->n_ns) != 0) {
+        return -1;
+    }
     return 0;
 } /* facade_ckpt_load */
 
@@ -947,7 +962,8 @@ static void
 facade_compute_geometry(struct facade_alloc *a)
 {
     struct chimera_media_space_info info;
-    uint64_t                        obj_budget, free_bytes, obj_bytes, ckpt_bytes;
+    uint64_t                        obj_budget, ns_budget;
+    uint64_t                        free_bytes, obj_bytes, ns_bytes, ckpt_bytes;
 
     a->provider->info(a->space, &info);
     a->nblocks       = info.nblocks;
@@ -957,9 +973,9 @@ facade_compute_geometry(struct facade_alloc *a)
     }
 
     /* Each checkpoint slot holds a header, the worst-case free-set
-     * fragmentation (<= nblocks/2 + 1 extents), and the object area sized for a
-     * budget that scales down on a small space so a tiny prototype still leaves
-     * a data region. */
+    * fragmentation (<= nblocks/2 + 1 extents), the object area and the
+    * namespace-record area, each sized for a budget that scales down on a small
+    * space so a tiny prototype still leaves a data region (M3). */
     obj_budget = FACADE_OBJ_BUDGET;
     if (obj_budget > a->nblocks / 16) {
         obj_budget = a->nblocks / 16;
@@ -967,11 +983,16 @@ facade_compute_geometry(struct facade_alloc *a)
     if (obj_budget == 0) {
         obj_budget = 1;
     }
+    ns_budget    = facade_ns_budget_for(a->nblocks);
+    a->ns_budget = (uint32_t) ns_budget;
+
     free_bytes = sizeof(struct facade_ckpt_hdr)
         + (a->nblocks / 2 + 1) * sizeof(struct facade_ckpt_ext);
     obj_bytes = obj_budget * (sizeof(struct facade_obj_rec)
                               + FACADE_OBJ_MAX_EXT * sizeof(struct facade_ckpt_objext));
-    ckpt_bytes = free_bytes + obj_bytes;
+    ns_bytes = ns_budget * (sizeof(struct facade_ns_ckpt_rec)
+                            + FACADE_NS_MAX_KEY + FACADE_NS_MAX_VALUE);
+    ckpt_bytes = free_bytes + obj_bytes + ns_bytes;
 
     a->ckpt_nblocks = (ckpt_bytes + CHIMERA_MEDIA_BLOCK_SIZE - 1) >> CHIMERA_MEDIA_BLOCK_SHIFT;
     if (a->ckpt_nblocks == 0) {
@@ -984,8 +1005,10 @@ facade_compute_geometry(struct facade_alloc *a)
     if (a->log_nblocks > 64) {
         a->log_nblocks = 64;
     }
-    if (a->log_nblocks < 4) {
-        a->log_nblocks = 4;   /* floor: a durable object txn is 3 records */
+    if (a->log_nblocks < FACADE_NS_MAX_TXN_LOG_BLOCKS) {
+        /* Floor raised (M1): a namespace transaction may emit up to
+         * FACADE_NS_MAX_TXN_LOG_BLOCKS records, and must fit an empty log. */
+        a->log_nblocks = FACADE_NS_MAX_TXN_LOG_BLOCKS;
     }
 
     a->ckpt_a_block = FACADE_SUPER_BLOCK + 1;
@@ -1466,6 +1489,7 @@ facade_open_super_done(
     }
 
     a->nblocks               = s.nblocks;
+    a->ns_budget             = facade_ns_budget_for(s.nblocks);
     a->data_first            = s.data_first;
     a->data_last             = s.data_last;
     a->ckpt_a_block          = s.ckpt_a_block;

@@ -36,7 +36,7 @@ extern "C" {
  * long before the counter catches the floor.  Also the grow step the fresh
  * format seeds.
  */
-#define FACADE_ID_RESERVE  1024ULL
+#define FACADE_ID_RESERVE            1024ULL
 
 /* Prototype object-table budget: the maximum live objects and the maximum
  * extents per object the checkpoint, the log OBJ record and recovery are all
@@ -46,8 +46,39 @@ extern "C" {
  * (sizeof(facade_lr_hdr) + sizeof(facade_obj_rec) + CAP * sizeof(objext) <=
  * 4096), and an op that would exceed the cap is refused NO_SPACE-shaped rather
  * than corrupting the map. */
-#define FACADE_OBJ_BUDGET  256u
-#define FACADE_OBJ_MAX_EXT 64u
+#define FACADE_OBJ_BUDGET            256u
+#define FACADE_OBJ_MAX_EXT           64u
+
+/*
+ * Namespace-record-store caps (v4).  A put/delete is one FACADE_LR_NS log block;
+ * key + value stay well within one 4 KiB block (facade_lr_hdr 48 + facade_lr_ns
+ * 24 + 256 + 512 = 840 <= 4096), so no multi-block record is ever needed.
+ * FACADE_NS_MAX_TXN_LOG_BLOCKS bounds a whole NS transaction's log footprint
+ * (NS records + OBJ records + COMMIT) to the raised log floor; the geometry's
+ * log_nblocks floor is >= this, so any accepted txn fits an empty log.
+ * FACADE_NS_BUDGET is the full-size live/checkpoint record cap; it scales down on
+ * a small media space (facade_compute_geometry, like obj_budget) into ns_budget.
+ */
+#define FACADE_NS_MAX_KEY            256u
+#define FACADE_NS_MAX_VALUE          512u
+#define FACADE_NS_MAX_TXN_LOG_BLOCKS 16u
+#define FACADE_NS_BUDGET             256u
+
+/*
+ * One in-memory namespace record.  The store is a sorted array of these ordered
+ * by EXACT key bytes (facade_ns.c) -- NOT common/rbtree.h, whose macro key is a
+ * single scalar field compared with < / > and so cannot express byte-string
+ * order (the M32 fix needs exact byte comparison, and the stable scan cursor
+ * needs true byte order, which a scalar/hash key would violate -- the H1 bug).
+ * key/val are owned heap copies; revision advances on each put of the key.
+ */
+struct facade_ns_rec {
+    uint8_t *key;
+    uint32_t key_len;
+    uint8_t *val;
+    uint32_t val_len;
+    uint64_t revision;
+};
 
 /* Invariant guard that survives NDEBUG (unlike assert): used for caller-side
  * violations that must never reach a release build silently (e.g. a
@@ -95,6 +126,7 @@ struct facade_obj {
     struct chimera_sc_stamps  stamps;
     uint64_t                  retention_until_ns;
     uint32_t                  retention_mode;
+    uint32_t                  refs;     /* minimal binding refcount: 0 or 1 (v4) */
     struct facade_extent_map *map;      /* logical->physical authority (NULL only when unused) */
 };
 
@@ -124,6 +156,13 @@ struct facade_alloc {
     /* object table (durable; folded into the checkpoint) */
     struct facade_obj                   *objs;      /* FACADE_OBJ_BUDGET entries */
     uint32_t                             nobjs;     /* used entries */
+
+    /* namespace record store (durable; folded into the checkpoint after the
+     * object section, v4).  A sorted-by-exact-key array of record pointers. */
+    struct facade_ns_rec               **ns_recs;   /* sorted ascending by key bytes */
+    uint32_t                             nns;        /* live record count */
+    uint32_t                             ns_cap;     /* allocated slots in ns_recs */
+    uint32_t                             ns_budget;  /* live + checkpoint cap (M3-scaled) */
 
     /* durability epoch (H5): in-memory ordering counter for allocations */
     uint64_t                             cur_epoch;     /* epoch new allocations are tagged with */
@@ -289,6 +328,80 @@ void
 facade_obj_remove(
     struct facade_alloc *alloc,
     struct facade_obj   *o);
+
+/* facade_ns.c: namespace record store helpers used by facade_alloc.c (checkpoint
+ * (de)serialize, teardown) and facade_recover.c (log replay).  The contract-typed
+ * transaction evaluator, scan and cursor table are in facade_ns.h. */
+
+/* Total byte order over key strings: memcmp over the shorter, then by length. */
+int
+facade_ns_keycmp(
+    const uint8_t *a,
+    uint32_t       alen,
+    const uint8_t *b,
+    uint32_t       blen);
+
+/* Find a live record by exact key, or NULL. */
+struct facade_ns_rec *
+facade_ns_find(
+    struct facade_alloc *alloc,
+    const uint8_t       *key,
+    uint32_t             klen);
+
+/* Lower-bound index of key in the sorted array; returns 1 and *r_idx = the match
+ * when present, else 0 and *r_idx = the insertion point. */
+int
+facade_ns_lower_bound(
+    struct facade_alloc *alloc,
+    const uint8_t       *key,
+    uint32_t             klen,
+    uint32_t            *r_idx);
+
+/* Install key->value at revision (create or replace), or remove key.  Used by
+ * the transaction commit, log replay and checkpoint load, so the revision is
+ * explicit.  put returns 0, or -1 on budget exhaustion / oom. */
+int
+facade_ns_apply_put(
+    struct facade_alloc *alloc,
+    const uint8_t       *key,
+    uint32_t             klen,
+    const uint8_t       *val,
+    uint32_t             vlen,
+    uint64_t             revision);
+void
+facade_ns_apply_delete(
+    struct facade_alloc *alloc,
+    const uint8_t       *key,
+    uint32_t             klen);
+
+/* Free every record and the array (teardown, and the reset before checkpoint
+ * load). */
+void
+facade_ns_destroy_all(
+    struct facade_alloc *alloc);
+
+/* Checkpoint (de)serialize for the NS section (facade_super.h facade_ns_ckpt_rec
+ * + key + value), after the object section.  _bytes sizes the section; _serialize
+ * writes it and advances *pp; _load reads n_ns records between *pp and end,
+ * returning 0 or -1 on a self-inconsistent record. */
+uint64_t
+facade_ns_ckpt_bytes(
+    const struct facade_alloc *alloc);
+void
+facade_ns_ckpt_serialize(
+    struct facade_alloc *alloc,
+    uint8_t            **pp);
+int
+facade_ns_ckpt_load(
+    struct facade_alloc *alloc,
+    const uint8_t      **pp,
+    const uint8_t       *end,
+    uint64_t             n_ns);
+
+/* The M3-scaled NS record budget for a space of nblocks blocks. */
+uint32_t
+facade_ns_budget_for(
+    uint64_t nblocks);
 
 /* Object-table iteration (epoch-held release scans it). */
 uint32_t
