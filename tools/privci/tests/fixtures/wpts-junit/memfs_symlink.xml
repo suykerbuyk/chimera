@@ -1,0 +1,11 @@
+<!-- SPDX-FileCopyrightText: 2026 Chimera-NAS Project Contributors -->
+<!-- SPDX-License-Identifier: Unlicense -->
+<testsuite name="wpts" tests="7" failures="0" errors="0" skipped="0">
+  <testcase name="CreateClose_SymbolicLinkInMiddle" classname="wpts"/>
+  <testcase name="CreateClose_SymbolicLinkAtLast" classname="wpts"/>
+  <testcase name="CreateClose_InvalidSymbolicLink" classname="wpts"/>
+  <testcase name="CreateClose_CreateAndCloseDirWithDotDir" classname="wpts"/>
+  <testcase name="CreateClose_CreateAndCloseDirWithDoubleDotDir" classname="wpts"/>
+  <testcase name="CreateClose_CreateAndCloseFileWithDotDir" classname="wpts"/>
+  <testcase name="CreateClose_CreateAndCloseFileWithDoubleDotDir" classname="wpts"/>
+</testsuite>

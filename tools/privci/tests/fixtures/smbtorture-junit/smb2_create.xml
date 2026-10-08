@@ -1,0 +1,8 @@
+<!-- SPDX-FileCopyrightText: 2026 Chimera-NAS Project Contributors -->
+<!-- SPDX-License-Identifier: Unlicense -->
+<testsuite name="smb2.create" tests="4" failures="1" errors="0" skipped="1">
+  <testcase name="smb2.create.bench-holepunch" classname="smb2.create"/>
+  <testcase name="smb2.create.mkdir" classname="smb2.create"/>
+  <testcase name="smb2.create.nulldacl" classname="smb2.create"><failure>  (foo.c:123) create failed: NT_STATUS_ACCESS_DENIED</failure></testcase>
+  <testcase name="smb2.create.async-dup" classname="smb2.create"><skipped/></testcase>
+</testsuite>

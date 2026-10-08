@@ -1,0 +1,18 @@
+# SPDX-FileCopyrightText: 2026 Chimera-NAS Project Contributors
+# SPDX-License-Identifier: Unlicense
+#
+# Hand-written smbtorture subtest stream, fed to scripts/smbtorture_to_junit.py
+# in test_compare.py to pin the testcase-name format.  smbtorture prints the
+# fully-qualified dotted subtest name after `success:`/`failure:`/`skip:`, so the
+# JUnit <testcase name="..."> carries the `smb2.<suite>.` prefix verbatim; the
+# section-3 require.txt patterns (`smb2\.create\.`, ...) depend on that prefix.
+test: smb2.create.bench-holepunch
+success: smb2.create.bench-holepunch
+test: smb2.create.mkdir
+success: smb2.create.mkdir
+test: smb2.create.nulldacl
+failure: smb2.create.nulldacl [
+  (foo.c:123) create failed: NT_STATUS_ACCESS_DENIED
+]
+test: smb2.create.async-dup
+skip: smb2.create.async-dup

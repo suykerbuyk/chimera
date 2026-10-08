@@ -198,6 +198,13 @@ targets.  Privileged
 and root runs belong to the qb CI legs (`qb.yaml`, `.devcontainer/quantum/qb-ci.sh`)
 and the VS Code devcontainer.
 
+There is also a **separate, opt-in** way to run those privileged CI test legs
+locally: the `podman-priv-*` family (`builders/priv/priv-ci.sh`,
+`builders/priv/README.md`), which runs them as root in a scoped Podman container
+via `sudo`.  It is deliberately a different target family — it adds no privilege
+to the unprivileged `podman-*` targets above — and it is local evidence, not a
+gate.
+
 ## What skips, and why
 
 Tests that need privilege SKIP (ctest exit code 77) instead of failing.  A

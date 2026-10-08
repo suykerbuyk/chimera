@@ -1,0 +1,41 @@
+# SPDX-FileCopyrightText: 2026 Chimera-NAS Project Contributors
+# SPDX-License-Identifier: Unlicense
+#
+# Pre-registered presence checks for the SMB section-3 compare (M1).  One regex
+# per line, matched against the testcase name part of each key; each must match
+# at least one case on BOTH sides.  Patterns adjusted to the P2 converter
+# formats.  ceph S3 and CLAIM_DELEG_CUR_FH are excluded on purpose -- they cannot
+# be present (no s3-tests venv; no pynfs CLAIM_DELEG_CUR_FH test).
+#
+# Known limitation (compare.py c-L2): --require proves these criteria are present
+# on both sides, not that they stayed non-skipped.  A Passed->Skipped regression
+# of a required case is reported but gated only if it is also an expect.txt
+# Passed->Passed entry.
+
+# smbtorture -- the suites chimera's gating actually runs (names carry the
+# smb2.<suite>. prefix, except smb2.mkdir which is a single case named exactly
+# "smb2.mkdir").  durable-open / durable-v2-open are NOT run as such; the real
+# durable suites are smb2.durable-open-disconnect and smb2.durable-v2-regressions.
+smb2\.create\.
+smb2\.mkdir\b
+smb2\.rename\.
+smb2\.streams\.
+smb2\.dir\.
+smb2\.durable-v2-regressions\.
+smb2\.durable-open-disconnect\.
+
+# WPTS -- dot-dir cases plus the three symlink cases
+CreateClose_CreateAndCloseDirWithDotDir$
+CreateClose_CreateAndCloseDirWithDoubleDotDir$
+CreateClose_CreateAndCloseFileWithDotDir$
+CreateClose_CreateAndCloseFileWithDoubleDotDir$
+CreateClose_SymbolicLinkInMiddle$
+CreateClose_SymbolicLinkAtLast$
+CreateClose_InvalidSymbolicLink$
+
+# pynfs -- CLAIM_FH codes (CLAIM_DELEG_CUR_FH has no test)
+\bOPEN7\b
+\bCOUR3\b
+
+# pjdfstest -- matched against ctest testcase names
+^chimera/posix/pjd/(open|mkdir|rename|link|symlink|unlink|rmdir|mkfifo|mknod)/
