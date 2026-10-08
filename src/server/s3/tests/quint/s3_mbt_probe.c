@@ -711,6 +711,214 @@ main(
               "remove unbound cred failed");
     }
 
+    /* ---- key confinement (SEC-5): dot-segment / cross-bucket ------------- */
+
+    /* The live CVE: a '..' segment in an object key climbs out of the bucket.
+     * Two sibling buckets with a secret in 'victim'; every key->path op must
+     * refuse '.', '..', or an empty segment (raw or percent-encoded) with 400
+     * InvalidArgument before any VFS lookup, so none of these reach 'victim'. */
+    {
+        const char       *bad_keys[] = {
+            "..",                      /* lone */
+            "../victim/secret",        /* leading -- the escape */
+            "a/../../victim/secret",   /* climb */
+            "a/..",                    /* trailing */
+            "%2e%2e/victim/secret",    /* percent, lower */
+            "%2E%2E/victim/secret",    /* percent, upper */
+            "a/%2e%2e/b",              /* percent, middle */
+        };
+        const int         n_bad = (int) (sizeof(bad_keys) / sizeof(bad_keys[0]));
+        struct s3_mbt_req req;
+        char              path[256];
+        int               k;
+
+        r = simple(&env, EVPL_HTTP_REQUEST_TYPE_PUT, "/victim");
+        CHECK(r->status == 200, "create victim bucket: got %d", r->status);
+        r = simple(&env, EVPL_HTTP_REQUEST_TYPE_PUT, "/attacker");
+        CHECK(r->status == 200, "create attacker bucket: got %d", r->status);
+        r = put_blocks(&env, "/victim/secret", s1, 1);
+        CHECK(r->status == 200, "put victim/secret: got %d", r->status);
+
+        /* The cross-bucket read regression: the escape now 400s, and the body
+         * is the error document, NOT the victim's bytes. */
+        r = simple(&env, EVPL_HTTP_REQUEST_TYPE_GET, "/attacker/../victim/secret");
+        CHECK(r->status == 400, "cross-bucket GET: got %d want 400", r->status);
+        CHECK(body_has(r, "<Code>InvalidArgument</Code>"),
+              "cross-bucket GET: body lacks InvalidArgument");
+        CHECK(!body_is_blocks(r, s1, 1), "cross-bucket GET leaked victim secret");
+
+        /* The 7 raw+percent '..' forms, for GET and HEAD. */
+        for (k = 0; k < n_bad; k++) {
+            snprintf(path, sizeof(path), "/attacker/%s", bad_keys[k]);
+            r = simple(&env, EVPL_HTTP_REQUEST_TYPE_GET, path);
+            CHECK(r->status == 400, "GET '%s': got %d want 400", bad_keys[k], r->status);
+            CHECK(body_has(r, "<Code>InvalidArgument</Code>"),
+                  "GET '%s': body lacks InvalidArgument", bad_keys[k]);
+            r = simple(&env, EVPL_HTTP_REQUEST_TYPE_HEAD, path);
+            CHECK(r->status == 400, "HEAD '%s': got %d want 400", bad_keys[k], r->status);
+            r = simple(&env, EVPL_HTTP_REQUEST_TYPE_DELETE, path);
+            CHECK(r->status == 400, "DELETE '%s': got %d want 400", bad_keys[k], r->status);
+        }
+
+        /* PUT (with a body) through the same gate. */
+        {
+            static uint8_t one[BS];
+            s3_mbt_expand_blocks(s1, 1, BS, one);
+            req = (struct s3_mbt_req) { .method   = EVPL_HTTP_REQUEST_TYPE_PUT,
+                                        .path     = "/attacker/../victim/secret",
+                                        .body     = one,
+                                        .body_len = BS };
+            r = s3_mbt_call(&env, &req);
+            CHECK(r->status == 400, "PUT bad key: got %d want 400", r->status);
+        }
+
+        /* CopyObject: bad DESTINATION (primary gate). */
+        req = (struct s3_mbt_req) { .method      = EVPL_HTTP_REQUEST_TYPE_PUT,
+                                    .path        = "/attacker/../victim/x",
+                                    .copy_source = "/victim/secret" };
+        r = s3_mbt_call(&env, &req);
+        CHECK(r->status == 400, "CopyObject bad dest: got %d want 400", r->status);
+
+        /* CopyObject: bad SOURCE (copy-source parser), raw and percent. */
+        req = (struct s3_mbt_req) { .method      = EVPL_HTTP_REQUEST_TYPE_PUT,
+                                    .path        = "/attacker/dst",
+                                    .copy_source = "/attacker/../victim/secret" };
+        r = s3_mbt_call(&env, &req);
+        CHECK(r->status == 400, "CopyObject bad src (raw): got %d want 400", r->status);
+        req.copy_source = "/attacker/%2e%2e/victim/secret";
+        r               = s3_mbt_call(&env, &req);
+        CHECK(r->status == 400, "CopyObject bad src (pct): got %d want 400", r->status);
+
+        /* UploadPartCopy: bad source (M1). */
+        {
+            struct s3_mbt_req ini = { .method = EVPL_HTTP_REQUEST_TYPE_POST,
+                                      .path   = "/attacker/mp",
+                                      .query  = "uploads=" };
+            char              uploadid[64], q[128];
+
+            r = s3_mbt_call(&env, &ini);
+            CHECK(r->status == 200, "UPC init: got %d", r->status);
+            {
+                const char *b = strstr((const char *) r->body, "<UploadId>");
+                CHECK(b != NULL, "UPC init lacks UploadId");
+                if (b) {
+                    memcpy(uploadid, b + 10, 32);
+                    uploadid[32] = '\0';
+                } else {
+                    uploadid[0] = '\0';
+                }
+            }
+            snprintf(q, sizeof(q), "partNumber=1&uploadId=%s", uploadid);
+            req = (struct s3_mbt_req) { .method      = EVPL_HTTP_REQUEST_TYPE_PUT,
+                                        .path        = "/attacker/mp",
+                                        .query       = q,
+                                        .copy_source = "/attacker/../victim/secret" };
+            r = s3_mbt_call(&env, &req);
+            CHECK(r->status == 400, "UploadPartCopy bad src (raw): got %d want 400", r->status);
+            req.copy_source = "/attacker/%2e%2e/victim/secret";
+            r               = s3_mbt_call(&env, &req);
+            CHECK(r->status == 400, "UploadPartCopy bad src (pct): got %d want 400", r->status);
+
+            snprintf(q, sizeof(q), "uploadId=%s", uploadid);
+            req = (struct s3_mbt_req) { .method = EVPL_HTTP_REQUEST_TYPE_DELETE,
+                                        .path   = "/attacker/mp",
+                                        .query  = q };
+            s3_mbt_call(&env, &req);     /* abort the upload (best effort) */
+        }
+
+        /* The five ?acl / ?tagging ops cross-bucket (the H1 surface): each 400s
+         * before its handler, so no victim ACL/tags are read, written, or
+         * cleared. */
+        {
+            const char *esc = "/attacker/../victim/secret";
+
+            req = (struct s3_mbt_req) { .method = EVPL_HTTP_REQUEST_TYPE_GET,
+                                        .path   = esc, .query = "acl=" };
+            r = s3_mbt_call(&env, &req);
+            CHECK(r->status == 400 && body_has(r, "<Code>InvalidArgument</Code>"),
+                  "GetObjectAcl cross-bucket: got %d", r->status);
+            CHECK(!body_has(r, "<AccessControlPolicy"),
+                  "GetObjectAcl leaked a victim ACL");
+
+            req.method = EVPL_HTTP_REQUEST_TYPE_PUT;
+            r          = s3_mbt_call(&env, &req);
+            CHECK(r->status == 400, "PutObjectAcl cross-bucket: got %d want 400", r->status);
+
+            req = (struct s3_mbt_req) { .method = EVPL_HTTP_REQUEST_TYPE_GET,
+                                        .path   = esc, .query = "tagging=" };
+            r = s3_mbt_call(&env, &req);
+            CHECK(r->status == 400 && body_has(r, "<Code>InvalidArgument</Code>"),
+                  "GetObjectTagging cross-bucket: got %d", r->status);
+            CHECK(!body_has(r, "<Tagging"), "GetObjectTagging leaked victim tags");
+
+            {
+                const char *tbody =
+                    "<Tagging><TagSet><Tag><Key>k</Key><Value>v</Value>"
+                    "</Tag></TagSet></Tagging>";
+                req.method   = EVPL_HTTP_REQUEST_TYPE_PUT;
+                req.body     = (const uint8_t *) tbody;
+                req.body_len = strlen(tbody);
+                r            = s3_mbt_call(&env, &req);
+                CHECK(r->status == 400, "PutObjectTagging cross-bucket: got %d want 400", r->status);
+            }
+
+            req = (struct s3_mbt_req) { .method = EVPL_HTTP_REQUEST_TYPE_DELETE,
+                                        .path   = esc, .query = "tagging=" };
+            r = s3_mbt_call(&env, &req);
+            CHECK(r->status == 400, "DeleteObjectTagging cross-bucket: got %d want 400", r->status);
+        }
+
+        /* DeleteObjects (batch): a bad key is reported per-key InvalidArgument,
+         * a good key in the same batch is still deleted. */
+        {
+            const char *dbody =
+                "<Delete><Object><Key>../victim/secret</Key></Object>"
+                "<Object><Key>good</Key></Object></Delete>";
+
+            r = put_blocks(&env, "/attacker/good", s1, 1);
+            CHECK(r->status == 200, "put attacker/good: got %d", r->status);
+
+            req = (struct s3_mbt_req) { .method   = EVPL_HTTP_REQUEST_TYPE_POST,
+                                        .path     = "/attacker",
+                                        .query    = "delete=",
+                                        .body     = (const uint8_t *) dbody,
+                                        .body_len = strlen(dbody) };
+            r = s3_mbt_call(&env, &req);
+            CHECK(r->status == 200, "DeleteObjects batch: got %d want 200", r->status);
+            CHECK(body_has(r, "<Code>InvalidArgument</Code>"),
+                  "DeleteObjects: bad key not reported InvalidArgument");
+            CHECK(body_has(r, "<Key>good</Key></Deleted>") ||
+                  body_has(r, "<Deleted><Key>good</Key>"),
+                  "DeleteObjects: good key not deleted");
+        }
+
+        /* M2: a single trailing '/' (folder-marker) is allowed; dot and
+         * internal/leading empty segments are refused. */
+        r = put_blocks(&env, "/attacker/folder/", s1, 0);
+        CHECK(r->status == 200 && !body_has(r, "InvalidArgument"),
+              "folder-marker 'folder/': got %d (want 200, not refused)", r->status);
+        {
+            const char *reject[] = { "a/../", "a//b", "./a", "a/.", ".", "a//" };
+            int         j;
+
+            for (j = 0; j < (int) (sizeof(reject) / sizeof(reject[0])); j++) {
+                snprintf(path, sizeof(path), "/attacker/%s", reject[j]);
+                r = simple(&env, EVPL_HTTP_REQUEST_TYPE_GET, path);
+                CHECK(r->status == 400, "reject '%s': got %d want 400", reject[j], r->status);
+            }
+        }
+
+        /* Negative controls: embedded dots are not dot-segments. */
+        r = put_blocks(&env, "/attacker/file.txt", s1, 1);
+        CHECK(r->status == 200, "put file.txt: got %d", r->status);
+        r = simple(&env, EVPL_HTTP_REQUEST_TYPE_GET, "/attacker/file.txt");
+        CHECK(r->status == 200, "get file.txt: got %d", r->status);
+        r = put_blocks(&env, "/attacker/a.b/c..d", s1, 1);
+        CHECK(r->status == 200, "put a.b/c..d: got %d", r->status);
+        r = simple(&env, EVPL_HTTP_REQUEST_TYPE_GET, "/attacker/a.b/c..d");
+        CHECK(r->status == 200, "get a.b/c..d: got %d", r->status);
+    }
+
     /* ---- teardown -------------------------------------------------------- */
 
     s3_mbt_env_fs_teardown(&env, "fs0");

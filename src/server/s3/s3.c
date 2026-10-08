@@ -515,6 +515,30 @@ CHIMERA_S3_REQUEST_CALLBACK(chimera_s3_dispatch_callback,
     memcpy(s3_request->bucket_fh, attr->va_fh, attr->va_fh_len);
     s3_request->bucket_fhlen = attr->va_fh_len;
 
+    /* Confinement gate (SEC-5): every branch below -- ?acl, ?tagging, and the
+     * method switch -- resolves s3_request->path as the object key relative to
+     * bucket_fh, so a ".", "..", or empty path segment would climb into (read or
+     * write) a sibling bucket.  Refuse such a key here, once, before any of them.
+     * We check a DECODED copy; the raw lookups still use s3_request->path
+     * directly, which is a safe strict superset: percent-decoding only exposes
+     * more (an undecoded "%2e%2e" is a literal segment to the raw walk, never a
+     * traversal), so the decoded buffer is NOT fed back into the lookup. */
+    if (s3_request->path_len > 0) {
+        char decoded[s3_request->path_len + 1];
+        int  declen = chimera_s3_pct_decode(decoded, (int) sizeof(decoded),
+                                            s3_request->path,
+                                            s3_request->path_len);
+
+        if (chimera_s3_key_has_bad_segment(decoded, declen)) {
+            s3_request->status    = CHIMERA_S3_STATUS_INVALID_ARGUMENT;
+            s3_request->vfs_state = CHIMERA_S3_VFS_STATE_COMPLETE;
+            if (s3_request->http_state == CHIMERA_S3_HTTP_STATE_RECVED) {
+                s3_server_respond(evpl, s3_request);
+            }
+            return;
+        }
+    }
+
     /* ?acl subresource (object or bucket): the ACL is a projection of the
      * target's owner and mode, so both directions run against the same
      * filehandle the normal routing would have used. */

@@ -17,6 +17,52 @@
 #include "s3_cred_cache.h"
 #include "s3_chunk.h"
 
+/* Confinement (SEC-5): non-zero if any '/'-separated component of key s[0..len)
+ * is ".", "..", or an empty component -- EXCEPT a single trailing '/' (the S3
+ * folder-marker idiom "prefix/") is allowed.  A leading '/' and an internal or
+ * doubled "//" are refused.  Modeled on chimera_smb_wire_path_has_dotdot
+ * (src/server/smb/smb_string.h) but stricter: S3 has no dot-dir compatibility to
+ * preserve.  `s` is the exact byte run the caller passes to chimera_vfs_lookup
+ * (already percent-decoded, or XML-unescaped, as that call site is). */
+static inline int
+chimera_s3_key_has_bad_segment(
+    const char *s,
+    int         len)
+{
+    int i = 0;
+
+    while (i < len) {
+        int start = i;
+        int seg, is_last;
+
+        while (i < len && s[i] != '/') {
+            i++;
+        }
+        seg     = i - start;
+        is_last = (i == len);         /* no '/' after this component */
+
+        if (seg == 0) {
+            /* An empty component is bad unless it is the single final one -- a
+             * lone trailing '/', which the loop never actually visits because it
+             * exits at i == len.  A doubled "a//" is visited here with
+             * is_last == 0 and is refused; so is a leading "/". */
+            if (!is_last) {
+                return 1;
+            }
+        } else if (seg == 1 && s[start] == '.') {
+            return 1;                 /* "." */
+        } else if (seg == 2 && s[start] == '.' && s[start + 1] == '.') {
+            return 1;                 /* ".." */
+        }
+
+        if (i < len) {
+            i++;                      /* skip the '/' separator */
+        }
+    }
+
+    return 0;
+} /* chimera_s3_key_has_bad_segment */
+
 enum chimera_s3_vfs_state {
     CHIMERA_S3_VFS_STATE_INIT,
     CHIMERA_S3_VFS_STATE_RECV,
