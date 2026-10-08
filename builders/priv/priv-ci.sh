@@ -785,6 +785,17 @@ do_test_run() {
     # through the scoped wrapper under the host-side interrupt/recovery net.  Not
     # exercised in P3 (needs sudo + podman).
     export_context "$run/context" "$ref"
+
+    # The bind SOURCES must exist on the host before the podman run: podman
+    # statfs's every -v source at mount time, so run-legs.sh's in-container
+    # `mkdir -p /build-root/<key>` is too late for the /build-root mount source.
+    # Create the shared build root (D4, mounted /build-root) and the scoped
+    # wrapper's TMPDIR here, in the live path -- for both `test` and `compare`,
+    # which drives this twice.  ($run/context and $run are already created by
+    # export_context and prepare_run.)
+    mkdir -p "$PRIV_BUILDROOT" "$PRIV_DIR/tmp" ||
+        die "cannot create host build root $PRIV_BUILDROOT or $PRIV_DIR/tmp"
+
     say "$label: running ${#SEL_LEG[@]} leg(s) in $run (source $sha); fs.aio-max-nr before=${before:-unknown}"
     run_privileged_container "$before" "$run" "$runid" "${argv[@]}"
 }
