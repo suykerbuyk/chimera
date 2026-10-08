@@ -12,14 +12,16 @@
 # of a required case is reported but gated only if it is also an expect.txt
 # Passed->Passed entry.
 
-# smbtorture -- eight suites (names carry the smb2.<suite>. prefix)
+# smbtorture -- the suites chimera's gating actually runs (names carry the
+# smb2.<suite>. prefix, except smb2.mkdir which is a single case named exactly
+# "smb2.mkdir").  durable-open / durable-v2-open are NOT run as such; the real
+# durable suites are smb2.durable-open-disconnect and smb2.durable-v2-regressions.
 smb2\.create\.
-smb2\.mkdir\.
+smb2\.mkdir\b
 smb2\.rename\.
 smb2\.streams\.
 smb2\.dir\.
-smb2\.durable-v2-open\.
-smb2\.durable-open\.
+smb2\.durable-v2-regressions\.
 smb2\.durable-open-disconnect\.
 
 # WPTS -- dot-dir cases plus the three symlink cases

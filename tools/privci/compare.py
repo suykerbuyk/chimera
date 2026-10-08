@@ -134,7 +134,17 @@ def _case_status(tc):
 
 
 def _parse_junit(path):
-    """Yield (name, status) for each <testcase> in a JUnit/CTest XML file."""
+    """Yield (name, status) for each <testcase> in a JUnit/CTest XML file.
+
+    pynfs's per-code JUnit puts the pynfs test code (OPEN7, COUR3, ...) in a
+    ``code`` attribute and the human description (testOPENClaimFH) in ``name``.
+    The section-3 patterns match the name part of the key, so fold the code into
+    that name -- ``"<code> <name>"`` -- letting a require/expect pattern address a
+    pynfs case by its code (``\\bOPEN7\\b`` matches the bare ``OPEN7`` case but not
+    the ``OPEN7a``/``OPEN7s`` variants).  Only pynfs emits ``code``; every other
+    suite (smbtorture, WPTS, CTest) has none and is unaffected, and because the
+    code is prefixed, name-tail patterns like ``...DotDir$`` still match.
+    """
     try:
         root = ET.parse(path).getroot()
     except Exception:
@@ -142,7 +152,11 @@ def _parse_junit(path):
     for tc in root.iter():
         if _localname(tc.tag) != "testcase":
             continue
-        yield (tc.get("name") or "?"), _case_status(tc)
+        name = tc.get("name") or "?"
+        code = tc.get("code")
+        if code:
+            name = code + " " + name
+        yield name, _case_status(tc)
 
 
 def collect(run_dir):

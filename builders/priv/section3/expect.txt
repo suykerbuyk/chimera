@@ -14,3 +14,23 @@
 Passed->Passed  CreateClose_SymbolicLinkInMiddle$  file=wpts-junit/memfs_symlink.xml  # decision 9: a non-final symlink now stops the walk with STOPPED_ON_SYMLINK (MS-FSA 2.1.5.1 phase 6), the result WPTS asserts; green at base (wpts_cases.csv:133)
 Passed->Passed  CreateClose_SymbolicLinkAtLast$    file=wpts-junit/memfs_symlink.xml  # final-component link already stopped before decision 9 (:132)
 Passed->Passed  CreateClose_InvalidSymbolicLink$   file=wpts-junit/memfs_symlink.xml  # shares the symlink create path (:131)
+
+# Accepted confinement deviation (operator-approved).  samba's smbtorture
+# test_close_no_attrib (registered "test_close_not_attrib") is the ONE timestamps
+# test whose filename uses a '/': BASEDIR "/" FNAME = "smb2-timestamps/testfile.dat"
+# (every other test in timestamps.c uses '\\').  A '/' is not a legal SMB2
+# separator and, on a passthrough backend, would let the kernel resolve the name
+# outside the share, so commit 06bd87c6 refuses it as OBJECT_NAME_INVALID
+# (chimera_smb_name_has_slash, smb_proc_create.c; asserted by smb_harden_test.c:448,
+# SEC-5).  Passed at base (pre-confinement '/' was resolved as a separator) ->
+# Failed at head by design; this is a correct rejection, not a regression.
+Passed->Failed  smb2\.timestamps\.test_close_not_attrib$  file=smbtorture-junit/smbtorture_smb2_timestamps_*.xml  # 06bd87c6: '/' in key refused OBJECT_NAME_INVALID (SEC-5); see smb-create-name-confinement / smb_harden_test.c:448
+# ...and the coarse per-suite CTest rollup that fails only because of the waived
+# subtest above.  Narrow (file=ctest, _timestamps_ only), so a DIFFERENT
+# timestamps subtest regressing is still caught by its own per-case junit entry;
+# this does NOT touch the acls suite rollup, which stays an unexpected failure.
+Passed->Failed  ^chimera/server/smb/smbtorture_smb2_timestamps_  file=ctest  # suite-level rollup of the waived test_close_not_attrib; the per-subtest junit gate above remains live
+# NOTE: smb2.acls.OVERWRITE_READ_ONLY_FILE is NOT waived -- it is a real create
+# error-precedence regression (ACCESS_DENIED where SHARING_VIOLATION is required;
+# task smb-create-overwrite-sharing-violation-precedence) and must stay an
+# unexpected new failure (exit 1) until fixed.
