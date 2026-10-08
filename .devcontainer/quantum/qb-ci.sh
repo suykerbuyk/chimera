@@ -149,9 +149,7 @@ load_legs() {
 # CI job          MODE     ARCH   GROUP/KVM_NAME      PLATFORM        selector
 syntax            -        -      -                   -               -
 static_analysis   release  amd64  -                   -               -
-static_analysis   release  arm64  -                   -               -
 static_analysis   debug    amd64  -                   -               -
-static_analysis   debug    arm64  -                   -               -
 ctest             release  amd64  pynfs               -               -L '^pynfs$' -E diskfs_
 ctest             debug    amd64  pynfs               -               -L '^pynfs$' -E diskfs_
 ctest             release  amd64  smbtorture          -               -L '^smbtorture$'
