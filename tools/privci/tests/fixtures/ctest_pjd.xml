@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-FileCopyrightText: 2026 Chimera-NAS Project Contributors -->
+<!-- SPDX-License-Identifier: Unlicense -->
+<!-- CTest output-junit shape for the pjdfstest ctest leg: name = the full
+     ctest test name (chimera/posix/pjd/<op>/<n>), matched by the pjd require
+     pattern against the name part of a ctest:: key. -->
+<testsuite name="chimera" tests="5" failures="0" errors="0" skipped="0">
+  <testcase name="chimera/posix/pjd/open/00" classname="chimera"/>
+  <testcase name="chimera/posix/pjd/mkdir/00" classname="chimera"/>
+  <testcase name="chimera/posix/pjd/rename/00" classname="chimera"/>
+  <testcase name="chimera/posix/pjd/symlink/00" classname="chimera"/>
+  <testcase name="chimera/posix/pjd/unlink/00" classname="chimera"/>
+</testsuite>

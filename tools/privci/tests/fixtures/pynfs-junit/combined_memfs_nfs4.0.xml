@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-FileCopyrightText: 2026 Chimera-NAS Project Contributors -->
+<!-- SPDX-License-Identifier: Unlicense -->
+<!-- pynfs testserver.py xml output (/opt/pynfs is container-only, so this is
+     hand-written from the documented format, not a live run): one testcase
+     per code, name = the bare pynfs code (OPEN7, COUR3, ...).  Written by
+     scripts/pynfs_test_wrapper.sh (the xml= option), with PYNFS_JUNIT_FILE
+     set at pynfs/CMakeLists.txt:345. -->
+<testsuite name="pynfs" tests="4" failures="0" errors="0" skipped="0">
+  <testcase name="OPEN7" classname="pynfs"/>
+  <testcase name="COUR3" classname="pynfs"/>
+  <testcase name="OPEN4" classname="pynfs"/>
+  <testcase name="LOCK24" classname="pynfs"/>
+</testsuite>

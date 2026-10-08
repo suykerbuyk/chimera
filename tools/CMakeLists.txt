@@ -17,6 +17,16 @@ if (NOT DISABLE_TESTS)
             ENVIRONMENT "PYTHONUNBUFFERED=1"
             TIMEOUT 60
         )
+        add_test(
+            NAME chimera/tools/privci/compare
+            COMMAND ${Python3_EXECUTABLE} -m unittest discover
+                    -s ${CMAKE_CURRENT_SOURCE_DIR}/privci/tests -v
+        )
+        set_tests_properties(chimera/tools/privci/compare PROPERTIES
+            LABELS "tools"
+            ENVIRONMENT "PYTHONUNBUFFERED=1"
+            TIMEOUT 60
+        )
     else()
         message(WARNING "Python3 not found - smbtorture report tests will be skipped")
     endif()

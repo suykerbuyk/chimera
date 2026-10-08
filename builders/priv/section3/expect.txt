@@ -1,0 +1,16 @@
+# SPDX-FileCopyrightText: 2026 Chimera-NAS Project Contributors
+# SPDX-License-Identifier: Unlicense
+#
+# Pre-registered expected transitions for the SMB section-3 compare
+# (decision 9: smbtorture/WPTS symlink/reparse now stop at a non-final link).
+# Fixed before any run; name regexes adjusted to the P2 converter formats only,
+# never to results.  Format: <FROM>-><TO>  <name-regex>  [file=<glob>]  # reason
+# See tools/privci/compare.py for the exact semantics.
+#
+# The three WPTS symlink cases are predicted to stay Passed: the WPTS oracle
+# already asserts STOPPED_ON_SYMLINK, and they are green at base.  There is no
+# smbtorture entry -- the gating allowlist has no symlink/reparse subtest, so any
+# smbtorture change is an unexpected new failure (exit 1).
+Passed->Passed  CreateClose_SymbolicLinkInMiddle$  file=wpts-junit/memfs_symlink.xml  # decision 9: a non-final symlink now stops the walk with STOPPED_ON_SYMLINK (MS-FSA 2.1.5.1 phase 6), the result WPTS asserts; green at base (wpts_cases.csv:133)
+Passed->Passed  CreateClose_SymbolicLinkAtLast$    file=wpts-junit/memfs_symlink.xml  # final-component link already stopped before decision 9 (:132)
+Passed->Passed  CreateClose_InvalidSymbolicLink$   file=wpts-junit/memfs_symlink.xml  # shares the symlink create path (:131)

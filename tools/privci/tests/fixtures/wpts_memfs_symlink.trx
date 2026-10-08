@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-FileCopyrightText: 2026 Chimera-NAS Project Contributors -->
+<!-- SPDX-License-Identifier: Unlicense -->
+<!-- Minimal WPTS (MS-SMB2) vstest TRX, fed to scripts/trx_to_junit.py in
+     test_compare.py to pin the WPTS testcase-name format and the
+     wpts-junit/memfs_symlink.xml output filename.  testName is carried through
+     verbatim, so the section-3 symlink entries (CreateClose_SymbolicLink*) and
+     the dot-dir require patterns match the per-case JUnit directly. -->
+<TestRun xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010">
+  <Results>
+    <UnitTestResult testName="CreateClose_SymbolicLinkInMiddle" outcome="Passed" />
+    <UnitTestResult testName="CreateClose_SymbolicLinkAtLast" outcome="Passed" />
+    <UnitTestResult testName="CreateClose_InvalidSymbolicLink" outcome="Passed" />
+    <UnitTestResult testName="CreateClose_CreateAndCloseDirWithDotDir" outcome="Passed" />
+    <UnitTestResult testName="CreateClose_CreateAndCloseDirWithDoubleDotDir" outcome="Passed" />
+    <UnitTestResult testName="CreateClose_CreateAndCloseFileWithDotDir" outcome="Passed" />
+    <UnitTestResult testName="CreateClose_CreateAndCloseFileWithDoubleDotDir" outcome="Passed" />
+  </Results>
+</TestRun>

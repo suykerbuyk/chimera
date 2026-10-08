@@ -199,3 +199,42 @@ podman-clean: ## Remove PODMAN_BUILD_DIR for this flavor (the image is left alon
 ##@ Docs
 
 docs: ## Print pointers to the API docs and OpenAPI spec
+
+##@ Podman privileged (opt-in; ROOT via sudo unless noted)
+
+# Opt-in local privileged test route (builders/priv/priv-ci.sh): it runs the CI
+# test legs as root in a scoped podman container, the way .gitlab-ci.yml runs
+# them, without qb.  These targets are NEVER prerequisites of any default target
+# and never run from `make test` or `make check`; the unprivileged SKIP-77
+# default-target contract is untouched.  The live image/test/compare runs need
+# sudo and are operator-run; PRIV_DRY_RUN=1 previews each without sudo.  See
+# docs/architecture/user-mode-podman.md and builders/priv/README.md.
+PRIV_CI = $(CURDIR)/builders/priv/priv-ci.sh
+PRIV_IMAGE ?= repository.mdh.quantum.com/chimera/chimera-dev:develop
+PRIV_DIR ?= $(HOME)/.cache/chimera/podman-priv
+PRIV_LEGS ?= ctest_*_pynfs ctest_*_smbtorture ctest_*_wpts ctest_*_rest ctest_quint_*
+PRIV_MODE ?= release
+PRIV_SUDO ?= sudo
+export PRIV_IMAGE PRIV_DIR PRIV_LEGS PRIV_MODE PRIV_SUDO
+export PRIV_REF PRIV_FRESH PRIV_DRY_RUN PRIV_CLEAN_STORE
+export PRIV_BASE PRIV_HEAD PRIV_EXPECT PRIV_REQUIRE
+
+.PHONY: podman-priv-list podman-priv-image podman-priv-test podman-priv-compare podman-priv-diff podman-priv-clean
+
+podman-priv-list: ## List the legs PRIV_LEGS selects (no sudo; PRIV_DRY_RUN=1 prints each script)
+	@$(PRIV_CI) list
+
+podman-priv-image: ## Pull+load chimera-dev into the scoped root store (sudo; PRIV_DRY_RUN=1 previews)
+	@$(PRIV_CI) image
+
+podman-priv-test: ## Build+run the selected legs in a privileged container (sudo; PRIV_DRY_RUN=1 previews)
+	@$(PRIV_CI) test
+
+podman-priv-compare: ## Compare PRIV_BASE vs PRIV_HEAD, write compare.md (sudo; PRIV_DRY_RUN=1 previews)
+	@$(PRIV_CI) compare
+
+podman-priv-diff: ## Compare two run dirs: make podman-priv-diff A=<dir> B=<dir> (PRIV_DRY_RUN=1 previews)
+	@$(PRIV_CI) diff "$(A)" "$(B)"
+
+podman-priv-clean: ## Remove PRIV_DIR run dirs; PRIV_CLEAN_STORE=1 also store+/run (sudo; PRIV_DRY_RUN=1 previews)
+	@$(PRIV_CI) clean
