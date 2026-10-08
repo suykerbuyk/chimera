@@ -39,9 +39,10 @@ Line references are to `develop` at `560311f4`.
 1. [What it is](#what-it-is)
 2. [How it came to be](#how-it-came-to-be)
 3. [Why it may be better](#why-it-may-be-better-than-what-was-there)
-4. [What it has already found](#what-it-has-already-found)
-5. [Maintaining it](#maintaining-it)
-6. [References](#references)
+4. [Privileged legs (opt-in)](#privileged-legs-opt-in)
+5. [What it has already found](#what-it-has-already-found)
+6. [Maintaining it](#maintaining-it)
+7. [References](#references)
 
 ## What it is
 
@@ -52,6 +53,7 @@ Line references are to `develop` at `560311f4`.
 | Native host (`make test`) | Your uid, no added capabilities, whatever libraries the host has | The everyday edit-build-test loop |
 | User-mode Podman (`make podman-*`) | Your uid mapped into the container, all capabilities dropped, `no-new-privileges`, a seccomp profile derived from Podman's default, no network for build and test | An unprivileged quick-tier run in a known image. With the default `thin` flavor, the image can be recreated from public inputs; the `dev` flavor cannot (see [below](#the-qb-kitchen-sink-image-as-a-local-loop)). |
 | qb CI and the VS Code devcontainers | `privileged: true` on every qb test task (for example `qb.yaml:427`) and in both devcontainers (`.devcontainer/devcontainer.json:35`, `.devcontainer/quantum/devcontainer.json:52`) | The real gate. It runs the extended tier and everything the unprivileged runs skip. |
+| Opt-in privileged Podman (`make podman-priv-*`) | Root in a scoped Podman container via `sudo`, the way `.gitlab-ci.yml` runs the legs, without qb (`builders/priv/priv-ci.sh`). Operator-run; `PRIV_DRY_RUN=1` previews without sudo | Local privileged **evidence** for the legs qb runs, not a gate. See [Privileged legs (opt-in)](#privileged-legs-opt-in). |
 
 The Podman loop is not a local copy of a qb leg, and it differs in three
 ways:
@@ -153,6 +155,14 @@ PODMAN_RUN = $(PODMAN) run --rm --init \
 Never add `--privileged`, capabilities or a relaxed seccomp profile to these
 targets. A test that needs privilege must skip (see the
 [skip contract](#skip-contract)), not demand privilege.
+
+**Amendment (operator decision, 2026-10-04).** The standing rule above is about
+the unprivileged `podman-*` family and still holds for it without exception.
+Privileged local runs are allowed only through a **separate** opt-in target
+family, `podman-priv-*`, which never touches these targets and is never a
+prerequisite of any default target (see
+[Privileged legs (opt-in)](#privileged-legs-opt-in)). It is local evidence, not a
+gate.
 
 ### The seccomp overlay
 
@@ -429,6 +439,7 @@ hard-code `pread`.
 | `fbbf2e1c` | 2026-10-03 | Record the measured scorecard | Skip counts and the corpus difference needed a measured baseline to compare later runs against. |
 | `73ace820` | 2026-10-03 | The seccomp overlay: drop the `io_pgetevents` deny | The pread fallback meant user-mode runs never exercised libevpl's libaio backend. The overlay restores it without allowing anything new. |
 | `560311f4` | 2026-10-03 | The thin pinned image as the default flavor, with the lock gate, `podman-image-bump` and per-flavor build dirs | The dev image could not be rebuilt without Quantum hosts, and nothing in it was pinned. |
+| `b5ccc5d4` | 2026-10-07 | The opt-in `podman-priv-*` family (`builders/priv/`): the scoped-root driver, in-container leg runner, `compare.py` and the section-3 `expect`/`require` files | There was no way to run the privileged CI test legs locally, off the gate, to gather evidence for a change (for example the SMB section-3 symlink confinement) without a full qb pipeline. |
 
 ### Design catches in the thin image
 
@@ -552,7 +563,9 @@ full build.
   the build dir, not an array or block device, and io_uring stays denied.
 - **qb remains the gate.** A change to passthrough, FUSE, KVM, netns-only or
   raised-limit code needs privileged evidence:
-  `.devcontainer/quantum/qb-ci.sh` or the GitLab pipeline.
+  `.devcontainer/quantum/qb-ci.sh` or the GitLab pipeline. The opt-in
+  [`podman-priv-*` route](#privileged-legs-opt-in) can run those legs locally, but
+  it is local privileged evidence, not a CI substitute.
 - **It is not bit-for-bit hermetic.** The inputs are pinned, but layer
   timestamps are not normalised and `SOURCE_DATE_EPOCH` is not set.
   "Recreatable" here means the same inputs, verified, not identical bytes.
@@ -566,6 +579,103 @@ full build.
   `~/.cache/chimera/evidence/thin-reproducible-image-2026-10-03/` and
   `~/.cache/chimera/baselines/podman-libaio-2026-10-03/`, but only on that
   host.
+
+## Privileged legs (opt-in)
+
+The unprivileged loop above cannot prove the privileged paths (see
+[Limits](#limits-what-a-green-run-does-not-prove)). The `podman-priv-*` family
+(`builders/priv/priv-ci.sh`, `make podman-priv-image|test|compare|diff|clean|list`)
+runs those legs locally, as root in a scoped Podman container, the way
+`.gitlab-ci.yml` runs them, **without qb**. It is opt-in local evidence, not a CI
+substitute. The legs and their commands come from the two existing sources of
+truth — `.devcontainer/quantum/qb-ci.sh` chooses the legs, `qb.yaml` supplies each
+leg's commands — so no new leg list is introduced. The operator runbook with the
+exact prepared commands is [`builders/priv/README.md`](../../builders/priv/README.md).
+
+**Sudo surface.** Every privileged Podman call goes through one scoped wrapper and
+no other `sudo` is assembled:
+
+```
+sudo env TMPDIR=$PRIV_DIR/tmp podman \
+  --root $PRIV_DIR/storage \
+  --runroot /run/chimera-priv-$USER/storage \
+  --tmpdir /run/chimera-priv-$USER/libpod \
+  --volumepath $PRIV_DIR/storage/volumes <args>
+```
+
+The only other `sudo` lines are the recovery `sysctl -w fs.aio-max-nr=<before>`
+and `chown -R <uid>:<gid> …`, and, on `clean PRIV_CLEAN_STORE=1`,
+`rm -rf $PRIV_DIR/storage` and `rm -rf /run/chimera-priv-$USER/{storage,libpod}`.
+`PRIV_DRY_RUN=1` prints all of them and runs none.
+
+**Fully scoped store.** `--root` (layers and the libpod DB, on `/home`),
+`--runroot` and `--tmpdir` (locks and libpod's `alive` lock, on the `/run`
+tmpfs), `--volumepath` and `TMPDIR` keep everything off `/var/lib/containers`
+except containers/image's small blob-info cache under `/var/lib/containers/cache`
+on `load`. `df /` moves by less than 100 MB. No `storage.conf` or
+`containers.conf` is written.
+
+**Disk budget.** All on `/home`. `image` refuses below 25 GiB free, `test` below
+10 GiB. Peak for a two-sided release compare is about 22 GB; a KVM leg adds
+~3.4 GB.
+
+**Host state restored.** `fs.aio-max-nr` is read unprivileged before a run and
+restored after (`aio-max-nr: restored <after> -> <before>`); the recovery lines
+name the value even if the in-container cleanup is bypassed. Kernel modules
+autoload as the legs need them. Only the KVM leg uses a bridge network (a host
+`podman0` interface and netavark rules for the run); every other leg uses
+`--network=none`.
+
+**Image identity and pinning.** `image` pulls `PRIV_IMAGE` rootless, stages it
+with `save`/`load` into the scoped store, asserts the config `.Id` matches across
+stores (not the manifest `.Digest`, which `save`/`load` changes), and writes
+`image.lock` (ref, RepoDigests, `.Id`, time). Runs pin by `.Id` and record it in
+`meta.txt`. The `:develop` tag is the last develop push and `:ci-chimera-<IID>` is
+one pipeline; neither names a source commit, so a `builders/dev` drift warning is
+expected for commits behind the image and is recorded with the run.
+
+**`expect` / `require` and exit codes.** `compare` (and `diff`) classify every
+testcase's transition from the base side to the head side and gate on two
+pre-registered files (`builders/priv/section3/expect.txt`,
+`require.txt`; `tools/privci/compare.py`):
+
+- `expect` lines are `<FROM>-><TO>  <name-regex>  [file=<glob>]  # reason`; an
+  entry is *satisfied* only if every case it matches shows exactly `FROM` on base
+  and `TO` on head, *stale* if it matches nothing, *mismatch* otherwise.
+- `require` lines are one regex each; each must match at least one case on **each**
+  side.
+- Exit **0** clean; **1** an unexpected new failure (a `Passed->Failed` not
+  covered by a satisfied `expect` entry), a required pattern missing, or the image
+  `.Id`s differ; **2** operator review required (an `expect` mismatch or stale,
+  with no exit-1 condition).
+
+**Known limitation — `require` guards presence, not non-skip.** A `require`
+pattern is satisfied by any matched case on each side, *including a Skipped one*.
+So a required case that regresses `Passed->Skipped` still satisfies `require`
+(present on both sides) and, with no exit condition of its own, exits 0; the
+regression is reported in the Passed↔Skipped section. To gate a specific case
+against silent skipping, list it in `expect.txt` as `Passed->Passed`, where an
+observed `Passed->Skipped` becomes an exit-2 mismatch.
+
+### What it does not reproduce
+
+Even green, this route is still not the gate:
+
+- **ceph S3.** The `/opt/s3-tests/.venv` is absent from `chimera-dev`, so neither
+  this route nor CI closes the S3 criterion here; that needs the
+  `.devcontainer/Dockerfile` image at both shas (follow-on).
+- **The shared build dir.** Legs share one build tree by default (`PRIV_FRESH=1`
+  to force a clean build); qb gives each leg a fresh pod.
+- **Sequential legs.** The legs run one after another in a single container; qb
+  runs them sharded across pods.
+- **Pod resource differences.** `--pids-limit=0` and the container's resources are
+  not qb's pod limits.
+- **The executor-shell assumption.** Each leg runs under `bash -e -o pipefail`;
+  whether qb uses exactly that shell is not visible in the repo and is recorded in
+  `meta.txt` as a deviation.
+- **Image currency.** The image tracks `develop`, not a source commit. Runs pin by
+  `.Id` and record the `builders/dev` drift warning; the operator weighs image
+  currency against the result.
 
 ## What it has already found
 
@@ -824,6 +934,11 @@ as `~/.cache/chimera/podman-build`. Remove those by hand.
 | `builders/dev/Dockerfile` | qb's `chimera-dev` image (the `dev` flavor) |
 | `builders/dev/seccomp-libaio.py` | Seccomp overlay generator |
 | `builders/dev/README.md` | Podman runbook: privilege model, skips |
+| `builders/priv/priv-ci.sh` | Host-side driver for the opt-in privileged route |
+| `builders/priv/run-legs.sh` | In-container root runner for the selected legs |
+| `builders/priv/README.md` | Privileged-route operator runbook (P4/P5/P6 commands, recovery) |
+| `tools/privci/compare.py` | Classifies base→head transitions and gates on `expect`/`require` |
+| `builders/priv/section3/{expect,require}.txt` | Pre-registered section-3 transitions and presence checks |
 | `CMakeLists.txt:596-672` | libaio probe and diskfs device type |
 | `CMakeLists.txt:766-841` | netns and raised-limits gates |
 | `src/vfs/linux/linux_common.h:388` | `open_by_handle_at` probe |

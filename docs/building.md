@@ -124,6 +124,12 @@ instead, and building that one needs the internal registry. See
 design, the skip list, how the loop differs from the CI legs, and how to
 maintain it.
 
+To run the privileged CI test legs locally (off the gate, as root in a scoped
+Podman container, for evidence rather than as a CI substitute), there is a
+separate opt-in route: `make podman-priv-*`, documented in
+[`builders/priv/README.md`](../builders/priv/README.md) and
+[Privileged legs (opt-in)](architecture/user-mode-podman.md#privileged-legs-opt-in).
+
 ### Other targets
 
 ```bash

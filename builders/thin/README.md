@@ -43,6 +43,11 @@ before the split, such as `~/.cache/chimera/podman-build` or
 `podman-build` and `podman-test` check for `clang` in `PODMAN_IMAGE` and stop
 with a pointer to `PODMAN_FLAVOR=dev` when it is missing.
 
+The thin image cannot run the privileged CI test legs: the opt-in
+`podman-priv-*` route (`builders/priv/README.md`) needs the `chimera-dev` image,
+which carries smbtorture, the WPTS/pynfs harnesses and the other extended-tier
+dependencies the thin image omits.
+
 ## Pins
 
 All three pins are `ARG` lines at the top of the Dockerfile.

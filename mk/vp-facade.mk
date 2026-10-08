@@ -58,7 +58,9 @@ PODMAN_SECCOMP = $(PODMAN_BUILD_DIR)/seccomp.json
 # Unprivileged on purpose: host uid, no capabilities, and the default seccomp
 # profile minus its io_pgetevents deny (builders/dev/seccomp-libaio.py) so the
 # diskfs tests can keep libaio.  io_uring stays denied.  Tests that need
-# privilege SKIP (exit 77); privileged runs belong to qb and the devcontainer.
+# privilege SKIP (exit 77); privileged runs belong to qb and the devcontainer,
+# or, as opt-in local evidence, to the `podman-priv-*` family below
+# (builders/priv/priv-ci.sh).  Never add privilege to these unprivileged targets.
 PODMAN_RUN = $(PODMAN) run --rm --init \
 	--userns=keep-id --user $(shell id -u):$(shell id -g) \
 	--cap-drop=ALL --security-opt no-new-privileges \
