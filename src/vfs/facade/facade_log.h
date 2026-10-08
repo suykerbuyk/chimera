@@ -42,6 +42,27 @@ enum facade_lr_type {
     FACADE_LR_FREE   = 2, /* a run of blocks was freed (returned to free) */
     FACADE_LR_OBJ    = 3, /* an object record: full facade_obj_rec + extents */
     FACADE_LR_COMMIT = 4, /* closes a transaction */
+    FACADE_LR_NS     = 5, /* a namespace record put/delete (namespace-record-store) */
+};
+
+/* FACADE_LR_NS op: a put installs key->value at revision; a delete removes key
+ * (val_len 0).  One NS record is one 4 KiB log block (the key/value caps in
+ * facade_ns.h keep header + key + value within the block). */
+enum facade_lr_ns_op {
+    FACADE_LR_NS_PUT    = 1,
+    FACADE_LR_NS_DELETE = 2,
+};
+
+/* FACADE_LR_NS payload: this header, then key_len key bytes, then val_len value
+ * bytes (val_len 0 for a delete).  The checkpoint stores the same key/value
+ * after struct facade_ns_ckpt_rec, so a record is identical in log and
+ * checkpoint. */
+struct facade_lr_ns {
+    uint64_t revision;
+    uint32_t key_len;
+    uint32_t val_len;
+    uint32_t op;       /* enum facade_lr_ns_op */
+    uint32_t reserved; /* must be zero */
 };
 
 /* One log-record header.  Followed by `len` payload bytes, the whole padded to

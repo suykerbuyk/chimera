@@ -22,8 +22,13 @@
 #include "common/macros.h"
 #include "facade_internal.h"   /* struct facade_alloc, facade_obj_*, facade_media_read */
 #include "facade_log.h"
+#include "facade_ns.h"         /* the full 6.2 namespace surface */
 #include "facade_object.h"     /* the full 6.1 object surface */
 #include "facade_sc_backend.h"
+
+/* Single-node watch registry (D10): NS_WATCH prefixes; events fire after an
+ * NS_TXN's COMMIT is durable.  Multi-node delivery is E8's. */
+#define FSB_MAX_WATCH 16
 
 /* Map a facade status to the contract error the op returns. */
 static uint32_t
@@ -65,6 +70,16 @@ struct fsb_state {
     void                                        *now_arg;
     int                                          down;       /* crashed; recover() pending */
     const struct chimera_sc_upcalls             *upcalls;
+    void                                        *up_private;
+
+    /* namespace-record-store: scan cursor table (H1) + watch registry. */
+    struct facade_ns_cursor_table                cursors;
+    struct {
+        uint64_t id;        /* 0 = empty */
+        uint8_t *prefix;
+        uint32_t plen;
+    }                                            watches[FSB_MAX_WATCH];
+    uint64_t                                     next_watch_id;
 };
 
 /* Default lease clock: the host CLOCK_MONOTONIC, used when the bind injects no
@@ -121,10 +136,11 @@ fsb_attach_finish(
     a->r_lease_ns         = FSB_LEASE_NS;
     a->r_durability_epoch = facade_alloc_power_loss_generation(s->alloc);
     memset(&a->r_limits, 0, sizeof(a->r_limits));
-    a->r_limits.max_txn_ops   = 8;
-    a->r_limits.max_key_len   = 64;
-    a->r_limits.max_value_len = 256;
+    a->r_limits.max_txn_ops   = FACADE_NS_MAX_TXN_LOG_BLOCKS - 1u; /* records + COMMIT */
+    a->r_limits.max_key_len   = FACADE_NS_MAX_KEY;
+    a->r_limits.max_value_len = FACADE_NS_MAX_VALUE;
     a->r_limits.max_io        = CHIMERA_MEDIA_BLOCK_SIZE;
+    a->r_limits.max_watch     = FSB_MAX_WATCH;
     a->r_limits.lease_ns      = FSB_LEASE_NS;
     req->status               = CHIMERA_SC_OK;
     req->complete(req);
@@ -355,45 +371,178 @@ fsb_obj_create(
     req->complete(req);
 } /* fsb_obj_create */
 
-/* ---- NS_TXN (single HOLD delta, the obligation's shape) ---- */
+/* ---- NS_WATCH event delivery (single node) ---- */
+
+/* Fire watch_event for every registered watch whose prefix matches a committed
+ * put/delete key.  The rec is built on the stack over the request's own key/value
+ * bytes (valid through the upcall, S11). */
+static void
+fsb_ns_fire_watches(
+    struct fsb_state                    *s,
+    const struct chimera_sc_ns_txn_args *t)
+{
+    uint32_t w, i;
+
+    if (!s->upcalls || !s->upcalls->watch_event) {
+        return;
+    }
+    for (w = 0; w < FSB_MAX_WATCH; w++) {
+        if (s->watches[w].id == 0) {
+            continue;
+        }
+        for (i = 0; i < t->nputs; i++) {
+            const struct chimera_sc_bytes *k = &t->puts[i].key;
+
+            if (k->len >= s->watches[w].plen &&
+                memcmp(k->data, s->watches[w].prefix, s->watches[w].plen) == 0) {
+                struct chimera_sc_record rec = { t->puts[i].key, t->puts[i].value, 0 };
+
+                s->upcalls->watch_event(s->watches[w].id, &rec, 0, 0, s->up_private);
+            }
+        }
+        for (i = 0; i < t->ndeletes; i++) {
+            const struct chimera_sc_bytes *k = &t->deletes[i];
+
+            if (k->len >= s->watches[w].plen &&
+                memcmp(k->data, s->watches[w].prefix, s->watches[w].plen) == 0) {
+                struct chimera_sc_bytes  empty = { NULL, 0, 0 };
+                struct chimera_sc_record rec   = { t->deletes[i], empty, 0 };
+
+                s->upcalls->watch_event(s->watches[w].id, &rec, 1, 0, s->up_private);
+            }
+        }
+    }
+} /* fsb_ns_fire_watches */
+
+/* ---- NS_TXN (full compare-and-set + deltas, durable, atomic) ---- */
+
+struct fsb_ns_txn_op {
+    struct fsb_state          *s;
+    struct chimera_sc_request *req;
+};
+
+static void
+fsb_ns_txn_done(
+    const struct facade_ns_txn_result *res,
+    void                              *priv)
+{
+    struct fsb_ns_txn_op          *op  = priv;
+    struct fsb_state              *s   = op->s;
+    struct chimera_sc_request     *req = op->req;
+    struct chimera_sc_ns_txn_args *txn = &req->ns_txn;
+
+    txn->r_revision     = res->r_revision;
+    txn->r_failed_part  = res->r_failed_part;
+    txn->r_failed_index = res->r_failed_index;
+    req->status         = res->status;
+    if (res->status == CHIMERA_SC_OK) {
+        fsb_ns_fire_watches(s, txn);
+    }
+    free(op);
+    req->complete(req);
+} /* fsb_ns_txn_done */
 
 static void
 fsb_ns_txn(
     struct fsb_state          *s,
     struct chimera_sc_request *req)
 {
-    struct chimera_sc_ns_txn_args *txn = &req->ns_txn;
-    const struct chimera_sc_delta *d;
-    struct facade_obj             *o;
+    struct fsb_ns_txn_op *op = calloc(1, sizeof(*op));
 
-    /* This slice implements only a single HOLD delta; the full NS_TXN surface
-     * (records, compares, other deltas, multi-record atomicity) is
-     * namespace-record-store's. */
-    if (txn->ncompares != 0 || txn->nputs != 0 || txn->ndeletes != 0 ||
-        txn->ndeltas != 1) {
-        req->status = CHIMERA_SC_E_NOT_SUPPORTED;
-        req->complete(req);
-        return;
-    }
-    d = &txn->deltas[0];
-    if (d->kind != CHIMERA_SC_DELTA_HOLD) {
-        req->status = CHIMERA_SC_E_NOT_SUPPORTED;
-        req->complete(req);
-        return;
-    }
-    o = facade_obj_find(s->alloc, d->hold.obj.b);
-    if (!o || (o->flags & FACADE_OBJ_HELD)) {
-        txn->r_failed_part  = CHIMERA_SC_TXN_DELTA;
-        txn->r_failed_index = 0;
-        req->status         = CHIMERA_SC_E_STATE;   /* HOLD needs an unheld object */
-        req->complete(req);
-        return;
-    }
-    o->flags       |= FACADE_OBJ_HELD;
-    txn->r_revision = 0;
-    req->status     = CHIMERA_SC_OK;
-    req->complete(req);
+    FACADE_CHECK(op != NULL, "oom ns txn op");
+    op->s   = s;
+    op->req = req;
+    facade_ns_txn(s->alloc, &req->ns_txn, fsb_ns_txn_done, op);
 } /* fsb_ns_txn */
+
+/* ---- NS_GET ---- */
+
+static void
+fsb_ns_get(
+    struct fsb_state          *s,
+    struct chimera_sc_request *req)
+{
+    struct chimera_sc_ns_get_args *g = &req->ns_get;
+    const uint8_t                 *val;
+    uint32_t                       vlen;
+    uint64_t                       rev;
+
+    req->status = facade_ns_get(s->alloc, g->key.data, g->key.len, &val, &vlen, &rev);
+    if (req->status == CHIMERA_SC_OK) {
+        g->r_value.data     = val;    /* into the live record; valid through complete() (S11) */
+        g->r_value.len      = vlen;
+        g->r_value.reserved = 0;
+        g->r_revision       = rev;
+    }
+    req->complete(req);
+} /* fsb_ns_get */
+
+/* ---- NS_SCAN ---- */
+
+static void
+fsb_ns_scan(
+    struct fsb_state          *s,
+    struct chimera_sc_request *req)
+{
+    struct chimera_sc_ns_scan_args *sc = &req->ns_scan;
+
+    req->status = facade_ns_scan(s->alloc, &s->cursors, sc->prefix.data, sc->prefix.len,
+                                 sc->cursor.b, sc->recs, sc->recs_cap, &sc->r_nrecs,
+                                 sc->r_next_cursor.b, &sc->r_eof);
+    req->complete(req);
+} /* fsb_ns_scan */
+
+/* ---- NS_WATCH / NS_UNWATCH (single node) ---- */
+
+static void
+fsb_ns_watch(
+    struct fsb_state          *s,
+    struct chimera_sc_request *req)
+{
+    struct chimera_sc_ns_watch_args *w = &req->ns_watch;
+    uint32_t                         i;
+
+    for (i = 0; i < FSB_MAX_WATCH; i++) {
+        if (s->watches[i].id == 0) {
+            s->watches[i].prefix = w->prefix.len ? malloc(w->prefix.len) : NULL;
+            FACADE_CHECK(w->prefix.len == 0 || s->watches[i].prefix != NULL,
+                         "oom watch prefix");
+            if (w->prefix.len) {
+                memcpy(s->watches[i].prefix, w->prefix.data, w->prefix.len);
+            }
+            s->watches[i].plen = w->prefix.len;
+            s->watches[i].id   = ++s->next_watch_id;
+            w->r_watch_id      = s->watches[i].id;
+            req->status        = CHIMERA_SC_OK;
+            req->complete(req);
+            return;
+        }
+    }
+    req->status = CHIMERA_SC_E_NO_SPACE;   /* watch table full (max_watch) */
+    req->complete(req);
+} /* fsb_ns_watch */
+
+static void
+fsb_ns_unwatch(
+    struct fsb_state          *s,
+    struct chimera_sc_request *req)
+{
+    uint64_t id = req->ns_unwatch.watch_id;
+    uint32_t i;
+
+    req->status = CHIMERA_SC_E_NOT_FOUND;
+    for (i = 0; i < FSB_MAX_WATCH; i++) {
+        if (s->watches[i].id == id && id != 0) {
+            free(s->watches[i].prefix);
+            s->watches[i].prefix = NULL;
+            s->watches[i].id     = 0;
+            s->watches[i].plen   = 0;
+            req->status          = CHIMERA_SC_OK;
+            break;
+        }
+    }
+    req->complete(req);
+} /* fsb_ns_unwatch */
 
 /* ---- OBJ_WRITE (DURABLE) ---- */
 
@@ -800,6 +949,18 @@ fsb_dispatch(
         case CHIMERA_SC_OP_NS_TXN:
             fsb_ns_txn(s, req);
             break;
+        case CHIMERA_SC_OP_NS_GET:
+            fsb_ns_get(s, req);
+            break;
+        case CHIMERA_SC_OP_NS_SCAN:
+            fsb_ns_scan(s, req);
+            break;
+        case CHIMERA_SC_OP_NS_WATCH:
+            fsb_ns_watch(s, req);
+            break;
+        case CHIMERA_SC_OP_NS_UNWATCH:
+            fsb_ns_unwatch(s, req);
+            break;
         case CHIMERA_SC_OP_OBJ_WRITE:
             fsb_obj_write(s, req);
             break;
@@ -861,6 +1022,7 @@ fsb_init(
     s->next_epoch = 100;
     s->now_ns     = bind->now_ns ? bind->now_ns : fsb_real_now_ns;
     s->now_arg    = bind->now_arg;
+    facade_ns_cursor_table_init(&s->cursors);
     return s;
 } /* fsb_init */
 
@@ -868,10 +1030,15 @@ static void
 fsb_destroy(void *private_data)
 {
     struct fsb_state *s = private_data;
+    uint32_t          i;
 
     if (s->alloc) {
         facade_alloc_abandon(s->alloc);
         s->alloc = NULL;
+    }
+    facade_ns_cursor_table_destroy(&s->cursors);
+    for (i = 0; i < FSB_MAX_WATCH; i++) {
+        free(s->watches[i].prefix);
     }
     free(s);
 } /* fsb_destroy */
@@ -901,8 +1068,8 @@ fsb_set_upcalls(
 {
     struct fsb_state *s = private_data;
 
-    (void) up_private;
-    s->upcalls = upcalls;
+    s->upcalls    = upcalls;
+    s->up_private = up_private;
 } /* fsb_set_upcalls */
 
 static const struct chimera_sc_backend fsb_backend = {
