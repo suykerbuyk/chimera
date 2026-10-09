@@ -2329,12 +2329,13 @@ SYMBOL_EXPORT struct chimera_vfs_module vfs_snfs = {
     .sdk_version  = CHIMERA_VFS_SDK_VERSION,
     .name         = "snfs",
     .fh_magic     = CHIMERA_VFS_FH_MAGIC_SNFS,
-    .capabilities = CHIMERA_VFS_CAP_BLOCKING | CHIMERA_VFS_CAP_OPEN_PATH_REQUIRED |
+    .capabilities = CHIMERA_VFS_CAP_OPEN_PATH_REQUIRED |
         CHIMERA_VFS_CAP_FS | CHIMERA_VFS_CAP_FS_RELATIVE_OP | CHIMERA_VFS_CAP_FS_PATH_OP |
         CHIMERA_VFS_CAP_CLAIM_RANGE |
         CHIMERA_VFS_CAP_COPY_RANGE | CHIMERA_VFS_CAP_CLONE_RANGE |
         CHIMERA_VFS_CAP_SPARSE
     ,
+    .blocking_ops   = CHIMERA_VFS_BLOCKING_ALL,
     .init           = snfs_init,
     .destroy        = snfs_destroy,
     .thread_init    = snfs_thread_init,
