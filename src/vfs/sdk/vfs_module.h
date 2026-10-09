@@ -28,7 +28,7 @@ struct chimera_vfs_request;
  * chimera_vfs_register() refuses a module built against a different
  * version, so a stale out-of-tree binary fails loudly at load time
  * instead of corrupting memory. */
-#define CHIMERA_VFS_SDK_VERSION            3
+#define CHIMERA_VFS_SDK_VERSION            4
 
 /* If set, module requires open handles for path operations
  * such as mkdir, remove, open_at, etc.  Equivalent to POSIX open
@@ -81,16 +81,25 @@ chimera_vfs_open_handle_retained(
 /* (1U << 1) was CHIMERA_VFS_CAP_OPEN_FILE_REQUIRED.  A data open is now always
  * a real open: see the note on CHIMERA_VFS_CAP_OPEN_PATH_REQUIRED. */
 
-/* If set, dispatch function is synchronous/blocking
- * and chimera will delegate VFS requests to a separate
- * threadpool.  This is useful for modules that perform
- * blocking operations such as I/O.
+/* (1U << 2) was CHIMERA_VFS_CAP_BLOCKING.  Which ops block is now
+ * chimera_vfs_module.blocking_ops; CHIMERA_VFS_BLOCKING_ALL is the old
+ * meaning. */
+
+/* Building blocks for chimera_vfs_module.blocking_ops: one bit per
+ * CHIMERA_VFS_OP_* opcode.  A module builds its mask either up from
+ * nothing, OR-ing in the ops that block:
  *
- * If not set, VFS requests will be dispatched from the
- * main threadpool and the dispatch function is expected
- * to return quickly.
+ *     CHIMERA_VFS_OP_BIT(CHIMERA_VFS_OP_READ) |
+ *     CHIMERA_VFS_OP_BIT(CHIMERA_VFS_OP_WRITE)
+ *
+ * or down from CHIMERA_VFS_BLOCKING_ALL, removing the ops that do not:
+ *
+ *     CHIMERA_VFS_BLOCKING_ALL & ~CHIMERA_VFS_OP_BIT(CHIMERA_VFS_OP_GETATTR)
  */
-#define CHIMERA_VFS_CAP_BLOCKING            (1U << 2)
+#define CHIMERA_VFS_OP_BIT(op) (1ULL << (op))
+
+/* Every op, including any opcode added after the module was written. */
+#define CHIMERA_VFS_BLOCKING_ALL            (~0ULL)
 
 /* If set, module supports chimera_vfs_create_unlinked()
  * Used primarily for S3 PUT.
@@ -415,11 +424,28 @@ struct chimera_vfs_module {
     uint64_t    capabilities;
 
     /* Optional
+     * Bitwise OR of CHIMERA_VFS_OP_BIT(CHIMERA_VFS_OP_*): the ops whose
+     * dispatch blocks and so must run on a sync delegation thread.  Ops not
+     * listed are dispatched from the main threadpool (or the async
+     * delegation pool) and must return quickly.  A module whose dispatch
+     * blocks for everything sets CHIMERA_VFS_BLOCKING_ALL.  See dispatch
+     * below.
+     *
+     * Listing only some ops gives up per-file serialization: when every op
+     * is delegated, all requests on one file run on the same delegation
+     * thread (FH-hash affinity), but an op dispatched inline can now run
+     * concurrently with a delegated op on the same file, and the module
+     * must tolerate that.  An opcode added to the SDK later is not
+     * blocking unless the module lists it.
+     */
+    uint64_t blocking_ops;
+
+    /* Optional
      * Called once at initialization to setup global state
      * Return a pointer to global state structure
      * Receives module-specific configuration JSON data as an argument.
      */
-    void      * (*init)(
+    void   * (*init)(
         const char                *cfgdata,
         struct prometheus_metrics *metrics);
 
@@ -427,7 +453,7 @@ struct chimera_vfs_module {
      * Called once at destruction to clean up global state
      * returned from the init function
      */
-    void        (*destroy)(
+    void     (*destroy)(
         void *);
 
     /* Optional
@@ -435,7 +461,7 @@ struct chimera_vfs_module {
      * Receives global state pointer as an argument
      * Return a pointer to per-thread state structure
      */
-    void      * (*thread_init)(
+    void   * (*thread_init)(
         struct evpl *evpl,
         void        *private_data);
 
@@ -443,7 +469,7 @@ struct chimera_vfs_module {
      * Called once per thread at destruction to clean up per-thread state
      * Receives per-thread state pointer as an argument
      */
-    void        (*thread_destroy)(
+    void     (*thread_destroy)(
         void *);
 
     /* Required
@@ -453,16 +479,17 @@ struct chimera_vfs_module {
      * Module shuold call request->complete(request) when the
      * request processing is completed.
      *
-     * If dispatch logic is blocking, set the blocking flag to 1 above.
+     * If dispatch logic is blocking for an op, list that op in
+     * blocking_ops above.
      *
-     * If blocking flag is unset, requests will be dispatched from
+     * For an op not in blocking_ops, the request will be dispatched from
      * chimera's main threadpool, ie the same threadpool that is
      * pumping network traffic.  In this case the dispatch function is
      * expected to quickly complete and then asynchronously make the
      * complete callback later after any underlying slow operations
      * such as I/O have been asynchronously completed.
      *
-     * If blocking flag is set, requests will be dispatched from a
+     * For an op in blocking_ops, the request will be dispatched from a
      * separate dedicated pool of threads which will expect to process
      * only one request at a time.  The thread handoff adds overhead,
      * but nonetheless this scheme avoids stalling the main network
