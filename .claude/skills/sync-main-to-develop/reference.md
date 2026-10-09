@@ -185,7 +185,7 @@ only the *quick* tier (the quint model-based tests); everything else is
 
 The qb ctest legs report only the test names without `-v`; the failure
 detail appears in the run's final error block, or in a re-run of the one
-leg with `-v` (`qb -o arenaud-claude-sa --plain -a amd64 -v chimera-dev
+leg with `-v` (`qb -o "$USER-sync-sa" --plain -a amd64 -v chimera-dev
 ctest_release`, ~40 min, separate tag so it does not collide with the
 check run).  Then decide whose bug it is:
 
@@ -253,7 +253,7 @@ packed its copy; the `tee` log itself is untracked and harmless.
 
 It does not run the Rocky9 build legs: the pipeline builds Rocky9 in its
 package jobs, outside the leg table.  Rocky9 is the only place snfs
-compiles, so always add `qb -o arenaud-claude --plain rocky9`.  The two
+compiles, so always add `qb -o "$USER-sync" --plain rocky9`.  The two
 runs use different output tags and do not collide.
 
 ### The builder image is not rebuilt by a bare single-leg qb
@@ -265,12 +265,12 @@ built from the sync branch. A sync usually touches `builders/dev/Dockerfile`
 (see quint above), so name the image task too:
 
 ```bash
-qb -o arenaud-claude --plain -a amd64 \
+qb -o "$USER-sync" --plain -a amd64 \
    -V CTEST_FILTER="-L pynfs" chimera-dev ctest_debug
 ```
 
 The `check` alias lists `chimera-dev` first, so a full
-`qb -o arenaud-claude --plain check` already rebuilds it.
+`qb -o "$USER-sync" --plain check` already rebuilds it.
 
 **Keep the tree clean for the whole run, not just the launch.** qb packs
 each task's context when that task *starts*, and the ctest, syntax and
@@ -325,7 +325,7 @@ distinguish READ_ONLY|WRITE_ONLY yet) and the ATTR_FH echo in getattr
 
 ## Merge commit message
 
-Compose in a file, then `git commit -F`. Include:
+Compose in a file, then `git commit -s -F <file>`. Include:
 
 - Subject `CHIM-<n>: merge origin/main into develop (sync-code-<date>)`
 - Upstream sha + new tag, previous tag + its sha
@@ -333,7 +333,8 @@ Compose in a file, then `git commit -F`. Include:
   (`sync-report.sh commits <from> <to>` emits the raw list)
 - Submodule moves, old → new
 - What was resolved and why, for any non-obvious resolution
-- `Signed-off-by: Alain Renaud <alain.renaud@quantum.com>`
+- The `Signed-off-by` trailer, written by `-s` from the committer
+  identity (`git var GIT_COMMITTER_IDENT`), never typed into the file
 
 ## Creating the sync ticket
 
@@ -354,7 +355,7 @@ Only create it after the user said yes to the step-0 question.  One
 | `issueTypeName` | `Story` |
 | `summary` | `code drop <YYYY-MM-DD>` (today's date) |
 | `description` | one line for now: "Sync origin/main into develop (tag sync-code-<YYYYMMDD>)"; step 10 replaces it with the MR body |
-| `assignee_account_id` | `557058:e1be4d17-4541-4eb7-9dee-9f3a3f35572f` (Alain Renaud) |
+| `assignee_account_id` | `<jira-account-id>`: the `account_id` that `atlassianUserInfo` returns for the session's user (SKILL.md, "Who is running the sync") |
 | `additional_fields.parent` | `{"key": "NG-684"}` |
 | `additional_fields.customfield_14100` | `"890ae327-8765-40ac-ba14-69fb7869cbd6"` (Team = Titans; bare id string) |
 | `additional_fields.customfield_10661` | numeric id of the active Titans sprint (see below) |
@@ -379,14 +380,18 @@ After the cluster runs are green.  `glab` is installed and authenticated
 against gitlab.mdh.quantum.com:
 
 ```bash
+GL_USER=$(glab api user | jq -r .username)   # <gitlab-user>
 glab mr create --repo chimera/chimera --source-branch <branch> \
     --target-branch develop --title "<merge commit subject>" \
-    --label "Sync origin/main" --assignee arenaud --reviewer arenaud \
+    --label "Sync origin/main" --assignee "$GL_USER" --reviewer <reviewer> \
     --description-file mr-body.md --yes
 ```
 
-`--assignee` and `--reviewer` take GitLab usernames (`arenaud`), not
-`@me`; `--yes` skips the confirmation prompt, which has no terminal here.
+`--assignee` and `--reviewer` take GitLab usernames, not `@me`, hence
+the `glab api user` lookup (its `--jq` flag does not work on glab 1.120;
+pipe to `jq`).  `<reviewer>` is the username the user named when asked
+(SKILL.md, "Who is running the sync"); `--yes` skips the confirmation
+prompt, which has no terminal here.
 
 Compose `mr-body.md` in the scratchpad and keep it: the sync ticket's
 description is built from it.  Its shape (MR !114 is the model):
@@ -464,4 +469,4 @@ GET endpoints) gets a comment saying what arrived, no link to Done.
 - Upstream-bound changes never carry a Jira key.
 - `qtm_build/` and `qb.yaml` are Quantum-only and get their own commit,
   never mixed with code that could go upstream.
-- Every commit gets the `Signed-off-by` trailer.
+- Every commit gets the `Signed-off-by` trailer, via `git commit -s`.
