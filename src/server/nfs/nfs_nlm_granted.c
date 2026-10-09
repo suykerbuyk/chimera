@@ -368,12 +368,6 @@ nlm_grant_job_start(
     }
     job->req     = *req;
     job->granter = ctx->granter;
-    /* Guarded to match the DL_DELETE in nlm_grant_job_finish: keeping both
-     * utlist ops out of the analyzer's view avoids a false-positive
-     * use-after-free where it models a finished (freed) job still on the list. */
-#ifndef __clang_analyzer__
-    DL_APPEND(ctx->active, job);
-#endif /* ifndef __clang_analyzer__ */
 
     /* Resolve the client's NLM (prog 100021 v4) callback port via its
      * portmapper, exactly as the NSM reboot-notify path resolves statd. */
@@ -383,12 +377,24 @@ nlm_grant_job_start(
                                             chimera_tcp_flavor_to_protocol(nfs_callback_tcp_flavor()),
                                             job->pm_ep, NULL, 0, NULL);
     if (!job->pm_conn) {
+        /* Nothing holds this job yet: no list, no conn, no timer.  Free it
+         * here rather than through nlm_grant_job_finish, whose deferred
+         * release exists for the disconnect callbacks a connected job
+         * still has to wait for. */
         chimera_nfs_info("NLM GRANTED: cannot reach portmap at %s for host '%s'",
                          job->req.client_addr, job->req.caller_name);
-        nlm_grant_job_finish(job);
+        evpl_endpoint_close(job->pm_ep);
+        free(job);
         return;
     }
     evpl_rpc2_conn_set_private_data(job->pm_conn, job);
+
+    /* Guarded to match the DL_DELETE in nlm_grant_job_release: keeping both
+     * utlist ops out of the analyzer's view avoids a false-positive
+     * use-after-free where it models a finished (freed) job still on the list. */
+#ifndef __clang_analyzer__
+    DL_APPEND(ctx->active, job);
+#endif /* ifndef __clang_analyzer__ */
 
     mapping.prog = NLM_PROGRAM;
     mapping.vers = NLM_VERSION;
