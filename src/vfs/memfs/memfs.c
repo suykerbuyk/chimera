@@ -1672,12 +1672,14 @@ memfs_map_attrs(
          * an over-allocated file's AllocationSize reflects the reserved space. */
         attr->va_space_used = inode->space_used > inode->alloc_size ?
             inode->space_used : inode->alloc_size;
-        attr->va_atime = inode->atime;
-        attr->va_mtime = inode->mtime;
-        attr->va_ctime = inode->ctime;
-        attr->va_ino   = inode->inum;
-        attr->va_dev   = (42ULL << 32) | 42;
-        attr->va_rdev  = inode->rdev;
+        attr->va_alloc_size = inode->alloc_size;
+        attr->va_set_mask  |= CHIMERA_VFS_ATTR_ALLOC_SIZE;
+        attr->va_atime      = inode->atime;
+        attr->va_mtime      = inode->mtime;
+        attr->va_ctime      = inode->ctime;
+        attr->va_ino        = inode->inum;
+        attr->va_dev        = (42ULL << 32) | 42;
+        attr->va_rdev       = inode->rdev;
 
         /* memfs persists DOS attributes, so report them alongside stat. */
         attr->va_set_mask      |= CHIMERA_VFS_ATTR_DOS_ATTRIBUTES;
@@ -1812,6 +1814,12 @@ memfs_map_attrs_fork(
         return;
     }
 
+    /* A named stream is a data fork whatever its base object is -- a
+     * directory's stream is read and written like a file's. */
+    if (attr->va_set_mask & CHIMERA_VFS_ATTR_MODE) {
+        attr->va_mode = S_IFREG | (attr->va_mode & 07777);
+    }
+
     if (attr->va_set_mask & CHIMERA_VFS_ATTR_SIZE) {
         attr->va_size       = stream->size;
         attr->va_space_used = stream->space_used;
@@ -1933,11 +1941,17 @@ memfs_apply_attrs(
     }
 
     if (set_mask & CHIMERA_VFS_ATTR_SIZE) {
+        uint64_t old_size = inode->size;
+
         attr->va_set_mask |= CHIMERA_VFS_ATTR_SIZE;
         inode->size        = attr->va_size;
         /* A reservation only holds while it exceeds the live data; once EOF is
-         * set at/above it the reservation is subsumed and no longer separate. */
-        if (inode->alloc_size <= inode->size) {
+         * set at/above it the reservation is subsumed and no longer separate.
+         * A truncation by more than a 4 KiB cluster releases it too, as NTFS
+         * releases the clusters past the new EOF (MS-FSA 2.1.5.15.5); an
+         * AllocationSize set in the same call is applied after this. */
+        if (inode->alloc_size <= inode->size ||
+            inode->size + 4096 < ((old_size + 4095) & ~4095ULL)) {
             inode->alloc_size = 0;
         }
     }
@@ -2332,6 +2346,14 @@ memfs_setattr(
      * inode's size lives on the inode, a stream's on its node), then mask the
      * SIZE bit off so memfs_apply_attrs only touches base-inode metadata. */
     if ((attr->va_set_mask & CHIMERA_VFS_ATTR_SIZE) && S_ISREG(inode->mode)) {
+        /* The base fork's AllocationSize reservation goes once EOF reaches it
+         * or the file is truncated by more than a cluster, as memfs_apply_attrs
+         * would do. */
+        if (!stream &&
+            (inode->alloc_size <= attr->va_size ||
+             attr->va_size + 4096 < ((*p_size + 4095) & ~4095ULL))) {
+            inode->alloc_size = 0;
+        }
         *p_size = attr->va_size;
         /* POSIX: a successful (f)truncate marks both the last data modification
          * (mtime) and last status change (ctime) times for update.  ctime is
@@ -2531,12 +2553,14 @@ memfs_mount(
          * an over-allocated file's AllocationSize reflects the reserved space. */
         attr->va_space_used = inode->space_used > inode->alloc_size ?
             inode->space_used : inode->alloc_size;
-        attr->va_atime = inode->atime;
-        attr->va_mtime = inode->mtime;
-        attr->va_ctime = inode->ctime;
-        attr->va_ino   = inode->inum;
-        attr->va_dev   = (42ULL << 32) | 42;
-        attr->va_rdev  = inode->rdev;
+        attr->va_alloc_size = inode->alloc_size;
+        attr->va_set_mask  |= CHIMERA_VFS_ATTR_ALLOC_SIZE;
+        attr->va_atime      = inode->atime;
+        attr->va_mtime      = inode->mtime;
+        attr->va_ctime      = inode->ctime;
+        attr->va_ino        = inode->inum;
+        attr->va_dev        = (42ULL << 32) | 42;
+        attr->va_rdev       = inode->rdev;
 
         /* memfs persists DOS attributes, so report them alongside stat. */
         attr->va_set_mask      |= CHIMERA_VFS_ATTR_DOS_ATTRIBUTES;
@@ -3751,6 +3775,7 @@ memfs_open_at(
         inode->atime = now;
         inode->mtime = now;
         inode->ctime = now;
+        inode->btime = now;
         inode->change++;
         inode->file.blocks     = NULL;
         inode->file.max_blocks = 0;
@@ -3938,6 +3963,7 @@ memfs_create_unlinked(
     inode->atime      = now;
     inode->mtime      = now;
     inode->ctime      = now;
+    inode->btime      = now;
     inode->change++;
     inode->file.blocks     = NULL;
     inode->file.max_blocks = 0;
@@ -6652,7 +6678,7 @@ memfs_set_xattr(
     void                       *private_data)
 {
     struct memfs_inode *inode;
-    struct memfs_xattr *xattr;
+    struct memfs_xattr *xattr, **tail;
     struct timespec     now;
     void               *value;
 
@@ -6697,8 +6723,12 @@ memfs_set_xattr(
         xattr->value_len = request->set_xattr.value_len;
         xattr->value     = malloc(request->set_xattr.value_len);
         memcpy(xattr->value, request->set_xattr.value, request->set_xattr.value_len);
-        xattr->next   = inode->xattrs;
-        inode->xattrs = xattr;
+        /* Append, so the xattrs list in the order they were set, as NTFS
+         * returns EAs (an SMB FileFullEaInformation scan walks this order). */
+        xattr->next = NULL;
+        for (tail = &inode->xattrs; *tail; tail = &(*tail)->next) {
+        }
+        *tail = xattr;
     }
 
     chimera_vfs_realtime(&now);
@@ -6821,7 +6851,7 @@ memfs_open_stream(
     void                       *private_data)
 {
     struct memfs_inode        *inode;
-    struct memfs_named_stream *stream;
+    struct memfs_named_stream *stream, **tail;
     struct memfs_stream_open  *so;
     unsigned int               flags = request->open_stream.flags;
     struct timespec            now;
@@ -6865,10 +6895,14 @@ memfs_open_stream(
         stream->name_len = request->open_stream.namelen;
         stream->id       = ++inode->next_stream_id;
         stream->linked   = 1;
-        stream->next     = inode->streams;
-        inode->streams   = stream;
-        inode->mtime     = now;
-        inode->ctime     = now;
+        /* Append, so streams list in the order they were created, as NTFS
+         * returns them (IFSTest StreamInformationTest checks by position). */
+        stream->next = NULL;
+        for (tail = &inode->streams; *tail; tail = &(*tail)->next) {
+        }
+        *tail        = stream;
+        inode->mtime = now;
+        inode->ctime = now;
         inode->change++;
         request->open_stream.r_created = 1;
     } else if (flags & CHIMERA_VFS_OPEN_EXCLUSIVE) {
@@ -7072,6 +7106,191 @@ memfs_remove_stream(
     request->status = CHIMERA_VFS_OK;
     request->complete(request);
 } /* memfs_remove_stream */
+
+static void
+memfs_rename_stream(
+    struct memfs_thread        *thread,
+    struct memfs_fs            *fs,
+    struct chimera_vfs_request *request,
+    void                       *private_data)
+{
+    struct memfs_inode        *inode;
+    struct memfs_named_stream *stream = NULL, *target = NULL, *cur, **pprev, **target_prev = NULL;
+    struct timespec            now;
+    char                      *name;
+
+    chimera_vfs_realtime(&now);
+
+    inode = memfs_inode_get_fh(fs, request->fh, request->fh_len);
+
+    if (unlikely(!inode)) {
+        request->status = CHIMERA_VFS_ESTALE;
+        request->complete(request);
+        return;
+    }
+
+    memfs_map_pre_attr(fs, &request->rename_stream.r_pre_attr, inode, request->fh);
+
+    pprev = &inode->streams;
+    for (cur = inode->streams; cur; cur = cur->next) {
+        /* Stream names match without regard to case (memfs_stream_find_by_name). */
+        if (cur->name_len == request->rename_stream.namelen &&
+            strncasecmp(cur->name, request->rename_stream.name, cur->name_len) == 0) {
+            stream = cur;
+        } else if (cur->name_len == request->rename_stream.new_namelen &&
+                   strncasecmp(cur->name, request->rename_stream.new_name, cur->name_len) == 0) {
+            target      = cur;
+            target_prev = pprev;
+        }
+        pprev = &cur->next;
+    }
+
+    if (request->rename_stream.namelen == 0) {
+        /* Renaming the unnamed data stream: its data becomes a named stream
+         * and the file is left a new, empty unnamed one (MS-FSA
+         * 2.1.5.15.12.1). */
+        if (!S_ISREG(inode->mode) || request->rename_stream.new_namelen == 0) {
+            evpl_mutex_unlock(&inode->lock);
+            request->status = CHIMERA_VFS_EINVAL;
+            request->complete(request);
+            return;
+        }
+        if (target) {
+            if (!(request->rename_stream.flags & CHIMERA_VFS_RENAME_STREAM_REPLACE) ||
+                target->size) {
+                evpl_mutex_unlock(&inode->lock);
+                request->status = (request->rename_stream.flags & CHIMERA_VFS_RENAME_STREAM_REPLACE) ?
+                    CHIMERA_VFS_EINVAL : CHIMERA_VFS_EEXIST;
+                request->complete(request);
+                return;
+            }
+            stream = target;
+        } else {
+            stream       = calloc(1, sizeof(*stream));
+            stream->name = malloc(request->rename_stream.new_namelen);
+            memcpy(stream->name, request->rename_stream.new_name, request->rename_stream.new_namelen);
+            stream->name_len = request->rename_stream.new_namelen;
+            stream->id       = ++inode->next_stream_id;
+            stream->linked   = 1;
+            for (pprev = &inode->streams; *pprev; pprev = &(*pprev)->next) {
+            }
+            *pprev = stream;
+        }
+
+        {
+            struct memfs_fork fork = stream->fork;
+
+            stream->fork       = inode->file;
+            inode->file        = fork;
+            stream->size       = inode->size;
+            stream->space_used = inode->space_used;
+            inode->size        = 0;
+            inode->space_used  = 0;
+        }
+
+        inode->mtime = now;
+        inode->ctime = now;
+        inode->change++;
+        memfs_map_post_attr(fs, &request->rename_stream.r_post_attr, inode, request->fh);
+        evpl_mutex_unlock(&inode->lock);
+        request->status = CHIMERA_VFS_OK;
+        request->complete(request);
+        return;
+    }
+
+    if (!stream) {
+        evpl_mutex_unlock(&inode->lock);
+        request->status = CHIMERA_VFS_ENOENT;
+        request->complete(request);
+        return;
+    }
+
+    if (request->rename_stream.new_namelen == 0) {
+        struct memfs_fork fork;
+
+        /* Renaming to the unnamed data stream: the stream's data becomes the
+         * file's, which must be empty (MS-FSA 2.1.5.15.12.1), and the named
+         * stream is gone. */
+        if (!S_ISREG(inode->mode) || inode->size) {
+            evpl_mutex_unlock(&inode->lock);
+            request->status = (!S_ISREG(inode->mode) ||
+                               (request->rename_stream.flags & CHIMERA_VFS_RENAME_STREAM_REPLACE)) ?
+                CHIMERA_VFS_EINVAL : CHIMERA_VFS_EEXIST;
+            request->complete(request);
+            return;
+        }
+
+        fork               = inode->file;
+        inode->file        = stream->fork;
+        stream->fork       = fork;
+        inode->size        = stream->size;
+        inode->space_used  = stream->space_used;
+        stream->size       = 0;
+        stream->space_used = 0;
+
+        for (pprev = &inode->streams; *pprev != stream; pprev = &(*pprev)->next) {
+        }
+        *pprev         = stream->next;
+        stream->linked = 0;
+        if (stream->refcnt == 0) {
+            memfs_stream_node_free(thread, inode->fs, stream);
+        } else {
+            stream->next        = inode->dead_streams;
+            inode->dead_streams = stream;
+        }
+
+        inode->mtime = now;
+        inode->ctime = now;
+        inode->change++;
+        memfs_map_post_attr(fs, &request->rename_stream.r_post_attr, inode, request->fh);
+        evpl_mutex_unlock(&inode->lock);
+        request->status = CHIMERA_VFS_OK;
+        request->complete(request);
+        return;
+    }
+
+    if (target) {
+        /* Only an empty stream may be replaced (MS-FSA 2.1.5.15.12.1). */
+        if (!(request->rename_stream.flags & CHIMERA_VFS_RENAME_STREAM_REPLACE)) {
+            evpl_mutex_unlock(&inode->lock);
+            request->status = CHIMERA_VFS_EEXIST;
+            request->complete(request);
+            return;
+        }
+        if (target->size) {
+            evpl_mutex_unlock(&inode->lock);
+            request->status = CHIMERA_VFS_EINVAL;
+            request->complete(request);
+            return;
+        }
+        /* Unlinked as remove_stream does: a handle still holding it (the
+         * VFS keeps recently closed handles) keeps it until its last close. */
+        *target_prev   = target->next;
+        target->linked = 0;
+        if (target->refcnt == 0) {
+            memfs_stream_node_free(thread, inode->fs, target);
+        } else {
+            target->next        = inode->dead_streams;
+            inode->dead_streams = target;
+        }
+    }
+
+    name = malloc(request->rename_stream.new_namelen);
+    memcpy(name, request->rename_stream.new_name, request->rename_stream.new_namelen);
+    free(stream->name);
+    stream->name     = name;
+    stream->name_len = request->rename_stream.new_namelen;
+
+    inode->ctime = now;
+    inode->change++;
+
+    memfs_map_post_attr(fs, &request->rename_stream.r_post_attr, inode, request->fh);
+
+    evpl_mutex_unlock(&inode->lock);
+
+    request->status = CHIMERA_VFS_OK;
+    request->complete(request);
+} /* memfs_rename_stream */
 
 
 /* ------------------------------------------------------------------ */
@@ -7588,6 +7807,9 @@ memfs_dispatch(
             break;
         case CHIMERA_VFS_OP_REMOVE_STREAM:
             memfs_remove_stream(thread, fs, request, private_data);
+            break;
+        case CHIMERA_VFS_OP_RENAME_STREAM:
+            memfs_rename_stream(thread, fs, request, private_data);
             break;
         case CHIMERA_VFS_OP_CLAIM_ACQUIRE:
             memfs_claim_acquire(thread, fs, shared, request);

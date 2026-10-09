@@ -76,13 +76,15 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     include_directories(SYSTEM ${HOMEBREW_PREFIX}/include ${HOMEBREW_PREFIX}/opt/krb5/include)
     link_directories(${HOMEBREW_PREFIX}/lib ${HOMEBREW_PREFIX}/opt/krb5/lib)
 
-    # chimera_vfs links its backend modules and the backends call back into the
-    # VFS core, so the shared-library graph is deliberately cyclic; the same is
-    # true of the protocol servers against chimera_server.  ELF resolves that at
-    # load time, but ld64 requires every symbol to bind at link time.  Allow
-    # shared libraries (only -- executables keep full link checking) to leave
-    # those references to the dynamic loader, matching the ELF behaviour.
+    # The protocol servers and chimera_server call into each other, so the
+    # shared-library graph is deliberately cyclic, and the VFS backend modules
+    # resolve some references from the process that loads them.  ELF resolves
+    # that at load time, but ld64 requires every symbol to bind at link time.
+    # Allow shared libraries and modules (only -- executables keep full link
+    # checking) to leave those references to the dynamic loader, matching the
+    # ELF behaviour.
     string(APPEND CMAKE_SHARED_LINKER_FLAGS " -Wl,-undefined,dynamic_lookup")
+    string(APPEND CMAKE_MODULE_LINKER_FLAGS " -Wl,-undefined,dynamic_lookup")
 else()
     message(FATAL_ERROR "Unsupported build platform ${CMAKE_SYSTEM_NAME}")
 endif()
@@ -224,8 +226,10 @@ if(CCACHE_PROGRAM)
     set(CMAKE_C_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
     # ccache cannot cache /Zi, which writes one PDB shared by every object in
     # a target.  Embed the debug information in each object (/Z7) instead; the
-    # linker still produces the PDB.
-    if(MSVC)
+    # linker still produces the PDB.  A build that wants debug information
+    # in every configuration (CI's Release cells, so a hung or crashed daemon
+    # can be symbolized) sets the variable itself.
+    if(MSVC AND NOT DEFINED CMAKE_MSVC_DEBUG_INFORMATION_FORMAT)
         set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT
             "$<$<CONFIG:Debug,RelWithDebInfo>:Embedded>")
     endif()

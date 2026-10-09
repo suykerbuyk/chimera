@@ -41,15 +41,15 @@ diff --git a/src/core/libfabric/libfabric.c b/src/core/libfabric/libfabric.c
 index 9b32f7e..a246979 100644
 --- a/src/core/libfabric/libfabric.c
 +++ b/src/core/libfabric/libfabric.c
-@@ -2140,6 +2140,9 @@ evpl_libfabric_create(
+@@ -2177,5 +2177,8 @@ evpl_libfabric_create(
                               evpl_libfabric_poll_exit,
                               evpl_libfabric_poll,
                               lf);
 +
 +    evpl_libfabric_abort_if(!lf->poll,
 +                            "evpl_add_poll returned NULL: event-loop poll-slot capacity exhausted");
-     lf->polling = evpl->poll_mode;
-     evpl_poll_set_prepare_callback(lf->poll, evpl_libfabric_prepare_wait);
+     lf->polling           = evpl->poll_mode;
+     lf->eq_interval_ticks = evpl_ns_to_ticks(1000000); /* 1 ms */
  
 diff --git a/src/core/poll.c b/src/core/poll.c
 index 7df8da5..0e40f39 100644

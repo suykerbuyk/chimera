@@ -69,11 +69,14 @@ set_tests_properties(chimera/server/smb/mbt/overwrite_sharing_precedence_probe_m
     TIMEOUT 90)
 
 # Hold a backend rename across TREE_DISCONNECT to exercise a completion after
-# the requesting tree has released its share.
+# the requesting tree has released its share.  The probe embeds memfs to hook
+# its dispatch; ENABLE_EXPORTS lets the server's VFS find that hooked vfs_memfs
+# instead of loading the memfs module.
 add_executable(smb2_rename_disconnect_probe smb2_rename_disconnect_probe.c)
 target_include_directories(smb2_rename_disconnect_probe PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(smb2_rename_disconnect_probe chimera_server chimera_metrics
-    chimera_vfs_memfs evpl)
+    chimera_vfs_memfs_objs evpl)
+set_target_properties(smb2_rename_disconnect_probe PROPERTIES ENABLE_EXPORTS ON)
 
 add_test(NAME chimera/server/smb/mbt/rename_disconnect_probe_memfs
     COMMAND $<TARGET_FILE:smb2_rename_disconnect_probe>)
@@ -138,12 +141,15 @@ set_tests_properties(chimera/server/smb/mbt/durable_probe_memfs PROPERTIES
 # cold-reclaim enforcement matrix (owner authentication, name/share binding,
 # CreateGuid/DHnC handling, conflict reservation and window expiry) with
 # negative controls.  Needs the sqlite KV module, so it is registered only when
-# that backend was built (CHIMERA_HAVE_SQLITE_VFS); it links it explicitly so
-# --as-needed cannot drop the module symbol dlsym resolves at runtime.
+# that backend was built (CHIMERA_HAVE_SQLITE_VFS).  The backend is now a
+# loadable module that chimera_vfs_init dlopens by name at run time, so depend
+# on it (rather than link it -- a MODULE library is not linkable) to force it
+# built beside libchimera_vfs where the loader finds it.
 if(TARGET chimera_vfs_sqlite)
     add_executable(smb2_durable_cold_probe smb2_durable_cold_probe.c)
     target_include_directories(smb2_durable_cold_probe PRIVATE ${CMAKE_SOURCE_DIR}/src)
-    target_link_libraries(smb2_durable_cold_probe chimera_server chimera_metrics chimera_vfs_sqlite)
+    target_link_libraries(smb2_durable_cold_probe chimera_server chimera_metrics)
+    add_dependencies(smb2_durable_cold_probe chimera_vfs_sqlite)
 
     add_test(NAME chimera/server/smb/mbt/durable_cold_probe_linux
         COMMAND $<TARGET_FILE:smb2_durable_cold_probe>)

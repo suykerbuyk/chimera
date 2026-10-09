@@ -11,6 +11,9 @@
 #include "vfs/vfs_release.h"
 #include "vfs/vfs_notify.h"
 
+static inline uint32_t chimera_smb_set_info_error_status(
+    enum chimera_vfs_error error_code);
+
 static void
 chimera_smb_set_info_callback(
     enum chimera_vfs_error    error_code,
@@ -34,19 +37,29 @@ chimera_smb_set_info_callback(
         bool                              has_skip = chimera_smb_parent_lease_skip(
             request->set_info.open_file->parent_lease_key, &skip_lo, &skip_hi);
 
+        char                              nname[CHIMERA_SMB_STREAM_NOTIFY_NAME_MAX];
+        uint32_t                          nlen = chimera_smb_open_file_notify_name(
+            request->set_info.open_file, nname);
+
+        /* A size change on a named stream changes that stream only. */
+        if ((request->set_info.open_file->flags & CHIMERA_SMB_OPEN_FILE_FLAG_STREAM) &&
+            (mask & CHIMERA_VFS_NOTIFY_STREAM_SIZE)) {
+            mask = CHIMERA_VFS_NOTIFY_STREAM_SIZE;
+        }
+
         chimera_vfs_notify_emit_lease(thread->shared->vfs->vfs_notify,
                                       request->set_info.open_file->parent_fh,
                                       request->set_info.open_file->parent_fh_len,
                                       mask,
-                                      request->set_info.open_file->name,
-                                      request->set_info.open_file->name_len,
+                                      nname,
+                                      nlen,
                                       NULL, 0,
                                       skip_lo, skip_hi, has_skip);
     }
 
     chimera_smb_open_file_release(request, request->set_info.open_file);
 
-    chimera_smb_complete_request(request, error_code ? SMB2_STATUS_INTERNAL_ERROR : SMB2_STATUS_SUCCESS);
+    chimera_smb_complete_request(request, chimera_smb_set_info_error_status(error_code));
 } /* chimera_smb_set_info_callback */
 
 /* Size mutations are made through an authorized open. Preserve its cache
@@ -226,6 +239,60 @@ chimera_smb_set_info_link_process(struct chimera_smb_request *request)
     }
 } /* chimera_smb_set_info_link_process */
 
+/* Merge a FileBasicInformation attribute change into the stored DOS set. */
+static void
+chimera_smb_set_info_basic_getattr_callback(
+    enum chimera_vfs_error    error_code,
+    struct chimera_vfs_attrs *attr,
+    void                     *private_data)
+{
+    struct chimera_smb_request *request = private_data;
+
+    if (!error_code && (attr->va_set_mask & CHIMERA_VFS_ATTR_DOS_ATTRIBUTES)) {
+        request->set_info.vfs_attrs.va_dos_attributes |=
+            attr->va_dos_attributes & ~(SMB_DOS_ATTR_SETTABLE | SMB2_FILE_ATTRIBUTE_NORMAL);
+    }
+
+    chimera_vfs_setattr(
+        request->compound->thread->vfs_thread,
+        &request->session_handle->session->cred,
+        request->set_info.open_file->handle,
+        &request->set_info.vfs_attrs,
+        0,
+        0,
+        chimera_smb_set_info_callback,
+        request);
+} /* chimera_smb_set_info_basic_getattr_callback */
+
+/* An EndOfFile set that truncates a data file leaves its AllocationSize where
+ * it was until the handle closes: NTFS gives back the clusters past the new EOF
+ * at cleanup, not at the set (IFSTest EndOfFileInformationTest reads the old
+ * allocation back through the open handle).  Keep the old allocation as the
+ * backend's reservation and have the close drop it. */
+static void
+chimera_smb_set_info_eof_getattr_callback(
+    enum chimera_vfs_error    error_code,
+    struct chimera_vfs_attrs *attr,
+    void                     *private_data)
+{
+    struct chimera_smb_request *request  = private_data;
+    uint64_t                    new_size = request->set_info.vfs_attrs.va_size;
+
+    if (!error_code && (attr->va_set_mask & CHIMERA_VFS_ATTR_SIZE) &&
+        new_size < attr->va_size) {
+        uint64_t alloc = chimera_smb_alloc_size(attr);
+
+        if (alloc > chimera_smb_round_cluster(new_size)) {
+            request->set_info.vfs_attrs.va_alloc_size = alloc;
+            request->set_info.vfs_attrs.va_req_mask  |= CHIMERA_VFS_ATTR_ALLOC_SIZE;
+            request->set_info.vfs_attrs.va_set_mask  |= CHIMERA_VFS_ATTR_ALLOC_SIZE;
+            request->set_info.open_file->flags       |= CHIMERA_SMB_OPEN_FILE_TRUNCATED;
+        }
+    }
+
+    chimera_smb_set_info_size(request);
+} /* chimera_smb_set_info_eof_getattr_callback */
+
 /* Resolve a FileAllocationInformation set once the current size is known.
  * Truncate (and advance LastWriteTime) only when the requested allocation is
  * below the current EOF; otherwise leave the data/EOF alone and just touch the
@@ -248,8 +315,11 @@ chimera_smb_set_info_allocation_getattr_callback(
 
     cur_size = attr->va_size;
 
-    request->set_info.vfs_attrs.va_req_mask = CHIMERA_VFS_ATTR_SIZE;
-    request->set_info.vfs_attrs.va_set_mask = CHIMERA_VFS_ATTR_SIZE;
+    /* The allocation becomes the request rounded to whole clusters (MS-FSA
+    * 2.1.5.15.1); the backend keeps the part past EOF as a reservation. */
+    request->set_info.vfs_attrs.va_req_mask   = CHIMERA_VFS_ATTR_SIZE | CHIMERA_VFS_ATTR_ALLOC_SIZE;
+    request->set_info.vfs_attrs.va_set_mask   = CHIMERA_VFS_ATTR_SIZE | CHIMERA_VFS_ATTR_ALLOC_SIZE;
+    request->set_info.vfs_attrs.va_alloc_size = chimera_smb_round_cluster(alloc_size);
 
     if (alloc_size < cur_size) {
         request->set_info.vfs_attrs.va_size = alloc_size;
@@ -595,11 +665,39 @@ chimera_smb_set_info(struct chimera_smb_request *request)
 
                     chimera_smb_unmarshal_basic_info(&request->set_info.attrs, &request->set_info.vfs_attrs);
 
-                    /* An explicit (non-sentinel) write-time set hands control of
-                     * the LastWriteTime to this handle: its own subsequent writes
-                     * and size-sets must stop advancing it (MS-FSA sticky mtime). */
-                    if (request->set_info.vfs_attrs.va_set_mask & CHIMERA_VFS_ATTR_MTIME) {
+                    /* An explicit write-time set -- or the -1 "freeze" value --
+                     * hands control of the LastWriteTime to this handle: its own
+                     * subsequent writes and size-sets must stop advancing it
+                     * (MS-FSA Open.UserSetModificationTime); -2 hands it back.
+                     * A zero leaves it as it was: setting only the attributes
+                     * must not freeze the write time. */
+                    if (request->set_info.attrs.smb_mtime == UINT64_MAX - 1) {
+                        request->set_info.open_file->flags &= ~CHIMERA_SMB_OPEN_FILE_WRITE_TIME_STICKY;
+                    } else if (request->set_info.attrs.smb_mtime != 0) {
                         request->set_info.open_file->flags |= CHIMERA_SMB_OPEN_FILE_WRITE_TIME_STICKY;
+                    }
+
+                    /* The same for the LastAccessTime, whose explicit value is
+                     * put back after a read (Open.UserSetAccessTime). */
+                    if (request->set_info.attrs.smb_atime == UINT64_MAX - 1) {
+                        request->set_info.open_file->flags &= ~CHIMERA_SMB_OPEN_FILE_ACCESS_TIME_STICKY;
+                    } else if (!chimera_smb_time_is_omit(request->set_info.attrs.smb_atime)) {
+                        request->set_info.open_file->flags       |= CHIMERA_SMB_OPEN_FILE_ACCESS_TIME_STICKY;
+                        request->set_info.open_file->sticky_atime = request->set_info.vfs_attrs.va_atime;
+                    }
+
+                    /* New attributes replace only the bits a client may set:
+                     * read the stored set first so SPARSE and REPARSE_POINT,
+                     * which the FSCTLs own, survive. */
+                    if (request->set_info.vfs_attrs.va_set_mask & CHIMERA_VFS_ATTR_DOS_ATTRIBUTES) {
+                        chimera_vfs_getattr(
+                            request->compound->thread->vfs_thread,
+                            &request->session_handle->session->cred,
+                            request->set_info.open_file->handle,
+                            CHIMERA_VFS_ATTR_DOS_ATTRIBUTES,
+                            chimera_smb_set_info_basic_getattr_callback,
+                            request);
+                        break;
                     }
 
                     chimera_vfs_setattr(
@@ -655,7 +753,20 @@ chimera_smb_set_info(struct chimera_smb_request *request)
                         request->set_info.vfs_attrs.va_set_mask     |= CHIMERA_VFS_ATTR_MTIME;
                     }
 
-                    chimera_smb_set_info_size(request);
+                    /* A data file's truncation keeps its clusters until the
+                     * handle closes, which needs the size it had. */
+                    if (request->set_info.open_file->flags & CHIMERA_SMB_OPEN_FILE_FLAG_STREAM) {
+                        chimera_smb_set_info_size(request);
+                        break;
+                    }
+                    chimera_vfs_getattr(
+                        request->compound->thread->vfs_thread,
+                        &request->session_handle->session->cred,
+                        request->set_info.open_file->handle,
+                        CHIMERA_VFS_ATTR_SIZE | CHIMERA_VFS_ATTR_SPACE_USED |
+                        CHIMERA_VFS_ATTR_ALLOC_SIZE | CHIMERA_VFS_ATTR_DOS_ATTRIBUTES,
+                        chimera_smb_set_info_eof_getattr_callback,
+                        request);
                     break;
                 case SMB2_FILE_ALLOCATION_INFO:
 
@@ -724,6 +835,19 @@ chimera_smb_set_info(struct chimera_smb_request *request)
                                 request->set_info.open_file->name,
                                 request->set_info.open_file->name_len,
                                 &request->session_handle->session->cred);
+
+                            /* A directory marked for deletion completes the
+                             * CHANGE_NOTIFYs watching it with DELETE_PENDING
+                             * now, as Windows does, rather than when the last
+                             * handle closes (IFSTest NotificationDeleteTest
+                             * watches and deletes through one handle). */
+                            if (request->set_info.open_file->flags &
+                                CHIMERA_SMB_OPEN_FILE_FLAG_DIRECTORY) {
+                                chimera_vfs_notify_emit_delete(
+                                    request->compound->thread->shared->vfs->vfs_notify,
+                                    request->set_info.open_file->handle->fh,
+                                    request->set_info.open_file->handle->fh_len);
+                            }
 
                             /* Setting delete-on-close on an open file is a pending
                              * namespace mutation: recall every OTHER holder's HANDLE

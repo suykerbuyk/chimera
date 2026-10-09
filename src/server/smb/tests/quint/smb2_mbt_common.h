@@ -194,6 +194,7 @@
 #define MBT_FILE_READ_ACCESS                    0x00120089u     /* R data/attr/EA + SYNC */
 #define MBT_FILE_WRITE_ACCESS                   0x00120116u     /* W data/attr/EA + SYNC */
 #define MBT_FILE_ATTRIBUTE_NORMAL               0x00000080u
+#define MBT_FILE_ATTRIBUTE_READONLY             0x00000001u
 #define MBT_FILE_DIRECTORY_FILE                 0x00000001u
 #define MBT_FILE_DELETE_ON_CLOSE                0x00001000u
 #define MBT_FILE_NON_DIRECTORY_FILE             0x00000040u
@@ -2750,6 +2751,7 @@ smb2c_build_create_full16(
     uint32_t                      access,
     uint32_t                      share,
     uint32_t                      create_options,
+    uint32_t                      file_attributes,
     const struct smb2_oplock_req *req,
     const struct smb2_cctx       *extra,
     int                           nextra)
@@ -2770,7 +2772,7 @@ smb2c_build_create_full16(
     body[3] = oplevel;                /* RequestedOplockLevel */
     p32(body, 4, 2);                  /* ImpersonationLevel = Impersonation */
     p32(body, 24, access);
-    p32(body, 28, MBT_FILE_ATTRIBUTE_NORMAL);
+    p32(body, 28, file_attributes);
     p32(body, 32, share);
     p32(body, 36, disp);
     p32(body, 40, create_options);
@@ -2827,6 +2829,7 @@ smb2c_build_create_full(
     uint32_t                      access,
     uint32_t                      share,
     uint32_t                      create_options,
+    uint32_t                      file_attributes,
     const struct smb2_oplock_req *req,
     const struct smb2_cctx       *extra,
     int                           nextra)
@@ -2835,7 +2838,8 @@ smb2c_build_create_full(
     int     nlen = utf16le(name, name16);
 
     return smb2c_build_create_full16(c, name16, nlen, disp, access, share,
-                                     create_options, req, extra, nextra);
+                                     create_options, file_attributes, req, extra,
+                                     nextra);
 } /* smb2c_build_create_full */
 
 static inline int
@@ -2849,7 +2853,8 @@ smb2c_build_create(
     const struct smb2_oplock_req *req)
 {
     return smb2c_build_create_full(c, name, disp, access, share,
-                                   create_options, req, NULL, 0);
+                                   create_options, MBT_FILE_ATTRIBUTE_NORMAL,
+                                   req, NULL, 0);
 } /* smb2c_build_create */
 
 /* Non-blocking CREATE with explicit CreateOptions (post only). */
@@ -2899,6 +2904,25 @@ smb2_create_opts(
     return out->status;
 } /* smb2_create_opts */
 
+/* Blocking CREATE of a non-directory file carrying explicit FileAttributes. */
+static inline uint32_t
+smb2_create_attrs(
+    struct smb2_conn       *c,
+    const char             *name,
+    uint32_t                disp,
+    uint32_t                access,
+    uint32_t                share,
+    uint32_t                file_attributes,
+    struct smb2_create_out *out)
+{
+    smb2c_send(c, smb2c_build_create_full(c, name, disp, access, share,
+                                          MBT_FILE_NON_DIRECTORY_FILE,
+                                          file_attributes, NULL, NULL, 0));
+    smb2c_wait(c);
+    smb2c_parse_create(c, out);
+    return out->status;
+} /* smb2_create_attrs */
+
 /* Blocking CREATE of a non-directory file. */
 static inline uint32_t
 smb2_create(
@@ -2929,7 +2953,9 @@ smb2_create_raw16(
     struct smb2_create_out *out)
 {
     smb2c_send(c, smb2c_build_create_full16(c, name16, nlen, disp, access,
-                                            share, create_options, NULL, NULL, 0));
+                                            share, create_options,
+                                            MBT_FILE_ATTRIBUTE_NORMAL,
+                                            NULL, NULL, 0));
     smb2c_wait(c);
     smb2c_parse_create(c, out);
     return out->status;
@@ -2955,7 +2981,8 @@ smb2_create_dur_post(
     int              n = smb2c_durable_contexts(dur, buf, ctxs);
 
     smb2c_send(c, smb2c_build_create_full(c, name, disp, access, share,
-                                          create_options, req, ctxs, n));
+                                          create_options, MBT_FILE_ATTRIBUTE_NORMAL,
+                                          req, ctxs, n));
 } /* smb2_create_dur_post */
 
 /* Blocking durable-reconnect CREATE from an already-encoded UTF-16LE name, so a
@@ -2977,7 +3004,8 @@ smb2_create_dur_raw16(
     int              n = smb2c_durable_contexts(dur, buf, ctxs);
 
     smb2c_send(c, smb2c_build_create_full16(c, name16, nlen, disp, access, share,
-                                            MBT_FILE_NON_DIRECTORY_FILE, req,
+                                            MBT_FILE_NON_DIRECTORY_FILE,
+                                            MBT_FILE_ATTRIBUTE_NORMAL, req,
                                             ctxs, n));
     smb2c_wait(c);
     smb2c_parse_create(c, out);

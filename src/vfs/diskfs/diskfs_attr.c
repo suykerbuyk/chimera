@@ -546,6 +546,26 @@ diskfs_inherit_acl_async(
 
 
 static void
+diskfs_getattr_stream_cb(
+    struct diskfs_inode *stream,
+    int                  status,
+    void                *private_data)
+{
+    struct chimera_vfs_request    *request = private_data;
+    struct diskfs_request_private *p       = request->plugin_data;
+
+    if (unlikely(status != CHIMERA_VFS_OK)) {
+        diskfs_op_fail(request, p->txn, status);
+        return;
+    }
+
+    diskfs_stream_overlay_attrs(&request->getattr.r_attr, stream,
+                                request->fh, request->fh_len);
+    diskfs_op_ok(request, p->txn);
+} /* diskfs_getattr_stream_cb */
+
+
+static void
 diskfs_getattr_inode_cb(
     struct diskfs_inode *inode,
     int                  status,
@@ -560,6 +580,19 @@ diskfs_getattr_inode_cb(
     }
 
     diskfs_map_attrs(p->thread, &request->getattr.r_attr, inode);
+
+    /* Through a stream handle: the file's attributes, with the stream's size
+     * and allocation laid over them. */
+    {
+        uint64_t sinum;
+        uint32_t sgen;
+
+        if (diskfs_fh_stream(request->fh, request->fh_len, &sinum, &sgen)) {
+            diskfs_inode_get_inum_async(p->thread, p->txn, p->fs, sinum, sgen,
+                                        diskfs_getattr_stream_cb, request);
+            return;
+        }
+    }
 
     diskfs_op_ok(request, p->txn);
 } /* diskfs_getattr_inode_cb */
@@ -799,6 +832,21 @@ static void
 diskfs_setattr_finish(struct chimera_vfs_request *request)
 {
     struct diskfs_request_private *p = request->plugin_data;
+
+    if (p->stream_base) {
+        struct chimera_vfs_attrs attrs = *request->setattr.set_attr;
+
+        /* The stream took its size; the rest is its file's. */
+        attrs.va_set_mask = p->stream_base_mask;
+        diskfs_apply_attrs(p->stream_base, &attrs);
+        request->setattr.set_attr->va_set_mask |= attrs.va_set_mask;
+
+        diskfs_map_attrs(p->thread, &request->setattr.r_post_attr, p->stream_base);
+        diskfs_stream_overlay_attrs(&request->setattr.r_post_attr, p->inode_stash[0],
+                                    request->fh, request->fh_len);
+        diskfs_op_ok(request, p->txn);
+        return;
+    }
 
     diskfs_map_attrs(p->thread, &request->setattr.r_post_attr,
                      p->inode_stash[0]);
@@ -1343,6 +1391,27 @@ diskfs_setattr_inode_cb(
 } /* diskfs_setattr_inode_cb */
 
 
+static void
+diskfs_setattr_stream_base_cb(
+    struct diskfs_inode *base,
+    int                  status,
+    void                *private_data)
+{
+    struct chimera_vfs_request    *request = private_data;
+    struct diskfs_request_private *p       = request->plugin_data;
+
+    if (unlikely(status != CHIMERA_VFS_OK)) {
+        diskfs_op_fail(request, p->txn, status);
+        return;
+    }
+
+    p->stream_base = base;
+    diskfs_inode_get_data_fh_async(p->thread, p->txn, p->fs,
+                                   request->fh, request->fh_len,
+                                   diskfs_setattr_inode_cb, request);
+} /* diskfs_setattr_stream_base_cb */
+
+
 void
 diskfs_setattr(
     struct diskfs_thread       *thread,
@@ -1351,12 +1420,33 @@ diskfs_setattr(
     void                       *private_data)
 {
     struct diskfs_request_private *p = request->plugin_data;
+    uint64_t                       sinum;
+    uint32_t                       sgen;
 
     (void) shared;
     (void) private_data;
 
     p->thread = thread;
     p->txn    = diskfs_txn_begin(thread, DISKFS_TXN_WRITE);
+
+    p->stream_base = NULL;
+
+    /* Through a stream handle, a size or allocation change is the stream's;
+     * every other attribute is its file's (diskfs_setattr_finish applies
+     * those).  The file is locked first, then the stream. */
+    if ((request->setattr.set_attr->va_set_mask &
+         (CHIMERA_VFS_ATTR_SIZE | CHIMERA_VFS_ATTR_ALLOC_SIZE)) &&
+        diskfs_fh_stream(request->fh, request->fh_len, &sinum, &sgen)) {
+        p->stream_base_mask = request->setattr.set_attr->va_set_mask &
+            (CHIMERA_VFS_ATTR_MODE | CHIMERA_VFS_ATTR_ATIME | CHIMERA_VFS_ATTR_MTIME |
+             CHIMERA_VFS_ATTR_CTIME | CHIMERA_VFS_ATTR_BTIME |
+             CHIMERA_VFS_ATTR_DOS_ATTRIBUTES);
+        request->setattr.set_attr->va_set_mask &= ~p->stream_base_mask;
+        diskfs_inode_get_fh_async(thread, p->txn, p->fs,
+                                  request->fh, request->fh_len,
+                                  diskfs_setattr_stream_base_cb, request);
+        return;
+    }
 
     diskfs_inode_get_fh_async(thread, p->txn, p->fs,
                               request->fh, request->fh_len,
@@ -2398,6 +2488,8 @@ diskfs_get_xattr_lookup_cb(
 
     if (rec->value_len > request->get_xattr.value_maxlen) {
         free(p->xattr_rec);
+        free(p->xattr_seqs);
+        p->xattr_seqs = NULL;
         diskfs_op_fail(request, p->txn, CHIMERA_VFS_ERANGE);
         return;
     }
@@ -2526,12 +2618,25 @@ diskfs_set_xattr_insert(struct chimera_vfs_request *request)
 
     rec_len = sizeof(*new_rec) + request->set_xattr.namelen +
         request->set_xattr.value_len;
-    new_rec            = malloc(rec_len);
+    new_rec            = malloc(rec_len + sizeof(p->xattr_seq));
     new_rec->name_len  = request->set_xattr.namelen;
     new_rec->value_len = request->set_xattr.value_len;
     memcpy(new_rec->data, request->set_xattr.name, request->set_xattr.namelen);
     memcpy(new_rec->data + request->set_xattr.namelen,
            request->set_xattr.value, request->set_xattr.value_len);
+
+    /* Stamp the creation sequence, unless the record is already as large as
+     * a record may be. */
+    if (rec_len + sizeof(p->xattr_seq) <= DISKFS_XATTR_REC_MAX) {
+        if (!p->xattr_seq) {
+            struct timespec now;
+
+            clock_gettime(CLOCK_REALTIME, &now);
+            p->xattr_seq = (uint64_t) now.tv_sec * 1000000000ULL + (uint64_t) now.tv_nsec;
+        }
+        memcpy((char *) new_rec + rec_len, &p->xattr_seq, sizeof(p->xattr_seq));
+        rec_len += sizeof(p->xattr_seq);
+    }
 
     /* The insert stages the record into op-owned storage up front, so the
      * staging buffer can be freed as soon as the call returns -- even if the
@@ -2588,6 +2693,8 @@ diskfs_set_xattr_lookup_cb(
             diskfs_op_fail(request, p->txn, CHIMERA_VFS_EEXIST);
             return;
         }
+        /* A replaced value keeps its place in the listing order. */
+        p->xattr_seq = diskfs_xattr_rec_seq(old_rec, (uint32_t) result);
         /* Replacing an existing EA: capture its FEALIST size so the insert
          * completion can apply the size delta to the cached aggregate. */
         if (chimera_vfs_xattr_is_user(request->set_xattr.name,
@@ -2650,6 +2757,7 @@ diskfs_set_xattr_inode_cb(
     p->inode_stash[0] = inode;
     p->ea_replace     = 0;
     p->ea_old_size    = 0;
+    p->xattr_seq      = 0;
 
     key          = diskfs_set_xattr_key(request);
     p->xattr_rec = malloc(DISKFS_BT_NODE_CAP);
@@ -2684,6 +2792,26 @@ diskfs_set_xattr(
 } /* diskfs_set_xattr */
 
 
+/* Finish a listing: names came out of the b+tree in hash order, so list them
+ * in the order they were first set. */
+static void
+diskfs_list_xattrs_done(struct chimera_vfs_request *request)
+{
+    struct diskfs_request_private *p = request->plugin_data;
+
+    chimera_vfs_xattr_sort_by_seq(request->list_xattrs.buffer, (uint32_t) p->loop_pos,
+                                  p->xattr_seqs, (uint32_t) p->loop_left);
+    free(p->xattr_seqs);
+    p->xattr_seqs = NULL;
+
+    request->list_xattrs.r_len    = (uint32_t) p->loop_pos;
+    request->list_xattrs.r_count  = (uint32_t) p->loop_left;
+    request->list_xattrs.r_eof    = 1;
+    request->list_xattrs.r_cookie = 0;
+    free(p->xattr_rec);
+    diskfs_op_ok(request, p->txn);
+} /* diskfs_list_xattrs_done */
+
 /* Consume one completed lookup; returns 1 if the request was finalized. */
 static int
 diskfs_list_xattrs_consume(
@@ -2699,39 +2827,42 @@ diskfs_list_xattrs_consume(
     diskfs_bt_op_free(p->thread, op);
 
     if (result < 0 || found.type != DISKFS_REC_XATTR) {
-        request->list_xattrs.r_len    = (uint32_t) p->loop_pos;
-        request->list_xattrs.r_count  = (uint32_t) p->loop_left;
-        request->list_xattrs.r_eof    = 1;
-        request->list_xattrs.r_cookie = 0;
-        free(p->xattr_rec);
-        diskfs_op_ok(request, p->txn);
+        diskfs_list_xattrs_done(request);
         return 1;
     }
 
     if (result < (int) sizeof(*rec) ||
         result < (int) (sizeof(*rec) + rec->name_len + rec->value_len)) {
         free(p->xattr_rec);
+        free(p->xattr_seqs);
+        p->xattr_seqs = NULL;
         diskfs_op_fail(request, p->txn, CHIMERA_VFS_EIO);
         return 1;
     }
     if (p->loop_pos + rec->name_len + 1 > request->list_xattrs.max_bytes) {
         free(p->xattr_rec);
+        free(p->xattr_seqs);
+        p->xattr_seqs = NULL;
         diskfs_op_fail(request, p->txn, CHIMERA_VFS_ERANGE);
         return 1;
     }
 
+    if (p->loop_left == p->xattr_seq_cap) {
+        uint64_t *grown;
+
+        p->xattr_seq_cap = p->xattr_seq_cap ? p->xattr_seq_cap * 2 : 16;
+        grown            = realloc(p->xattr_seqs, p->xattr_seq_cap * sizeof(*grown));
+        chimera_diskfs_abort_if(!grown, "Out of memory listing xattrs");
+        p->xattr_seqs = grown;
+    }
+    p->xattr_seqs[p->loop_left] = diskfs_xattr_rec_seq(rec, (uint32_t) result);
     memcpy(buf + p->loop_pos, rec->data, rec->name_len);
     p->loop_pos       += rec->name_len;
     buf[p->loop_pos++] = '\0';
     p->loop_left++;
 
     if (found.subkey == UINT64_MAX) {
-        request->list_xattrs.r_len    = (uint32_t) p->loop_pos;
-        request->list_xattrs.r_count  = (uint32_t) p->loop_left;
-        request->list_xattrs.r_eof    = 1;
-        request->list_xattrs.r_cookie = 0;
-        free(p->xattr_rec);
-        diskfs_op_ok(request, p->txn);
+        diskfs_list_xattrs_done(request);
         return 1;
     }
 
@@ -2799,6 +2930,8 @@ diskfs_list_xattrs_inode_cb(
     p->loop_off       = 0;
     p->loop_pos       = 0;
     p->loop_left      = 0;
+    p->xattr_seqs     = NULL;
+    p->xattr_seq_cap  = 0;
 
     diskfs_list_xattrs_step(request);
 } /* diskfs_list_xattrs_inode_cb */

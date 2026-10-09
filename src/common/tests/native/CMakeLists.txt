@@ -28,6 +28,8 @@ endif()
 # The full build already registers this test against chimera_common.
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     add_executable(native_rcu_test ../rcu_test.c ../../chimera_rcu.c)
+    # chimera_rcu.c is compiled in, so its data is defined here, not imported.
+    target_compile_definitions(native_rcu_test PRIVATE CHIMERA_COMMON_BUILD)
     target_include_directories(native_rcu_test PRIVATE
         "${CHIMERA_SOURCE_ROOT}/src" "${_native_libevpl_inc}")
     if(MSVC)

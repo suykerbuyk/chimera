@@ -505,7 +505,7 @@ main(
         _exit(SKIP_RC);
     }
 
-    chimera_vfs_get_root_fh(vroot, &vroot_len);
+    chimera_vfs_get_root_fh(G.t->vfs, vroot, &vroot_len);
     chimera_vfs_lookup(G.t, &root, vroot, vroot_len, "test", 4,
                        CHIMERA_VFS_ATTR_FH, 0, attr_cb, NULL);
     wait_done();

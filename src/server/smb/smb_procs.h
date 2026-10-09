@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include "common/export.h"
+
 #include "vfs/vfs_idmap.h"
 #include "vfs/sdk/vfs_sid.h"
 
@@ -35,18 +37,18 @@ void chimera_smb_negotiate_reply(
 /* Phase 0 test hooks. Exposed so tests/phase0_contexts_test.c can drive the
  * negotiate-context and CREATE-context dispatch paths directly without
  * standing up a full SMB compound + connection. Not used outside tests. */
-int chimera_smb_parse_one_negotiate_context(
+SYMBOL_EXPORT int chimera_smb_parse_one_negotiate_context(
     struct chimera_smb_request *request,
     uint16_t                    type,
     const uint8_t              *data,
     uint16_t                    data_len);
 
-int chimera_smb_parse_create_contexts(
+SYMBOL_EXPORT int chimera_smb_parse_create_contexts(
     const uint8_t              *buf,
     uint32_t                    buf_len,
     struct chimera_smb_request *request);
 
-uint32_t chimera_smb_build_create_response_contexts(
+SYMBOL_EXPORT uint32_t chimera_smb_build_create_response_contexts(
     struct chimera_smb_request *request,
     uint8_t                    *ctx_buf,
     uint32_t                    ctx_buf_size);
@@ -230,9 +232,30 @@ void chimera_smb_parse_sd_to_attrs(
     uint32_t                  sd_len,
     struct chimera_vfs_attrs *attrs);
 
+/* SECURITY_INFORMATION bits (MS-DTYP 2.4.7): the AdditionalInformation of a
+ * security QUERY_INFO / SET_INFO names the descriptor components the client
+ * is reading or replacing.  Everything else in the descriptor it sends is
+ * context the server MUST leave alone (MS-FSA 2.1.5.16). */
+#define SMB_OWNER_SECURITY_INFORMATION               0x00000001
+#define SMB_GROUP_SECURITY_INFORMATION               0x00000002
+#define SMB_DACL_SECURITY_INFORMATION                0x00000004
+#define SMB_SACL_SECURITY_INFORMATION                0x00000008
+#define SMB_LABEL_SECURITY_INFORMATION               0x00000010
+#define SMB_ATTRIBUTE_SECURITY_INFORMATION           0x00000020
+#define SMB_SCOPE_SECURITY_INFORMATION               0x00000040
+#define SMB_PROCESS_TRUST_LABEL_SECURITY_INFORMATION 0x00000080
+#define SMB_ACCESS_FILTER_SECURITY_INFORMATION       0x00000100
+#define SMB_BACKUP_SECURITY_INFORMATION              0x00010000
+
+/* The components chimera's model stores: what a whole-descriptor decode (the
+ * create-time SecD context) selects. */
+#define SMB_SD_ALL_SECURITY_INFORMATION \
+        (SMB_OWNER_SECURITY_INFORMATION | SMB_GROUP_SECURITY_INFORMATION | \
+         SMB_DACL_SECURITY_INFORMATION)
+
 /* Collects real (non-algorithmic) SID strings a decode pass could not resolve,
 * so the SET_SECURITY handler can resolve them off the event loop and retry. */
-#define SMB_MAX_UNRES_SIDS 16
+#define SMB_MAX_UNRES_SIDS                           16
 struct smb_unres_sids {
     char sids[SMB_MAX_UNRES_SIDS][CHIMERA_IDMAP_SID_MAX];
     int  count;
@@ -248,12 +271,16 @@ struct chimera_vfs;
  * With `unres` non-NULL (the first SET_SECURITY pass) a real SID that is not
  * yet cached is recorded there and its ACE skipped; with `unres` NULL (the
  * final pass, or the create-time path) it is kept as an opaque
- * CHIMERA_PRINCIPAL_SID.  Returns 0 on success.  Exported for the SMB unit
- * tests.
+ * CHIMERA_PRINCIPAL_SID.  `sec_info` is the SECURITY_INFORMATION mask naming
+ * the components to decode: only the owner (OWNER), the group (GROUP) and the
+ * DACL including its modefromsid mode ACE (DACL) sections it selects are read;
+ * the rest of the descriptor is ignored and leaves attrs untouched.  Returns 0
+ * on success.  Exported for the SMB unit tests.
  */
-int chimera_smb_sd_to_acl(
+SYMBOL_EXPORT int chimera_smb_sd_to_acl(
     const uint8_t            *sd_buf,
     uint32_t                  sd_len,
+    uint32_t                  sec_info,
     struct chimera_vfs_attrs *attrs,
     struct chimera_acl       *acl,
     unsigned                  acl_max_aces,
@@ -271,7 +298,7 @@ int chimera_smb_sd_to_acl(
  * algorithmic modefromsid SID is the last resort.  Returns the SD length, or
  * -1 if it does not fit.  Exported for the SMB unit tests.
  */
-int chimera_smb_acl_to_sd(
+SYMBOL_EXPORT int chimera_smb_acl_to_sd(
     uint32_t                  uid,
     uint32_t                  gid,
     uint32_t                  mode,
@@ -294,7 +321,7 @@ int chimera_smb_acl_to_sd(
  * not cached is kept as an opaque CHIMERA_PRINCIPAL_SID (no async resolution
  * here -- this is the create-time path).
  */
-void chimera_smb_parse_sd_to_acl(
+SYMBOL_EXPORT void chimera_smb_parse_sd_to_acl(
     const uint8_t            *sd_buf,
     uint32_t                  sd_len,
     struct chimera_vfs_attrs *attrs,
@@ -318,6 +345,13 @@ void chimera_smb_ioctl_set_reparse(
     struct chimera_smb_request *request);
 
 void chimera_smb_ioctl_get_reparse(
+    struct chimera_smb_request *request);
+void chimera_smb_ioctl_delete_reparse(
+    struct chimera_smb_request *request);
+void chimera_smb_ioctl_object_id(
+    struct chimera_smb_request *request);
+
+void chimera_smb_ioctl_get_retrieval_pointers(
     struct chimera_smb_request *request);
 
 void chimera_smb_ioctl_set_sparse(
@@ -377,7 +411,7 @@ void chimera_smb_lock_reply(
  * (the stashed grant result, SMB2_STATUS_CANCELLED, or
  * SMB2_STATUS_RANGE_NOT_LOCKED).  Cancels the VFS ticket bookkeeping, installs or
  * tears down the entry, drops the open_file reference the park held, and replies. */
-void chimera_smb_lock_park_finish(
+SYMBOL_EXPORT void chimera_smb_lock_park_finish(
     struct chimera_smb_request *request,
     uint32_t                    status);
 
@@ -386,27 +420,27 @@ void chimera_smb_lock_park_finish(
  * SMB2_STATUS_RANGE_NOT_LOCKED.  No-op when no lock is parked.  Must run on the
  * open's owning thread.  Returns the aborted request (whose open_file reference
  * the caller's completion drops), or NULL. */
-struct chimera_smb_request *
+SYMBOL_EXPORT struct chimera_smb_request *
 chimera_smb_lock_abort_parked(
     struct chimera_server_smb_thread *thread,
     struct chimera_smb_open_file     *open_file);
 
 /* Drain (release + free) every byte-range lock entry held by `open_file`.
  * Called at close before the underlying VFS handle is released. */
-void chimera_smb_open_file_drain_locks(
+SYMBOL_EXPORT void chimera_smb_open_file_drain_locks(
     struct chimera_server_smb_thread *thread,
     struct chimera_smb_open_file     *open_file);
 
 /* The same without waking waiters, for final shutdown (no live connection
  * is left to answer one). */
-void chimera_smb_open_file_drain_locks_nopump(
+SYMBOL_EXPORT void chimera_smb_open_file_drain_locks_nopump(
     struct chimera_server_smb_thread *thread,
     struct chimera_smb_open_file     *open_file);
 
 /* break_cb wired onto SMB cache claims at CREATE time.  Sends an
  * OPLOCK_BREAK Notification on the conn the open was created on, or
  * forcibly revokes if the conn is gone. */
-void chimera_smb_lease_break_cb(
+SYMBOL_EXPORT void chimera_smb_lease_break_cb(
     struct chimera_vfs_claim *claim,
     uint8_t                   needed_mode,
     void                     *private_data);
@@ -425,17 +459,17 @@ void chimera_smb_lease_break_thread_init(
 
 /* Send all lease-break notifications queued for this thread's connections.
  * Called from the request reply path so op-triggered breaks follow the reply. */
-void chimera_smb_lease_break_flush(
+SYMBOL_EXPORT void chimera_smb_lease_break_flush(
     struct chimera_server_smb_thread *thread);
 
 void chimera_smb_lease_break_thread_destroy(
     struct chimera_server_smb_thread *thread);
 
-int chimera_smb_parse_oplock_break(
+SYMBOL_EXPORT int chimera_smb_parse_oplock_break(
     struct evpl_iovec_cursor   *request_cursor,
     struct chimera_smb_request *request);
 
-void chimera_smb_oplock_break(
+SYMBOL_EXPORT void chimera_smb_oplock_break(
     struct chimera_smb_request *request);
 
 /* Resume CREATEs parked whose triggered lease break has now settled.  Called
@@ -451,10 +485,10 @@ void chimera_smb_create_resume_parked_broadcast(
     struct chimera_server_smb_thread *origin);
 
 /* Resume doorbell handler (runs on its owning thread). */
-void chimera_smb_create_resume_doorbell_callback(
+SYMBOL_EXPORT void chimera_smb_create_resume_doorbell_callback(
     struct evpl          *evpl,
     struct evpl_doorbell *doorbell);
 
-void chimera_smb_oplock_break_reply(
+SYMBOL_EXPORT void chimera_smb_oplock_break_reply(
     struct evpl_iovec_cursor   *reply_cursor,
     struct chimera_smb_request *request);

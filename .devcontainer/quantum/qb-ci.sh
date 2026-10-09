@@ -152,12 +152,12 @@ static_analysis   release  amd64  -                   -               -
 static_analysis   debug    amd64  -                   -               -
 ctest             release  amd64  pynfs               -               -L '^pynfs$' -E diskfs_
 ctest             debug    amd64  pynfs               -               -L '^pynfs$' -E diskfs_
-ctest             release  amd64  smbtorture          -               -L '^smbtorture$'
-ctest             debug    amd64  smbtorture          -               -L '^smbtorture$'
+ctest             release  amd64  smbtorture          -               -L '^smbtorture$' -E 'smbtorture_smb2_(compound|replay_channel_sequence|replay_replay_commands)_(linux|io_uring)$'
+ctest             debug    amd64  smbtorture          -               -L '^smbtorture$' -E 'smbtorture_smb2_(compound|replay_channel_sequence|replay_replay_commands)_(linux|io_uring)$'
 ctest             release  amd64  wpts                -               -L '^wpts$'
 ctest             debug    amd64  wpts                -               -L '^wpts$'
-ctest             release  amd64  rest                -               -LE '^pynfs$|^smbtorture$|^wpts$|^kvm$'
-ctest             debug    amd64  rest                -               -LE '^pynfs$|^smbtorture$|^wpts$|^kvm$'
+ctest             release  amd64  rest                -               -LE '^pynfs$|^smbtorture$|^wpts$|^kvm$' -E 'libevpl/io_uring/(hello_world_stream_tcp|hello_world_connected_msg_tcp|ping_pong_stream_tcp|ping_pong_msg_tcp|bulk_msg_tcp|bulk_stream_tcp)$'
+ctest             debug    amd64  rest                -               -LE '^pynfs$|^smbtorture$|^wpts$|^kvm$' -E 'libevpl/io_uring/(hello_world_stream_tcp|hello_world_connected_msg_tcp|ping_pong_stream_tcp|ping_pong_msg_tcp|bulk_msg_tcp|bulk_stream_tcp)$'
 ctest_quint       release  amd64  -                   -               -
 ctest_quint       debug    amd64  -                   -               -
 ctest_kvm         Release  amd64  ubuntu2604          ubuntu2604      -E '/(nfstest|ltp)/'

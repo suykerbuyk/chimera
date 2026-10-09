@@ -14,6 +14,7 @@
 #endif /* ifdef _WIN32 */
 #ifndef _WIN32
 #include <dlfcn.h>
+#include <limits.h>
 #endif /* ifndef _WIN32 */
 #include <stdlib.h>
 #include <string.h>
@@ -31,7 +32,7 @@
 #include "vfs/vfs.h"
 #include "vfs/vfs_internal.h"
 #include "vfs/vfs_open_cache.h"
-#include "vfs/root/vfs_root.h"
+#include "vfs/vfs_rootfs.h"
 #include "vfs/vfs_dump.h"
 #include "vfs/vfs_name_cache.h"
 #include "vfs/vfs_attr_cache.h"
@@ -41,19 +42,6 @@
 #include "vfs/vfs_claim.h"
 #include "vfs/vfs_pnfs.h"
 #include "vfs/vfs_mount_table.h"
-#include "vfs/memfs/memfs.h"
-#include "vfs/memkv/memkv.h"
-#include "vfs/linux/linux.h"
-
-#ifdef HAVE_IO_URING
-#include "vfs/io_uring/io_uring.h"
-#endif /* ifdef HAVE_IO_URING */
-
-#ifdef HAVE_CAIRN
-#include "vfs/cairn/cairn.h"
-#endif /* ifdef HAVE_CAIRN */
-
-#include "vfs/diskfs/diskfs.h"
 #include "common/misc.h"
 #include "common/macros.h"
 #include "prometheus-c.h"
@@ -225,6 +213,35 @@ static uint64_t
 chimera_vfs_close_sweep_min_age_ns(
     void);
 
+/* Log every handle a cache still holds a reference to.  Shutdown cannot finish
+ * until each is released, so a drain that stalls names its culprits instead of
+ * hanging silently. */
+static void
+chimera_vfs_close_thread_log_held(
+    struct vfs_open_cache *cache,
+    const char            *which)
+{
+    struct chimera_vfs_open_handle *handle;
+    char                            fh[2 * CHIMERA_VFS_FH_SIZE + 1];
+
+    for (unsigned int i = 0; i < cache->num_shards; i++) {
+        struct vfs_open_cache_shard *shard = &cache->shards[i];
+
+        evpl_mutex_lock(&shard->lock);
+        for (handle = shard->handles; handle; handle = handle->bucket_next) {
+            for (int b = 0; b < handle->fh_len; b++) {
+                snprintf(fh + 2 * b, 3, "%02x", handle->fh[b]);
+            }
+            fh[2 * handle->fh_len] = '\0';
+            chimera_vfs_error("shutdown: %s cache still holds %s handle %s "
+                              "(opencnt %u, access_mode %u, flags %x)",
+                              which, handle->vfs_module->name, fh, handle->opencnt,
+                              handle->access_mode, handle->flags);
+        }
+        evpl_mutex_unlock(&shard->lock);
+    }
+} /* chimera_vfs_close_thread_log_held */
+
 static void
 chimera_vfs_close_thread_wake_shutdown(
     struct evpl          *evpl,
@@ -254,6 +271,20 @@ chimera_vfs_close_thread_wake_shutdown(
 
     if (!shutdown) {
         return;
+    }
+
+    if (close_thread->shutdown_started == 0) {
+        close_thread->shutdown_started = chimera_vfs_now_ticks();
+    } else if (!close_thread->shutdown_stall_logged &&
+               (count || close_thread->num_pending) &&
+               chimera_vfs_ticks_to_ns(chimera_vfs_now_ticks() -
+                                       close_thread->shutdown_started) > 5000000000ULL) {
+        close_thread->shutdown_stall_logged = 1;
+        chimera_vfs_error("shutdown: close drain stalled for 5s with %" PRIu64
+                          " handles still referenced and %d closes in flight",
+                          count, close_thread->num_pending);
+        chimera_vfs_close_thread_log_held(close_thread->vfs->vfs_open_path_cache, "path");
+        chimera_vfs_close_thread_log_held(close_thread->vfs->vfs_open_file_cache, "file");
     }
 
     if (count == 0 && close_thread->num_pending == 0) {
@@ -599,41 +630,199 @@ chimera_vfs_create_call_rcu_workers(int nworkers)
 
 #endif /* CHIMERA_HAVE_URCU */
 
-/* Native builds resolve built-ins explicitly so archive members are retained.
-* External modules require a shared Chimera SDK and remain a Unix facility. */
-static struct chimera_vfs_module *
-chimera_vfs_find_module(const char *symbol)
-{
 #ifdef _WIN32
-    extern struct chimera_vfs_module vfs_root, vfs_memfs, vfs_memkv;
-    extern struct chimera_vfs_module vfs_nfs, vfs_smb, vfs_diskfs;
-#ifdef CHIMERA_HAVE_SQLITE_VFS
-    extern struct chimera_vfs_module vfs_sqlite;
-#endif /* ifdef CHIMERA_HAVE_SQLITE_VFS */
-    struct chimera_vfs_module       *builtins[] = {
-        &vfs_root,
-        &vfs_memfs,
-        &vfs_memkv,
-        &vfs_nfs,
-        &vfs_smb,
-        &vfs_diskfs,
-#ifdef HAVE_CAIRN
-        &vfs_cairn,
-#endif /* ifdef HAVE_CAIRN */
-#ifdef CHIMERA_HAVE_SQLITE_VFS
-        &vfs_sqlite,
-#endif /* ifdef CHIMERA_HAVE_SQLITE_VFS */
-    };
-    for (size_t i = 0; i < sizeof(builtins) / sizeof(builtins[0]); i++) {
-        if (!strncmp(symbol, "vfs_", 4) && !strcmp(symbol + 4, builtins[i]->name)) {
-            return builtins[i];
+
+/* Directory the VFS backend modules are loaded from when a module config
+ * names no explicit module_path: $CHIMERA_VFS_MODULE_DIR when set, otherwise
+ * the directory chimera_vfs.dll itself was loaded from, which is where the
+ * build and the install put the modules (see the Unix counterpart below). */
+static void
+chimera_vfs_module_dir(
+    char  *dir,
+    size_t dirlen)
+{
+    const char *env = getenv("CHIMERA_VFS_MODULE_DIR");
+    HMODULE     self;
+    DWORD       len;
+    char       *sep, *alt;
+
+    if (env && env[0] != '\0') {
+        snprintf(dir, dirlen, "%s", env);
+        return;
+    }
+
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR) (uintptr_t) chimera_vfs_module_dir, &self)) {
+        len = GetModuleFileNameA(self, dir, (DWORD) dirlen);
+        if (len > 0 && len < dirlen) {
+            sep = strrchr(dir, '\\');
+            alt = strrchr(dir, '/');
+            if (alt && (!sep || alt > sep)) {
+                sep = alt;
+            }
+            if (sep) {
+                *sep = '\0';
+                return;
+            }
         }
     }
-    return NULL;
+
+    snprintf(dir, dirlen, "%s", CHIMERA_VFS_MODULE_INSTALL_DIR);
+} /* chimera_vfs_module_dir */
+
+/* Resolve the module named module_name to its vfs_<name> descriptor, loading
+ * its DLL from module_path, or from the module directory when module_path is
+ * empty.  A module the executable itself exports (one a test binary embeds)
+ * is used as is, as dlsym(RTLD_DEFAULT) finds it on Unix; loading a DLL a
+ * second time returns the copy already loaded. */
+static struct chimera_vfs_module *
+chimera_vfs_load_module(
+    const char *module_name,
+    const char *module_path)
+{
+    struct chimera_vfs_module *module;
+    char                       modsym[80];
+    char                       dir[MAX_PATH];
+    char                       path[MAX_PATH + 128];
+    wchar_t                    wpath[MAX_PATH + 128];
+    wchar_t                    wfull[MAX_PATH + 128];
+    char                       err[256];
+    HMODULE                    handle;
+    DWORD                      rc;
+
+    snprintf(modsym, sizeof(modsym), "vfs_%s", module_name);
+
+    module = (struct chimera_vfs_module *) (uintptr_t)
+        GetProcAddress(GetModuleHandleW(NULL), modsym);
+
+    if (module) {
+        return module;
+    }
+
+    if (module_path && module_path[0] != '\0') {
+        snprintf(path, sizeof(path), "%s", module_path);
+    } else {
+        chimera_vfs_module_dir(dir, sizeof(dir));
+        snprintf(path, sizeof(path), "%s\\%s%s%s", dir,
+                 CHIMERA_VFS_MODULE_PREFIX, module_name, CHIMERA_VFS_MODULE_SUFFIX);
+    }
+
+    /* The search flags below take an absolute path, and resolve the module's
+     * own dependencies (rocksdb.dll for cairn, say) from its directory. */
+    chimera_vfs_abort_if(!MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath,
+                                              (int) (sizeof(wpath) / sizeof(wpath[0]))),
+                         "VFS module path %s is not valid UTF-8 or is too long", path);
+    rc = GetFullPathNameW(wpath, (DWORD) (sizeof(wfull) / sizeof(wfull[0])), wfull, NULL);
+    chimera_vfs_abort_if(rc == 0 || rc >= sizeof(wfull) / sizeof(wfull[0]),
+                         "Cannot resolve VFS module path %s", path);
+
+    handle = LoadLibraryExW(wfull, NULL,
+                            LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+
+    if (!handle) {
+        rc = GetLastError();
+        if (!FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                            NULL, rc, 0, err, sizeof(err), NULL)) {
+            snprintf(err, sizeof(err), "error %lu", (unsigned long) rc);
+        }
+        chimera_vfs_abort("Failed to load VFS module %s from %s: %s",
+                          module_name, path, err);
+    }
+
+    module = (struct chimera_vfs_module *) (uintptr_t) GetProcAddress(handle, modsym);
+
+    chimera_vfs_abort_if(!module, "VFS module %s has no symbol %s in %s",
+                         module_name, modsym, path);
+
+    chimera_vfs_info("VFS module %s loaded from %s", module_name, path);
+
+    return module;
+} /* chimera_vfs_load_module */
+
 #else  /* ifdef _WIN32 */
-    return dlsym(RTLD_DEFAULT, symbol);
+
+/* Directory the VFS backend modules are loaded from when a module config
+ * names no explicit module_path: $CHIMERA_VFS_MODULE_DIR when set, otherwise
+ * the directory libchimera_vfs itself was loaded from.  The build places the
+ * in-tree modules beside libchimera_vfs and installs them beside it too, so
+ * the same rule finds them in a build tree and in an installed tree. */
+static void
+chimera_vfs_module_dir(
+    char  *dir,
+    size_t dirlen)
+{
+    const char *env = getenv("CHIMERA_VFS_MODULE_DIR");
+    Dl_info     info;
+    char       *slash;
+
+    if (env && env[0] != '\0') {
+        snprintf(dir, dirlen, "%s", env);
+        return;
+    }
+
+    /* A file-local function has no canonical PLT address in the executable,
+     * so dladdr reports this library rather than whatever links it. */
+    if (dladdr((void *) chimera_vfs_module_dir, &info) && info.dli_fname) {
+        snprintf(dir, dirlen, "%s", info.dli_fname);
+        slash = strrchr(dir, '/');
+        if (slash) {
+            *slash = '\0';
+            return;
+        }
+    }
+
+    snprintf(dir, dirlen, "%s", CHIMERA_VFS_MODULE_INSTALL_DIR);
+} /* chimera_vfs_module_dir */
+
+/* Resolve the module named module_name to its vfs_<name> descriptor, loading
+ * its shared object from module_path, or from the module directory when
+ * module_path is empty.  A module whose symbol is already present in the
+ * process (one a test binary embeds, or one an earlier config entry loaded)
+ * is used as is. */
+static struct chimera_vfs_module *
+chimera_vfs_load_module(
+    const char *module_name,
+    const char *module_path)
+{
+    struct chimera_vfs_module *module;
+    char                       modsym[80];
+    char                       dir[PATH_MAX];
+    char                       path[PATH_MAX + 128];
+    void                      *handle;
+
+    snprintf(modsym, sizeof(modsym), "vfs_%s", module_name);
+
+    module = dlsym(RTLD_DEFAULT, modsym);
+
+    if (module) {
+        return module;
+    }
+
+    if (module_path && module_path[0] != '\0') {
+        snprintf(path, sizeof(path), "%s", module_path);
+    } else {
+        chimera_vfs_module_dir(dir, sizeof(dir));
+        snprintf(path, sizeof(path), "%s/%s%s%s", dir,
+                 CHIMERA_VFS_MODULE_PREFIX, module_name, CHIMERA_VFS_MODULE_SUFFIX);
+    }
+
+    handle = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
+
+    chimera_vfs_abort_if(!handle, "Failed to load VFS module %s from %s: %s",
+                         module_name, path, dlerror());
+
+    module = dlsym(handle, modsym);
+
+    chimera_vfs_abort_if(!module, "VFS module %s has no symbol %s in %s",
+                         module_name, modsym, path);
+
+    chimera_vfs_info("VFS module %s loaded from %s", module_name, path);
+
+    return module;
+} /* chimera_vfs_load_module */
+
 #endif /* ifdef _WIN32 */
-} /* chimera_vfs_find_module */
 
 SYMBOL_EXPORT struct chimera_vfs *
 chimera_vfs_init(
@@ -650,11 +839,6 @@ chimera_vfs_init(
 {
     struct chimera_vfs        *vfs;
     struct chimera_vfs_module *module;
-    char                       modsym[80];
-
-#ifndef _WIN32
-    void                      *handle;
-#endif /* ifndef _WIN32 */
     const char                *effective_kv_module;
 
     /* Bring up the process-wide TSC clock before any cache/timestamp use. */
@@ -723,46 +907,22 @@ chimera_vfs_init(
     vfs->vfs_state  = chimera_vfs_state_init();
     vfs->pnfs       = chimera_vfs_pnfs_create();
 
-    /* Register the root pseudo-filesystem module */
-    chimera_vfs_register(vfs, &vfs_root, NULL);
-    /* Create the root mount entry in the mount table */
-    chimera_vfs_root_register_mount(vfs);
+    /* Until a mount is placed at "/", the built-in rootfs is the namespace
+     * root (see vfs_rootfs.h). */
+    chimera_vfs_register(vfs, &chimera_vfs_rootfs_module, NULL);
+    chimera_vfs_rootfs_mount(vfs);
 
     for (int i = 0; i < num_modules; i++) {
-        chimera_vfs_info("Initializing VFS module %s...", module_cfgs[i].module_name);
-        snprintf(modsym, sizeof(modsym), "vfs_%s", module_cfgs[i].module_name);
-
-        // If a module path is specified, attempt to load the shared object
-        if (module_cfgs[i].module_path[0] != '\0') {
-            // Check if the symbol is already present (module already loaded)
-            if (chimera_vfs_find_module(modsym) != NULL) {
-                chimera_vfs_error("Module %s already loaded, skipping dlopen of %s",
-                                  module_cfgs[i].module_name, module_cfgs[i].module_path);
-            } else {
-#ifdef _WIN32
-                chimera_vfs_abort_if(1, "External VFS modules require a shared-library build: %s",
-                                     module_cfgs[i].module_path);
-#else  /* ifdef _WIN32 */
-                // Attempt to load the module shared object
-                handle = dlopen(module_cfgs[i].module_path, RTLD_NOW | RTLD_GLOBAL);
-                if (!handle) {
-                    chimera_vfs_abort_if(1, "Failed to load module %s from %s: %s",
-                                         module_cfgs[i].module_name,
-                                         module_cfgs[i].module_path,
-                                         dlerror());
-                }
-                chimera_vfs_info("Module %s loaded from %s", module_cfgs[i].module_name, module_cfgs[i].module_path);
-#endif /* ifdef _WIN32 */
-            }
+        /* The namespace root used to be a module named "root" that configs
+         * listed; it is now part of the VFS core. */
+        if (!strcmp(module_cfgs[i].module_name, "root")) {
+            continue;
         }
 
-        // Lookup the module symbol (should be present after dlopen or if statically linked)
-        module = chimera_vfs_find_module(modsym);
-        chimera_vfs_abort_if(!module,
-                             "Module %s symbol %s not found after loading %s",
-                             module_cfgs[i].module_name,
-                             modsym,
-                             module_cfgs[i].module_path);
+        chimera_vfs_info("Initializing VFS module %s...", module_cfgs[i].module_name);
+
+        module = chimera_vfs_load_module(module_cfgs[i].module_name,
+                                         module_cfgs[i].module_path);
 
         // Register the module with the VFS, passing its config path
         chimera_vfs_register(vfs, module, module_cfgs[i].config_data);
@@ -785,20 +945,9 @@ chimera_vfs_init(
 
     /* The default KV is a VFS-core facility, not a share backend, so callers
      * need not list it among module_cfgs.  If it wasn't explicitly registered,
-     * auto-register it from its built-in symbol (vfs_memkv / vfs_sqlite, linked
-     * into chimera_vfs). */
+     * load it from the module directory like any other backend. */
     if (!vfs->kv_module) {
-        if (strcmp(effective_kv_module, "memkv") == 0) {
-            /* memkv is built into chimera_vfs; reference it directly so the
-            * symbol is always retained regardless of linker --as-needed. */
-            module = &vfs_memkv;
-        } else {
-            snprintf(modsym, sizeof(modsym), "vfs_%s", effective_kv_module);
-            module = chimera_vfs_find_module(modsym);
-        }
-        chimera_vfs_abort_if(!module,
-                             "KV module '%s' not found (symbol vfs_%s)",
-                             effective_kv_module, effective_kv_module);
+        module = chimera_vfs_load_module(effective_kv_module, NULL);
         chimera_vfs_register(vfs, module, NULL);
         vfs->kv_module = vfs->modules[module->fh_magic];
     }
@@ -1461,8 +1610,8 @@ chimera_vfs_register(
 {
     /* A module built against a different SDK contract would misinterpret the
      * request/module structures; refuse it at load time rather than corrupt
-     * memory.  Out-of-tree modules arrive via dlopen (module_path), so this
-     * is their only compatibility gate. */
+     * memory.  Every backend, in-tree or not, arrives via dlopen, so this is
+     * its only compatibility gate. */
     chimera_vfs_abort_if(module->sdk_version != CHIMERA_VFS_SDK_VERSION,
                          "module %s was built against VFS SDK version %u; this chimera provides version %u",
                          module->name, module->sdk_version, CHIMERA_VFS_SDK_VERSION);
@@ -1487,10 +1636,13 @@ chimera_vfs_thread_drain(struct chimera_vfs_thread *thread)
 
 SYMBOL_EXPORT void
 chimera_vfs_get_root_fh(
-    uint8_t  *fh,
-    uint32_t *fh_len)
+    struct chimera_vfs *vfs,
+    uint8_t            *fh,
+    uint32_t           *fh_len)
 {
-    chimera_vfs_root_get_fh(fh, fh_len);
+    if (chimera_vfs_mount_table_namespace_root(vfs->mount_table, fh, fh_len) != 0) {
+        chimera_vfs_rootfs_root_fh(fh, fh_len);
+    }
 } /* chimera_vfs_get_root_fh */
 
 SYMBOL_EXPORT int

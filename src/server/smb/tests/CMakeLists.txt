@@ -51,6 +51,16 @@ if(CHIMERA_NETNS_TESTING)
     set_tests_properties(chimera/server/smb/smbclient_kerberos_no_fallback PROPERTIES
         SKIP_RETURN_CODE 77)
 
+    # Kerberos-first client against a server with no Kerberos: the local user
+    # must still log on over NTLM, and a client that insists on Kerberos must
+    # be refused.  smbclient falls back to NTLM on its own, so the steering
+    # itself is pinned by the raw wire probe in smbclient_ntlm.
+    add_test(NAME chimera/server/smb/smbclient_kerberos_ntlm_fallback
+        COMMAND ${CMAKE_SOURCE_DIR}/scripts/kerberos_test_wrapper.sh
+                ${CMAKE_CURRENT_BINARY_DIR}/smbclient_auth_test --mode=kerberos-ntlm-fallback)
+    set_tests_properties(chimera/server/smb/smbclient_kerberos_ntlm_fallback PROPERTIES
+        SKIP_RETURN_CODE 77)
+
     find_program(SAMBA_TOOL samba-tool)
     if(SAMBA_TOOL)
         add_test(NAME chimera/server/smb/smbclient_winbind
@@ -87,8 +97,7 @@ set(CHIMERA_TEST_TIER "extended")
 # Security-descriptor native-SID round trip: the SD decoder and
 # emitter driven directly, with and without an identity authority.
 add_executable(smb_sd_sid_test smb_sd_sid_test.c)
-target_link_libraries(smb_sd_sid_test chimera_server chimera_smb chimera_vfs
-    chimera_vfs_memfs chimera_vfs_memkv evpl)
+target_link_libraries(smb_sd_sid_test chimera_server chimera_smb chimera_vfs evpl)
 target_include_directories(smb_sd_sid_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
 add_test(NAME chimera/server/smb/sd_sid_test
@@ -102,6 +111,15 @@ target_include_directories(smb_harden_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
 add_test(NAME chimera/server/smb/harden_test
     COMMAND ${CMAKE_CURRENT_BINARY_DIR}/smb_harden_test)
+
+# DCE/RPC bind handling (smb_dcerpc.h): the bind_ack fields a Windows RPC
+# client validates.  Header-only logic driven with hand-built PDUs.
+add_executable(smb_dcerpc_test smb_dcerpc_test.c)
+target_link_libraries(smb_dcerpc_test chimera_server chimera_smb)
+target_include_directories(smb_dcerpc_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+add_test(NAME chimera/server/smb/dcerpc_test
+    COMMAND ${CMAKE_CURRENT_BINARY_DIR}/smb_dcerpc_test)
 
 # SMB2 Extended Attribute wire-format helpers (smb_ea.h): FILE_FULL_EA /
 # FILE_GET_EA parse/emit round-trip and bounds, case-insensitive name compare,
@@ -3744,6 +3762,30 @@ set(SMBTORTURE_ENABLED_cairn
     smb2.winattr2
     # smb2.zero-data-ioctl
     smb2.zero-data-ioctl
+    # named streams (cairn keeps each stream as an inode of its own)
+    smb2.fileid.fileid
+    smb2.ioctl-on-stream
+    smb2.kernel-oplocks.kernel_oplocks2
+    smb2.kernel-oplocks.kernel_oplocks4
+    smb2.kernel-oplocks.kernel_oplocks6
+    smb2.stream-inherit-perms
+    smb2.streams.attributes1
+    smb2.streams.attributes2
+    smb2.streams.basefile-rename-with-open-stream
+    smb2.streams.create-disposition
+    smb2.streams.delete
+    smb2.streams.dir
+    smb2.streams.io
+    smb2.streams.names
+    smb2.streams.names2
+    # smb2.streams.names3 opens the base file by a re-cased path; cairn
+    # has no case-insensitive name lookup (memfs_dirent_find_ci) yet
+    smb2.streams.rename
+    smb2.streams.rename2
+    smb2.streams.sharemodes
+    smb2.streams.zero-byte
+    smb2.oplock.batch26
+    smb2.lease.request
 )
 
 set(SMBTORTURE_ENABLED_diskfs_io_uring
@@ -4345,6 +4387,31 @@ set(SMBTORTURE_ENABLED_diskfs_io_uring
     smb2.winattr2
     # smb2.zero-data-ioctl
     smb2.zero-data-ioctl
+    # named streams (diskfs keeps each stream as an inode of its own)
+    smb2.fileid.fileid
+    smb2.ioctl-on-stream
+    smb2.kernel-oplocks.kernel_oplocks2
+    smb2.kernel-oplocks.kernel_oplocks4
+    smb2.kernel-oplocks.kernel_oplocks6
+    smb2.stream-inherit-perms
+    smb2.streams.attributes1
+    smb2.streams.attributes2
+    smb2.streams.basefile-rename-with-open-stream
+    smb2.streams.create-disposition
+    smb2.streams.delete
+    smb2.streams.dir
+    smb2.streams.io
+    smb2.streams.names
+    smb2.streams.names2
+    # smb2.streams.names3 opens the base file by a re-cased path; diskfs
+    # has no case-insensitive name lookup (memfs_dirent_find_ci) yet
+    smb2.streams.rename
+    # smb2.streams.rename2 renames to and from the unnamed data stream, which
+    # diskfs does not do
+    smb2.streams.sharemodes
+    smb2.streams.zero-byte
+    smb2.oplock.batch26
+    smb2.lease.request
 )
 
 set(SMBTORTURE_ENABLED_diskfs_aio
@@ -4943,6 +5010,31 @@ set(SMBTORTURE_ENABLED_diskfs_aio
     smb2.winattr2
     # smb2.zero-data-ioctl
     smb2.zero-data-ioctl
+    # named streams (diskfs keeps each stream as an inode of its own)
+    smb2.fileid.fileid
+    smb2.ioctl-on-stream
+    smb2.kernel-oplocks.kernel_oplocks2
+    smb2.kernel-oplocks.kernel_oplocks4
+    smb2.kernel-oplocks.kernel_oplocks6
+    smb2.stream-inherit-perms
+    smb2.streams.attributes1
+    smb2.streams.attributes2
+    smb2.streams.basefile-rename-with-open-stream
+    smb2.streams.create-disposition
+    smb2.streams.delete
+    smb2.streams.dir
+    smb2.streams.io
+    smb2.streams.names
+    smb2.streams.names2
+    # smb2.streams.names3 opens the base file by a re-cased path; diskfs
+    # has no case-insensitive name lookup (memfs_dirent_find_ci) yet
+    smb2.streams.rename
+    # smb2.streams.rename2 renames to and from the unnamed data stream, which
+    # diskfs does not do
+    smb2.streams.sharemodes
+    smb2.streams.zero-byte
+    smb2.oplock.batch26
+    smb2.lease.request
 )
 
 # >>> SMBTORTURE_BLOCK_END

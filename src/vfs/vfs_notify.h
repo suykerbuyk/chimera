@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include "common/export.h"
+
 #include <stdint.h>
 #include "common/thread.h"
 #include <uthash.h>
@@ -11,37 +13,42 @@
 #include "sdk/vfs_fh.h"
 
 /* Event types matching SMB2 CompletionFilter categories */
-#define CHIMERA_VFS_NOTIFY_FILE_ADDED    0x0001
-#define CHIMERA_VFS_NOTIFY_FILE_REMOVED  0x0002
-#define CHIMERA_VFS_NOTIFY_FILE_MODIFIED 0x0004
-#define CHIMERA_VFS_NOTIFY_DIR_ADDED     0x0008
-#define CHIMERA_VFS_NOTIFY_DIR_REMOVED   0x0010
+#define CHIMERA_VFS_NOTIFY_FILE_ADDED     0x0001
+#define CHIMERA_VFS_NOTIFY_FILE_REMOVED   0x0002
+#define CHIMERA_VFS_NOTIFY_FILE_MODIFIED  0x0004
+#define CHIMERA_VFS_NOTIFY_DIR_ADDED      0x0008
+#define CHIMERA_VFS_NOTIFY_DIR_REMOVED    0x0010
 /* A rename of a FILE.  Split from the directory case because the two SMB2
  * name filters are: MS-FSCC scopes FILE_NOTIFY_CHANGE_FILE_NAME to file name
  * changes "including renaming" and _DIR_NAME to directory ones, so a client
  * watching directory names must not be woken because a file was renamed. */
-#define CHIMERA_VFS_NOTIFY_RENAMED       0x0020
-#define CHIMERA_VFS_NOTIFY_ATTRS_CHANGED 0x0040
-#define CHIMERA_VFS_NOTIFY_SIZE_CHANGED  0x0080
+#define CHIMERA_VFS_NOTIFY_RENAMED        0x0020
+#define CHIMERA_VFS_NOTIFY_ATTRS_CHANGED  0x0040
+#define CHIMERA_VFS_NOTIFY_SIZE_CHANGED   0x0080
 /* Named-stream (alternate data stream) change classes, mapping to the
  * SMB2 FILE_NOTIFY_CHANGE_STREAM_{NAME,SIZE,WRITE} completion filters.
  * STREAM_NAME covers a stream being created/renamed/removed; STREAM_SIZE
  * a change to a stream's length; STREAM_WRITE a write into a stream's
  * data.  A write to a file's default ($DATA) fork touches both the
  * stream size and stream data, so the write path emits SIZE|WRITE. */
-#define CHIMERA_VFS_NOTIFY_STREAM_NAME   0x0100
-#define CHIMERA_VFS_NOTIFY_STREAM_SIZE   0x0200
-#define CHIMERA_VFS_NOTIFY_STREAM_WRITE  0x0400
+#define CHIMERA_VFS_NOTIFY_STREAM_NAME    0x0100
+#define CHIMERA_VFS_NOTIFY_STREAM_SIZE    0x0200
+#define CHIMERA_VFS_NOTIFY_STREAM_WRITE   0x0400
 /* A rename of a DIRECTORY.  Raised instead of CHIMERA_VFS_NOTIFY_RENAMED when
  * the caller knows the renamed object is one (CHIMERA_VFS_RENAME_SRC_IS_DIR);
  * a caller that does not know raises RENAMED, which both name filters see --
  * the conservative answer for a protocol that cannot tell us. */
-#define CHIMERA_VFS_NOTIFY_RENAMED_DIR   0x0800
+#define CHIMERA_VFS_NOTIFY_RENAMED_DIR    0x0800
+/* Qualifiers on CHIMERA_VFS_NOTIFY_STREAM_NAME: the named stream was created or
+ * removed (SMB FILE_ACTION_ADDED_STREAM / _REMOVED_STREAM).  They select the
+ * action reported, not the completion filter that matches it. */
+#define CHIMERA_VFS_NOTIFY_STREAM_ADDED   0x1000
+#define CHIMERA_VFS_NOTIFY_STREAM_REMOVED 0x2000
 
-#define CHIMERA_VFS_NOTIFY_RING_SIZE     32
-#define CHIMERA_VFS_NOTIFY_NUM_BUCKETS   64
-#define CHIMERA_VFS_NOTIFY_MAX_PENDING   256
-#define CHIMERA_VFS_NOTIFY_MAX_DEPTH     64
+#define CHIMERA_VFS_NOTIFY_RING_SIZE      32
+#define CHIMERA_VFS_NOTIFY_NUM_BUCKETS    64
+#define CHIMERA_VFS_NOTIFY_MAX_PENDING    256
+#define CHIMERA_VFS_NOTIFY_MAX_DEPTH      64
 
 struct chimera_vfs_notify_event {
     uint32_t action;           /* CHIMERA_VFS_NOTIFY_* */
@@ -222,7 +229,7 @@ struct chimera_vfs_notify {
 
 /* Public API */
 
-struct chimera_vfs_notify *
+SYMBOL_EXPORT struct chimera_vfs_notify *
 chimera_vfs_notify_init(
     struct chimera_vfs *vfs);
 
@@ -239,11 +246,11 @@ chimera_vfs_notify_init(
  * frontends (NFS/SMB/S3 servers) before tearing down the VFS.  Tests
  * that need concurrent shutdown must arrange their own quiescence.
  */
-void
+SYMBOL_EXPORT void
 chimera_vfs_notify_destroy(
     struct chimera_vfs_notify *notify);
 
-struct chimera_vfs_notify_watch *
+SYMBOL_EXPORT struct chimera_vfs_notify_watch *
 chimera_vfs_notify_watch_create(
     struct chimera_vfs_notify    *notify,
     const uint8_t                *dir_fh,
@@ -253,7 +260,7 @@ chimera_vfs_notify_watch_create(
     chimera_vfs_notify_callback_t callback,
     void                         *private_data);
 
-void
+SYMBOL_EXPORT void
 chimera_vfs_notify_watch_destroy(
     struct chimera_vfs_notify       *notify,
     struct chimera_vfs_notify_watch *watch);
@@ -263,14 +270,14 @@ chimera_vfs_notify_watch_destroy(
  * different CompletionFilter or WATCH_TREE flag — without this we
  * would either deliver too many events (filter ignored) or never
  * adjust subtree scope (watch_tree fixed at first request). */
-void
+SYMBOL_EXPORT void
 chimera_vfs_notify_watch_update(
     struct chimera_vfs_notify       *notify,
     struct chimera_vfs_notify_watch *watch,
     uint32_t                         filter_mask,
     int                              watch_tree);
 
-int
+SYMBOL_EXPORT int
 chimera_vfs_notify_drain(
     struct chimera_vfs_notify_watch *watch,
     struct chimera_vfs_notify_event *events,
@@ -284,7 +291,7 @@ chimera_vfs_notify_drain(
  * rescan, so the *next* CHANGE_NOTIFY on the handle must also report overflow
  * (MS-SMB2 / smb2.notify.valid-req).
  */
-void
+SYMBOL_EXPORT void
 chimera_vfs_notify_mark_overflow(
     struct chimera_vfs_notify_watch *watch);
 
@@ -294,11 +301,11 @@ chimera_vfs_notify_mark_overflow(
  * polls this alongside drain to complete a pending CHANGE_NOTIFY with
  * STATUS_DELETE_PENDING.
  */
-int
+SYMBOL_EXPORT int
 chimera_vfs_notify_watch_take_deleted(
     struct chimera_vfs_notify_watch *watch);
 
-void
+SYMBOL_EXPORT void
 chimera_vfs_notify_emit(
     struct chimera_vfs_notify *notify,
     const uint8_t             *dir_fh,
@@ -314,7 +321,7 @@ chimera_vfs_notify_emit(
  * directory-lease break this fires: the mutating client's cached directory view
  * is coherent with the change it just made (MS-SMB2 dirlease self-exemption).
  * `has_skip` == false is exactly chimera_vfs_notify_emit (break every lease). */
-void
+SYMBOL_EXPORT void
 chimera_vfs_notify_emit_lease(
     struct chimera_vfs_notify *notify,
     const uint8_t             *dir_fh,
@@ -332,7 +339,7 @@ chimera_vfs_notify_emit_lease(
  * the SMB create path when a create-capable disposition only opened an existing
  * file — change-notify fires (conservatively) but the directory's contents did
  * not change, so a directory read lease must not be recalled. */
-void
+SYMBOL_EXPORT void
 chimera_vfs_notify_emit_nobreak(
     struct chimera_vfs_notify *notify,
     const uint8_t             *dir_fh,
@@ -349,7 +356,7 @@ chimera_vfs_notify_emit_nobreak(
  * CHANGE_NOTIFY on a handle to the now-deleted directory completes with
  * STATUS_DELETE_PENDING instead of parking forever.
  */
-void
+SYMBOL_EXPORT void
 chimera_vfs_notify_emit_delete(
     struct chimera_vfs_notify *notify,
     const uint8_t             *fh,
@@ -381,7 +388,7 @@ chimera_vfs_notify_emit_delete(
 
 /* Mark a watch as a sync watcher owned by `origin` (may be NULL, though a
  * NULL-origin sync watch gates even its own endpoint's mutations). */
-void
+SYMBOL_EXPORT void
 chimera_vfs_notify_watch_set_sync(
     struct chimera_vfs_notify       *notify,
     struct chimera_vfs_notify_watch *watch,
@@ -390,27 +397,27 @@ chimera_vfs_notify_watch_set_sync(
 /* Detach and return the watch's queued sync events (FIFO order).  Each
  * returned event MUST eventually be passed to chimera_vfs_notify_gate_ack
  * or its gate stalls until the deadline sweep. */
-struct chimera_vfs_notify_sync_event *
+SYMBOL_EXPORT struct chimera_vfs_notify_sync_event *
 chimera_vfs_notify_drain_sync(
     struct chimera_vfs_notify_watch *watch);
 
 /* Acknowledge one sync event: the consumer has invalidated its caches for
  * the event's name(s).  Frees the event; the last outstanding ack resumes
  * the gated operation's completion on its owning thread. */
-void
+SYMBOL_EXPORT void
 chimera_vfs_notify_gate_ack(
     struct chimera_vfs_notify            *notify,
     struct chimera_vfs_notify_sync_event *event);
 
 /* Fire every gate past its deadline (called from the periodic close-thread
  * sweep). */
-void
+SYMBOL_EXPORT void
 chimera_vfs_notify_gate_sweep(
     struct chimera_vfs_notify *notify);
 
 /* vfs_notify_gate.c: install the completion gate on a namespace-mutating
  * request when sync watchers exist.  Called by chimera_vfs_dispatch; cheap
  * no-op when no sync watches are registered. */
-void
+SYMBOL_EXPORT void
 chimera_vfs_notify_gate_install(
     struct chimera_vfs_request *request);

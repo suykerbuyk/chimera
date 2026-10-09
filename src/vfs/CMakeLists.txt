@@ -16,7 +16,7 @@ add_compile_definitions(_LGPL_SOURCE)
 
 add_library(chimera_vfs ${CHIMERA_LIBRARY_TYPE} vfs.c vfs_lsan.c vfs_cred.c vfs_sdk_utils.c
             vfs_acl.c vfs_acl_serialize.c vfs_access.c vfs_idmap.c vfs_identity.c
-            vfs_sid.c
+            vfs_sid.c vfs_rootfs.c vfs_mount_cross.c
             vfs_proc_mount.c vfs_proc_umount.c
             vfs_proc_mkfs.c vfs_proc_rmfs.c
             vfs_proc_mkdir_at.c vfs_proc_mknod_at.c vfs_proc_close.c vfs_proc_open_fh.c
@@ -43,6 +43,7 @@ add_library(chimera_vfs ${CHIMERA_LIBRARY_TYPE} vfs.c vfs_lsan.c vfs_cred.c vfs_
             vfs_proc_list_xattrs.c vfs_proc_remove_xattr.c
             vfs_proc_open_stream.c vfs_proc_list_streams.c
             vfs_proc_remove_stream.c
+            vfs_proc_rename_stream.c
             vfs_pnfs.c vfs_pnfs_io.c vfs_proc_get_layout.c)
 
 target_compile_definitions(chimera_vfs PRIVATE
@@ -67,10 +68,46 @@ install(FILES
         ${OTEL_SRC}/oteltracing.h
         DESTINATION include/chimera)
 
+# The VFS backends are plugins: each builds as a loadable module that
+# chimera_vfs_init dlopens by name at runtime (src/vfs/vfs.c), and none is
+# linked into chimera_vfs.  They land beside libchimera_vfs in the build tree
+# and install beside it, which is where the loader looks for a module whose
+# config gives no explicit module_path.  On Windows the modules are DLLs
+# bound to chimera_vfs.dll and chimera_common.dll exactly as the Linux ones
+# are to the shared objects.
+set(CHIMERA_VFS_MODULE_TYPE MODULE)
+
+target_compile_definitions(chimera_vfs PRIVATE
+    CHIMERA_VFS_MODULE_PREFIX="${CMAKE_SHARED_MODULE_PREFIX}chimera_vfs_"
+    CHIMERA_VFS_MODULE_SUFFIX="${CMAKE_SHARED_MODULE_SUFFIX}"
+    CHIMERA_VFS_MODULE_INSTALL_DIR="${CMAKE_INSTALL_PREFIX}/lib")
+
+# Finish a backend target created with add_library(... ${CHIMERA_VFS_MODULE_TYPE}):
+# place it where the loader finds it and bind it to the VFS core it plugs into.
+function(chimera_vfs_module target)
+    if (WIN32)
+        # Beside chimera_vfs.dll, which CMake places with the executables;
+        # a MODULE is a LIBRARY artifact, so it has to be sent there.
+        set_target_properties(${target} PROPERTIES
+            LIBRARY_OUTPUT_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
+    else ()
+        set_target_properties(${target} PROPERTIES
+            LIBRARY_OUTPUT_DIRECTORY ${CHIMERA_VFS_BINARY_DIR})
+    endif ()
+    target_link_libraries(${target} chimera_vfs chimera_common)
+    install(TARGETS ${target} DESTINATION lib)
+    set_property(GLOBAL APPEND PROPERTY CHIMERA_VFS_MODULE_TARGETS ${target})
+endfunction()
+
+set(CHIMERA_VFS_BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR})
+
+# Quantum downstream VFS layers: these build against the module machinery
+# defined above (CHIMERA_VFS_MODULE_TYPE / chimera_vfs_module) and so are
+# added after it.
 add_subdirectory(contract)
 add_subdirectory(media)
 add_subdirectory(facade)
-add_subdirectory(root)
+
 add_subdirectory(memfs)
 add_subdirectory(memkv)
 
@@ -111,31 +148,18 @@ else ()
     message(STATUS "sqlite3 not found; skipping chimera_vfs_sqlite")
 endif()
 
+get_property(CHIMERA_VFS_MODULE_TARGETS GLOBAL PROPERTY CHIMERA_VFS_MODULE_TARGETS)
+
 target_link_libraries(chimera_vfs
-    chimera_vfs_root chimera_vfs_memfs chimera_vfs_memkv chimera_vfs_diskfs
-    chimera_vfs_nfs chimera_vfs_smb
     chimera_common prometheus-c xxhash ${CHIMERA_DL_LIB} ${CHIMERA_RCU_LIBS})
 
-if (CHIMERA_LINUX)
-    target_link_libraries(chimera_vfs chimera_vfs_linux)
-endif()
-
-if (CHIMERA_VFS_IO_URING)
-    target_link_libraries(chimera_vfs chimera_vfs_io_uring)
-endif()
-
-if (SQLITE_ENABLED)
-    target_link_libraries(chimera_vfs chimera_vfs_sqlite)
-endif()
-
-if (DEMFS_ENABLED)
-    target_link_libraries(chimera_vfs chimera_vfs_diskfs)
-endif()
-
-if (CAIRN_ENABLED)
-    target_link_libraries(chimera_vfs chimera_vfs_cairn)
-endif()
+# Nothing links the backends, so give the libraries that bring up a VFS a
+# build dependency on them: building any of those builds a loadable set.
+add_custom_target(chimera_vfs_modules DEPENDS ${CHIMERA_VFS_MODULE_TARGETS})
 
 if (NOT DISABLE_TESTS)
     add_subdirectory(tests)
 endif()
+
+# Exports its data rather than importing it (common/export.h).
+target_compile_definitions(chimera_vfs PRIVATE CHIMERA_VFS_BUILD)

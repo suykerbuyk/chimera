@@ -446,7 +446,7 @@ main(void)
     chimera_vfs_mount(G.vfs_thread, NULL, "/test", "pathshim", "fs0", NULL, mount_cb, NULL);
     wait_done(); assert(G.status == 0);
 
-    chimera_vfs_get_root_fh(vroot, &vroot_len);
+    chimera_vfs_get_root_fh(G.vfs_thread->vfs, vroot, &vroot_len);
     chimera_vfs_lookup(G.vfs_thread, &root, vroot, vroot_len, "test", 4,
                        CHIMERA_VFS_ATTR_FH, 0, attr_cb, NULL);
     wait_done(); assert(G.status == 0);
