@@ -1710,14 +1710,17 @@ chimera_io_uring_readdir(
 
     fd = request->readdir.handle->vfs_private;
 
-    /* No credential impersonation here, deliberately: READDIR acts purely
-     * through an open handle the engine already authorized, and POSIX binds
-     * a directory stream's rights at opendir -- a chmod after that must not
-     * break an open stream.  The per-request "." re-open below (a private
-     * cursor over the same object, no path resolution) and the child statx
-     * would otherwise re-check DAC against the current mode.  Stateless
-     * wire callers still face per-operation DAC where it belongs: at the
-     * cred-keyed open of the handle itself. */
+    /* No credential impersonation here, deliberately: the engine has
+     * already decided whether the caller may list this directory, and
+     * whether it may search it and so see the entries' attributes and
+     * handles (chimera_vfs_readdir, which withholds them otherwise).  POSIX
+     * binds a directory stream's right to list at opendir -- a chmod after
+     * that must not break an open stream.  The per-request "." re-open below
+     * (a private cursor over the same object, no path resolution) and the
+     * child statx would otherwise re-check DAC against the current mode.  A
+     * stateless wire caller holds no stream (the by-handle open authorizes
+     * nothing), so the engine checks it against the current mode and ACL on
+     * every READDIR. */
 
     if (thread->readdir_verifier) {
         struct stat st;
@@ -2857,13 +2860,19 @@ chimera_io_uring_rename_at(
          * "may the replaced directory be emptied" before the POSIX type
          * pairing, answering ENOTEMPTY where rename(2) specifies EISDIR for
          * a non-directory moved onto a directory.  Re-derive the type pair
-         * (as root: DAC was settled above) and correct that corner. */
+         * (as root: DAC was settled above) and correct that corner.
+         * A directory moved onto a non-empty directory is ENOTEMPTY on ext4
+         * and EEXIST on XFS.  rename(2) allows either; report ENOTEMPTY. */
         struct stat ost, nst;
 
         if (fstatat(old_fd, fullname, &ost, AT_SYMLINK_NOFOLLOW) == 0 &&
-            fstatat(new_fd, full_newname, &nst, AT_SYMLINK_NOFOLLOW) == 0 &&
-            !S_ISDIR(ost.st_mode) && S_ISDIR(nst.st_mode)) {
-            renameat_errno = EISDIR;
+            fstatat(new_fd, full_newname, &nst, AT_SYMLINK_NOFOLLOW) == 0) {
+            if (!S_ISDIR(ost.st_mode) && S_ISDIR(nst.st_mode)) {
+                renameat_errno = EISDIR;
+            } else if (S_ISDIR(ost.st_mode) && S_ISDIR(nst.st_mode) &&
+                       renameat_errno == EEXIST) {
+                renameat_errno = ENOTEMPTY;
+            }
         }
     }
 

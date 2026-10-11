@@ -22,6 +22,21 @@ The checks below, and a build, are the evidence.
 - A branch named `CHIM-<n>-sync-<date>` / `chim-<n>-sync-<date>`
 - Creating a `sync-code-<YYYYMMDD>` tag
 
+## Who is running the sync
+
+Nothing in this skill names a person.  Every identity below is resolved
+from the session that runs it, once, before step 0, and the values are
+reused verbatim in the steps that cite them.  A value that cannot be
+resolved stops the run: ask, do not substitute a remembered one.
+
+| Value | Resolve with | Used in |
+|---|---|---|
+| `<jira-account-id>` | `atlassianUserInfo` -> `account_id` | step 0, ticket assignee |
+| `<gitlab-user>` | `glab api user \| jq -r .username` | step 9, MR assignee |
+| `<reviewer>` | ask with AskUserQuestion (a GitLab username other than `<gitlab-user>`) | step 9 |
+| `<qb-tag>` | `$USER-sync`; a single-leg re-run beside it uses `$USER-sync-sa` (`qb-ci.sh` picks its own `$USER-<branch>`; none of the three collide) | step 8, reference.md |
+| commit identity | `git var GIT_COMMITTER_IDENT` must name the user; `git commit -s` then writes the trailer | steps 6, 7 |
+
 ## Checklist
 
 Create a todo per step. Do not skip a step because the merge was clean.
@@ -34,14 +49,15 @@ Create a todo per step. Do not skip a step because the merge was clean.
      the branch without one.
    - Answer is yes: create a CHIM **Story** titled `code drop <YYYY-MM-DD>`
      with the exact fields in reference.md ("Creating the sync ticket"):
-     assignee Alain, Team Titans, the current Titans sprint, 1 story
-     point, parent NG-684, component Unsure.  Read the key back and use it
+     assignee `<jira-account-id>`, Team Titans, the current Titans
+     sprint, 1 story point, parent NG-684, component Unsure.  Read the key back and use it
      for the rest of the sync.  Remember that the skill created it: step
      10 fills its description from the MR body.
    - Answer is no: stop and ask for the key to use.
 
 1. **Tag the upstream snapshot.** Lightweight tag on the upstream commit,
-   pushed to `origin` only (never `arenaud16`):
+   pushed to `origin` only (never to a personal fork remote, if the clone
+   has one):
    ```bash
    git fetch origin --tags --prune
    git tag sync-code-$(date +%Y%m%d) origin/main
@@ -73,17 +89,19 @@ Create a todo per step. Do not skip a step because the merge was clean.
    cache, build it as configured: `sudo cmake -S . -B /build/Release &&
    sudo cmake --build /build/Release -j 8`.
 
-6. **Merge commit message.** Compose it before committing; `git commit -F`.
-   Format and rationale in reference.md.
+6. **Merge commit message.** Compose it before committing;
+   `git commit -s -F <file>`.  `-s` adds the `Signed-off-by` trailer from
+   the committer identity; never type one into the file.  Format and
+   rationale in reference.md.
 
 7. **Follow-up commits.** Downstream fixes are separate commits, each
-   `CHIM-<n>:` prefixed with a `Signed-off-by` trailer. `qtm_build/` and
+   `CHIM-<n>:` prefixed and committed with `-s`. `qtm_build/` and
    `qb.yaml` never share a commit with anything else.
 
 8. **Verify.** On the cluster, never `make check` locally:
    ```bash
    .devcontainer/quantum/qb-ci.sh -a amd64 2>&1 | tee qb-ci.log
-   qb -o arenaud-claude --plain rocky9
+   qb -o "$USER-sync" --plain rocky9
    ```
    `qb-ci.sh` builds chimera-dev once and runs the merge-train legs sharded
    the way `.gitlab-ci.yml` does, so a failure names one shard instead of
@@ -94,8 +112,9 @@ Create a todo per step. Do not skip a step because the merge was clean.
 
 9. **Open the MR.** Push the branch, then `glab mr create` against
    `develop`: title = the merge commit subject, label `Sync origin/main`,
-   body composed in a file in the shape reference.md gives ("Opening the
-   MR").  Keep that file: step 10 reuses it.
+   assignee `<gitlab-user>`, reviewer `<reviewer>`, body composed in a
+   file in the shape reference.md gives ("Opening the MR").  Keep that
+   file: step 10 reuses it.
 
 10. **Update the Jira tickets.** For every CHIM ticket whose upstream PR
     landed in this range (the merge message's "Jira coverage" paragraph),
@@ -113,6 +132,7 @@ Create a todo per step. Do not skip a step because the merge was clean.
 |---|---|
 | "No ticket was given, I'll branch now and fill the key in later" | The key is in the branch name and every commit. Ask first (step 0). |
 | "The last sync's ticket is still open, reuse it" | One ticket per code drop. Create a new one. |
+| "Memory / the last MR says who the assignee and qb tag are" | Those are the previous runner's. Resolve every value from the identity table for this session. |
 | "The merge was clean, so it's fine" | Every break so far was a clean auto-merge. Run the checks. |
 | "Only N files conflicted, small sync" | Conflict count is unrelated to breakage. A header that *moves* never conflicts. |
 | "The checks passed, skip the build" | The checks encode known failures only. The build finds the new ones. |
