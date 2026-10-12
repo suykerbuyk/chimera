@@ -179,10 +179,104 @@ struct chimera_vfs_link_at_gate {
     struct chimera_vfs_open_handle *op_handle;
     chimera_vfs_link_at_callback_t  callback;
     void                           *private_data;
+    /* For a replace: the clobbered object's handle, resolved up front so its
+    * removal can be authorized (delete_allowed + sticky) before the link. */
+    uint8_t                         target_fh[CHIMERA_VFS_FH_SIZE];
+    int                             target_fh_len;
 };
 
 _Static_assert(sizeof(struct chimera_vfs_link_at_gate) <= CHIMERA_VFS_GATE_SCRATCH_SIZE,
                "link_at gate context outgrew the request gate scratch area");
+
+/* Issue the backend link using the fields saved on the gate.  Factored out so
+ * every terminal path (plain link, and the authorized-replace path) dispatches
+ * identically.  The stored dir_fh/name/fh are the caller's buffers (not the
+ * gate scratch), so they stay valid for the request after the scratch frees. */
+static void
+chimera_vfs_link_at_gate_dispatch(struct chimera_vfs_link_at_gate *gate)
+{
+    chimera_vfs_link_at_dispatch(gate->thread, gate->cred, gate->fh, gate->fhlen,
+                                 gate->dir_fh, gate->dir_fhlen, gate->name,
+                                 gate->namelen, gate->replace, gate->attr_mask,
+                                 gate->pre_attr_mask, gate->post_attr_mask,
+                                 gate->parent_lease_skip_valid ?
+                                 gate->parent_lease_skip : NULL,
+                                 gate->op_handle,
+                                 gate->callback, gate->private_data);
+} /* chimera_vfs_link_at_gate_dispatch */
+
+/* Terminal callback of the replaced-object delete authorization
+ * (chimera_vfs_gate_callback_t).  On OK the removal of the clobbered object is
+ * authorized, so perform the link; otherwise surface the authorization error.
+ * Either way this ends the chain, so the gate scratch is freed here. */
+static void
+chimera_vfs_link_at_gate_delete_cb(
+    enum chimera_vfs_error status,
+    void                  *private_data)
+{
+    struct chimera_vfs_link_at_gate *gate = private_data;
+
+    if (status != CHIMERA_VFS_OK) {
+        gate->callback(status, NULL, NULL, NULL, gate->private_data);
+        chimera_vfs_gate_scratch_free(gate->thread, gate);
+        return;
+    }
+
+    chimera_vfs_link_at_gate_dispatch(gate);
+    chimera_vfs_gate_scratch_free(gate->thread, gate);
+} /* chimera_vfs_link_at_gate_delete_cb */
+
+/* Replace path: the clobbered name has been looked up
+ * (chimera_vfs_lookup_callback_t).  'attr' is valid only when status is OK, so
+ * branch on status before touching it.  Mirrors rename_at's destination lookup,
+ * but fails closed when an existing name resolves without a usable file handle
+ * (deliberate divergence from rename_at:602-604, tracked by
+ * rename-replace-no-fh-fail-closed). */
+static void
+chimera_vfs_link_at_resolve_cb(
+    enum chimera_vfs_error    status,
+    struct chimera_vfs_attrs *attr,
+    void                     *private_data)
+{
+    struct chimera_vfs_link_at_gate *gate = private_data;
+
+    /* Arm 1: no existing object at the name -> nothing is replaced; link it. */
+    if (status == CHIMERA_VFS_ENOENT) {
+        chimera_vfs_link_at_gate_dispatch(gate);
+        chimera_vfs_gate_scratch_free(gate->thread, gate);
+        return;
+    }
+
+    /* Arm 2: any other lookup error -> cannot authorize a replace; refuse. */
+    if (status != CHIMERA_VFS_OK) {
+        gate->callback(status, NULL, NULL, NULL, gate->private_data);
+        chimera_vfs_gate_scratch_free(gate->thread, gate);
+        return;
+    }
+
+    /* Arm 3: an existing object with a usable handle -> authorize destroying it
+     * (delete_allowed on the directory / object + the sticky owner rule),
+     * exactly as rename_at authorizes replacing a destination.  Copy the handle
+     * into gate-owned storage first: the lookup attrs are freed when this
+     * callback returns, and the delete gate retains the pointer. */
+    if ((attr->va_set_mask & CHIMERA_VFS_ATTR_FH) &&
+        attr->va_fh_len > 0 && attr->va_fh_len <= CHIMERA_VFS_FH_SIZE) {
+        memcpy(gate->target_fh, attr->va_fh, attr->va_fh_len);
+        gate->target_fh_len = attr->va_fh_len;
+
+        chimera_vfs_gate_delete_always(&gate->gate_ctx, gate->thread, gate->cred,
+                                       gate->dir_fh, gate->dir_fhlen,
+                                       gate->target_fh, gate->target_fh_len,
+                                       chimera_vfs_link_at_gate_delete_cb, gate);
+        return;
+    }
+
+    /* Arm 4: an existing name resolved without a usable handle -> the delete
+    * authorization cannot be evaluated against the object being destroyed, so
+    * fail closed rather than replace it on the directory add check alone. */
+    gate->callback(CHIMERA_VFS_EACCES, NULL, NULL, NULL, gate->private_data);
+    chimera_vfs_gate_scratch_free(gate->thread, gate);
+} /* chimera_vfs_link_at_resolve_cb */
 
 static void
 chimera_vfs_link_at_gate_complete(
@@ -197,14 +291,22 @@ chimera_vfs_link_at_gate_complete(
         return;
     }
 
-    chimera_vfs_link_at_dispatch(gate->thread, gate->cred, gate->fh, gate->fhlen,
-                                 gate->dir_fh, gate->dir_fhlen, gate->name,
-                                 gate->namelen, gate->replace, gate->attr_mask,
-                                 gate->pre_attr_mask, gate->post_attr_mask,
-                                 gate->parent_lease_skip_valid ?
-                                 gate->parent_lease_skip : NULL,
-                                 gate->op_handle,
-                                 gate->callback, gate->private_data);
+    /* The directory "add a name" permission is granted.  A plain link (no
+     * replace) destroys nothing, so dispatch directly.  A replace destroys
+     * whatever the name currently points at, which must be authorized like a
+     * delete (SEC-4): resolve the clobbered name's handle, then run
+     * delete_allowed on it before the link.  The lookup uses flag 0 (follow a
+     * final symlink) for parity with rename_at's destination lookup.  Scratch
+     * is freed only in the terminal callbacks, never here. */
+    if (gate->replace != 0) {
+        chimera_vfs_lookup(gate->thread, gate->cred, gate->dir_fh,
+                           gate->dir_fhlen, gate->name, gate->namelen,
+                           CHIMERA_VFS_ATTR_FH, 0,
+                           chimera_vfs_link_at_resolve_cb, gate);
+        return;
+    }
+
+    chimera_vfs_link_at_gate_dispatch(gate);
     chimera_vfs_gate_scratch_free(gate->thread, gate);
 } /* chimera_vfs_link_at_gate_complete */
 
@@ -327,6 +429,9 @@ chimera_vfs_link_at_path(
         gate->op_handle    = op_handle;
         gate->callback     = callback;
         gate->private_data = private_data;
+        /* Recycled gate scratch is not zeroed; clear the resolved-target len so
+         * the replace path only acts on a handle this request actually copied. */
+        gate->target_fh_len = 0;
 
         chimera_vfs_gate_fh_dac(&gate->gate_ctx, thread, cred,
                                 dir_fh, dir_fhlen,
