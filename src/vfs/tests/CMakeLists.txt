@@ -98,6 +98,15 @@ add_executable(vfs_enforce_test vfs_enforce_test.c)
 target_link_libraries(vfs_enforce_test chimera_vfs evpl)
 add_test(chimera/vfs/enforce_test vfs_enforce_test)
 
+# link_at(replace=1) authorizes destroying the clobbered name like a delete
+# (SEC-4 / D11).  Driven over memfs with explicit AUTH_UNIX creds; depend on the
+# loadable memfs/memkv modules so chimera_vfs_init dlopens them from the build
+# tree.
+add_executable(vfs_link_replace_test vfs_link_replace_test.c)
+target_link_libraries(vfs_link_replace_test chimera_vfs evpl)
+add_dependencies(vfs_link_replace_test chimera_vfs_memfs chimera_vfs_memkv)
+add_test(chimera/vfs/link_replace_test vfs_link_replace_test)
+
 # The attrstrip shim module lives in the test binary (wrapping an embedded
 # memfs) and is found by chimera_vfs_init in the executable's own exports
 # (dlsym(RTLD_DEFAULT), or GetProcAddress on the executable on Windows),
