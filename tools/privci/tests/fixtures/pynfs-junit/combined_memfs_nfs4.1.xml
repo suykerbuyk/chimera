@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-FileCopyrightText: 2026 Chimera-NAS Project Contributors -->
+<!-- SPDX-License-Identifier: Unlicense -->
+<!-- pynfs testserver.py xml output, trimmed from a real on-host run
+     (podman-priv head 61d14614,
+     ctest_debug_pynfs/pynfs-junit/combined_memfs_nfs4.1.xml): the pynfs test
+     code (OPEN7, COUR3, ...) is the `code` attribute and the human description
+     (testOPENClaimFH) is `name`; the two are distinct.  compare.py folds the
+     code in front of the name ("OPEN7 testOPENClaimFH") so a require/expect
+     pattern can address a case by its code (\bOPEN7\b).  If the fold is
+     removed, the key is the bare description and \bOPEN7\b no longer matches,
+     so the compare test goes red.
+
+     OPEN7 (CLAIM_FH) and COUR3 are 4.1 features: they do NOT appear in
+     combined_memfs_nfs4.0.xml (0 hits there), only in the 4.1 / 4.2 files, so
+     this fixture is named and sourced after nfs4.1.  Statuses are preserved
+     from that source: OPEN7 passes, COUR3 is skipped.  Written by
+     scripts/pynfs_test_wrapper.sh (the xml= option), PYNFS_JUNIT_FILE set at
+     pynfs/CMakeLists.txt:345. -->
+<testsuite name="all" tests="2" errors="0" failures="0" skipped="1">
+  <testcase code="OPEN7" name="testOPENClaimFH" classname="st_open"/>
+  <testcase code="COUR3" name="testShareReservation00" classname="st_courtesy">
+    <skipped/>
+  </testcase>
+</testsuite>

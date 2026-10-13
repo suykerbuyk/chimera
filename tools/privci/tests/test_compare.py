@@ -10,6 +10,7 @@ running the real scripts/*_to_junit.py converters), and that
 builders/priv/section3/{expect,require}.txt parse and match those formats.
 """
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -64,6 +65,22 @@ def build_side(root, ctest=None, junit=None, meta=None, leg="legA"):
             for key, val in meta.items():
                 handle.write("%s: %s\n" % (key, val))
     return root
+
+
+def _effective_lines(path):
+    """The lines parse_expect/parse_require treat as entries.
+
+    Mirrors the parser's own skip rule (non-blank, not a ``#`` comment) so a
+    parse-count assertion can be derived from the file instead of hard-coded --
+    editing expect.txt/require.txt then cannot silently rot the count.
+    """
+    out = []
+    with open(path) as handle:
+        for raw in handle:
+            stripped = raw.strip()
+            if stripped and not stripped.startswith("#"):
+                out.append(stripped)
+    return out
 
 
 class CompareCase(unittest.TestCase):
@@ -360,14 +377,22 @@ class TestConverterFormats(CompareCase):
         self.assertTrue(os.path.exists(golden_path))
         self.assertEqual(cases, dict(compare._parse_junit(golden_path)))
 
-    def test_pynfs_bare_code_format(self):
-        # pynfs testserver.py --xml (/opt/pynfs, container-only; invoked in
-        # scripts/pynfs_test_wrapper.sh via --xml=RESULTS_XML, PYNFS_JUNIT_FILE
-        # set at pynfs/CMakeLists.txt:345).  Names are the bare code.
+    def test_pynfs_code_attr_folded_into_name(self):
+        # Real pynfs junit (trimmed on-host: podman-priv head 61d14614): the
+        # code (OPEN7) is in `code=`, the description (testOPENClaimFH) in
+        # `name=`.  compare.py folds them to "<code> <name>" so a require/expect
+        # pattern can address a case by its code (\bOPEN7\b).  Removing the fold
+        # in compare.py leaves the bare description as the key, which \bOPEN7\b
+        # does not match -- this test then goes RED (the fix is shown capable of
+        # failing, not merely read as correct).
         cases = dict(compare._parse_junit(
-            os.path.join(FIX, "pynfs-junit", "combined_memfs_nfs4.0.xml")))
-        self.assertIn("OPEN7", cases)
-        self.assertIn("COUR3", cases)
+            os.path.join(FIX, "pynfs-junit", "combined_memfs_nfs4.1.xml")))
+        self.assertIn("OPEN7 testOPENClaimFH", cases)      # code folded in
+        self.assertIn("COUR3 testShareReservation00", cases)
+        self.assertNotIn("testOPENClaimFH", cases)         # not left bare
+        # the require.txt pattern matches only because of the fold.
+        self.assertTrue(re.search(r"\bOPEN7\b", "OPEN7 testOPENClaimFH"))
+        self.assertIsNone(re.search(r"\bOPEN7\b", "testOPENClaimFH"))
 
     def test_ctest_junit_name_format(self):
         # CTest --output-junit names are the full ctest test name; the pjd
@@ -381,9 +406,20 @@ class TestConverterFormats(CompareCase):
 # section3/expect.txt and require.txt parse and match the P2 formats.
 # --------------------------------------------------------------------------- #
 class TestSection3Files(CompareCase):
+    # The suites chimera actually runs (post-b6eef6e1): smb2.mkdir is a single
+    # case "smb2.mkdir" (kept here as .x to exercise the \b require pattern),
+    # and the real durable suites are durable-v2-regressions /
+    # durable-open-disconnect, not durable-v2-open / durable-open.
     SMBT_SUITES = ["smb2.create.x", "smb2.mkdir.x", "smb2.rename.x",
-                   "smb2.streams.x", "smb2.dir.x", "smb2.durable-v2-open.x",
-                   "smb2.durable-open.x", "smb2.durable-open-disconnect.x"]
+                   "smb2.streams.x", "smb2.dir.x",
+                   "smb2.durable-v2-regressions.x",
+                   "smb2.durable-open-disconnect.x"]
+    # The one timestamps subtest whose '/'-name is refused post-confinement
+    # (06bd87c6): Passed@base -> Failed@head by design, waived in expect.txt
+    # via a per-subtest junit entry and a per-suite CTest rollup entry.
+    TS_CASE = "smb2.timestamps.test_close_not_attrib"
+    TS_JUNIT = "smbtorture-junit/smbtorture_smb2_timestamps_memfs.xml"
+    TS_CTEST = "chimera/server/smb/smbtorture_smb2_timestamps_memfs"
     WPTS = ["CreateClose_SymbolicLinkInMiddle", "CreateClose_SymbolicLinkAtLast",
             "CreateClose_InvalidSymbolicLink",
             "CreateClose_CreateAndCloseDirWithDotDir",
@@ -395,30 +431,53 @@ class TestSection3Files(CompareCase):
            "chimera/posix/pjd/rename/00", "chimera/posix/pjd/symlink/00",
            "chimera/posix/pjd/unlink/00"]
 
-    def _section3_side(self, name):
+    def _section3_side(self, name, head=False):
+        # The waived timestamps subtest and its CTest rollup are Passed on base
+        # and Failed on head, matching the two expect.txt deviation entries;
+        # every other case is Passed on both sides.
         root = self._dir(name)
+        ts = compare.FAILED if head else compare.PASSED
         build_side(root, leg="smbtorture",
                    junit={"smbtorture-junit/suites.xml":
-                          [(n, compare.PASSED) for n in self.SMBT_SUITES]})
+                          [(n, compare.PASSED) for n in self.SMBT_SUITES],
+                          self.TS_JUNIT: [(self.TS_CASE, ts)]})
         build_side(root, leg="wpts",
                    junit={"wpts-junit/memfs_symlink.xml":
                           [(n, compare.PASSED) for n in self.WPTS]})
         build_side(root, leg="pynfs",
-                   junit={"pynfs-junit/combined_memfs_nfs4.0.xml":
+                   junit={"pynfs-junit/combined_memfs_nfs4.1.xml":
                           [(n, compare.PASSED) for n in self.PYNFS]})
         build_side(root, leg="rest",
-                   ctest=[(n, compare.PASSED) for n in self.PJD])
+                   ctest=[(n, compare.PASSED) for n in self.PJD]
+                   + [(self.TS_CTEST, ts)])
         return root
 
     def test_section3_files_parse(self):
-        expects = compare.parse_expect(os.path.join(SECTION3, "expect.txt"))
-        requires = compare.parse_require(os.path.join(SECTION3, "require.txt"))
-        self.assertEqual(len(expects), 3)           # the three symlink cases
-        self.assertEqual(len(requires), 8 + 7 + 2 + 1)
+        epath = os.path.join(SECTION3, "expect.txt")
+        rpath = os.path.join(SECTION3, "require.txt")
+        expects = compare.parse_expect(epath)
+        requires = compare.parse_require(rpath)
+        # Parse-derived, not a magic total: exactly one parsed entry per
+        # non-comment, non-blank line, so editing the files cannot silently rot
+        # this count (the old 3 / 8+7+2+1 literals rotted when b6eef6e1 landed).
+        self.assertEqual(len(expects), len(_effective_lines(epath)))
+        self.assertEqual(len(requires), len(_effective_lines(rpath)))
+        # Structural invariants, asserted rather than assumed.
+        for e in expects:
+            self.assertIn(e.frm, compare.STATUSES)
+            self.assertIn(e.to, compare.STATUSES)
+            re.compile(e.regex)
+        for r in requires:
+            re.compile(r.regex)
+        # The entries this unit's repair depends on are actually present.
+        expect_regexes = {e.regex for e in expects}
+        self.assertIn(r"smb2\.timestamps\.test_close_not_attrib$",
+                      expect_regexes)
+        self.assertIn(r"CreateClose_SymbolicLinkInMiddle$", expect_regexes)
 
     def test_section3_clean_run_exit_0_no_stale(self):
         base = self._section3_side("b")
-        head = self._section3_side("h")
+        head = self._section3_side("h", head=True)
         cmp, _ = compare.run(base, head,
                              os.path.join(SECTION3, "expect.txt"),
                              os.path.join(SECTION3, "require.txt"),
@@ -431,26 +490,71 @@ class TestSection3Files(CompareCase):
         self.assertEqual(cmp.exit_code, 0)
 
     def test_section3_symlink_regression_is_caught(self):
-        """A symlink case going Passed->Failed is an unexpected failure (exit 1)."""
+        """A symlink case going Passed->Failed is an unexpected failure (exit 1).
+
+        The head is an otherwise-clean section-3 side (the timestamps waiver
+        satisfied, not mismatched) with ONLY the symlink flipped to Failed, so
+        the exit-1 signal isolates the symlink regression instead of mixing it
+        with a waiver mismatch.
+        """
         base = self._section3_side("b")
-        head = self._dir("h")
-        build_side(head, leg="smbtorture",
-                   junit={"smbtorture-junit/suites.xml":
-                          [(n, compare.PASSED) for n in self.SMBT_SUITES]})
+        head = self._section3_side("h", head=True)
+        # Flip only the symlink; rewriting the wpts leg in place.
         build_side(head, leg="wpts", junit={"wpts-junit/memfs_symlink.xml":
                    [("CreateClose_SymbolicLinkInMiddle", compare.FAILED)]
                    + [(n, compare.PASSED) for n in self.WPTS[1:]]})
-        build_side(head, leg="pynfs",
-                   junit={"pynfs-junit/combined_memfs_nfs4.0.xml":
-                          [(n, compare.PASSED) for n in self.PYNFS]})
-        build_side(head, leg="rest",
-                   ctest=[(n, compare.PASSED) for n in self.PJD])
         cmp, _ = compare.run(base, head,
                              os.path.join(SECTION3, "expect.txt"),
                              os.path.join(SECTION3, "require.txt"),
                              os.path.join(head, "compare.md"))
         # Listed Passed->Passed but observed Passed->Failed: mismatch + unexpected.
         self.assertEqual(cmp.exit_code, 1)
+        # Isolated: the symlink is the sole unexpected new failure, and the
+        # timestamps waiver entries stay satisfied (no spurious mismatch).
+        self.assertEqual({k.split("::", 1)[1] for k in cmp.unexpected},
+                         {"CreateClose_SymbolicLinkInMiddle"})
+        ts_entries = [e for e in cmp.expects if "timestamps" in e.regex]
+        self.assertTrue(ts_entries)
+        self.assertTrue(all(e.verdict == "satisfied" for e in ts_entries))
+
+    def test_matcher_fixes_present_and_behave(self):
+        """One regression assertion per b6eef6e1 require-matcher fix.
+
+        The positive matches are exercised with the exact regex pulled from
+        require.txt (not a re-typed copy), so a typo in the production pattern
+        cannot be masked by the same typo in the test.  The negative direction
+        uses the now-removed old forms, each backed by assertNotIn to prove it
+        is really gone from production.
+        """
+        requires = compare.parse_require(os.path.join(SECTION3, "require.txt"))
+        regexes = {r.regex for r in requires}
+
+        def prod(pattern):
+            """The single production require regex equal to `pattern`."""
+            self.assertIn(pattern, regexes)
+            return next(r for r in regexes if r == pattern)
+
+        # mkdir: the real case is named exactly "smb2.mkdir".  The production
+        # word-boundary form matches it; the old trailing-dot form (removed
+        # from require.txt) never could -- that was the bug.
+        mkdir = prod(r"smb2\.mkdir\b")
+        self.assertTrue(re.search(mkdir, "smb2.mkdir"))
+        self.assertNotIn(r"smb2\.mkdir\.", regexes)
+        self.assertIsNone(re.search(r"smb2\.mkdir\.", "smb2.mkdir"))  # old form
+
+        # durable: the production patterns are the real suite names and match
+        # them; the old durable-open / -v2-open forms are gone and would not
+        # even substring-match the real names.
+        v2 = prod(r"smb2\.durable-v2-regressions\.")
+        disc = prod(r"smb2\.durable-open-disconnect\.")
+        self.assertTrue(re.search(v2, "smb2.durable-v2-regressions.replay"))
+        self.assertTrue(re.search(disc, "smb2.durable-open-disconnect.reopen"))
+        self.assertNotIn(r"smb2\.durable-v2-open\.", regexes)
+        self.assertNotIn(r"smb2\.durable-open\.", regexes)
+        self.assertIsNone(re.search(r"smb2\.durable-open\.",           # old form
+                                    "smb2.durable-open-disconnect.reopen"))
+        self.assertIsNone(re.search(r"smb2\.durable-v2-open\.",        # old form
+                                    "smb2.durable-v2-regressions.replay"))
 
 
 if __name__ == "__main__":
