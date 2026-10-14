@@ -55,7 +55,7 @@ trap 'rm -rf "$tmp"; "$PODMAN" rmi -f "$REF_IMAGE" >/dev/null 2>&1 || true' EXIT
 raw=$tmp/raw
 skopeo inspect --raw "docker://$BASE_NAME:$BASE_TAG" > "$raw" || die "skopeo inspect --raw failed"
 [ -s "$raw" ] || die "empty manifest for $BASE_NAME:$BASE_TAG"
-grep -Eq '"mediaType"[[:space:]]*:[[:space:]]*"application/vnd\.(oci\.image\.(index|manifest)\.v1|docker\.distribution\.manifest\.(list\.)?v2)\+json"' "$raw" ||
+grep -Eq '"mediaType"[[:space:]]*:[[:space:]]*"application\\?/vnd\.(oci\.image\.(index|manifest)\.v1|docker\.distribution\.manifest\.(list\.)?v2)\+json"' "$raw" ||
     die "no manifest or index mediaType in the response for $BASE_NAME:$BASE_TAG"
 d=$(sha256sum < "$raw" | cut -c1-64)
 echo "$d" | grep -Eq '^[0-9a-f]{64}$' || die "bad digest: '$d'"

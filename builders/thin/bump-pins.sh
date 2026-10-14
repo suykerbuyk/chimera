@@ -56,7 +56,7 @@ resolve() {
     ref=$1 raw=$tmp/raw
     skopeo inspect --raw "docker://$ref" > "$raw" || die "skopeo inspect --raw $ref failed"
     [ -s "$raw" ] || die "empty manifest for $ref"
-    grep -Eq '"mediaType"[[:space:]]*:[[:space:]]*"application/vnd\.(oci\.image\.(index|manifest)\.v1|docker\.distribution\.manifest\.(list\.)?v2)\+json"' "$raw" ||
+    grep -Eq '"mediaType"[[:space:]]*:[[:space:]]*"application\\?/vnd\.(oci\.image\.(index|manifest)\.v1|docker\.distribution\.manifest\.(list\.)?v2)\+json"' "$raw" ||
         die "no manifest or index mediaType in the response for $ref"
     d=$(sha256sum < "$raw" | cut -c1-64)
     echo "$d" | grep -Eq '^[0-9a-f]{64}$' || die "bad digest for $ref: '$d'"
