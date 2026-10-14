@@ -800,6 +800,33 @@ do_test_run() {
     run_privileged_container "$before" "$run" "$runid" "${argv[@]}"
 }
 
+# Recursively stage every submodule gitlink recorded in <committish>'s tree of
+# the repo at <repo>, extracting each at its *pinned* commit into <dest> under
+# <prefix>.  Unlike `submodule foreach ... HEAD`, this uses the sha the parent
+# tree pins, not the ambient worktree HEAD, so a drifted checkout cannot leak
+# the wrong submodule content into the build (the P5 libevpl patch-apply break).
+# Nested gitlinks (e.g. ext/libevpl's own ext/*) are covered at each level's pin.
+stage_submodules() {
+    local repo=$1 committish=$2 dest=$3 prefix=$4
+    local mode type sha path sub full
+    while read -r mode type sha path; do
+        [[ $type == commit ]] || continue
+        sub="$repo/$path"
+        full="$prefix$path"
+        [[ -d $sub ]] ||
+            die "submodule $full not initialized on disk ($sub); run 'git submodule update --init --recursive' then retry"
+        if ! git -C "$sub" cat-file -e "${sha}^{commit}" 2>/dev/null; then
+            git -C "$sub" fetch --quiet --all --tags 2>/dev/null || true
+            git -C "$sub" cat-file -e "${sha}^{commit}" 2>/dev/null ||
+                die "submodule $full: pinned commit $sha not present and fetch did not resolve it"
+        fi
+        git -C "$sub" archive --format=tar --prefix="$full/" "$sha" | tar -x -C "$dest" ||
+            die "staging submodule $full @ $sha failed"
+        # Recurse into this submodule's own gitlinks at the pin it records.
+        stage_submodules "$sub" "$sha" "$dest" "$full/"
+    done < <(git -C "$repo" ls-tree -r "$committish")
+}
+
 # Export the source into <dest> (Plan 2.1 "Source"): a recursive git archive of
 # a ref, or the tracked + untracked-not-ignored working tree.  Live path only.
 export_context() {
@@ -807,10 +834,11 @@ export_context() {
     rm -rf "${dest:?}"
     mkdir -p "$dest"
     if [[ -n $ref ]]; then
-        # Recursive archive including submodules, from local objects.
+        # Superproject at <ref>, then every submodule at the pin <ref> records
+        # (recursively) -- never the ambient worktree HEAD.  Staging failures
+        # are fatal (no silent skip), so a missing/unresolvable pin stops the run.
         git -C "$ROOT" archive --format=tar "$ref" | tar -x -C "$dest"
-        git -C "$ROOT" submodule --quiet foreach --recursive \
-            'git archive --format=tar --prefix="$displaypath/" HEAD | tar -x -C "'"$dest"'"' 2>/dev/null || true
+        stage_submodules "$ROOT" "$ref" "$dest" ""
     else
         # Working tree: tracked plus untracked-not-ignored.
         (cd "$ROOT" && git ls-files -z --cached --others --exclude-standard) |
