@@ -728,6 +728,49 @@ run_privileged_container() {
     return "$rc"
 }
 
+# Keep the operator's sudo credential primed for the whole privileged run.  A
+# compare spans hours and raises privilege several times (each side's container
+# launch, the end-of-run cleanup); sudo's ~15 min credential cache would
+# otherwise expire and re-prompt at the base->head transition and at the end,
+# stalling an unattended run indefinitely.  Prime once (-v prompts a single
+# time) from the privileged entry points, then refresh in the background until
+# the script exits.  Idempotent: a second call while already primed is a no-op.
+SUDO_KEEPALIVE_PID=""
+sudo_keepalive_start() {
+    [[ -n $PRIV_DRY_RUN ]]       && return 0   # dry-run never raises privilege
+    [[ $(id -u) -eq 0 ]]         && return 0   # already root (refuse_root guards the real path)
+    [[ -n $SUDO_KEEPALIVE_PID ]] && return 0   # already running
+    require_sudo_set
+    # Prime once.  A NOPASSWD sudo makes -v a no-op; a PRIV_SUDO wrapper that
+    # does not understand -v must not abort the run -- tolerate a priming
+    # failure and start the refresher only if the credential is then usable
+    # non-interactively.  Otherwise leave today's per-call prompting in place.
+    "$PRIV_SUDO" -v 2>/dev/null || true
+    if ! "$PRIV_SUDO" -n true 2>/dev/null; then
+        say "note: could not prime $PRIV_SUDO non-interactively; no keep-alive started"
+        return 0
+    fi
+    # Run the refresher in its OWN process group ('set -m' makes $! a group
+    # leader) so sudo_keepalive_stop can signal the whole group -- the loop AND
+    # its external 'sleep' child.  A plain kill of $! would hit only the subshell
+    # and orphan the sleep to PID 1 for up to its interval.  Toggle job control
+    # off again immediately so the rest of the run is unaffected.
+    set -m
+    ( while sleep 50; do "$PRIV_SUDO" -n true 2>/dev/null || exit 0; done ) &
+    SUDO_KEEPALIVE_PID=$!
+    set +m
+    trap sudo_keepalive_stop EXIT
+}
+
+sudo_keepalive_stop() {
+    [[ -n $SUDO_KEEPALIVE_PID ]] || return 0
+    # Signal the refresher's whole process group (loop + sleep); fall back to the
+    # bare pid if the group is already gone, then reap so no child lingers.
+    kill -- -"$SUDO_KEEPALIVE_PID" 2>/dev/null || kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
+    wait "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
+    SUDO_KEEPALIVE_PID=""
+}
+
 # Run one side end to end: select, prepare the run dir, export the context, and
 # run the privileged container (or preview it under PRIV_DRY_RUN).  Prints the
 # run dir path on the last line of stdout via RUN_DIR_OUT.
@@ -1033,6 +1076,7 @@ cmd_test() {
         [[ -z $free ]] || ((free >= PRIV_TEST_MIN_GIB)) ||
             die "test: only ${free} GiB free on $PRIV_DIR's filesystem (need >= ${PRIV_TEST_MIN_GIB})"
     fi
+    sudo_keepalive_start
     do_test_run "$PRIV_REF" test
 }
 
@@ -1049,6 +1093,7 @@ cmd_compare() {
     [[ -f $PRIV_EXPECT ]]  || die "PRIV_EXPECT not found: $PRIV_EXPECT"
     [[ -f $PRIV_REQUIRE ]] || die "PRIV_REQUIRE not found: $PRIV_REQUIRE"
 
+    sudo_keepalive_start
     do_test_run "$PRIV_BASE" base; local base_run=$RUN_DIR_OUT
     do_test_run "$PRIV_HEAD" head; local head_run=$RUN_DIR_OUT
 
