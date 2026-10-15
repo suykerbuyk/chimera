@@ -3377,9 +3377,21 @@ Package: python3-boolean
 Architecture: all
 Version: 5.0-1
 
+Package: python3-boto3
+Architecture: all
+Version: 1.40.72-1build1
+
+Package: python3-botocore
+Architecture: all
+Version: 1.40.72+repack-1build1
+
 Package: python3-build
 Architecture: all
 Version: 1.4.0-1
+
+Package: python3-certifi
+Architecture: all
+Version: 2026.1.4+ds-1
 
 Package: python3-cffi-backend
 Architecture: amd64
@@ -3428,6 +3440,10 @@ Version: 0.22.4+dfsg-1
 Package: python3-gssapi
 Architecture: amd64
 Version: 1.10.1-1build1
+
+Package: python3-idna
+Architecture: all
+Version: 3.11-1
 
 Package: python3-inflect
 Architecture: all
@@ -3517,6 +3533,10 @@ Package: python3-pyproject-hooks
 Architecture: all
 Version: 1.2.0-1
 
+Package: python3-requests
+Architecture: all
+Version: 2.32.5+dfsg-1ubuntu1
+
 Package: python3-roman-numerals
 Architecture: all
 Version: 4.1.0-1
@@ -3529,6 +3549,10 @@ Package: python3-ruamel.yaml.clib
 Architecture: amd64
 Version: 0.2.15+ds-1build1
 
+Package: python3-s3transfer
+Architecture: all
+Version: 0.14.0-1build1
+
 Package: python3-samba
 Architecture: amd64
 Version: 2:4.23.6+dfsg-1ubuntu2
@@ -3540,6 +3564,10 @@ Version: 78.1.1-0.1build1
 Package: python3-setuptools-whl
 Architecture: all
 Version: 78.1.1-0.1build1
+
+Package: python3-six
+Architecture: all
+Version: 1.17.0-2build1
 
 Package: python3-talloc
 Architecture: amd64

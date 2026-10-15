@@ -64,6 +64,7 @@ RUN apt-get -y update && \
     build-essential=12.12ubuntu2 ruby-full=1:3.3build1 autoconf=2.72-3.1ubuntu2 automake=1:1.18.1-3build1 make=4.4.1-3 libtool=2.5.4-9 pkg-config=2.5.1-4 libs3-dev=2.0-4ubuntu4 gh=2.46.0-4 npm=9.2.0~ds3-1 reuse=5.0.2-1build1 libssl-dev=3.5.5-1ubuntu3 openssl=3.5.5-1ubuntu3 \
     libkrb5-3=1.22.1-2ubuntu4 libkrb5-dev=1.22.1-2ubuntu4 libgssapi-krb5-2=1.22.1-2ubuntu4 libwbclient-dev=2:4.23.6+dfsg-1ubuntu2 libcrypt-dev=1:4.5.1-1 curl=8.18.0-1ubuntu2.1 jq=1.8.1-4ubuntu2 libicu-dev=78.2-2ubuntu1 awscli=2.31.35-1 \
     krb5-kdc=1.22.1-2ubuntu4 krb5-admin-server=1.22.1-2ubuntu4 krb5-user=1.22.1-2ubuntu4 python3-pip=25.1.1+dfsg-1ubuntu2 python3-setuptools=78.1.1-0.1build1 python3-venv=3.14.3-0ubuntu2 \
+    python3-boto3=1.40.72-1build1 \
     dh-python=7.20260309 pybuild-plugin-pyproject=7.20260309 debhelper-compat \
     samba=2:4.23.6+dfsg-1ubuntu2 samba-ad-dc=2:4.23.6+dfsg-1ubuntu2 samba-ad-provision=2:4.23.6+dfsg-1ubuntu2 samba-vfs-modules=2:4.23.6+dfsg-1ubuntu2 smbclient=2:4.23.6+dfsg-1ubuntu2 samba-testsuite=2:4.23.6+dfsg-1ubuntu2 && \
     gem install jekyll bundler
