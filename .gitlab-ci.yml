@@ -730,6 +730,16 @@ dev_branch:
   # Publish only on a real push/merge to develop -- not on the nightly schedule
   # (which only tests) and not on tag pipelines (the release job handles those).
   rules:
+    # Forks (e.g. jsuykerbuyk/chimera) have no publish_* CI/CD variables -- those
+    # are set on the canonical chimera/chimera project only.  An unset variable
+    # is null (not ""), so test with !$VAR (GitLab 18.11+), which is true for
+    # both unset and empty; guard BOTH publish destinations so a half-configured
+    # project skips rather than failing mid-script on the raw copy.  With no
+    # publish destination there is nothing to copy to, so skip rather than fail
+    # the fork's develop pipeline.  On the canonical both vars are set, so this
+    # rule never matches and the next rule runs the job exactly as before.
+    - if: '!$publish_docker_dest_internal || !$publish_raw_dest_internal'
+      when: never
     - if: '$CI_COMMIT_BRANCH == "develop" && $CI_PIPELINE_SOURCE == "push"'
   script:
     - >-
