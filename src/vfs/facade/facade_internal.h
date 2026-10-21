@@ -127,6 +127,15 @@ struct facade_obj {
     uint64_t                  retention_until_ns;
     uint32_t                  retention_mode;
     uint32_t                  refs;     /* minimal binding refcount: 0 or 1 (v4) */
+    /* Object content hash (data-verification, v5): computed at SEAL, persisted in
+     * the durable object record, reported by OBJ_STAT (NONE until sealed). */
+    uint8_t                   obj_csum[16];
+    uint32_t                  obj_csum_algo; /* CHIMERA_SC_CHECKSUM_* (0 = NONE) */
+    uint32_t                  obj_csum_len;  /* hash length in bytes (0 = absent) */
+    /* In-memory ONLY (never serialized, not durable): set at SEAL dispatch to
+     * freeze the object while its content is hashed; cleared on every seal exit.
+     * A crash loses it -> the object is still OPEN with no digest, client retries. */
+    uint8_t                   sealing;
     struct facade_extent_map *map;      /* logical->physical authority (NULL only when unused) */
 };
 

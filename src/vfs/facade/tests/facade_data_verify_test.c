@@ -41,6 +41,9 @@
 #include "facade_extent.h"
 #include "facade_log.h"
 #include "facade_object.h"
+#include "facade_ns.h"         /* facade_ns_txn (N5 freeze oracle) */
+#include "common/crypto.h"     /* chimera_crypto_digest (expected object MD5) */
+#include "sc_types.h"          /* chimera_sc_obj_meta, CHIMERA_SC_CHECKSUM_MD5 */
 
 #define ONE_GIB (1ULL << 30)
 #define BS      CHIMERA_MEDIA_BLOCK_SIZE
@@ -333,6 +336,140 @@ ts_phys(
           ext.kind == CHIMERA_SC_SEG_DATA);
     return ext.phys_block + (lb - ext.logical_block);
 } /* ts_phys */
+
+/* ---- P3 (object MD5 at SEAL) helpers ---- */
+
+static enum facade_status
+ts_seal(
+    struct ts    *t,
+    const uint8_t id[16])
+{
+    struct epoch_w w = { 0, FACADE_E_IO, 0 };
+
+    facade_obj_seal(t->alloc, id, on_epoch, &w);
+    pump(t->evpl, &w.done);
+    return w.st;
+} /* ts_seal */
+
+/* Dispatch a SEAL but do NOT wait: leaves o->sealing set and the hash chain in
+ * flight, for the freeze-interleave oracles.  *w receives the completion. */
+static void
+ts_seal_start(
+    struct ts      *t,
+    const uint8_t   id[16],
+    struct epoch_w *w)
+{
+    w->done = 0;
+    w->st   = FACADE_E_IO;
+    facade_obj_seal(t->alloc, id, on_epoch, w);
+} /* ts_seal_start */
+
+static enum facade_status
+ts_truncate(
+    struct ts    *t,
+    const uint8_t id[16],
+    uint64_t      new_size)
+{
+    struct epoch_w w = { 0, FACADE_E_IO, 0 };
+
+    facade_obj_truncate(t->alloc, id, new_size, on_epoch, &w);
+    pump(t->evpl, &w.done);
+    return w.st;
+} /* ts_truncate */
+
+static enum facade_status
+ts_allocate(
+    struct ts    *t,
+    const uint8_t id[16],
+    uint64_t      offset,
+    uint64_t      length)
+{
+    struct epoch_w w = { 0, FACADE_E_IO, 0 };
+
+    facade_obj_allocate(t->alloc, id, offset, length, on_epoch, &w);
+    pump(t->evpl, &w.done);
+    return w.st;
+} /* ts_allocate */
+
+static enum facade_status
+ts_punch(
+    struct ts    *t,
+    const uint8_t id[16],
+    uint64_t      offset,
+    uint64_t      length)
+{
+    struct epoch_w w = { 0, FACADE_E_IO, 0 };
+
+    facade_obj_punch(t->alloc, id, offset, length, on_epoch, &w);
+    pump(t->evpl, &w.done);
+    return w.st;
+} /* ts_punch */
+
+struct cb_w {
+    int done;
+    enum facade_status st;
+};
+
+static void
+on_cb(
+    enum facade_status st,
+    void              *priv)
+{
+    struct cb_w *w = priv;
+
+    w->st   = st;
+    w->done = 1;
+} /* on_cb */
+
+static enum facade_status
+ts_discard(
+    struct ts    *t,
+    const uint8_t id[16])
+{
+    struct cb_w w = { 0, FACADE_E_IO };
+
+    facade_obj_discard(t->alloc, id, on_cb, &w);
+    pump(t->evpl, &w.done);
+    return w.st;
+} /* ts_discard */
+
+/* obj_stat of `id` into m; returns 0 on success. */
+static int
+ts_stat(
+    struct ts                  *t,
+    const uint8_t               id[16],
+    struct chimera_sc_obj_meta *m)
+{
+    return facade_obj_stat(t->alloc, id, m);
+} /* ts_stat */
+
+/* o->change of a live object (white-box, for the freeze oracle). */
+static uint64_t
+ts_change(
+    struct ts    *t,
+    const uint8_t id[16])
+{
+    struct facade_obj *o = facade_obj_find(t->alloc, id);
+
+    CHECK(o != NULL);
+    return o->change;
+} /* ts_change */
+
+struct ns_w {
+    int                         done;
+    struct facade_ns_txn_result res;
+};
+
+static void
+on_ns(
+    const struct facade_ns_txn_result *r,
+    void                              *priv)
+{
+    struct ns_w *w = priv;
+
+    w->res  = *r;
+    w->done = 1;
+} /* on_ns */
 
 /* Assert object `id`'s extent at block `lb` is DATA with the expected checksum. */
 static void
@@ -697,6 +834,297 @@ main(void)
         /* 64 bytes at offset 0: boff==0, len<BS, DATA exists -> RMW pre-read. */
         CHECK(ts_write_sub(&t, id, 0, patch, sizeof(patch))
               == FACADE_E_DATA_UNRECOVERABLE);
+
+        ts_close_media(&t);
+    }
+
+    /* ---- 8 (P3): object content MD5 at SEAL -- MD5(content), survives reopen,
+     *      and an OPEN object reports NONE. ---- */
+    {
+        uint8_t                    id[16];
+        uint8_t                    b0[BS], b1[BS], b2[BS], content[3 * BS], expect[16];
+        struct chimera_sc_obj_meta m;
+
+        mkid(id, 0x81);
+        fillpat(b0, BS, 0x80);
+        fillpat(b1, BS, 0x81);
+        fillpat(b2, BS, 0x82);
+        memcpy(content, b0, BS);
+        memcpy(content + BS, b1, BS);
+        memcpy(content + 2 * BS, b2, BS);
+        CHECK(chimera_crypto_digest(CHIMERA_CRYPTO_MD5, content, sizeof(content),
+                                    expect, sizeof(expect)) == 1);
+
+        ts_open_media(&t, dir, 7);
+        ts_format(&t);
+        ts_open(&t);
+
+        ts_write_block(&t, id, 0, b0);
+        ts_write_block(&t, id, 1, b1);
+        ts_write_block(&t, id, 2, b2);
+
+        /* OPEN object reports NONE. */
+        CHECK(ts_stat(&t, id, &m) == 0 && m.state == CHIMERA_SC_OBJ_OPEN);
+        CHECK(m.checksum.algorithm == CHIMERA_SC_CHECKSUM_NONE && m.checksum.len == 0);
+
+        /* seal -> MD5(content). */
+        CHECK(ts_seal(&t, id) == FACADE_OK);
+        CHECK(ts_stat(&t, id, &m) == 0 && m.state == CHIMERA_SC_OBJ_SEALED);
+        CHECK(m.checksum.algorithm == CHIMERA_SC_CHECKSUM_MD5 && m.checksum.len == 16);
+        CHECK(memcmp(m.checksum.bytes, expect, 16) == 0);
+
+        /* digest survives close + reopen (persisted in the durable OBJ record). */
+        ts_reopen(&t);
+        CHECK(ts_stat(&t, id, &m) == 0 && m.state == CHIMERA_SC_OBJ_SEALED);
+        CHECK(m.checksum.algorithm == CHIMERA_SC_CHECKSUM_MD5 && m.checksum.len == 16);
+        CHECK(memcmp(m.checksum.bytes, expect, 16) == 0);
+
+        ts_close_media(&t);
+    }
+
+    /* ---- 9 (P3): the SEAL freeze (N1) -- every object-op is refused while an
+     *      object is sealing, including one parked in its RMW read; the map and
+     *      o->change are unchanged, and the seal still completes. ---- */
+    {
+        uint8_t                    x[16], y[16];
+        uint8_t                    b[BS], patch[64];
+        struct epoch_w             sw, pw;
+        uint64_t                   ch0;
+        struct chimera_sc_obj_meta m;
+
+        mkid(x, 0x91);
+        mkid(y, 0x92);
+        fillpat(b, BS, 0x90);
+        fillpat(patch, sizeof(patch), 0x9A);
+
+        ts_open_media(&t, dir, 8);
+        ts_format(&t);
+        ts_open(&t);
+
+        ts_write_block(&t, x, 0, b);
+        ts_write_block(&t, y, 0, b);
+
+        /* X: entry rejects.  Start a seal (o->sealing set, hash in flight), then
+         * every mutator is refused E_STATE at entry without touching the object. */
+        ts_seal_start(&t, x, &sw);
+        CHECK(!sw.done);                       /* seal pending (async hash) */
+        ch0 = ts_change(&t, x);
+
+        CHECK(ts_write_sub(&t, x, 0, patch, sizeof(patch)) == FACADE_E_STATE);
+        CHECK(ts_truncate(&t, x, 0) == FACADE_E_STATE);
+        CHECK(ts_allocate(&t, x, 4 * BS, BS) == FACADE_E_STATE);
+        CHECK(ts_punch(&t, x, 0, BS) == FACADE_E_STATE);
+        CHECK(ts_discard(&t, x) == FACADE_E_STATE);
+
+        /* none of the rejected ops changed the object. */
+        CHECK(ts_change(&t, x) == ch0);
+        check_block_csum(&t, x, 0, facade_crc32(b, BS));   /* map intact */
+
+        /* let the seal finish. */
+        pump(t.evpl, &sw.done);
+        CHECK(sw.st == FACADE_OK);
+        CHECK(ts_stat(&t, x, &m) == 0 && m.state == CHIMERA_SC_OBJ_SEALED);
+        CHECK(m.checksum.algorithm == CHIMERA_SC_CHECKSUM_MD5);
+
+        /* Y: a sub-block write parks in its RMW read BEFORE the seal, then submits
+         * after the seal began -- it is frozen out at the prepare chokepoint. */
+        pw.done = 0;
+        pw.st   = FACADE_E_IO;
+        facade_obj_write(t.alloc, y, 0, patch, sizeof(patch),
+                         CHIMERA_SC_WRITE_DURABLE, on_epoch, &pw);
+        CHECK(!pw.done);                       /* parked in the RMW pre-read */
+        ts_seal_start(&t, y, &sw);
+        CHECK(!sw.done);
+        pump(t.evpl, &pw.done);
+        CHECK(pw.st == FACADE_E_STATE);        /* parked RMW write frozen out */
+        pump(t.evpl, &sw.done);
+        CHECK(sw.st == FACADE_OK);             /* the seal still completes */
+        CHECK(ts_stat(&t, y, &m) == 0 && m.state == CHIMERA_SC_OBJ_SEALED);
+
+        ts_close_media(&t);
+    }
+
+    /* ---- 10 (P3): the SEAL freeze across the NS-txn path (N5) -- an NS delta
+     *      targeting a sealing object is refused E_STATE with r_failed_part DELTA,
+     *      nothing committed, and the in-flight seal completes with the right MD5. ---- */
+    {
+        uint8_t                       x[16], y[16];
+        uint8_t                       b[BS], expect[16];
+        struct epoch_w                sw;
+        struct ns_w                   nw;
+        struct chimera_sc_delta       d;
+        struct chimera_sc_ns_txn_args args;
+        struct chimera_sc_obj_meta    m;
+
+        mkid(x, 0xA1);
+        mkid(y, 0xA2);
+        fillpat(b, BS, 0xA0);
+        CHECK(chimera_crypto_digest(CHIMERA_CRYPTO_MD5, b, BS, expect, sizeof(expect)) == 1);
+
+        ts_open_media(&t, dir, 9);
+        ts_format(&t);
+        ts_open(&t);
+
+        ts_write_block(&t, x, 0, b);
+        ts_write_block(&t, y, 0, b);
+
+        /* a DELETE delta against a sealing X. */
+        ts_seal_start(&t, x, &sw);
+        CHECK(!sw.done);
+        memset(&d, 0, sizeof(d));
+        d.kind = CHIMERA_SC_DELTA_DELETE;
+        memcpy(d.del.obj.b, x, 16);
+        memset(&args, 0, sizeof(args));
+        args.deltas  = &d;
+        args.ndeltas = 1;
+        nw.done      = 0;
+        facade_ns_txn(t.alloc, &args, on_ns, &nw);
+        pump(t.evpl, &nw.done);
+        CHECK(nw.res.status == CHIMERA_SC_E_STATE &&
+              nw.res.r_failed_part == CHIMERA_SC_TXN_DELTA);
+        pump(t.evpl, &sw.done);
+        CHECK(sw.st == FACADE_OK);
+        CHECK(ts_stat(&t, x, &m) == 0 && m.state == CHIMERA_SC_OBJ_SEALED);
+        CHECK(memcmp(m.checksum.bytes, expect, 16) == 0);   /* right MD5 despite the NS txn */
+
+        /* a SEAL delta against a sealing Y. */
+        ts_seal_start(&t, y, &sw);
+        CHECK(!sw.done);
+        memset(&d, 0, sizeof(d));
+        d.kind = CHIMERA_SC_DELTA_SEAL;
+        memcpy(d.seal.obj.b, y, 16);
+        memset(&args, 0, sizeof(args));
+        args.deltas  = &d;
+        args.ndeltas = 1;
+        nw.done      = 0;
+        facade_ns_txn(t.alloc, &args, on_ns, &nw);
+        pump(t.evpl, &nw.done);
+        CHECK(nw.res.status == CHIMERA_SC_E_STATE &&
+              nw.res.r_failed_part == CHIMERA_SC_TXN_DELTA);
+        pump(t.evpl, &sw.done);
+        CHECK(sw.st == FACADE_OK);
+        CHECK(ts_stat(&t, y, &m) == 0 && m.state == CHIMERA_SC_OBJ_SEALED);
+        CHECK(memcmp(m.checksum.bytes, expect, 16) == 0);
+
+        ts_close_media(&t);
+    }
+
+    /* ---- 11 (P3): sealing an object with a corrupted block fails
+     *      DATA_UNRECOVERABLE and leaves it OPEN and WRITABLE. ---- */
+    {
+        uint8_t                    id[16];
+        uint8_t                    b[BS], b2[BS];
+        uint64_t                   phys;
+        struct chimera_sc_obj_meta m;
+
+        mkid(id, 0xB1);
+        fillpat(b, BS, 0xB0);
+        fillpat(b2, BS, 0xBB);
+
+        ts_open_media(&t, dir, 10);
+        ts_format(&t);
+        ts_open(&t);
+
+        ts_write_block(&t, id, 0, b);
+        ts_crash_recover(&t);                  /* drain: delegate authoritative */
+        ts_reopen(&t);
+
+        phys = ts_phys(&t, id, 0);
+        CHECK(t.control->corrupt(t.space, phys, 1) == 0);
+
+        CHECK(ts_seal(&t, id) == FACADE_E_DATA_UNRECOVERABLE);
+        CHECK(ts_stat(&t, id, &m) == 0 && m.state == CHIMERA_SC_OBJ_OPEN);
+        CHECK(m.checksum.algorithm == CHIMERA_SC_CHECKSUM_NONE);
+
+        /* the sealing flag was cleared: the object is writable again. */
+        ts_write_block(&t, id, 0, b2);         /* CHECKs OK internally */
+        CHECK(ts_stat(&t, id, &m) == 0 && m.state == CHIMERA_SC_OBJ_OPEN);
+
+        ts_close_media(&t);
+    }
+
+    /* ---- 12 (P3): durability -- a COMMITTED seal's digest survives crash +
+     *      recover (durable only via the seal txn COMMIT); an object whose seal
+     *      never committed carries no durable digest. ---- */
+    {
+        uint8_t                    x[16], y[16];
+        uint8_t                    b[BS], expect[16];
+        struct chimera_sc_obj_meta m;
+
+        mkid(x, 0xC1);
+        mkid(y, 0xC2);
+        fillpat(b, BS, 0xC0);
+        CHECK(chimera_crypto_digest(CHIMERA_CRYPTO_MD5, b, BS, expect, sizeof(expect)) == 1);
+
+        ts_open_media(&t, dir, 11);
+        ts_format(&t);
+        ts_open(&t);
+
+        ts_write_block(&t, x, 0, b);
+        CHECK(ts_seal(&t, x) == FACADE_OK);    /* X committed SEALED with the digest */
+        ts_write_block(&t, y, 0, b);           /* Y written but never sealed */
+
+        ts_crash_recover(&t);
+        ts_reopen(&t);
+
+        CHECK(ts_stat(&t, x, &m) == 0 && m.state == CHIMERA_SC_OBJ_SEALED);
+        CHECK(m.checksum.algorithm == CHIMERA_SC_CHECKSUM_MD5 &&
+              memcmp(m.checksum.bytes, expect, 16) == 0);   /* digest durable */
+
+        CHECK(ts_stat(&t, y, &m) == 0 && m.state == CHIMERA_SC_OBJ_OPEN);
+        CHECK(m.checksum.algorithm == CHIMERA_SC_CHECKSUM_NONE);   /* no commit -> no digest */
+
+        ts_close_media(&t);
+    }
+
+    /* ---- 13 (P3, H1): the epoch-held release sweep must NOT free a sealing
+     *      object's blocks mid-hash.  A DETACH/re-ATTACH sweep queued after the
+     *      seal barrier released the slot and before the seal commits must SKIP
+     *      the sealing object; the seal then completes on valid blocks. ---- */
+    {
+        uint8_t                    id[16];
+        uint8_t                    b[BS], expect[16];
+        struct epoch_w             sw;
+        struct cb_w                rw;
+        struct chimera_sc_obj_meta m;
+        uint64_t                   phys0, free0;
+
+        mkid(id, 0xD1);
+        fillpat(b, BS, 0xD0);
+        CHECK(chimera_crypto_digest(CHIMERA_CRYPTO_MD5, b, BS, expect, sizeof(expect)) == 1);
+
+        ts_open_media(&t, dir, 12);
+        ts_format(&t);
+        ts_open(&t);
+
+        ts_write_block(&t, id, 0, b);
+
+        /* Start the seal: the barrier snapshots + releases the slot, the hash is
+         * in flight, o->sealing is set. */
+        ts_seal_start(&t, id, &sw);
+        CHECK(!sw.done);
+        phys0 = ts_phys(&t, id, 0);
+        free0 = t.alloc->free_blocks;
+
+        /* Queue the epoch-held release sweep (DETACH/re-ATTACH) now -- after the
+         * barrier, before the seal commits.  It must skip the sealing object. */
+        rw.done = 0;
+        rw.st   = FACADE_E_IO;
+        facade_obj_release_epoch_held(t.alloc, on_cb, &rw);
+        pump(t.evpl, &rw.done);
+        CHECK(rw.st == FACADE_OK);
+
+        /* the sealing object survives the sweep with its blocks intact. */
+        CHECK(facade_obj_find(t.alloc, id) != NULL);
+        CHECK(ts_phys(&t, id, 0) == phys0);
+        CHECK(t.alloc->free_blocks == free0);   /* nothing was freed */
+
+        /* the seal then completes correctly on the valid blocks. */
+        pump(t.evpl, &sw.done);
+        CHECK(sw.st == FACADE_OK);
+        CHECK(ts_stat(&t, id, &m) == 0 && m.state == CHIMERA_SC_OBJ_SEALED);
+        CHECK(m.checksum.algorithm == CHIMERA_SC_CHECKSUM_MD5 &&
+              memcmp(m.checksum.bytes, expect, 16) == 0);
 
         ts_close_media(&t);
     }

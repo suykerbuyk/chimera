@@ -791,6 +791,40 @@ ns_build_obj_payload(
     facade_ckpt_serialize_objext(o->map, &p);
 } /* ns_build_obj_payload */
 
+/* data-verification: an object being sealed (o->sealing) is frozen while its
+ * content is hashed.  The NS-txn path has its own FIFO starter and so bypasses
+ * the object-op prepare chokepoint; a delta that would mutate a sealing object's
+ * state is therefore refused here, before anything is staged or appended -- the
+ * whole NS txn fails CHIMERA_SC_E_STATE, exactly like a compare failure. */
+static int
+ns_obj_sealing(
+    struct facade_alloc            *a,
+    const struct chimera_sc_obj_id *id)
+{
+    struct facade_obj *o = facade_obj_find(a, id->b);
+
+    return o && o->sealing;
+} /* ns_obj_sealing */
+
+static int
+ns_delta_targets_sealing(
+    struct facade_alloc           *a,
+    const struct chimera_sc_delta *d)
+{
+    switch (d->kind) {
+        case CHIMERA_SC_DELTA_CREATE:  return ns_obj_sealing(a, &d->create.obj);
+        case CHIMERA_SC_DELTA_REPLACE: return ns_obj_sealing(a, &d->replace.new_obj) ||
+                   ns_obj_sealing(a, &d->replace.old_obj);
+        case CHIMERA_SC_DELTA_DELETE:  return ns_obj_sealing(a, &d->del.obj);
+        case CHIMERA_SC_DELTA_SEAL:    return ns_obj_sealing(a, &d->seal.obj);
+        case CHIMERA_SC_DELTA_RETAG:   return ns_obj_sealing(a, &d->retag.obj);
+        case CHIMERA_SC_DELTA_HOLD:
+        case CHIMERA_SC_DELTA_UNHOLD:  return ns_obj_sealing(a, &d->hold.obj);
+        case CHIMERA_SC_DELTA_RECALL_HINT:
+        default:                       return 0;   /* advisory: mutates no object */
+    } /* switch */
+} /* ns_delta_targets_sealing */
+
 /* Evaluate the whole transaction into the staged state and the emit list.
  * Returns CHIMERA_SC_OK (emit list built, nothing applied to live yet) or an
  * error (res.r_failed_part/index set). */
@@ -817,8 +851,16 @@ ns_evaluate(struct ns_txn_ctx *c)
 
     /* 2. deltas, in order, against the intermediate staged state. */
     for (i = 0; i < t->ndeltas; i++) {
-        uint32_t st = ns_apply_delta(c, &t->deltas[i]);
+        uint32_t st;
 
+        /* Freeze reject (data-verification): refuse before staging if the delta's
+         * target is mid-seal. */
+        if (ns_delta_targets_sealing(c->a, &t->deltas[i])) {
+            c->res.r_failed_part  = CHIMERA_SC_TXN_DELTA;
+            c->res.r_failed_index = i;
+            return CHIMERA_SC_E_STATE;
+        }
+        st = ns_apply_delta(c, &t->deltas[i]);
         if (st != CHIMERA_SC_OK) {
             c->res.r_failed_part  = CHIMERA_SC_TXN_DELTA;
             c->res.r_failed_index = i;

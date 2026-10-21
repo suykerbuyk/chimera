@@ -26,7 +26,10 @@ target_include_directories(chimera_facade PUBLIC
 
 # chimera_facade does every media access through the media provider vtable and
 # calls no libevpl function; it references struct evpl_iovec only as the vtable's
-# buffer type.  So it links no evpl.
+# buffer type.  So it links no evpl.  The object content-MD5 at SEAL
+# (data-verification) uses the common crypto primitives, which depend only on
+# OpenSSL::Crypto -- NOT evpl, so the core stays evpl-free.
+target_link_libraries(chimera_facade PUBLIC chimera_crypto)
 
 install(TARGETS chimera_facade DESTINATION lib)
 

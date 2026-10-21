@@ -316,6 +316,9 @@ facade_obj_serialize_hdr(
     hdr->nextents           = facade_extent_map_count(o->map);
     hdr->refs               = o->refs;
     hdr->reserved           = 0;
+    memcpy(hdr->obj_csum, o->obj_csum, 16);   /* object content hash (v5); NONE until sealed */
+    hdr->obj_csum_algo = o->obj_csum_algo;
+    hdr->obj_csum_len  = o->obj_csum_len;
 } /* facade_obj_serialize_hdr */
 
 SYMBOL_EXPORT struct facade_obj *
@@ -355,6 +358,10 @@ facade_obj_put_rec(
     o->retention_until_ns           = hdr->retention_until_ns;
     o->retention_mode               = hdr->retention_mode;
     o->refs                         = hdr->refs;
+    memcpy(o->obj_csum, hdr->obj_csum, 16);   /* object content hash survives reopen (v5) */
+    o->obj_csum_algo = hdr->obj_csum_algo;
+    o->obj_csum_len  = hdr->obj_csum_len;
+    o->sealing       = 0;                     /* in-memory only; never loaded */
     for (k = 0; k < hdr->nextents; k++) {
         if (exts[k].nblocks == 0 ||
             (exts[k].kind != CHIMERA_SC_SEG_DATA &&

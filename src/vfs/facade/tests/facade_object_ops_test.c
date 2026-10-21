@@ -876,22 +876,28 @@ test_use_after_discard(void)
     facade_obj_write(a, idz, BS, pat, BS, CHIMERA_SC_WRITE_DURABLE, tu_on_epoch, &zw);
     TCHECK(!zw.done, "Z write in flight (holds the FIFO)");
 
-    /* All three queue behind the FIFO; X still exists at their dispatch checks. */
+    /* discard + write queue behind the FIFO; X still exists at their dispatch
+     * checks.  (A SEAL here would freeze X via o->sealing and change this race --
+     * that freeze interaction is covered in facade_data_verify_test; this test
+     * keeps the CR-3 use-after-discard guard: a queued txn op against a removed X
+     * must fail NOT_FOUND, never dereference it.) */
     facade_obj_discard(a, idx, tu_on_status, &dw);
-    facade_obj_seal(a, idx, tu_on_epoch, &sw);
     facade_obj_write(a, idx, 0, pat, BS, CHIMERA_SC_WRITE_DURABLE, tu_on_epoch, &ww);
-    TCHECK(!dw.done && !sw.done && !ww.done, "all queued behind the in-flight write");
+    TCHECK(!dw.done && !ww.done, "discard + write queued behind the in-flight write");
 
-    /* Drain: Z completes, discard removes X, then seal/write run against the
-     * now-missing X -- they must fail NOT_FOUND, never dereference it. */
+    /* Drain: Z completes, discard removes X, then the write runs against the
+     * now-missing X -- it must fail NOT_FOUND, never dereference it. */
     facade_test_media_release_all(space);
     facade_test_media_stall_writes(space, 0);
 
     TCHECK(zw.done && zw.st == FACADE_OK, "Z write completes");
     TCHECK(dw.done && dw.st == FACADE_OK, "discard X completes");
     TCHECK(facade_obj_find(a, idx) == NULL, "X is gone");
-    TCHECK(sw.done && sw.st == FACADE_E_NOT_FOUND, "seal of discarded X -> NOT_FOUND");
     TCHECK(ww.done && ww.st == FACADE_E_NOT_FOUND, "write of discarded X -> NOT_FOUND");
+
+    /* A SEAL of the now-missing X is refused at entry (NOT_FOUND), not a deref. */
+    facade_obj_seal(a, idx, tu_on_epoch, &sw);
+    TCHECK(sw.done && sw.st == FACADE_E_NOT_FOUND, "seal of discarded X -> NOT_FOUND");
 
     tu_close(a);
     tu_media_close(space);

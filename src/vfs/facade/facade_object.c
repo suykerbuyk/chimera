@@ -30,11 +30,13 @@
 #include <string.h>
 
 #include "common/macros.h"
+#include "common/crypto.h"   /* chimera_crypto_hash_* (MD5 object content hash) */
 #include "facade_internal.h"
 #include "facade_log.h"
 #include "facade_object.h"
 #include "media_types.h"
 #include "sc_request.h"   /* CHIMERA_SC_SEG_*, struct chimera_sc_segment */
+#include "sc_types.h"     /* CHIMERA_SC_CHECKSUM_MD5 */
 
 #define FACADE_TXN_MAX_AF (FACADE_OBJ_MAX_EXT + 1u)   /* <=1 ALLOC + <=CAP FREE */
 
@@ -48,6 +50,12 @@ struct facade_obj_txn {
                                                   * not yet exist); 0 = a mutator
                                                   * whose target must still exist
                                                   * when prepare runs (CR-3) */
+    int                       is_seal_txn; /* 1 = the SEAL txn; exempt from the
+                                            * prepare-chokepoint o->sealing reject
+                                            * (it is the op that set the flag) */
+    uint64_t                  seal_change; /* o->change captured at the seal barrier;
+                                            * prep_seal fails if it moved */
+    uint8_t                   seal_csum[16]; /* the content MD5 to stamp at SEAL */
     uint32_t                  (*prepare)(
         struct facade_obj_txn *t);      /* post-compaction mutation; facade_status */
 
@@ -75,6 +83,11 @@ struct facade_obj_txn {
     uint32_t                  saved_flags, saved_state, saved_ret_mode;
     uint64_t                  saved_size, saved_change, saved_ret_until;
     struct chimera_sc_stamps  saved_stamps;
+    /* seal rollback: the object content hash + the in-memory sealing flag (so a
+    * failed seal txn restores an OPEN object with checksum NONE, never MD5). */
+    uint8_t                   saved_obj_csum[16];
+    uint32_t                  saved_obj_csum_algo, saved_obj_csum_len;
+    uint8_t                   saved_sealing;
 
     /* log append state. */
     uint64_t                  txn_id;
@@ -202,6 +215,10 @@ facade_txn_fail(
             o->stamps             = t->saved_stamps;
             o->retention_until_ns = t->saved_ret_until;
             o->retention_mode     = t->saved_ret_mode;
+            memcpy(o->obj_csum, t->saved_obj_csum, 16);
+            o->obj_csum_algo = t->saved_obj_csum_algo;
+            o->obj_csum_len  = t->saved_obj_csum_len;
+            o->sealing       = t->saved_sealing;
         }
     } else if (o) {
         facade_obj_remove(a, o);        /* created by prepare (clone); undo it */
@@ -374,6 +391,21 @@ facade_txn_prepare_phase(struct facade_obj_txn *t)
         t->saved_stamps    = o->stamps;
         t->saved_ret_until = o->retention_until_ns;
         t->saved_ret_mode  = o->retention_mode;
+        memcpy(t->saved_obj_csum, o->obj_csum, 16);
+        t->saved_obj_csum_algo = o->obj_csum_algo;
+        t->saved_obj_csum_len  = o->obj_csum_len;
+        t->saved_sealing       = o->sealing;
+    }
+
+    /* Freeze chokepoint (data-verification): once a SEAL has set o->sealing, no
+     * other mutator may change the object's content between the hash and the
+     * seal commit.  A mutator that passed its entry check before the flag was set
+     * (including one parked in an async RMW read) fails HERE, before prepare
+     * mutates the live map -- so the seal hashes a stable image.  The seal txn
+     * itself is exempt (it is the op that set the flag). */
+    if (o && o->sealing && !t->is_seal_txn) {
+        facade_txn_fail(t, FACADE_E_STATE);
+        return;
     }
 
     st = t->prepare(t);
@@ -612,7 +644,7 @@ facade_obj_write(
         cb(FACADE_E_NOT_FOUND, a->power_loss_generation, private_data);
         return;
     }
-    if (o->state != CHIMERA_SC_OBJ_OPEN) {
+    if (o->state != CHIMERA_SC_OBJ_OPEN || o->sealing) {
         cb(FACADE_E_STATE, a->power_loss_generation, private_data);
         return;
     }
@@ -653,17 +685,236 @@ facade_obj_write(
     facade_txn_submit(t);
 } /* facade_obj_write */
 
-/* ---- OBJ_SEAL ---- */
+/* ---- OBJ_SEAL (object content MD5, three-step freeze; data-verification) ----
+ *
+ * SEAL computes an MD5 over the object's content and persists it in the durable
+ * object record (for OBJ_STAT / the S3 single-part ETag).  It is a three-step
+ * operation on the evpl thread:
+ *
+ *   Step 0  freeze: set o->sealing synchronously at dispatch, so every mutator
+ *           class refuses the object -- the entry rejects, the prepare chokepoint
+ *           (facade_txn_prepare_phase), and the NS-txn ns_evaluate reject.
+ *   Step 1  quiesce: take one brief FIFO-slot barrier; every pre-seal mutator has
+ *           drained and every later one is frozen out, so the DATA extent list is
+ *           final.  Snapshot it (metadata only) + o->change, then release.
+ *   Step 2  hash: an async callback chain over the SNAPSHOT -- read a block,
+ *           verify its checksum, crypto_update, read the next; a corrupt block
+ *           aborts SEAL DATA_UNRECOVERABLE.  Media completions drive it; there is
+ *           NO blocking wait (that would deadlock crash-sim/loopback).
+ *   Step 3  commit: a seal txn stamps the digest and flips OPEN->SEALED, with the
+ *           hash rechecked against o->change under the slot and full rollback.
+ *
+ * o->sealing is in-memory only (never serialized) and is cleared on EVERY exit:
+ * a failed seal leaves the object OPEN and writable.
+ */
 
+struct facade_seal_ext {
+    uint64_t              logical;
+    chimera_media_block_t phys;
+    uint32_t              data_csum;
+    uint32_t              csum_algo;
+};
+
+struct facade_seal_ctx {
+    struct facade_alloc        *a;
+    uint8_t                     id[16];
+    facade_epoch_cb_t           cb;
+    void                       *priv;
+    uint64_t                    seal_change; /* o->change captured under the barrier */
+    uint64_t                    size;        /* content length at the barrier */
+    struct chimera_crypto_hash *md5;
+    void                       *block;       /* 4 KiB read buffer */
+    struct facade_seal_ext      exts[FACADE_OBJ_MAX_EXT]; /* DATA snapshot, logical order */
+    uint32_t                    nexts;
+    uint32_t                    cur;
+    uint8_t                     digest[16];
+};
+
+static void facade_seal_hash_next(
+    struct facade_seal_ctx *c);
+
+/* facade_extent_map_foreach callback: collect the DATA extents (logical order). */
+static void
+facade_seal_collect_cb(
+    const struct facade_extent *rec,
+    void                       *priv)
+{
+    struct facade_seal_ctx *c = priv;
+
+    if (rec->kind != CHIMERA_SC_SEG_DATA) {
+        return;   /* holes/UNWRITTEN read as zeros; not fetched from media */
+    }
+    FACADE_CHECK(c->nexts < FACADE_OBJ_MAX_EXT, "seal snapshot extent overflow");
+    c->exts[c->nexts].logical   = rec->logical_block;
+    c->exts[c->nexts].phys      = rec->phys_block;
+    c->exts[c->nexts].data_csum = rec->data_csum;
+    c->exts[c->nexts].csum_algo = rec->csum_algo;
+    c->nexts++;
+} /* facade_seal_collect_cb */
+
+/* Step 3 prepare: recheck the content did not move, then stamp + flip. */
 static uint32_t
 facade_prep_seal(struct facade_obj_txn *t)
 {
     struct facade_obj *o = facade_obj_find(t->a, t->id);
 
-    o->state = CHIMERA_SC_OBJ_SEALED;
+    /* (i) the content hashed under the freeze must still describe this object
+     * (the freeze guarantees it; the recheck is the belt-and-suspenders the plan
+     * requires, and it must run BEFORE the o->change++ below). */
+    if (o->change != t->seal_change) {
+        return FACADE_E_STATE;
+    }
+    /* (ii) stamp the content hash; (iii) flip OPEN -> SEALED. */
+    memcpy(o->obj_csum, t->seal_csum, 16);
+    o->obj_csum_algo = CHIMERA_SC_CHECKSUM_MD5;
+    o->obj_csum_len  = 16;
+    o->state         = CHIMERA_SC_OBJ_SEALED;
     o->change++;
     return FACADE_OK;
 } /* facade_prep_seal */
+
+/* Completion shim wrapping the seal txn's user callback: clear o->sealing on
+ * EVERY exit (success, change-mismatch, or append/commit failure via
+ * facade_txn_fail) so a failed seal leaves an OPEN, writable object. */
+static void
+facade_seal_txn_done(
+    enum facade_status st,
+    uint64_t           epoch,
+    void              *priv)
+{
+    struct facade_seal_ctx *c  = priv;
+    struct facade_obj      *o  = facade_obj_find(c->a, c->id);
+    facade_epoch_cb_t       cb = c->cb;
+    void                   *cp = c->priv;
+
+    if (o) {
+        o->sealing = 0;
+    }
+    free(c->block);
+    free(c);
+    cb(st, epoch, cp);
+} /* facade_seal_txn_done */
+
+/* Step-2 abort (before the seal txn is queued): clear the freeze and report. */
+static void
+facade_seal_abort(
+    struct facade_seal_ctx *c,
+    enum facade_status      st)
+{
+    struct facade_alloc *a  = c->a;
+    struct facade_obj   *o  = facade_obj_find(a, c->id);
+    facade_epoch_cb_t    cb = c->cb;
+    void                *cp = c->priv;
+    uint64_t             g  = a->power_loss_generation;
+
+    if (o) {
+        o->sealing = 0;
+    }
+    if (c->md5) {
+        chimera_crypto_hash_free(c->md5);
+    }
+    free(c->block);
+    free(c);
+    cb(st, g, cp);
+} /* facade_seal_abort */
+
+/* Step 3: queue the seal txn carrying the digest + the captured change. */
+static void
+facade_seal_submit_txn(struct facade_seal_ctx *c)
+{
+    struct facade_obj_txn *t = facade_txn_new(c->a, c->id, 2u, facade_prep_seal,
+                                              facade_seal_txn_done, c);
+
+    t->is_seal_txn = 1;
+    t->seal_change = c->seal_change;
+    memcpy(t->seal_csum, c->digest, 16);
+    facade_txn_submit(t);
+} /* facade_seal_submit_txn */
+
+static void
+facade_seal_finalize(struct facade_seal_ctx *c)
+{
+    int rc = chimera_crypto_final(c->md5, c->digest, sizeof(c->digest));
+
+    FACADE_CHECK(rc == 1, "md5 final failed");
+    chimera_crypto_hash_free(c->md5);
+    c->md5 = NULL;
+    facade_seal_submit_txn(c);
+} /* facade_seal_finalize */
+
+static void
+facade_seal_read_done(
+    enum facade_status st,
+    void              *priv)
+{
+    struct facade_seal_ctx *c = priv;
+    uint64_t                off, n;
+
+    if (st != FACADE_OK) {
+        facade_seal_abort(c, st);
+        return;
+    }
+    /* Verify the snapshotted block before it enters the hash: a corrupt block
+     * must not be sealed into a published content hash. */
+    if (c->exts[c->cur].csum_algo != FACADE_DATA_CSUM_CRC32 ||
+        facade_crc32(c->block, CHIMERA_MEDIA_BLOCK_SIZE) != c->exts[c->cur].data_csum) {
+        facade_seal_abort(c, FACADE_E_DATA_UNRECOVERABLE);
+        return;
+    }
+    /* Hash only the content bytes of this block (the last block is trimmed to the
+     * object size; a full-block-written object hashes exactly its content). */
+    off = c->exts[c->cur].logical << CHIMERA_MEDIA_BLOCK_SHIFT;
+    n   = (off < c->size)
+          ? ((c->size - off < CHIMERA_MEDIA_BLOCK_SIZE) ? (c->size - off)
+                                                        : CHIMERA_MEDIA_BLOCK_SIZE)
+          : 0;
+    if (n) {
+        chimera_crypto_update(c->md5, c->block, (size_t) n);
+    }
+    c->cur++;
+    facade_seal_hash_next(c);
+} /* facade_seal_read_done */
+
+static void
+facade_seal_hash_next(struct facade_seal_ctx *c)
+{
+    if (c->cur >= c->nexts) {
+        facade_seal_finalize(c);
+        return;
+    }
+    facade_media_read(c->a, c->block, c->exts[c->cur].phys, 1,
+                      facade_seal_read_done, c);
+} /* facade_seal_hash_next */
+
+/* Step 1: runs under the FIFO slot (quiesced).  Snapshot + release, then hash. */
+static void
+facade_seal_barrier(void *arg)
+{
+    struct facade_seal_ctx *c = arg;
+    struct facade_alloc    *a = c->a;
+    struct facade_obj      *o = facade_obj_find(a, c->id);
+
+    if (!o) {
+        /* An in-flight discard that was already past its re-validation when the
+         * seal dispatched may have removed the object; abort cleanly. */
+        facade_txn_release(a);
+        facade_seal_abort(c, FACADE_E_NOT_FOUND);
+        return;
+    }
+    c->seal_change = o->change;
+    c->size        = o->size;
+    c->nexts       = 0;
+    facade_extent_map_foreach(o->map, facade_seal_collect_cb, c);
+    facade_txn_release(a);   /* metadata-only snapshot: no I/O was done under the slot */
+
+    /* Step 2: hash the snapshot, media-completion-driven. */
+    c->md5 = chimera_crypto_hash_new(CHIMERA_CRYPTO_MD5, NULL, 0, NULL, 0);
+    FACADE_CHECK(c->md5 != NULL, "md5 ctx alloc");
+    c->block = calloc(1, CHIMERA_MEDIA_BLOCK_SIZE);
+    FACADE_CHECK(c->block != NULL, "oom seal block");
+    c->cur = 0;
+    facade_seal_hash_next(c);
+} /* facade_seal_barrier */
 
 SYMBOL_EXPORT void
 facade_obj_seal(
@@ -672,17 +923,31 @@ facade_obj_seal(
     facade_epoch_cb_t    cb,
     void                *private_data)
 {
-    struct facade_obj *o = facade_obj_find(a, id);
+    struct facade_obj      *o = facade_obj_find(a, id);
+    struct facade_seal_ctx *c;
 
     if (!o) {
         cb(FACADE_E_NOT_FOUND, a->power_loss_generation, private_data);
         return;
     }
-    if (o->state != CHIMERA_SC_OBJ_OPEN) {
+    if (o->state != CHIMERA_SC_OBJ_OPEN || o->sealing) {
         cb(FACADE_E_STATE, a->power_loss_generation, private_data);
         return;
     }
-    facade_txn_submit(facade_txn_new(a, id, 2u, facade_prep_seal, cb, private_data));
+
+    /* Step 0: freeze synchronously.  From here every object-op entry reject, the
+     * prepare chokepoint, and the NS-txn ns_evaluate reject refuse this object. */
+    o->sealing = 1;
+
+    c = calloc(1, sizeof(*c));
+    FACADE_CHECK(c != NULL, "oom seal ctx");
+    c->a = a;
+    memcpy(c->id, id, 16);
+    c->cb   = cb;
+    c->priv = private_data;
+
+    /* Step 1: quiesce under one brief FIFO-slot barrier. */
+    facade_txn_acquire(a, facade_seal_barrier, c);
 } /* facade_obj_seal */
 
 /* ---- OBJ_TRUNCATE ---- */
@@ -720,7 +985,7 @@ facade_obj_truncate(
         cb(FACADE_E_NOT_FOUND, a->power_loss_generation, private_data);
         return;
     }
-    if (o->state != CHIMERA_SC_OBJ_OPEN) {
+    if (o->state != CHIMERA_SC_OBJ_OPEN || o->sealing) {
         cb(FACADE_E_STATE, a->power_loss_generation, private_data);
         return;
     }
@@ -780,7 +1045,7 @@ facade_obj_allocate(
         cb(FACADE_E_NOT_FOUND, a->power_loss_generation, private_data);
         return;
     }
-    if (o->state != CHIMERA_SC_OBJ_OPEN) {
+    if (o->state != CHIMERA_SC_OBJ_OPEN || o->sealing) {
         cb(FACADE_E_STATE, a->power_loss_generation, private_data);
         return;
     }
@@ -837,7 +1102,7 @@ facade_obj_punch(
         cb(FACADE_E_NOT_FOUND, a->power_loss_generation, private_data);
         return;
     }
-    if (o->state != CHIMERA_SC_OBJ_OPEN) {
+    if (o->state != CHIMERA_SC_OBJ_OPEN || o->sealing) {
         cb(FACADE_E_STATE, a->power_loss_generation, private_data);
         return;
     }
@@ -1050,8 +1315,16 @@ facade_obj_stat(
     m->size             = o->size;
     m->allocated_bytes  = facade_extent_map_owned_blocks(o->map)
         << CHIMERA_MEDIA_BLOCK_SHIFT;
-    m->checksum.algorithm = CHIMERA_SC_CHECKSUM_NONE;
-    m->checksum.len       = 0;
+    /* Object content hash (5.1): reported once SEALED; NONE while open or mid-seal
+     * (the digest is stamped only by the seal txn's commit). */
+    if (o->state == CHIMERA_SC_OBJ_SEALED && o->obj_csum_len > 0) {
+        m->checksum.algorithm = o->obj_csum_algo;
+        m->checksum.len       = o->obj_csum_len;
+        memcpy(m->checksum.bytes, o->obj_csum, o->obj_csum_len);
+    } else {
+        m->checksum.algorithm = CHIMERA_SC_CHECKSUM_NONE;
+        m->checksum.len       = 0;
+    }
     m->stamps             = o->stamps;
     m->retention.until_ns = o->retention_until_ns;
     m->retention.mode     = o->retention_mode;
@@ -1164,8 +1437,9 @@ facade_release_start(void *arg)
 
         if (!o) {
             skip_st = FACADE_E_NOT_FOUND;                  /* gone while queued */
-        } else if (o->state != CHIMERA_SC_OBJ_OPEN || (o->flags & FACADE_OBJ_HELD)) {
-            skip_st = FACADE_E_STATE;                      /* sealed/held while queued */
+        } else if (o->state != CHIMERA_SC_OBJ_OPEN || (o->flags & FACADE_OBJ_HELD) ||
+                   o->sealing) {
+            skip_st = FACADE_E_STATE;                      /* sealed/held/sealing while queued */
         } else {
             facade_release_one(a, o);
             released = 1;
@@ -1176,7 +1450,13 @@ facade_release_start(void *arg)
         for (i = 0; i < n; i++) {
             struct facade_obj *o = facade_obj_at(a, i);
 
-            if (o && o->state == CHIMERA_SC_OBJ_OPEN && !(o->flags & FACADE_OBJ_HELD)) {
+            /* Skip a sealing object (data-verification, H1): the epoch-held sweep
+             * must NOT punch+free the blocks the in-flight seal hash is reading,
+             * or Step 3 would commit against a freed id.  The freeze defers the
+             * release -- once the seal commits the object is SEALED (no longer
+             * epoch-held), so it is correctly retained; a later sweep leaves it. */
+            if (o && o->state == CHIMERA_SC_OBJ_OPEN && !(o->flags & FACADE_OBJ_HELD) &&
+                !o->sealing) {
                 facade_release_one(a, o);
                 released = 1;
             }
@@ -1209,8 +1489,8 @@ facade_obj_discard(
         cb(FACADE_E_NOT_FOUND, private_data);
         return;
     }
-    if (o->state != CHIMERA_SC_OBJ_OPEN || (o->flags & FACADE_OBJ_HELD)) {
-        cb(FACADE_E_STATE, private_data);   /* sealed/held: not epoch-held */
+    if (o->state != CHIMERA_SC_OBJ_OPEN || (o->flags & FACADE_OBJ_HELD) || o->sealing) {
+        cb(FACADE_E_STATE, private_data);   /* sealed/held/sealing: not epoch-held */
         return;
     }
     c = calloc(1, sizeof(*c));
