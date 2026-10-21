@@ -1110,6 +1110,42 @@ fsb_recover(void *backend_private)
     return rc;
 } /* fsb_recover */
 
+/* The E3 fixture corrupt hook (data-verification): make object `id`'s stored data
+ * fail verification.  OBJ_STAT/OBJ_MAP do not expose phys, so resolve the DATA
+ * blocks via facade_obj_data_phys; then DRAIN with a crash()+recover() cycle so
+ * the delegate image is authoritative (the crash-sim overlays its journal
+ * newest-wins, so corrupting the delegate while the clean copy sits in the
+ * journal would be masked -- durable data survives the drain, and the obligation
+ * is sequential so no I/O is in flight when crash() runs).  fsb_recover must NOT
+ * be skipped: it clears s->down, else the next read is fenced (E_FENCED).
+ * Finally flip bits in each DATA block.  Returns 0, or -1 for an unknown object. */
+static int
+fsb_corrupt(
+    void                           *backend_private,
+    const struct chimera_sc_obj_id *id)
+{
+    struct fsb_state     *s = backend_private;
+    chimera_media_block_t phys[FACADE_OBJ_MAX_EXT];
+    uint32_t              n, i;
+
+    if (!s->alloc) {
+        return -1;
+    }
+    n = facade_obj_data_phys(s->alloc, id->b, phys, FACADE_OBJ_MAX_EXT);
+    if (n == 0) {
+        return -1;   /* unknown object, or no stored DATA to corrupt */
+    }
+    if (fsb_crash(s) != 0 || fsb_recover(s) != 0) {
+        return -1;
+    }
+    for (i = 0; i < n; i++) {
+        if (s->control->corrupt(s->space, phys[i], 1) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+} /* fsb_corrupt */
+
 SYMBOL_EXPORT void
 facade_sc_bind_init(
     struct facade_sc_bind                       *b,
@@ -1136,6 +1172,6 @@ facade_sc_fixture_init(
     fx->cfgdata = (const char *) bind;
     fx->crash   = fsb_crash;
     fx->recover = fsb_recover;
-    fx->corrupt = NULL;   /* D9 verification is object-ops-v1 */
+    fx->corrupt = fsb_corrupt;   /* data-verification (P5): resolve+drain+corrupt */
     fx->fill    = NULL;
 } /* facade_sc_fixture_init */

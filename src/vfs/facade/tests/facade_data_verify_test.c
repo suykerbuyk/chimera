@@ -1324,6 +1324,44 @@ main(void)
         ts_close_media(&t);
     }
 
+    /* ---- 16 (P5): the exit criterion at the facade level -- a corrupted block
+     *      is detected on READ (DATA_UNRECOVERABLE, no bytes) AND by SCRUB. ---- */
+    {
+        uint8_t        id[16];
+        uint8_t        b[BS], out[BS];
+        struct scrub_w w;
+        uint32_t       rlen;
+        uint64_t       first;
+        int            i;
+
+        mkid(id, 0xC9);
+        fillpat(b, BS, 0xC8);
+
+        ts_open_media(&t, dir, 15);
+        ts_format(&t);
+        ts_open(&t);
+
+        ts_write_block(&t, id, 0, b);
+        ts_crash_recover(&t);                  /* drain: delegate authoritative */
+        ts_reopen(&t);
+        CHECK(t.control->corrupt(t.space, ts_phys(&t, id, 0), 1) == 0);
+
+        /* detected on READ: DATA_UNRECOVERABLE, no bytes, sentinel untouched. */
+        memset(out, 0xEE, BS);
+        CHECK(ts_read(&t, id, 0, out, BS, &rlen) == FACADE_E_DATA_UNRECOVERABLE);
+        CHECK(rlen == 0);
+        for (i = 0; i < (int) BS; i++) {
+            CHECK(out[i] == 0xEE);
+        }
+
+        /* detected by SCRUB: the same object is flagged (first bad block 0). */
+        ts_scrub(&t, &w);
+        CHECK(w.st == FACADE_OK && w.nbad == 1 && w.nids == 1);
+        CHECK(scrub_reported(&w, id, &first) && first == 0);
+
+        ts_close_media(&t);
+    }
+
     evpl_destroy(t.evpl);
     CHECK(rmdir(dir) == 0);
     printf("facade_data_verify_test: OK\n");

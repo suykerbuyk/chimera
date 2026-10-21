@@ -686,6 +686,13 @@ chimera_sc_oblig_corrupt_is_unrecoverable(struct chimera_sc_conformance_ctx *ctx
         for (i = 0; i < read.req.obj_read.r_niov; i++) {
             evpl_iovec_release(ctx->evpl, &iov[i]);
         }
+    } else {
+        /* No-bytes oracle: a read that did not succeed must return NO object
+         * bytes -- the backend never hands back the data that failed
+         * verification (D9).  Valid for every backend: a non-OK read owes the
+         * caller no iovecs. */
+        CHIMERA_SC_EXPECT(ctx, read.req.obj_read.r_niov == 0,
+                          "a failed read must return no object bytes");
     }
 
     CHIMERA_SC_EXPECT_STATUS(ctx, read.req.status, CHIMERA_SC_E_DATA_UNRECOVERABLE);

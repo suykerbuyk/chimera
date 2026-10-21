@@ -1688,3 +1688,44 @@ facade_scrub(
     c->priv   = private_data;
     facade_txn_acquire(a, facade_scrub_start, c);
 } /* facade_scrub */
+
+/* ---- DATA phys resolver (for the E3 fixture corrupt hook) ---- */
+
+struct facade_dp_ctx {
+    chimera_media_block_t *out;
+    uint32_t               cap;
+    uint32_t               n;
+};
+
+static void
+facade_dp_cb(
+    const struct facade_extent *rec,
+    void                       *priv)
+{
+    struct facade_dp_ctx *d = priv;
+
+    if (rec->kind != CHIMERA_SC_SEG_DATA) {
+        return;   /* UNWRITTEN/HOLE have no stored bytes to corrupt */
+    }
+    if (d->n < d->cap) {
+        d->out[d->n] = rec->phys_block;   /* DATA extents are one block */
+    }
+    d->n++;
+} /* facade_dp_cb */
+
+SYMBOL_EXPORT uint32_t
+facade_obj_data_phys(
+    struct facade_alloc   *a,
+    const uint8_t          id[16],
+    chimera_media_block_t *out,
+    uint32_t               cap)
+{
+    struct facade_obj   *o = facade_obj_find(a, id);
+    struct facade_dp_ctx d = { out, cap, 0 };
+
+    if (!o) {
+        return 0;
+    }
+    facade_extent_map_foreach(o->map, facade_dp_cb, &d);
+    return d.n < cap ? d.n : cap;   /* number written to out */
+} /* facade_obj_data_phys */

@@ -218,6 +218,19 @@ facade_scrub(
     facade_scrub_done_cb   done,
     void                  *private_data);
 
+/*
+ * Resolve object `id`'s stored DATA blocks to their physical lbas (one block per
+ * DATA extent), in logical order, into out[0..cap).  Returns the number written
+ * (<= cap), or 0 if the object is unknown or has no DATA blocks.  Used by the E3
+ * conformance fixture's corrupt hook (OBJ_STAT/OBJ_MAP do not expose phys).
+ */
+uint32_t
+facade_obj_data_phys(
+    struct facade_alloc   *alloc,
+    const uint8_t          id[16],
+    chimera_media_block_t *out,
+    uint32_t               cap);
+
 #ifdef __cplusplus
 }
 #endif /* ifdef __cplusplus */
