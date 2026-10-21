@@ -363,9 +363,11 @@ facade_obj_put_rec(
             return NULL;   /* self-inconsistent record */
         }
         /* The inline per-block checksum covers exactly one 4 KiB block, so a
-         * DATA extent must span one block; a malformed/future image carrying a
-         * multi-block DATA extent is refused rather than under-covered (v5). */
-        if (exts[k].kind == CHIMERA_SC_SEG_DATA && exts[k].nblocks != 1) {
+         * DATA extent must span one block AND carry a usable (CRC32) checksum; a
+         * malformed/future image with a multi-block or un-checksummed DATA extent
+         * is refused rather than under-covered or read unverified (v5, H1). */
+        if (exts[k].kind == CHIMERA_SC_SEG_DATA &&
+            (exts[k].nblocks != 1 || exts[k].csum_algo != FACADE_DATA_CSUM_CRC32)) {
             return NULL;
         }
         facade_extent_map_insert(o->map, exts[k].logical_block,

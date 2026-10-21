@@ -41,6 +41,7 @@ fsb_status(enum facade_status st)
         case FACADE_E_NOT_FOUND: return CHIMERA_SC_E_NOT_FOUND;
         case FACADE_E_INVAL:     return CHIMERA_SC_E_INVALID;
         case FACADE_E_SHUTDOWN:  return CHIMERA_SC_E_FENCED;
+        case FACADE_E_DATA_UNRECOVERABLE: return CHIMERA_SC_E_DATA_UNRECOVERABLE;
         default:                 return CHIMERA_SC_E_IO;
     } /* switch */
 } /* fsb_status */

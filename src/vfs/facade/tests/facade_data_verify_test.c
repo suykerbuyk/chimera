@@ -14,7 +14,8 @@
  *      block) survives crash + recover (LOG replay) and a subsequent reopen
  *      (CHECKPOINT load); UNWRITTEN extents carry NONE.
  *   3. LOAD GUARD: facade_obj_put_rec refuses an OBJ record whose DATA extent
- *      spans more than one block (the inline csum covers exactly one block).
+ *      spans more than one block OR carries no usable (CRC32) checksum (H1) --
+ *      the inline csum covers exactly one block and must be verifiable.
  *   4. N4 ORACLE: a format==1 OBJ log record under a v5 superblock STOPS the
  *      durable prefix (facade_recover.c) -- the record is NOT applied and
  *      facade_alloc_open still SUCCEEDS; it is NOT FACADE_E_FORMAT.
@@ -254,6 +255,85 @@ ts_write_block(
     CHECK(w.st == FACADE_OK);
 } /* ts_write_block */
 
+/* Write `len` bytes at byte `offset` of object `id`; returns the facade status
+ * (does not CHECK -- the caller asserts).  A len < BS write over an existing
+ * DATA block takes the RMW pre-read path (facade_write_after_read). */
+static enum facade_status
+ts_write_sub(
+    struct ts    *t,
+    const uint8_t id[16],
+    uint64_t      offset,
+    const void   *data,
+    uint32_t      len)
+{
+    struct epoch_w w = { 0, FACADE_E_IO, 0 };
+
+    facade_obj_write(t->alloc, id, offset, data, len, CHIMERA_SC_WRITE_DURABLE,
+                     on_epoch, &w);
+    pump(t->evpl, &w.done);
+    return w.st;
+} /* ts_write_sub */
+
+struct read_w {
+    int      done;
+    enum facade_status st;
+    uint32_t len;
+    uint64_t size;
+};
+
+static void
+on_read(
+    enum facade_status st,
+    uint32_t           len,
+    uint64_t           size,
+    void              *priv)
+{
+    struct read_w *w = priv;
+
+    w->st   = st;
+    w->len  = len;
+    w->size = size;
+    w->done = 1;
+} /* on_read */
+
+/* Read `len` bytes at byte `offset` of object `id` into out; returns the facade
+ * status and (via r_len) the reported length.  out is the caller buffer the
+ * verify path must leave untouched on a DATA_UNRECOVERABLE failure. */
+static enum facade_status
+ts_read(
+    struct ts    *t,
+    const uint8_t id[16],
+    uint64_t      offset,
+    void         *out,
+    uint32_t      len,
+    uint32_t     *r_len)
+{
+    struct read_w w = { 0, FACADE_E_IO, 0, 0 };
+
+    facade_obj_read(t->alloc, id, offset, len, out, on_read, &w);
+    pump(t->evpl, &w.done);
+    if (r_len) {
+        *r_len = w.len;
+    }
+    return w.st;
+} /* ts_read */
+
+/* The physical lba backing block `lb` of object `id` (for raw corruption). */
+static uint64_t
+ts_phys(
+    struct ts    *t,
+    const uint8_t id[16],
+    uint64_t      lb)
+{
+    struct facade_obj   *o = facade_obj_find(t->alloc, id);
+    struct facade_extent ext;
+
+    CHECK(o != NULL);
+    CHECK(facade_extent_map_lookup(o->map, lb, &ext) == 1 &&
+          ext.kind == CHIMERA_SC_SEG_DATA);
+    return ext.phys_block + (lb - ext.logical_block);
+} /* ts_phys */
+
 /* Assert object `id`'s extent at block `lb` is DATA with the expected checksum. */
 static void
 check_block_csum(
@@ -451,14 +531,23 @@ main(void)
         memset(&ext, 0, sizeof(ext));
         ext.logical_block = 0;
         ext.phys_block    = t.alloc->data_first;
-        ext.nblocks       = 2;                 /* > 1: forbidden for DATA */
         ext.kind          = CHIMERA_SC_SEG_DATA;
         ext.owned         = 1;
 
+        /* A multi-block DATA extent is refused by the nblocks guard (even when
+         * correctly CRC32-tagged). */
+        ext.nblocks   = 2;
+        ext.csum_algo = FACADE_DATA_CSUM_CRC32;
         CHECK(facade_obj_put_rec(t.alloc, &hdr, &ext) == NULL);
 
-        /* A single-block DATA extent is accepted (control). */
-        ext.nblocks = 1;
+        /* A single-block DATA extent with NO usable checksum (NONE) is refused
+         * too -- it could otherwise be read from media unverified (H1). */
+        ext.nblocks   = 1;
+        ext.csum_algo = FACADE_DATA_CSUM_NONE;
+        CHECK(facade_obj_put_rec(t.alloc, &hdr, &ext) == NULL);
+
+        /* A single-block, CRC32-tagged DATA extent is accepted (control). */
+        ext.csum_algo = FACADE_DATA_CSUM_CRC32;
         CHECK(facade_obj_put_rec(t.alloc, &hdr, &ext) != NULL);
 
         ts_close_media(&t);
@@ -529,6 +618,86 @@ main(void)
         CHECK(w.st == FACADE_E_FORMAT);
 
         t.alloc = NULL;                        /* open failed: no handle to abandon */
+        ts_close_media(&t);
+    }
+
+    /* ---- 6 (P2): verify-on-read -- a corrupted stored block reads back
+     *      DATA_UNRECOVERABLE with NO bytes delivered, a clean block reads back
+     *      its bytes, and a hole read is not verified. ---- */
+    {
+        uint8_t  id[16], idh[16];
+        uint8_t  b[BS], out[BS], hole[BS];
+        uint64_t phys;
+        uint32_t rlen;
+        int      i;
+
+        mkid(id,  0x61);
+        mkid(idh, 0x6E);
+        fillpat(b, BS, 0x66);
+
+        ts_open_media(&t, dir, 5);
+        ts_format(&t);
+        ts_open(&t);
+
+        ts_write_block(&t, id, 0, b);          /* full block at lb 0, durable */
+        ts_crash_recover(&t);                  /* drain: the delegate is authoritative */
+        ts_reopen(&t);
+
+        /* a clean read returns the right bytes (verify passes). */
+        memset(out, 0xCD, BS);
+        CHECK(ts_read(&t, id, 0, out, BS, &rlen) == FACADE_OK);
+        CHECK(rlen == BS && memcmp(out, b, BS) == 0);
+
+        /* corrupt the stored block; the read must fail and deliver no bytes. */
+        phys = ts_phys(&t, id, 0);
+        CHECK(t.control->corrupt(t.space, phys, 1) == 0);
+        memset(out, 0xCD, BS);                 /* sentinel */
+        CHECK(ts_read(&t, id, 0, out, BS, &rlen) == FACADE_E_DATA_UNRECOVERABLE);
+        CHECK(rlen == 0);                      /* no length reported */
+        for (i = 0; i < (int) BS; i++) {
+            CHECK(out[i] == 0xCD);             /* caller buffer byte-unchanged */
+        }
+
+        /* a hole read (kind != DATA) is zeros and is NOT verified. */
+        fillpat(hole, BS, 0x6A);
+        ts_write_block(&t, idh, 2, hole);      /* lb 2 written; lb 0,1 are holes */
+        memset(out, 0xCD, BS);
+        CHECK(ts_read(&t, idh, 0, out, BS, &rlen) == FACADE_OK);
+        CHECK(rlen == BS);
+        for (i = 0; i < (int) BS; i++) {
+            CHECK(out[i] == 0);
+        }
+
+        ts_close_media(&t);
+    }
+
+    /* ---- 7 (P2): RMW launder guard -- a sub-block overwrite of a corrupted
+     *      block fails DATA_UNRECOVERABLE (facade_write_after_read verifies the
+     *      pre-read before the copy-on-write merge). ---- */
+    {
+        uint8_t  id[16];
+        uint8_t  b[BS], patch[64];
+        uint64_t phys;
+
+        mkid(id, 0x71);
+        fillpat(b, BS, 0x77);
+        fillpat(patch, sizeof(patch), 0x7A);
+
+        ts_open_media(&t, dir, 6);
+        ts_format(&t);
+        ts_open(&t);
+
+        ts_write_block(&t, id, 0, b);          /* full block at lb 0, durable */
+        ts_crash_recover(&t);
+        ts_reopen(&t);
+
+        phys = ts_phys(&t, id, 0);
+        CHECK(t.control->corrupt(t.space, phys, 1) == 0);
+
+        /* 64 bytes at offset 0: boff==0, len<BS, DATA exists -> RMW pre-read. */
+        CHECK(ts_write_sub(&t, id, 0, patch, sizeof(patch))
+              == FACADE_E_DATA_UNRECOVERABLE);
+
         ts_close_media(&t);
     }
 

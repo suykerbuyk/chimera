@@ -92,6 +92,8 @@ struct facade_obj_txn {
             uint64_t offset;
             uint32_t len;
             uint32_t level;
+            uint32_t pre_csum;      /* expected checksum of the RMW pre-read block */
+            uint32_t pre_csum_algo; /* enum facade_data_csum_algo (0 = no pre-read) */
             uint8_t  staging[CHIMERA_MEDIA_BLOCK_SIZE];
         } write;
         struct {
@@ -559,8 +561,22 @@ facade_write_after_read(
     struct facade_obj_txn *t    = priv;
     uint32_t               boff = (uint32_t) (t->u.write.offset & (CHIMERA_MEDIA_BLOCK_SIZE - 1));
 
+    /* The pre-read block must verify before it is merged: a corrupted existing
+     * block cannot be the base of a copy-on-write.  A verify failure is dropped
+     * exactly like a pre-read I/O failure -- free the bufs and call the user cb;
+     * the txn has not been submitted, so the FIFO slot is NOT held and
+     * facade_txn_fail (which would release it) must NOT be called. */
+    /* This callback runs only after a DATA-block pre-read, which must carry a
+     * usable (CRC32) checksum; an un-checksummed or mismatched pre-read block is
+     * unrecoverable -- fail CLOSED (never silently merge it, H1). */
+    if (st == FACADE_OK &&
+        (t->u.write.pre_csum_algo != FACADE_DATA_CSUM_CRC32 ||
+         facade_crc32(t->u.write.staging, CHIMERA_MEDIA_BLOCK_SIZE) != t->u.write.pre_csum)) {
+        st = FACADE_E_DATA_UNRECOVERABLE;
+    }
     if (st != FACADE_OK) {
-        /* The pre-read failed; report through the write cb and drop the txn. */
+        /* The pre-read failed (I/O or verification); report through the write cb
+         * and drop the txn. */
         facade_epoch_cb_t cb = t->cb;
         void             *cp = t->priv;
         uint64_t          g  = t->a->power_loss_generation;
@@ -623,8 +639,12 @@ facade_obj_write(
         chimera_media_block_t phys = cur.phys_block + (lb - cur.logical_block);
 
         /* data is borrowed until the read completes (facade_write_after_read
-         * merges it); stash it in data_buf for that step. */
-        t->data_buf = data;
+         * merges it); stash it in data_buf for that step.  The pre-read block is
+         * verified there (v5) so a sub-block overwrite cannot launder corruption
+         * into the freshly-checksummed merged block. */
+        t->data_buf              = data;
+        t->u.write.pre_csum      = cur.data_csum;
+        t->u.write.pre_csum_algo = cur.csum_algo;
         facade_media_read(a, t->u.write.staging, phys, 1,
                           facade_write_after_read, t);
         return;
@@ -915,7 +935,9 @@ struct facade_read_ctx {
     uint32_t             boff;
     uint32_t             len;
     uint64_t             obj_size;
-    void                *block;   /* 4 KiB temp for a DATA read */
+    void                *block;      /* 4 KiB temp for a DATA read */
+    uint32_t             data_csum;  /* expected per-block checksum (v5) */
+    uint32_t             csum_algo;  /* enum facade_data_csum_algo */
 };
 
 static void
@@ -930,7 +952,18 @@ facade_read_done(
     uint64_t                size = c->obj_size;
 
     if (st == FACADE_OK) {
-        memcpy(c->out, (uint8_t *) c->block + c->boff, c->len);
+        /* Verify the stored block against its per-block checksum BEFORE any byte
+         * reaches the caller.  This site is reached only for a DATA extent, which
+         * must carry a usable (CRC32) checksum; an un-checksummed or mismatched
+         * DATA block is unrecoverable -- fail CLOSED (never silently skip, H1) and
+         * never return the bad bytes (c->out is left untouched; only the temp
+         * block and ctx are freed). */
+        if (c->csum_algo != FACADE_DATA_CSUM_CRC32 ||
+            facade_crc32(c->block, CHIMERA_MEDIA_BLOCK_SIZE) != c->data_csum) {
+            st = FACADE_E_DATA_UNRECOVERABLE;
+        } else {
+            memcpy(c->out, (uint8_t *) c->block + c->boff, c->len);
+        }
     }
     free(c->block);
     free(c);
@@ -978,14 +1011,16 @@ facade_obj_read(
 
         c = calloc(1, sizeof(*c));
         FACADE_CHECK(c != NULL, "oom read ctx");
-        c->a        = a;
-        c->cb       = cb;
-        c->priv     = private_data;
-        c->out      = out;
-        c->boff     = boff;
-        c->len      = len;
-        c->obj_size = o->size;
-        c->block    = calloc(1, CHIMERA_MEDIA_BLOCK_SIZE);
+        c->a         = a;
+        c->cb        = cb;
+        c->priv      = private_data;
+        c->out       = out;
+        c->boff      = boff;
+        c->len       = len;
+        c->obj_size  = o->size;
+        c->data_csum = cur.data_csum;
+        c->csum_algo = cur.csum_algo;
+        c->block     = calloc(1, CHIMERA_MEDIA_BLOCK_SIZE);
         FACADE_CHECK(c->block != NULL, "oom read block");
         facade_media_read(a, c->block, phys, 1, facade_read_done, c);
         return;
