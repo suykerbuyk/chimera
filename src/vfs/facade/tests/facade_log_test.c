@@ -407,6 +407,7 @@ write_obj_rec(
     xr->nblocks       = 1;
     xr->kind          = CHIMERA_SC_SEG_DATA;
     xr->owned         = 1;
+    xr->csum_algo     = FACADE_DATA_CSUM_CRC32;   /* a v5 DATA extent must be CRC32-tagged */
     build_rec(blk, FACADE_LR_OBJ, seq, txn, payload, (uint32_t) sizeof(payload));
     write_block(space, lba, blk);
 } /* write_obj_rec */
