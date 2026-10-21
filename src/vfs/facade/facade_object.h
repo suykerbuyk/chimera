@@ -26,6 +26,65 @@
  *
  * The core links no libevpl: callers pass plain buffers; the contract adapter
  * (facade_sc_backend.c) marshals evpl iovecs around these calls.
+ *
+ * ---- data-verification (D9, on-media v5) ---------------------------------
+ *
+ * The backend verifies its own stored data and never returns bytes that fail
+ * verification; unrecoverable data fails CHIMERA_SC_E_DATA_UNRECOVERABLE (the
+ * prototype has no protection class, so there is no repair source).
+ *
+ *  - Format v5 (facade_super.h): each extent record (facade_ckpt_objext) carries
+ *    a per-physical-block data checksum (data_csum + csum_algo), and the durable
+ *    object record (facade_obj_rec) carries an object content hash (obj_csum +
+ *    algo/len).  A v4 image is refused, not read as blank.  The grown OBJ record
+ *    still fits one 4 KiB log block: hdr 48 + obj_rec 136 + 64 * objext 40 =
+ *    2744 <= 4096; FACADE_LR_FORMAT is bumped so a v4-shaped log record is
+ *    dropped, not mis-parsed.
+ *
+ *  - DATA => 1 block + CRC32 invariant.  A stored DATA extent is exactly one
+ *    block and must carry a usable (FACADE_DATA_CSUM_CRC32) checksum; the write
+ *    path computes it, and facade_obj_put_rec (the checkpoint/log reinsert)
+ *    REFUSES a DATA extent that is multi-block or not CRC32-tagged, so a
+ *    malformed/future image is rejected rather than read unverified.  Both read
+ *    sites -- OBJ_READ (facade_read_done, before the memcpy) and the sub-block
+ *    RMW pre-read (facade_write_after_read, before the merge) -- recompute the
+ *    checksum and fail CLOSED.
+ *
+ *  - Object content MD5 at SEAL, in three steps (so the hash is stable without
+ *    ever holding the one-slot txn FIFO across a full-object read):
+ *      0. freeze: set o->sealing synchronously; every object-state writer then
+ *         refuses the object -- the object-op entry rejects + the prepare
+ *         chokepoint, the epoch-held/discard release sweep, and the NS-txn
+ *         ns_evaluate reject (the writer set is complete);
+ *      1. quiesce: one brief FIFO-slot barrier snapshots the DATA extent list +
+ *         o->change, then releases;
+ *      2. hash: an async, media-completion-driven callback chain over the
+ *         snapshot (verify each block, crypto_update, read the next); a corrupt
+ *         block aborts SEAL DATA_UNRECOVERABLE;
+ *      3. commit: the seal txn rechecks o->change, stamps obj_csum + MD5 and
+ *         flips OPEN->SEALED, with full rollback of the new fields; o->sealing is
+ *         cleared on every exit (a failed seal stays OPEN and writable).
+ *    o->sealing is in-memory only (never serialized), so a crash before the
+ *    commit leaves an OPEN object with no digest.  The core links chimera_crypto
+ *    (OpenSSL only -- NOT evpl) for the MD5.  OBJ_STAT reports the MD5 once
+ *    SEALED, NONE while open/mid-seal.
+ *
+ *  - Scrub (facade_scrub): a backend/operator tool (NOT a contract op, O6) that
+ *    verifies every stored DATA block and reports unrecoverable object ids.  It
+ *    snapshots the DATA extents under one brief FIFO-slot barrier (no I/O under
+ *    the slot), verifies OUT of the slot, and -- to avoid a false positive from a
+ *    block freed+realloced mid-scrub -- rechecks a per-lba monotonic reuse stamp
+ *    AFTER each read: changed => skip.  The stamp is an lba-indexed uint64_t
+ *    array over the data region (not a free-run node field), bumped per-lba
+ *    across the whole run in facade_alloc_free and facade_alloc_blocks;
+ *    in-memory, not persisted.
+ *
+ *  - Corruption injection (fsb_corrupt, facade_sc_backend.c, for the E3
+ *    conformance fixture): resolve id -> DATA phys (facade_obj_data_phys; STAT/MAP
+ *    do not expose phys), DRAIN with a crash()+recover() cycle so the delegate
+ *    image is authoritative (the crash-sim journal would otherwise mask a
+ *    delegate corruption; recover() must run, else the next read is fenced), then
+ *    flip bits in each DATA block.
  */
 
 #include <stdint.h>
