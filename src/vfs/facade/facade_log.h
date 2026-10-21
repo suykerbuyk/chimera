@@ -35,7 +35,11 @@ struct facade_alloc;
 
 /* "FACLOGR2" as a little-endian u64. */
 #define FACADE_LR_MAGIC  0x3252474F4C434146ULL
-#define FACADE_LR_FORMAT 1u
+/* v2 (data-verification): the OBJ record's facade_obj_rec and facade_ckpt_objext
+ * grew (object content hash, per-block data checksum).  A reader stops the
+ * durable prefix at a record whose format != FACADE_LR_FORMAT (facade_recover.c),
+ * so a v1-shaped record under a v5 image is dropped, not mis-parsed. */
+#define FACADE_LR_FORMAT 2u
 
 enum facade_lr_type {
     FACADE_LR_ALLOC  = 1, /* a run of blocks was allocated (removed from free) */

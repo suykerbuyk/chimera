@@ -529,8 +529,12 @@ facade_prep_write(struct facade_obj_txn *t)
     t->data_nblocks = 1;
     t->has_data     = 1;
 
+    /* Per-block data checksum (v5): crc32 over the exact 4 KiB block that is
+     * FUA'd to media (staging is zero-padded for a sub-block write), so the
+     * verify-on-read path (P2) can detect a corrupted stored block. */
     facade_extent_map_insert(o->map, lb, 1, p, CHIMERA_SC_SEG_DATA, 1u,
-                             facade_txn_on_freed, t);
+                             facade_crc32(t->u.write.staging, CHIMERA_MEDIA_BLOCK_SIZE),
+                             FACADE_DATA_CSUM_CRC32, facade_txn_on_freed, t);
     /* Extent-cap guard (internal.h FACADE_OBJ_MAX_EXT): an op whose map would
      * exceed the per-object cap is refused NO_SPACE-shaped BEFORE any record is
      * logged -- the machinery rolls back the map mutation and frees the block.
@@ -726,8 +730,10 @@ facade_prep_allocate(struct facade_obj_txn *t)
     if (st != FACADE_OK) {
         return st;
     }
+    /* UNWRITTEN blocks read as zeros from the map and never touch media, so
+     * they carry no stored-data checksum (NONE). */
     facade_extent_map_insert(o->map, lb, nblk, p, CHIMERA_SC_SEG_UNWRITTEN, 1u,
-                             facade_txn_on_freed, t);
+                             0u, FACADE_DATA_CSUM_NONE, facade_txn_on_freed, t);
     if (facade_extent_map_count(o->map) > FACADE_OBJ_MAX_EXT) {
         return FACADE_E_NO_SPACE;   /* extent-cap guard (rolled back) */
     }

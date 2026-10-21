@@ -68,7 +68,7 @@ set_tests_properties(chimera/vfs/facade/facade_loopback_test PROPERTIES
 # backend-attach-capabilities: attach / version negotiation / epoch lease /
 # renew / fence / detach via the facade backend (facade_attach_test).
 foreach(_t facade_recover_crash_test facade_conformance_durability_test
-           facade_conformance_ns_test facade_attach_test)
+           facade_conformance_ns_test facade_attach_test facade_data_verify_test)
     add_executable(${_t} ${_t}.c)
     target_include_directories(${_t} PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
@@ -87,6 +87,8 @@ foreach(_t facade_recover_crash_test facade_conformance_durability_test
         TIMEOUT 300)
 endforeach()
 target_link_libraries(facade_recover_crash_test
+    chimera_facade chimera_media_crashsim chimera_media_loopback evpl)
+target_link_libraries(facade_data_verify_test
     chimera_facade chimera_media_crashsim chimera_media_loopback evpl)
 target_link_libraries(facade_conformance_durability_test
     chimera_facade_sc_backend chimera_sc_conformance

@@ -26,8 +26,10 @@ struct facade_ext_rec {
     uint64_t              logical_block;
     uint64_t              nblocks;
     chimera_media_block_t phys_block;
-    uint32_t              kind;    /* CHIMERA_SC_SEG_DATA | CHIMERA_SC_SEG_UNWRITTEN */
-    uint32_t              owned;   /* 1 = this object's blocks; 0 = borrowed (clone) */
+    uint32_t              kind;      /* CHIMERA_SC_SEG_DATA | CHIMERA_SC_SEG_UNWRITTEN */
+    uint32_t              owned;     /* 1 = this object's blocks; 0 = borrowed (clone) */
+    uint32_t              data_csum; /* per-block data checksum (v5); 0 when not DATA */
+    uint32_t              csum_algo; /* enum facade_data_csum_algo */
 };
 
 struct facade_extent_map {
@@ -49,7 +51,9 @@ facade_ext_rec_new(
     uint64_t              nblocks,
     chimera_media_block_t phys_block,
     uint32_t              kind,
-    uint32_t              owned)
+    uint32_t              owned,
+    uint32_t              data_csum,
+    uint32_t              csum_algo)
 {
     struct facade_ext_rec *r = malloc(sizeof(*r));
 
@@ -59,6 +63,8 @@ facade_ext_rec_new(
     r->phys_block    = phys_block;
     r->kind          = kind;
     r->owned         = owned;
+    r->data_csum     = data_csum;   /* explicit: facade_ext_rec_new does not memset */
+    r->csum_algo     = csum_algo;
     return r;
 } /* facade_ext_rec_new */
 
@@ -128,7 +134,7 @@ facade_clear_range(
             /* The record encloses the range: split into head + tail. */
             tail = facade_ext_rec_new(end, rend - end,
                                       r->phys_block + (end - r->logical_block),
-                                      r->kind, r->owned);
+                                      r->kind, r->owned, r->data_csum, r->csum_algo);
             r->nblocks = lb - r->logical_block;
             rb_tree_insert(&m->tree, logical_block, tail);
             return;
@@ -179,6 +185,8 @@ facade_extent_map_insert(
     chimera_media_block_t     phys,
     uint32_t                  kind,
     uint32_t                  owned,
+    uint32_t                  data_csum,
+    uint32_t                  csum_algo,
     facade_freed_cb_t         on_freed,
     void                     *private_data)
 {
@@ -191,7 +199,8 @@ facade_extent_map_insert(
     facade_clear_range(m, logical_block, logical_block + nblocks,
                        on_freed, private_data);
 
-    r = facade_ext_rec_new(logical_block, nblocks, phys, kind, owned);
+    r = facade_ext_rec_new(logical_block, nblocks, phys, kind, owned,
+                           data_csum, csum_algo);
     rb_tree_insert(&m->tree, logical_block, r);
 } /* facade_extent_map_insert */
 
@@ -227,6 +236,8 @@ facade_extent_map_lookup(
         r_ext->kind          = r->kind;
         r_ext->phys_block    = r->phys_block;
         r_ext->owned         = r->owned;
+        r_ext->data_csum     = r->data_csum;
+        r_ext->csum_algo     = r->csum_algo;
         return 1;
     }
 
@@ -243,6 +254,8 @@ facade_extent_map_lookup(
     r_ext->kind       = CHIMERA_SC_SEG_HOLE;
     r_ext->phys_block = 0;
     r_ext->owned      = 0;
+    r_ext->data_csum  = 0;
+    r_ext->csum_algo  = FACADE_DATA_CSUM_NONE;
     return 0;
 } /* facade_extent_map_lookup */
 
@@ -292,7 +305,8 @@ facade_extent_map_clone(
     for (r = facade_ext_first(src); r; r = facade_ext_next(src, r)) {
         struct facade_ext_rec *c =
             facade_ext_rec_new(r->logical_block, r->nblocks, r->phys_block,
-                               r->kind, force_borrow ? 0u : r->owned);
+                               r->kind, force_borrow ? 0u : r->owned,
+                               r->data_csum, r->csum_algo);
 
         rb_tree_insert(&dst->tree, logical_block, c);
     }
@@ -315,6 +329,8 @@ facade_extent_map_foreach(
         e.kind          = r->kind;
         e.phys_block    = r->phys_block;
         e.owned         = r->owned;
+        e.data_csum     = r->data_csum;
+        e.csum_algo     = r->csum_algo;
         cb(&e, private_data);
     }
 } /* facade_extent_map_foreach */

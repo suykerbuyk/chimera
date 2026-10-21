@@ -59,7 +59,27 @@ extern "C" {
  * invariant survive a crash.  A v3 image (object table without refs, no NS
  * section) is refused, not read as blank (facade_alloc_open -> FACADE_E_FORMAT).
  */
-#define FACADE_FORMAT_VERSION 4u
+/*
+ * v5 (data-verification): each object extent carries a per-physical-block data
+ * checksum (data_csum + csum_algo) in facade_ckpt_objext, and the durable object
+ * record carries an object-level content hash (obj_csum + algo/len), so stored
+ * data can be verified on read (D9) and the S3-ETag object hash survives a crash.
+ * A v4 image (objext without a data checksum, object record without the content
+ * hash) is refused, not read as blank (facade_alloc_open -> FACADE_E_FORMAT).
+ */
+#define FACADE_FORMAT_VERSION 5u
+
+/*
+ * Per-physical-block data-checksum algorithm (data-verification, v5).  Facade-
+ * private and distinct from the contract's object-hash CHIMERA_SC_CHECKSUM_*:
+ * this names the algorithm over a single 4 KiB DATA block, stored inline in
+ * facade_ckpt_objext.  CRC32 is facade_crc32 (the in-link integrity primitive);
+ * the tag makes a later algorithm swap landable.
+ */
+enum facade_data_csum_algo {
+    FACADE_DATA_CSUM_NONE  = 0, /* no stored-data checksum (UNWRITTEN / unset) */
+    FACADE_DATA_CSUM_CRC32 = 1, /* facade_crc32 over the 4 KiB physical block */
+};
 
 #define FACADE_SUPER_BLOCK    0u /* superblock lba */
 #define FACADE_SUPER_SIZE     CHIMERA_MEDIA_BLOCK_SIZE /* one block */
@@ -136,6 +156,13 @@ struct facade_obj_rec {
     uint32_t nextents;
     uint32_t refs;               /* minimal binding refcount, 0 or 1 (v4) */
     uint32_t reserved;           /* must be zero; keeps the u32 count even (no padding) */
+    /* Object-level content hash (data-verification, v5).  P1 round-trips these
+     * as zero/NONE; data-verification's SEAL path fills them.  obj_csum is 16
+     * bytes at an 8-aligned offset (16 is a multiple of 8), then two u32, so the
+     * record stays padding-free at 136 bytes on LP64. */
+    uint8_t  obj_csum[16];       /* content hash bytes (e.g. MD5) */
+    uint32_t obj_csum_algo;      /* CHIMERA_SC_CHECKSUM_* (0 = NONE) */
+    uint32_t obj_csum_len;       /* hash length in bytes (0 = absent) */
 };
 
 /*
@@ -155,8 +182,10 @@ struct facade_ckpt_objext {
     uint64_t logical_block;
     uint64_t phys_block;
     uint64_t nblocks;
-    uint32_t kind;     /* CHIMERA_SC_SEG_DATA / _UNWRITTEN */
-    uint32_t owned;    /* 1 = this object allocated the blocks; 0 = borrowed (clone) */
+    uint32_t kind;      /* CHIMERA_SC_SEG_DATA / _UNWRITTEN */
+    uint32_t owned;     /* 1 = this object allocated the blocks; 0 = borrowed (clone) */
+    uint32_t data_csum; /* per-4K-block checksum of the DATA block; 0 for UNWRITTEN (v5) */
+    uint32_t csum_algo; /* enum facade_data_csum_algo; keeps the u32 count even -> 40 B */
 };
 
 /* Object-record flags. */

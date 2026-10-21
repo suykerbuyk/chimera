@@ -362,9 +362,16 @@ facade_obj_put_rec(
             exts[k].nblocks > UINT32_MAX) {
             return NULL;   /* self-inconsistent record */
         }
+        /* The inline per-block checksum covers exactly one 4 KiB block, so a
+         * DATA extent must span one block; a malformed/future image carrying a
+         * multi-block DATA extent is refused rather than under-covered (v5). */
+        if (exts[k].kind == CHIMERA_SC_SEG_DATA && exts[k].nblocks != 1) {
+            return NULL;
+        }
         facade_extent_map_insert(o->map, exts[k].logical_block,
                                  (uint32_t) exts[k].nblocks, exts[k].phys_block,
-                                 exts[k].kind, exts[k].owned ? 1u : 0u, NULL, NULL);
+                                 exts[k].kind, exts[k].owned ? 1u : 0u,
+                                 exts[k].data_csum, exts[k].csum_algo, NULL, NULL);
     }
     return o;
 } /* facade_obj_put_rec */
@@ -788,6 +795,8 @@ facade_ckpt_write_objext(
     xr.nblocks       = rec->nblocks;
     xr.kind          = rec->kind;
     xr.owned         = rec->owned;
+    xr.data_csum     = rec->data_csum;   /* per-block data checksum (v5) */
+    xr.csum_algo     = rec->csum_algo;
     memcpy(*pp, &xr, sizeof(xr));
     *pp += sizeof(xr);
 } /* facade_ckpt_write_objext */

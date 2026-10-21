@@ -120,8 +120,11 @@ facade_recover_parse(
                 return 0;
             }
             memcpy(&e->obj_hdr, payload, sizeof(e->obj_hdr));
+            /* Exact-length OBJ payload (v5): len must be the record header plus
+             * exactly nextents extents -- a v1-shaped (shorter) record under a
+             * v5 image is refused here as well as by the format-field check. */
             if (e->obj_hdr.nextents > FACADE_OBJ_MAX_EXT ||
-                hdr.len < sizeof(e->obj_hdr)
+                hdr.len != sizeof(e->obj_hdr)
                 + (uint64_t) e->obj_hdr.nextents * sizeof(struct facade_ckpt_objext)) {
                 return 0;
             }
