@@ -52,6 +52,8 @@ struct facade_extent {
     uint32_t              kind;        /* CHIMERA_SC_SEG_DATA / _UNWRITTEN / _HOLE */
     chimera_media_block_t phys_block;  /* media lba; unused when kind != DATA/UNWRITTEN */
     uint32_t              owned;       /* 1 = this object allocated the blocks; 0 = borrowed */
+    uint32_t              data_csum;   /* per-block data checksum (v5); 0 when not DATA */
+    uint32_t              csum_algo;   /* enum facade_data_csum_algo */
 };
 
 /* Reports physical blocks the map no longer references (overlap replace or
@@ -74,7 +76,9 @@ facade_extent_map_destroy(
 
 /* Map [logical_block, logical_block + nblocks) to physical phys, kind
  * CHIMERA_SC_SEG_DATA or CHIMERA_SC_SEG_UNWRITTEN, owned 1 (this object's own
- * blocks) or 0 (borrowed from a clone origin).  Overlapping ranges are
+ * blocks) or 0 (borrowed from a clone origin).  data_csum/csum_algo are the
+ * per-block data checksum (v5): facade_crc32 + FACADE_DATA_CSUM_CRC32 for a DATA
+ * block, 0 + FACADE_DATA_CSUM_NONE for UNWRITTEN.  Overlapping ranges are
  * split/replaced atomically; replaced OWNED physical ranges are reported via
  * on_freed (may be NULL); borrowed ranges are dropped silently. */
 void
@@ -85,6 +89,8 @@ facade_extent_map_insert(
     chimera_media_block_t     phys,
     uint32_t                  kind,
     uint32_t                  owned,
+    uint32_t                  data_csum,
+    uint32_t                  csum_algo,
     facade_freed_cb_t         on_freed,
     void                     *private_data);
 
