@@ -142,6 +142,58 @@ facade_free_add(
     a->free_blocks += nblocks;
 } /* facade_free_add */
 
+/* ------------------------------------------------------------------ */
+/* per-lba reuse stamp (data-verification scrub)                      */
+/* ------------------------------------------------------------------ */
+
+/* Allocate the lba-indexed reuse-stamp array once the data region is known
+ * (called from both the format and the open paths after data_first/data_last
+ * are set).  In-memory only; sized for the data region. */
+static void
+facade_reuse_init(struct facade_alloc *a)
+{
+    uint64_t n = (a->data_last > a->data_first) ? a->data_last - a->data_first : 0;
+
+    free(a->reuse_stamp);
+    a->reuse_stamp = n ? calloc(n, sizeof(uint64_t)) : NULL;
+    FACADE_CHECK(n == 0 || a->reuse_stamp != NULL, "oom reuse-stamp array");
+    a->reuse_tick = 0;
+} /* facade_reuse_init */
+
+/* Bump EVERY lba in [start, start + nblocks) to a fresh monotonic stamp (per-lba
+ * across the whole run, not just the first lba), so a scrub detects a free or a
+ * realloc of any block in the run. */
+static void
+facade_reuse_bump(
+    struct facade_alloc  *a,
+    chimera_media_block_t start,
+    uint32_t              nblocks)
+{
+    chimera_media_block_t b;
+    uint64_t              g;
+
+    if (!a->reuse_stamp) {
+        return;
+    }
+    g = ++a->reuse_tick;
+    for (b = start; b < start + nblocks; b++) {
+        if (b >= a->data_first && b < a->data_last) {
+            a->reuse_stamp[b - a->data_first] = g;
+        }
+    }
+} /* facade_reuse_bump */
+
+SYMBOL_EXPORT uint64_t
+facade_reuse_stamp(
+    const struct facade_alloc *a,
+    chimera_media_block_t      lba)
+{
+    if (!a->reuse_stamp || lba < a->data_first || lba >= a->data_last) {
+        return 0;
+    }
+    return a->reuse_stamp[lba - a->data_first];
+} /* facade_reuse_stamp */
+
 SYMBOL_EXPORT enum facade_status
 facade_alloc_blocks(
     struct facade_alloc   *a,
@@ -184,6 +236,7 @@ facade_alloc_blocks(
     }
 
     a->free_blocks -= nblocks;
+    facade_reuse_bump(a, start, nblocks);   /* the allocated run was reused */
     if (r_start) {
         *r_start = start;
     }
@@ -204,6 +257,7 @@ facade_alloc_free(
                  "free outside the data region");
     facade_free_insert(a, start, nblocks);
     a->free_blocks += nblocks;
+    facade_reuse_bump(a, start, nblocks);   /* the freed run changed owner */
 } /* facade_alloc_free */
 
 SYMBOL_EXPORT uint64_t
@@ -539,6 +593,7 @@ facade_alloc_destroy(struct facade_alloc *a)
     rb_tree_destroy(&a->free_by_start, facade_free_node_destroy, NULL);
     free(a->objs);
     free(a->super_buf);
+    free(a->reuse_stamp);
     free(a);
 } /* facade_alloc_destroy */
 
@@ -1034,6 +1089,7 @@ facade_compute_geometry(struct facade_alloc *a)
     a->log_block    = a->ckpt_b_block + a->ckpt_nblocks;
     a->data_first   = a->log_block + a->log_nblocks;
     a->data_last    = a->nblocks;
+    facade_reuse_init(a);
 } /* facade_compute_geometry */
 
 /* ------------------------------------------------------------------ */
@@ -1506,10 +1562,11 @@ facade_open_super_done(
         return;
     }
 
-    a->nblocks               = s.nblocks;
-    a->ns_budget             = facade_ns_budget_for(s.nblocks);
-    a->data_first            = s.data_first;
-    a->data_last             = s.data_last;
+    a->nblocks    = s.nblocks;
+    a->ns_budget  = facade_ns_budget_for(s.nblocks);
+    a->data_first = s.data_first;
+    a->data_last  = s.data_last;
+    facade_reuse_init(a);
     a->ckpt_a_block          = s.ckpt_a_block;
     a->ckpt_b_block          = s.ckpt_b_block;
     a->ckpt_nblocks          = s.ckpt_nblocks;

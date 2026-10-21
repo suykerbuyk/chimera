@@ -162,6 +162,15 @@ struct facade_alloc {
     struct rb_tree                       free_by_start;
     uint64_t                             free_blocks;
 
+    /* Per-data-block reuse stamp (data-verification scrub).  An lba-indexed
+     * array over the data region (index = lba - data_first), bumped to a fresh
+     * monotonic tick on every free/alloc of that lba (per-lba across the whole
+     * run), so a scrub that snapshots a block's stamp and rechecks it after the
+     * read detects a free+realloc and skips it instead of false-reporting.
+     * In-memory only, not persisted; lifetime is the alloc handle. */
+    uint64_t                            *reuse_stamp; /* data_last - data_first entries */
+    uint64_t                             reuse_tick;  /* monotonic stamp source */
+
     /* object table (durable; folded into the checkpoint) */
     struct facade_obj                   *objs;      /* FACADE_OBJ_BUDGET entries */
     uint32_t                             nobjs;     /* used entries */
@@ -420,6 +429,14 @@ struct facade_obj *
 facade_obj_at(
     struct facade_alloc *alloc,
     uint32_t             slot);
+
+/* The current reuse stamp of a data-region lba (0 outside the data region or
+ * before any free/alloc touched it).  The scrub snapshots it under the slot and
+ * rechecks it after each read to detect a free+realloc (facade_alloc.c). */
+uint64_t
+facade_reuse_stamp(
+    const struct facade_alloc *alloc,
+    chimera_media_block_t      lba);
 
 /* Durable-object-transaction FIFO (facade_alloc.c).  acquire runs start(arg)
  * now if the slot is free, else queues it; release runs the next queued starter

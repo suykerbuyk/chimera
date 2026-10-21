@@ -1518,3 +1518,173 @@ facade_obj_release_epoch_held(
     c->is_discard = 0;   /* sweep every OPEN && !HELD object inside the slot */
     facade_txn_acquire(a, facade_release_start, c);
 } /* facade_obj_release_epoch_held */
+
+/* ---- SCRUB (data-verification): verify every stored DATA block ---- */
+
+struct facade_scrub_ent {
+    uint8_t               obj_id[16];
+    uint64_t              logical;
+    chimera_media_block_t phys;
+    uint32_t              data_csum;
+    uint32_t              csum_algo;
+    uint64_t              reuse_stamp;   /* snapshot of the block's reuse stamp */
+};
+
+struct facade_scrub_ctx {
+    struct facade_alloc     *a;
+    facade_scrub_report_cb   report;
+    facade_scrub_done_cb     done;
+    void                    *priv;
+    struct facade_scrub_ent *ents;       /* object-major snapshot (heap) */
+    uint32_t                 nents;
+    uint32_t                 cur;
+    uint32_t                 nbad;
+    void                    *block;      /* 4 KiB read buffer */
+    const uint8_t           *collect_id; /* object id while collecting its extents */
+    uint8_t                  cur_obj[16];
+    int                      have_cur_obj;
+    int                      cur_obj_bad; /* already reported the current object */
+};
+
+static void facade_scrub_verify_next(
+    struct facade_scrub_ctx *c);
+
+/* facade_extent_map_foreach callback: snapshot one DATA extent (filter BEFORE any
+ * read -- UNWRITTEN/HOLE never reach media).  DATA extents are one block. */
+static void
+facade_scrub_collect_cb(
+    const struct facade_extent *rec,
+    void                       *priv)
+{
+    struct facade_scrub_ctx *c = priv;
+    struct facade_scrub_ent *e;
+
+    if (rec->kind != CHIMERA_SC_SEG_DATA) {
+        return;
+    }
+    e = &c->ents[c->nents++];
+    memcpy(e->obj_id, c->collect_id, 16);
+    e->logical     = rec->logical_block;
+    e->phys        = rec->phys_block;
+    e->data_csum   = rec->data_csum;
+    e->csum_algo   = rec->csum_algo;
+    e->reuse_stamp = facade_reuse_stamp(c->a, rec->phys_block);
+} /* facade_scrub_collect_cb */
+
+static void
+facade_scrub_finish(struct facade_scrub_ctx *c)
+{
+    facade_scrub_done_cb done = c->done;
+    void                *priv = c->priv;
+    uint32_t             nbad = c->nbad;
+
+    free(c->ents);
+    free(c->block);
+    free(c);
+    done(FACADE_OK, nbad, priv);
+} /* facade_scrub_finish */
+
+static void
+facade_scrub_read_done(
+    enum facade_status st,
+    void              *priv)
+{
+    struct facade_scrub_ctx *c = priv;
+    struct facade_scrub_ent *e = &c->ents[c->cur];
+
+    /* A new object starts: reset the per-object "already reported" latch. */
+    if (!c->have_cur_obj || memcmp(c->cur_obj, e->obj_id, 16) != 0) {
+        memcpy(c->cur_obj, e->obj_id, 16);
+        c->have_cur_obj = 1;
+        c->cur_obj_bad  = 0;
+    }
+
+    if (st == FACADE_OK && !c->cur_obj_bad) {
+        /* Recheck the reuse stamp AFTER the read: if it changed, the block was
+         * freed/realloced since the snapshot and no longer holds this object's
+         * content -- skip it, never a false DATA_UNRECOVERABLE. */
+        if (facade_reuse_stamp(c->a, e->phys) == e->reuse_stamp &&
+            (e->csum_algo != FACADE_DATA_CSUM_CRC32 ||
+             facade_crc32(c->block, CHIMERA_MEDIA_BLOCK_SIZE) != e->data_csum)) {
+            c->report(e->obj_id, e->logical, c->priv);   /* first bad block */
+            c->cur_obj_bad = 1;
+            c->nbad++;
+        }
+    }
+    /* A transient media read error is not a verification failure; skip it. */
+    c->cur++;
+    facade_scrub_verify_next(c);
+} /* facade_scrub_read_done */
+
+static void
+facade_scrub_verify_next(struct facade_scrub_ctx *c)
+{
+    while (c->cur < c->nents) {
+        struct facade_scrub_ent *e = &c->ents[c->cur];
+
+        /* Once an object is reported, skip its remaining extents (first bad
+         * block is enough) without any further reads. */
+        if (c->have_cur_obj && c->cur_obj_bad &&
+            memcmp(c->cur_obj, e->obj_id, 16) == 0) {
+            c->cur++;
+            continue;
+        }
+        facade_media_read(c->a, c->block, e->phys, 1, facade_scrub_read_done, c);
+        return;
+    }
+    facade_scrub_finish(c);
+} /* facade_scrub_verify_next */
+
+/* Runs under the FIFO slot: snapshot the DATA extents (metadata only, no I/O),
+ * release the slot, then verify out of the slot. */
+static void
+facade_scrub_start(void *arg)
+{
+    struct facade_scrub_ctx *c = arg;
+    struct facade_alloc     *a = c->a;
+    uint32_t                 i, n = facade_obj_slot_count(a);
+    uint64_t                 cap = 0;
+
+    for (i = 0; i < n; i++) {
+        struct facade_obj *o = facade_obj_at(a, i);
+
+        if (o) {
+            cap += facade_extent_map_count(o->map);   /* upper bound (DATA+UNWRITTEN) */
+        }
+    }
+    c->ents = cap ? calloc((size_t) cap, sizeof(*c->ents)) : NULL;
+    FACADE_CHECK(cap == 0 || c->ents != NULL, "oom scrub snapshot");
+    c->nents = 0;
+    for (i = 0; i < n; i++) {
+        struct facade_obj *o = facade_obj_at(a, i);
+
+        if (o) {
+            c->collect_id = o->id;
+            facade_extent_map_foreach(o->map, facade_scrub_collect_cb, c);
+        }
+    }
+
+    facade_txn_release(a);   /* no media I/O was done under the slot */
+
+    c->cur   = 0;
+    c->block = calloc(1, CHIMERA_MEDIA_BLOCK_SIZE);
+    FACADE_CHECK(c->block != NULL, "oom scrub block");
+    facade_scrub_verify_next(c);
+} /* facade_scrub_start */
+
+SYMBOL_EXPORT void
+facade_scrub(
+    struct facade_alloc   *a,
+    facade_scrub_report_cb report,
+    facade_scrub_done_cb   done,
+    void                  *private_data)
+{
+    struct facade_scrub_ctx *c = calloc(1, sizeof(*c));
+
+    FACADE_CHECK(c != NULL, "oom scrub ctx");
+    c->a      = a;
+    c->report = report;
+    c->done   = done;
+    c->priv   = private_data;
+    facade_txn_acquire(a, facade_scrub_start, c);
+} /* facade_scrub */

@@ -471,6 +471,77 @@ on_ns(
     w->done = 1;
 } /* on_ns */
 
+/* ---- P4 (scrub) helpers ---- */
+
+#define SCRUB_MAX_REPORTS 16
+
+struct scrub_w {
+    int                done;
+    enum facade_status st;
+    uint32_t           nbad;             /* from done() */
+    uint32_t           nids;             /* from report() */
+    uint8_t            ids[SCRUB_MAX_REPORTS][16];
+    uint64_t           firstbad[SCRUB_MAX_REPORTS];
+};
+
+static void
+scrub_report(
+    const uint8_t obj_id[16],
+    uint64_t      first_bad_logical,
+    void         *priv)
+{
+    struct scrub_w *w = priv;
+
+    if (w->nids < SCRUB_MAX_REPORTS) {
+        memcpy(w->ids[w->nids], obj_id, 16);
+        w->firstbad[w->nids] = first_bad_logical;
+        w->nids++;
+    }
+} /* scrub_report */
+
+static void
+scrub_done(
+    enum facade_status st,
+    uint32_t           nbad,
+    void              *priv)
+{
+    struct scrub_w *w = priv;
+
+    w->st   = st;
+    w->nbad = nbad;
+    w->done = 1;
+} /* scrub_done */
+
+static void
+ts_scrub(
+    struct ts      *t,
+    struct scrub_w *w)
+{
+    memset(w, 0, sizeof(*w));
+    w->st = FACADE_E_IO;
+    facade_scrub(t->alloc, scrub_report, scrub_done, w);
+    pump(t->evpl, &w->done);
+} /* ts_scrub */
+
+static int
+scrub_reported(
+    const struct scrub_w *w,
+    const uint8_t         id[16],
+    uint64_t             *first_bad)
+{
+    uint32_t i;
+
+    for (i = 0; i < w->nids; i++) {
+        if (memcmp(w->ids[i], id, 16) == 0) {
+            if (first_bad) {
+                *first_bad = w->firstbad[i];
+            }
+            return 1;
+        }
+    }
+    return 0;
+} /* scrub_reported */
+
 /* Assert object `id`'s extent at block `lb` is DATA with the expected checksum. */
 static void
 check_block_csum(
@@ -1125,6 +1196,130 @@ main(void)
         CHECK(ts_stat(&t, id, &m) == 0 && m.state == CHIMERA_SC_OBJ_SEALED);
         CHECK(m.checksum.algorithm == CHIMERA_SC_CHECKSUM_MD5 &&
               memcmp(m.checksum.bytes, expect, 16) == 0);
+
+        ts_close_media(&t);
+    }
+
+    /* ---- 14 (P4): scrub correctness -- empty table, clean media, and a
+     *      corrupted subset reported exactly (first bad block), with UNWRITTEN
+     *      extents never verified. ---- */
+    {
+        uint8_t        a_id[16], b_id[16], c_id[16];
+        uint8_t        b0[BS], b1[BS];
+        struct scrub_w w;
+        uint64_t       first;
+
+        mkid(a_id, 0xE1);
+        mkid(b_id, 0xE2);
+        mkid(c_id, 0xE3);
+        fillpat(b0, BS, 0xE0);
+        fillpat(b1, BS, 0xE5);
+
+        ts_open_media(&t, dir, 13);
+        ts_format(&t);
+        ts_open(&t);
+
+        /* empty object table: scrub reports nothing and starts no media I/O. */
+        ts_scrub(&t, &w);
+        CHECK(w.st == FACADE_OK && w.nbad == 0 && w.nids == 0);
+
+        /* A: two clean DATA blocks.  B: two DATA blocks (one will be corrupted).
+         * C: one DATA block + one UNWRITTEN block (must never be verified). */
+        ts_write_block(&t, a_id, 0, b0);
+        ts_write_block(&t, a_id, 1, b1);
+        ts_write_block(&t, b_id, 0, b0);
+        ts_write_block(&t, b_id, 1, b1);
+        ts_write_block(&t, c_id, 0, b0);
+        CHECK(ts_allocate(&t, c_id, BS, BS) == FACADE_OK);   /* UNWRITTEN at logical 1 */
+
+        ts_crash_recover(&t);                  /* drain: delegate authoritative */
+        ts_reopen(&t);
+
+        /* all clean: scrub reports nothing. */
+        ts_scrub(&t, &w);
+        CHECK(w.st == FACADE_OK && w.nbad == 0 && w.nids == 0);
+
+        /* corrupt B's second block; scrub reports exactly B at logical 1. */
+        CHECK(t.control->corrupt(t.space, ts_phys(&t, b_id, 1), 1) == 0);
+        ts_scrub(&t, &w);
+        CHECK(w.st == FACADE_OK && w.nbad == 1 && w.nids == 1);
+        CHECK(scrub_reported(&w, b_id, &first) && first == 1);
+        CHECK(!scrub_reported(&w, a_id, NULL));      /* A clean */
+        CHECK(!scrub_reported(&w, c_id, NULL));      /* C's UNWRITTEN not verified */
+
+        ts_close_media(&t);
+    }
+
+    /* ---- 15 (P4): the per-lba reuse-stamp -- (A) a scrub rechecks the stamp
+     *      after the read, so a block corrupted+freed while the read is in flight
+     *      is skipped, not false-reported; (B) the stamp is bumped per-lba across
+     *      a whole multi-block alloc AND free (not just the first lba). ---- */
+    {
+        uint8_t              id[16], x[16];
+        uint8_t              b[BS];
+        struct scrub_w       w;
+        struct facade_obj   *o;
+        struct facade_extent ext;
+        uint64_t             phys, snap, q, s0, s1, s2, u0, u1, u2;
+
+        mkid(id, 0xF1);
+        mkid(x,  0xF2);
+        fillpat(b, BS, 0xF0);
+
+        ts_open_media(&t, dir, 14);
+        ts_format(&t);
+        ts_open(&t);
+
+        /* --- (A) recheck-after-read skips a freed block (no false positive) --- */
+        ts_write_block(&t, id, 0, b);
+        ts_crash_recover(&t);
+        ts_reopen(&t);
+        phys = ts_phys(&t, id, 0);
+        snap = facade_reuse_stamp(t.alloc, phys);
+
+        /* Corrupt the block FIRST, so the scrub's read returns bad bytes (the
+         * crash-sim fills the read buffer from the delegate at submit time).  The
+         * snapshot still captures the extent's stored csum + the stamp `snap`. */
+        CHECK(t.control->corrupt(t.space, phys, 1) == 0);
+
+        /* Dispatch the scrub (snapshot {id@phys, snap}, read deferred + buffer
+         * filled with the corrupted bytes), then FREE the block while the read is
+         * in flight (discard bumps the stamp).  The post-read recheck sees the
+         * changed stamp and SKIPS -- without it, the corrupted read would
+         * false-report id (verified non-vacuous by a break-test). */
+        memset(&w, 0, sizeof(w));
+        w.st = FACADE_E_IO;
+        facade_scrub(t.alloc, scrub_report, scrub_done, &w);
+        CHECK(!w.done);                                    /* read deferred */
+        {
+            struct cb_w dw = { 0, FACADE_E_IO };
+            facade_obj_discard(t.alloc, id, on_cb, &dw);   /* frees phys, bumps stamp */
+            pump(t.evpl, &w.done);                         /* drain the scrub */
+            pump(t.evpl, &dw.done);
+            CHECK(dw.st == FACADE_OK);
+        }
+        CHECK(w.st == FACADE_OK);
+        CHECK(facade_reuse_stamp(t.alloc, phys) != snap);   /* the block was freed */
+        CHECK(w.nbad == 0 && w.nids == 0);                 /* recheck skipped it: no false positive */
+
+        /* --- (B) per-lba bump across a whole multi-block run (alloc and free) --- */
+        CHECK(facade_obj_create_entry(t.alloc, x, NULL) != NULL);
+        CHECK(ts_allocate(&t, x, 0, 3 * BS) == FACADE_OK); /* one 3-block UNWRITTEN run */
+        o = facade_obj_find(t.alloc, x);
+        CHECK(o != NULL && facade_extent_map_lookup(o->map, 0, &ext) == 1);
+        q  = ext.phys_block;
+        s0 = facade_reuse_stamp(t.alloc, q);
+        s1 = facade_reuse_stamp(t.alloc, q + 1);
+        s2 = facade_reuse_stamp(t.alloc, q + 2);
+        /* every lba of the run was stamped by the alloc -- not just the first. */
+        CHECK(s0 != 0 && s1 != 0 && s2 != 0 && s0 == s1 && s1 == s2);
+
+        CHECK(ts_discard(&t, x) == FACADE_OK);             /* one 3-block free */
+        u0 = facade_reuse_stamp(t.alloc, q);
+        u1 = facade_reuse_stamp(t.alloc, q + 1);
+        u2 = facade_reuse_stamp(t.alloc, q + 2);
+        /* every lba of the run was re-stamped by the free -- not just the first. */
+        CHECK(u0 != s0 && u1 != s1 && u2 != s2 && u0 == u1 && u1 == u2);
 
         ts_close_media(&t);
     }

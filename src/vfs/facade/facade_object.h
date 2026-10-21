@@ -185,6 +185,39 @@ facade_obj_release_epoch_held(
     facade_cb_t          cb,
     void                *private_data);
 
+/*
+ * Scrub (data-verification, D9): walk the object table, verify every stored DATA
+ * block against its per-block checksum, and report the objects that cannot be
+ * recovered.  A backend/operator tool, NOT a Chimera-facing contract op (O6:
+ * Chimera consumes storage and does not verify it); surfaced through the facade's
+ * public API for the sc_backend adapter / an operator control seam.  It repairs
+ * nothing.
+ *
+ * Concurrency: one brief metadata-only snapshot under the FIFO slot (DATA extents
+ * only, with each block's reuse stamp), then media reads OUT of the slot; each
+ * block's reuse stamp is rechecked AFTER its read, so a block freed+realloced
+ * since the snapshot is skipped rather than false-reported.
+ *
+ * `report` fires once per unrecoverable object, with its first bad logical block.
+ * `done` fires once at the end with the count of unrecoverable objects.
+ */
+typedef void (*facade_scrub_report_cb)(
+    const uint8_t obj_id[16],
+    uint64_t      first_bad_logical_block,
+    void         *private_data);
+
+typedef void (*facade_scrub_done_cb)(
+    enum facade_status status,
+    uint32_t           n_unrecoverable,
+    void              *private_data);
+
+void
+facade_scrub(
+    struct facade_alloc   *alloc,
+    facade_scrub_report_cb report,
+    facade_scrub_done_cb   done,
+    void                  *private_data);
+
 #ifdef __cplusplus
 }
 #endif /* ifdef __cplusplus */
