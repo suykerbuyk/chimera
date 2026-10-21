@@ -47,6 +47,7 @@ chimera_nfs4_open_downgrade(
     status = nfs_state_table_acquire(table, &args->open_stateid,
                                      NFS4_SLOT_TYPE_OPEN,
                                      &state_void, &state_type);
+    status = nfs4_stateid_acquire_status(status, req->minorversion);
     if (status != NFS4_OK) {
         res->status = status;
         chimera_nfs4_compound_complete(req, res->status);
@@ -91,6 +92,22 @@ chimera_nfs4_open_downgrade(
                 nfs4_replay_record(&owner->replay, args->seqid,
                                    OP_OPEN_DOWNGRADE, status, NULL);
             }
+            evpl_mutex_unlock(&owner->lock);
+            nfs_state_table_release(table, open_state, NFS4_SLOT_TYPE_OPEN,
+                                    thread->vfs_thread);
+            res->status = status;
+            chimera_nfs4_compound_complete(req, res->status);
+            return;
+        }
+    }
+
+    if (!is_v40) {
+        /* RFC 8881 §8.2.2: the same seqid rules hold on 4.1+ (without the
+         * owner-seqid machinery above); a superseded stateid must not
+         * downgrade the open a concurrent OPEN has since re-published. */
+        status = nfs4_stateid_check_seqid(open_state->seqid,
+                                          args->open_stateid.seqid);
+        if (status != NFS4_OK) {
             evpl_mutex_unlock(&owner->lock);
             nfs_state_table_release(table, open_state, NFS4_SLOT_TYPE_OPEN,
                                     thread->vfs_thread);

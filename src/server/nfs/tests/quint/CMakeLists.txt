@@ -133,6 +133,13 @@ target_link_libraries(nfs4_setattr_stateid_probe
     chimera_server chimera_nfs_common chimera_metrics jansson)
 mbt_add_krb5(nfs4_setattr_stateid_probe)
 
+add_executable(nfs4_lock_relock_probe nfs4_lock_relock_probe.c)
+target_include_directories(nfs4_lock_relock_probe PRIVATE
+    ${CMAKE_BINARY_DIR}/src/nfs_common)
+target_link_libraries(nfs4_lock_relock_probe
+    chimera_server chimera_nfs_common chimera_metrics jansson)
+mbt_add_krb5(nfs4_lock_relock_probe)
+
 add_executable(nfs_aux_probe nfs_aux_probe.c)
 target_include_directories(nfs_aux_probe PRIVATE
     ${CMAKE_BINARY_DIR}/src/nfs_common)
@@ -347,7 +354,11 @@ set_tests_properties(chimera/server/nfs/mbt4/open_access_probe_memfs PROPERTIES
 # an open stateid, or a lock stateid anchored to a write-capable open of the
 # same file, including the seqid-0 form a Linux client sends while it holds a
 # POSIX lock.  Runs on a passthrough backend as well, where the truncate is
-# applied through the open's own descriptor.  Needs no corpus.
+# applied through the open's own descriptor.  The _deleg variant serves
+# delegations and runs the holder's matrix instead: I/O through the holder's
+# own open, lock and delegation stateids must not recall its delegation, and
+# a delegation stateid authorizes exactly what the delegation grants.  Needs
+# no corpus.
 foreach(backend memfs linux)
     if(backend STREQUAL "linux" AND NOT CHIMERA_LINUX)
         continue()
@@ -360,7 +371,28 @@ foreach(backend memfs linux)
         LABELS "quint;nfs4_mbt;multiproto;${backend}"
         SKIP_RETURN_CODE 77
         TIMEOUT 90)
+    add_test(NAME chimera/server/nfs/mbt4/setattr_stateid_probe_${backend}_deleg
+        COMMAND $<TARGET_FILE:nfs4_setattr_stateid_probe> ${backend} --deleg)
+    set_tests_properties(chimera/server/nfs/mbt4/setattr_stateid_probe_${backend}_deleg
+        PROPERTIES
+        ENVIRONMENT "CHIMERA_MBT_ARTIFACTS=nfs4_setattr_stateid_probe_${backend}_deleg"
+        LABELS "quint;nfs4_mbt;multiproto;${backend}"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 90)
 endforeach()
+# Byte-range re-lock probe: a LOCK by a lock-owner over bytes it already holds
+# replaces its coverage there (RFC 7530 section 9.3 downgrade/upgrade, the
+# fcntl semantics OPEN4_RESULT_LOCKTYPE_POSIX promises), so other lock-owners
+# see the new mode while the parts of the old lock outside the range keep
+# standing.  pynfs LOCKCHGD/LOCKCHGU only check the re-lock's own status.
+# NFSv4 byte-range claims never project to a backend, so memfs is enough.
+# Needs no corpus.
+add_test(NAME chimera/server/nfs/mbt4/lock_relock_probe_memfs
+    COMMAND $<TARGET_FILE:nfs4_lock_relock_probe>)
+set_tests_properties(chimera/server/nfs/mbt4/lock_relock_probe_memfs PROPERTIES
+    ENVIRONMENT "CHIMERA_MBT_ARTIFACTS=nfs4_lock_relock_probe_memfs"
+    LABELS "quint;nfs4_mbt;multiproto;memfs"
+    TIMEOUT 90)
 # ---------------------------------------------------------------------------
 # The same ground truth again, called under Kerberos.
 #

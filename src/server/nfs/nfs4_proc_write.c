@@ -89,7 +89,7 @@ chimera_nfs4_write_open_callback(
     req->handle      = handle;
     req->args_write4 = args;
 
-    if (req->io_owner_from_deleg) {
+    if (req->io_owner_valid) {
         /* A delegation-authorized write: present the delegation holder's own
          * claim actor (same protocol/client/fh as the cache claim created at
          * OPEN) so the VFS I/O path recognises the writer as the delegation
@@ -99,7 +99,7 @@ chimera_nfs4_write_open_callback(
         struct chimera_claim_actor io_owner = {
             .owner          = {
                 .proto      = CHIMERA_CLAIM_PROTO_NFSV4,
-                .client_key = req->session->client_unified->client_id,
+                .client_key = req->io_owner_client_id,
                 .owner_lo   = handle->fh_hash,
                 .owner_hi   = 0,
             },
@@ -149,9 +149,10 @@ chimera_nfs4_write(
     struct nfs_open_state          *open_state;
     nfsstat4                        status;
 
-    req->nfs_state_ref       = NULL;
-    req->handle              = NULL;
-    req->io_owner_from_deleg = false;
+    req->nfs_state_ref      = NULL;
+    req->handle             = NULL;
+    req->io_owner_valid     = false;
+    req->io_owner_client_id = 0;
 
     /* RFC 7530 §9.6.2: WRITE is refused with NFS4ERR_GRACE while the
      * server-reboot grace window is open, because a byte-range lock that
@@ -228,6 +229,7 @@ chimera_nfs4_write(
 
     status = nfs_state_table_acquire(table, &args->stateid, 0,
                                      &state_void, &state_type);
+    status = nfs4_stateid_acquire_status(status, req->minorversion);
     if (status != NFS4_OK) {
         res->status = status;
         evpl_iovecs_release(thread->evpl, args->data.iov, args->data.niov);
@@ -247,23 +249,39 @@ chimera_nfs4_write(
         return;
     }
 
-    /* A (write) delegation stateid authorizes the WRITE but carries no open
+    /* A delegation stateid authorizes the WRITE when it is a write
+     * delegation of the current filehandle: a read delegation grants no
+     * write (NFS4ERR_OPENMODE, as a read-only open), and a delegation on
+     * another file designates no state for this one.  It carries no open
      * handle; drop the ref and open the current FH on the fly. */
     if (state_type == NFS4_SLOT_TYPE_DELEG) {
+        struct nfs_delegation *deleg = state_void;
+
+        if (req->fhlen == 0) {
+            status = NFS4ERR_NOFILEHANDLE;
+        } else if (deleg->fh_len != req->fhlen ||
+                   memcmp(deleg->fh, req->fh, req->fhlen) != 0) {
+            status = NFS4ERR_BAD_STATEID;
+        } else if (deleg->type != OPEN_DELEGATE_WRITE) {
+            status = NFS4ERR_OPENMODE;
+        } else {
+            /* This write is the delegation holder's own: carry the holder
+             * as the claim actor on the on-the-fly write so it does not
+             * recall the client's own delegation.  The holder is the
+             * delegation's client, which a 4.0 compound (no session) names
+             * through the stateid alone. */
+            req->io_owner_valid     = true;
+            req->io_owner_client_id = deleg->client->client_id;
+        }
         nfs_state_table_release(table, state_void, state_type,
                                 thread->vfs_thread);
-        if (req->fhlen == 0) {
-            res->status = NFS4ERR_NOFILEHANDLE;
+        if (status != NFS4_OK) {
+            res->status = status;
             evpl_iovecs_release(thread->evpl, args->data.iov, args->data.niov);
             chimera_nfs4_compound_complete(req, res->status);
             return;
         }
         req->args_write4 = args;
-        /* This write is authorized by the client's own (write) delegation:
-         * carry the holder's lease owner on the on-the-fly write so it does
-         * not recall the client's own delegation. */
-        req->io_owner_from_deleg = (req->session &&
-                                    req->session->client_unified);
         chimera_vfs_open_fh(thread->vfs_thread, &req->cred,
                             req->fh,
                             req->fhlen,
@@ -282,6 +300,13 @@ chimera_nfs4_write(
     }
     state_handle = nfs_state_io_handle(state_void, state_type, OPEN4_SHARE_ACCESS_WRITE);
 
+    /* RFC 7530 §9.1.4.2: a superseded or never-issued open/lock stateid seqid
+     * is refused.  Gated on 4.0: RFC 8881 §8.2.2 lets a 4.1+ client send a
+     * zero seqid to mean "the most current", which is the common choice for
+     * READ/WRITE, and does not require it to track every server-side OPEN
+     * upgrade's seqid for I/O it issues through a cached stateid.  The
+     * stateid-modifying ops (LOCK/LOCKU/OPEN_DOWNGRADE) do enforce it
+     * on every minor version. */
     if (req->minorversion == 0) {
         uint32_t current_seqid = (state_type == NFS4_SLOT_TYPE_OPEN) ?
             open_state->seqid :
