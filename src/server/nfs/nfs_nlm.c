@@ -14,6 +14,7 @@
 #include "nfs_nlm_state.h"
 #include "nfs_nlm_range.h"
 #include "nfs_nlm_granted.h"
+#include "nfs_nlm_test_hooks.h"
 #include "nfs_nsm.h"
 #include "vfs/vfs_procs.h"
 #include "vfs/vfs_release.h"
@@ -357,6 +358,8 @@ struct nlm_lock_resume {
      * (chimera_nfs_nlm4_lock_replace): their claims are released already,
      * their open handles are released on ctx->thread, then they are freed. */
     struct nlm_lock_entry          *drop;
+    /* A deferred grant that replaced held locks: submitted on ctx->thread
+     * once chimera_nfs_nlm4_lock_replace has carved them. */
     struct nlm_grant_request        grant;  /* when deliver             */
     bool                            deliver;
     bool                            monitor;
@@ -388,30 +391,19 @@ nlm_lock_ctx_free(void *vctx)
     free(ctx);
 } /* nlm_lock_ctx_free */
 
-/* Snapshot a self-contained grant job from the now-granted lock entry.
- *
- * CALLER MUST HOLD nlm_state.mutex.  The entry is only guaranteed to exist
- * while it is held: a client reap (FREE_ALL, SM_NOTIFY, or the last
- * connection dropping) takes every entry off client->locks under the mutex
- * and frees them as soon as it drops it, so reading the entry afterwards is
- * a use-after-free.  The job is a pure value copy, so once it is filled in
- * nothing downstream aliases lock state. */
+/* The lock half of a grant request -- what nlm_granter_revoke matches on --
+ * filled from the entry alone, so a revoke names exactly what the submit
+ * did.  Leaves client_addr and the cookie empty. */
 static void
-chimera_nfs_nlm4_build_grant_locked(
-    struct nlm_lock_ctx      *ctx,
-    struct nlm_grant_request *reqp)
+chimera_nfs_nlm4_grant_lock_fill(
+    const struct nlm_lock_entry *entry,
+    const char                  *hostname,
+    struct nlm_grant_request    *reqp)
 {
-    struct nlm_lock_entry   *entry = ctx->entry;
     struct nlm_grant_request req;
 
     memset(&req, 0, sizeof(req));
-    snprintf(req.client_addr, sizeof(req.client_addr), "%s", ctx->client_addr);
-    snprintf(req.caller_name, sizeof(req.caller_name), "%s",
-             ctx->client->hostname);
-    req.cookie_len = ctx->cookie.len < LM_MAXSTRLEN ? ctx->cookie.len : LM_MAXSTRLEN;
-    if (req.cookie_len) {
-        memcpy(req.cookie, ctx->cookie.data, req.cookie_len);
-    }
+    snprintf(req.caller_name, sizeof(req.caller_name), "%s", hostname);
     req.fh_len = entry->fh_len < NFS4_FHSIZE ? entry->fh_len : NFS4_FHSIZE;
     memcpy(req.fh, entry->fh, req.fh_len);
     req.oh_len = entry->oh_len < LM_MAXSTRLEN ? entry->oh_len : LM_MAXSTRLEN;
@@ -427,26 +419,61 @@ chimera_nfs_nlm4_build_grant_locked(
     req.exclusive = entry->exclusive ? 1 : 0;
 
     *reqp = req;
+} /* chimera_nfs_nlm4_grant_lock_fill */
+
+/* Snapshot a self-contained grant job from the now-granted lock entry.
+ *
+ * CALLER MUST HOLD nlm_state.mutex.  The entry is only guaranteed to exist
+ * while it is held: a client reap (FREE_ALL, SM_NOTIFY, or the last
+ * connection dropping) takes every entry off client->locks under the mutex
+ * and frees them as soon as it drops it, so reading the entry afterwards is
+ * a use-after-free.  The job is a pure value copy, so once it is filled in
+ * nothing downstream aliases lock state. */
+static void
+chimera_nfs_nlm4_build_grant_locked(
+    struct nlm_lock_ctx      *ctx,
+    struct nlm_grant_request *reqp)
+{
+    struct nlm_grant_request req;
+
+    chimera_nfs_nlm4_grant_lock_fill(ctx->entry, ctx->client->hostname, &req);
+    snprintf(req.client_addr, sizeof(req.client_addr), "%s", ctx->client_addr);
+    req.cookie_len = ctx->cookie.len < LM_MAXSTRLEN ? ctx->cookie.len : LM_MAXSTRLEN;
+    if (req.cookie_len) {
+        memcpy(req.cookie, ctx->cookie.data, req.cookie_len);
+    }
+
+    *reqp = req;
 } /* chimera_nfs_nlm4_build_grant_locked */
 
-/* Hand a snapshot built above to the outbound NLM_GRANTED engine.  Caller
- * must NOT hold nlm_state.mutex. */
+/* Test-only seams (nfs_nlm_test_hooks.h); all NULL unless a test sets them. */
+SYMBOL_EXPORT struct chimera_nfs_nlm_test_hooks chimera_nfs_nlm_test_hooks;
+
+/* Hand a snapshot built above to the outbound NLM_GRANTED engine.
+ *
+ * CALLER MUST HOLD nlm_state.mutex.  A grant CANCEL can release is submitted
+ * from inside the mutex section that published it, so the revoke that
+ * CANCEL queues after it drops the mutex lands behind this submit on the
+ * granter's intake FIFO; a grant that replaced held locks is submitted from the
+ * resume instead (chimera_nfs_nlm4_lock_acquire_cb says why).  Both granter
+ * calls are fine under the mutex: get_or_create wants it held (so two
+ * threads cannot both create a granter), and submit takes only the
+ * granter's own lock. */
 static void
-chimera_nfs_nlm4_submit_grant(
-    struct nlm_lock_ctx      *ctx,
-    struct nlm_grant_request *req)
+chimera_nfs_nlm4_submit_grant_locked(
+    struct chimera_server_nfs_shared *shared,
+    const struct nlm_grant_request   *req)
 {
-    struct chimera_server_nfs_shared *shared = ctx->thread->shared;
-    struct nlm_granter               *granter;
+    struct nlm_granter *granter;
 
-    /* Lazily create the granter (idempotent).  Done under nlm_state.mutex so two
-     * threads cannot both create one. */
-    evpl_mutex_lock(&shared->nlm_state.mutex);
     granter = nlm_granter_get_or_create(shared);
-    evpl_mutex_unlock(&shared->nlm_state.mutex);
-
     nlm_granter_submit(granter, req);
-} /* chimera_nfs_nlm4_submit_grant */
+
+    if (chimera_nfs_nlm_test_hooks.grant_submitted) {
+        chimera_nfs_nlm_test_hooks.grant_submitted(
+            req, chimera_nfs_nlm_test_hooks.arg);
+    }
+} /* chimera_nfs_nlm4_submit_grant_locked */
 
 /* Fired (once) synchronously inside chimera_vfs_claim_acquire when a blocking
  * LOCK queues on a conflict.  Sends the RFC 1813 / XNFS NLM4_BLOCKED interim
@@ -539,10 +566,16 @@ chimera_nfs_nlm4_lock_resume_run(
     }
 
     /* A blocked lock already had its original RPC answered with
-     * NLM4_BLOCKED, so its grant goes out of band via NLM_GRANTED. */
+     * NLM4_BLOCKED, so its grant goes out of band via NLM_GRANTED.  Only one
+     * that replaced held locks is submitted here, after their carve; any
+     * other was submitted by chimera_nfs_nlm4_lock_acquire_cb under the
+     * mutex that published it, and lands in the !reply case below. */
     if (r->deliver) {
-        chimera_nfs_debug("NLM LOCK: deferred lock granted -> NLM_GRANTED callback");
-        chimera_nfs_nlm4_submit_grant(ctx, &r->grant);
+        chimera_nfs_debug("NLM LOCK: deferred lock granted -> "
+                          "NLM_GRANTED callback submitted after the carve");
+        evpl_mutex_lock(&shared->nlm_state.mutex);
+        chimera_nfs_nlm4_submit_grant_locked(shared, &r->grant);
+        evpl_mutex_unlock(&shared->nlm_state.mutex);
         nlm_lock_ctx_free(ctx);
         return;
     }
@@ -719,7 +752,9 @@ chimera_nfs_nlm4_lock_replace(
  * the claim.  Only the RPC send and the VFS handle release are marshalled
  * home, because an evpl send and a VFS request pool both belong to one
  * thread -- doing either from a foreign one corrupts the pool or trips
- * libevpl's LOCAL-iovec owner check. */
+ * libevpl's LOCAL-iovec owner check.  The resume also carries an upgrade's
+ * GRANTED submit, for ordering after the carve rather than thread
+ * ownership. */
 static void
 chimera_nfs_nlm4_lock_acquire_cb(
     enum chimera_vfs_claim_result            result,
@@ -735,6 +770,11 @@ chimera_nfs_nlm4_lock_acquire_cb(
     struct nlm_lock_resume            work;
     struct nlm_lock_resume           *r;
 
+    if (chimera_nfs_nlm_test_hooks.acquire_cb_enter) {
+        chimera_nfs_nlm_test_hooks.acquire_cb_enter(
+            entry->svid, ctx->was_blocked, chimera_nfs_nlm_test_hooks.arg);
+    }
+
     (void) conflict;
     (void) granted;
 
@@ -749,11 +789,20 @@ chimera_nfs_nlm4_lock_acquire_cb(
         uint64_t                   c_length  = 0;
         struct chimera_claim_owner c_owner;
         bool                       reaped;
+        bool                       taken_back;
 
         memset(&c_owner, 0, sizeof(c_owner));
 
         evpl_mutex_lock(&shared->nlm_state.mutex);
         reaped = entry->reaped;
+        /* A CANCEL found this request pending but could not withdraw it --
+         * the file was still being opened, the claim core had already
+         * decided it, or a pump had it off the queue for a re-check -- so
+         * it left this flag and answered the client, who has withdrawn the
+         * request: a grant landing now belongs to nobody, whether it was
+         * deferred or decided at once.  The reap check stays first: a
+         * reaped client is owed no LOCK_RES (see below). */
+        taken_back = !reaped && entry->cancel_requested;
         if (reaped) {
             /* The client was reaped (FREE_ALL, SM_NOTIFY, or its last
              * connection dropped) while this acquire was in flight, and the
@@ -761,6 +810,11 @@ chimera_nfs_nlm4_lock_acquire_cb(
              * Granting now would hand a lock to a client we have already
              * told holds none -- drop it instead.  Still linked, so unlink
              * under the same mutex the reaper used. */
+            DL_DELETE(ctx->client->locks, entry);
+        } else if (taken_back) {
+            /* Unlinked before it is published, so nothing ever sees it
+             * held: no grant snapshot, no submit, no take-over of the
+             * owner's other locks. */
             DL_DELETE(ctx->client->locks, entry);
         } else {
             entry->pending        = false;
@@ -785,7 +839,26 @@ chimera_nfs_nlm4_lock_acquire_cb(
              * reap, which frees it. */
             if (ctx->was_blocked) {
                 chimera_nfs_nlm4_build_grant_locked(ctx, &work.grant);
-                work.deliver = true;
+                /* Only a grant that took nothing over can be handed back on
+                 * CANCEL.  One that replaced locks this owner already held
+                 * (a blocked upgrade or a re-lock over held bytes) cannot:
+                 * the client still believes it holds those, and releasing
+                 * the merged range would free bytes it never gave up. */
+                entry->grant_unconfirmed = (parents == NULL);
+                /* The two kinds are submitted at different times.  CANCEL
+                 * can release one that took nothing over the moment this
+                 * mutex drops, and its revoke only catches a submit already
+                 * on the granter's intake FIFO -- so submit that one here.
+                 * One that replaced held locks is never released by CANCEL,
+                 * but the client must not hear of it before
+                 * chimera_nfs_nlm4_lock_replace has carved those locks, or
+                 * it could act on the merged range while their remainders
+                 * are still detached -- so the resume submits it. */
+                if (parents) {
+                    work.deliver = true;
+                } else {
+                    chimera_nfs_nlm4_submit_grant_locked(shared, &work.grant);
+                }
             }
         }
         evpl_mutex_unlock(&shared->nlm_state.mutex);
@@ -800,9 +873,32 @@ chimera_nfs_nlm4_lock_acquire_cb(
             entry->file_state = NULL;
             work.handle       = entry->handle;
             work.entry        = entry;
-            /* The original LOCK RPC was already answered with NLM4_BLOCKED
-             * (only blocked entries can still be pending here), so no reply
-             * is owed and no NLM_GRANTED callback is wanted. */
+            /* No NLM_GRANTED callback is wanted, and a deferred grant's LOCK
+             * was already answered NLM4_BLOCKED.  A grant decided at once
+             * still owes its LOCK or NM_LOCK an answer on the open encoding:
+             * NLM4_DENIED, as for a grant taken back by CANCEL.  A LOCK_MSG
+             * gets no LOCK_RES: that would be a new call on ctx->conn, which
+             * a reap for the client's last connection dropping has already
+             * freed, and a client reaped any other way has restarted. */
+            work.reply = !ctx->was_blocked && ctx->proc != 17;
+            work.stat  = NLM4_DENIED;
+        } else if (taken_back) {
+            chimera_nfs_debug("NLM LOCK: grant taken back by CANCEL; releasing");
+            /* The claim is inserted, unlike on the DENIED path below, so it
+             * is released -- which pumps the next waiter, as above. */
+            chimera_vfs_claim_release(vfs_state, entry->file_state,
+                                      &entry->claim);
+            chimera_vfs_state_put(vfs_state, entry->file_state);
+            entry->file_state = NULL;
+            work.handle       = entry->handle;
+            work.entry        = entry;
+            /* A grant decided at once still owes its LOCK an answer, and
+             * gets NLM4_DENIED.  A deferred one was answered NLM4_BLOCKED:
+             * a proc-2 LOCK learns the outcome from its CANCEL reply, and a
+             * LOCK_MSG still gets its final LOCK_RES, as when the CANCEL
+             * dequeues it. */
+            work.reply = !ctx->was_blocked || ctx->proc == 17;
+            work.stat  = NLM4_DENIED;
         } else {
             if (parents) {
                 work.drop = chimera_nfs_nlm4_lock_replace(thread, ctx->client,
@@ -813,9 +909,13 @@ chimera_nfs_nlm4_lock_acquire_cb(
                                                           reap_gen);
             }
             work.monitor = !ctx->nm_lock;
-            if (!work.deliver) {
+            if (!ctx->was_blocked) {
                 work.reply = true;
                 work.stat  = NLM4_GRANTED;
+            } else if (!work.deliver) {
+                chimera_nfs_debug("NLM LOCK: deferred lock granted -> "
+                                  "NLM_GRANTED callback submitted "
+                                  "under the lock");
             }
         }
     } else {
@@ -1293,6 +1393,9 @@ chimera_nfs_nlm4_do_lock(
                                entry->fh, entry->fh_len,
                                entry->offset, entry->length);
     if (dup && dup->exclusive == entry->exclusive) {
+        /* The reply below tells the client it holds the lock, so a later
+         * CANCEL must no longer take a deferred grant back. */
+        dup->grant_unconfirmed = false;
         evpl_mutex_unlock(&shared->nlm_state.mutex);
         chimera_nfs_debug("NLM LOCK: duplicate lock request -> NLM4_GRANTED (idempotent)");
         res.cookie.len  = ctx->cookie.len;
@@ -1318,6 +1421,42 @@ chimera_nfs_nlm4_do_lock(
         nlm_lock_entry_free(entry);
         nlm_lock_ctx_free(ctx);
         return;
+    }
+
+    /* A blocking LOCK of a tuple this owner already has pending is the
+     * re-send a waiting client polls with (Linux lockd every 30 s, same
+     * arguments and cookie).  Answer it NLM4_BLOCKED from the request
+     * already queued and queue nothing beside it, as knfsd
+     * (nlmsvc_lookup_block) and ganesha do: a second copy would be granted
+     * after the client's CANCEL withdrew the first, to a waiter that no
+     * longer exists, and its promotion replaces the first's so neither is
+     * a deferred grant a CANCEL could hand back.  A request a CANCEL has
+     * already marked (cancel_requested) or the reaper has already taken
+     * (reaped) is withdrawn, so a re-send that meets only one of those is
+     * a new request and queues as one. */
+    if (ctx->block) {
+        DL_FOREACH(client->locks, dup)
+        {
+            if (dup->pending && !dup->cancel_requested && !dup->reaped &&
+                dup->oh_len    == entry->oh_len    &&
+                dup->fh_len    == entry->fh_len    &&
+                dup->svid      == entry->svid      &&
+                dup->offset    == entry->offset    &&
+                dup->length    == entry->length    &&
+                dup->exclusive == entry->exclusive &&
+                memcmp(dup->oh, entry->oh, entry->oh_len) == 0 &&
+                memcmp(dup->fh, entry->fh, entry->fh_len) == 0) {
+                break;
+            }
+        }
+        if (dup) {
+            evpl_mutex_unlock(&shared->nlm_state.mutex);
+            chimera_nfs_debug("NLM LOCK: re-sent blocking request joins the one already queued -> NLM4_BLOCKED");
+            nlm4_send_res(shared, evpl, conn, encoding, &args->cookie, NLM4_BLOCKED, proc);
+            nlm_lock_entry_free(entry);
+            free(ctx);
+            return;
+        }
     }
 
     /* Pre-insert the pending entry so concurrent requests see it immediately */
@@ -1383,7 +1522,9 @@ chimera_nfs_nlm4_do_cancel(
     struct chimera_server_nfs_shared *shared    = thread->shared;
     struct chimera_vfs_state         *vfs_state = thread->vfs->vfs_state;
     struct nlm_client                *client;
-    struct nlm_lock_entry            *entry, *match;
+    struct nlm_lock_entry            *entry, *match, *marked, *unconfirmed;
+    struct nlm_granter               *granter = NULL;
+    struct nlm_grant_request          revoke;
     char                              safe_hostname[LM_MAXSTRLEN + 1];
     size_t                            hn_len;
     uint64_t                          want_length;
@@ -1405,19 +1546,21 @@ chimera_nfs_nlm4_do_cancel(
 
     evpl_mutex_lock(&shared->nlm_state.mutex);
     HASH_FIND_STR(shared->nlm_state.clients, safe_hostname, client);
-    match = NULL;
+    match       = NULL;
+    marked      = NULL;
+    unconfirmed = NULL;
     if (client) {
         DL_FOREACH(client->locks, entry)
         {
-            /* Only pending entries can be cancelled; granted entries
-             * require UNLOCK to release.  CANCEL identifies the specific
-             * outstanding blocked LOCK request, which per RFC 1813 (struct
-             * nlm4_cancargs / nlm4_lock) is keyed by its mode as well as
-             * owner+range, so match the exact
-             * (oh, svid, fh, range, exclusive) tuple. */
-            if (!entry->pending) {
-                continue;
-            }
+            /* CANCEL identifies the specific outstanding blocked LOCK
+             * request, which per RFC 1813 (struct nlm4_cancargs / nlm4_lock)
+             * is keyed by its mode as well as owner+range, so match the
+             * exact (oh, svid, fh, range, exclusive) tuple.  A pending entry
+             * is the request itself.  A granted one normally needs UNLOCK,
+             * except a deferred grant the client never confirmed (see
+             * grant_unconfirmed): its NLM_GRANTED may never have arrived,
+             * and the CANCEL says the waiter gave up, so leaving it held
+             * would orphan the lock behind every later request. */
             if (entry->oh_len    != args->alock.oh.len  ||
                 entry->fh_len    != args->alock.fh.len  ||
                 entry->svid      != args->alock.svid    ||
@@ -1428,9 +1571,45 @@ chimera_nfs_nlm4_do_cancel(
                 memcmp(entry->fh, args->alock.fh.data, entry->fh_len) != 0) {
                 continue;
             }
+            if (!entry->pending) {
+                if (entry->grant_unconfirmed && !unconfirmed) {
+                    unconfirmed = entry;
+                }
+                continue;
+            }
+            /* A request an earlier CANCEL already marked (cancel_requested)
+             * has been withdrawn, but may still sit queued until its
+             * conflict clears (see below).  A later CANCEL of the same tuple
+             * -- an interrupted client retrying with the same svid -- is
+             * for the live request, so prefer one that is not marked. */
+            if (entry->cancel_requested) {
+                if (!marked) {
+                    marked = entry;
+                }
+                continue;
+            }
             match = entry;
             break;
         }
+    }
+
+    /* Only marked requests match: retry the withdrawal on the first.  Its
+     * claim_cancel usually succeeds now and removes the leftover. */
+    if (!match) {
+        match = marked;
+    }
+
+    /* A pending request wins: the CANCEL is for an outstanding request
+     * first, and falls back to an unconfirmed grant of the same tuple only
+     * when there is none.  Unhook that grant here so a concurrent reap
+     * cannot free it. */
+    if (match) {
+        unconfirmed = NULL;
+    } else if (unconfirmed) {
+        DL_DELETE(client->locks, unconfirmed);
+        chimera_nfs_nlm4_grant_lock_fill(unconfirmed, client->hostname,
+                                         &revoke);
+        granter = shared->nlm_granter;
     }
 
     if (match && match->file_state) {
@@ -1449,7 +1628,59 @@ chimera_nfs_nlm4_do_cancel(
         cancelled       = chimera_vfs_claim_cancel(vfs_state, &match->ticket);
         ctx_for_lock_cb = match->ticket.private_data;
     }
+
+    /* Not withdrawn: the file is still being opened (no file_state yet),
+     * claim_acquire has not queued the ticket yet, or the ticket is off the
+     * claim core's queue.  It is off the queue once the core has decided the
+     * request -- dequeued it to grant it, or granted it at once -- and the
+     * completion is on its way, but also while a pump re-checks it: the
+     * pump takes every waiter off the queue and puts back the ones still
+     * blocked.  Mark the request and leave it to whatever completes it,
+     * which hands the grant back.  A request caught early may still queue
+     * and be answered NLM4_BLOCKED after the CANCEL reply, and one the pump
+     * put back stays queued until its conflict clears; either is taken back
+     * when its grant lands, and a later CANCEL of the same tuple retries
+     * the withdrawal only when no unmarked request matches (see the match
+     * loop above).  CANCEL withdraws the request whether or not
+     * NLM4_BLOCKED was ever sent: Linux lockd sends one from the
+     * interruptible wait that follows BLOCKED, but also when the process is
+     * killed during the LOCK call itself, because nlmclnt_lock presets the
+     * result to BLOCKED.  A grant that lands after it is handed back, and a
+     * LOCK still open is answered NLM4_DENIED. */
+    if (match && !cancelled) {
+        match->cancel_requested = true;
+    }
     evpl_mutex_unlock(&shared->nlm_state.mutex);
+
+    /* Release before replying, the way UNLOCK does, so the LOCK a client
+     * typically sends right after its CANCEL finds the range free.  Outside
+     * the mutex: the claim core may pump waiters whose completion callbacks
+     * take it. */
+    if (unconfirmed) {
+        chimera_nfs_debug("NLM CANCEL: releasing a deferred grant the client "
+                          "never confirmed (svid=%d)", unconfirmed->svid);
+        if (unconfirmed->claim_inserted) {
+            chimera_vfs_claim_release_ranged(thread->vfs_thread, vfs_state,
+                                             unconfirmed->file_state,
+                                             &unconfirmed->claim);
+            unconfirmed->claim_inserted = false;
+        }
+        if (unconfirmed->file_state) {
+            chimera_vfs_state_put(vfs_state, unconfirmed->file_state);
+            unconfirmed->file_state = NULL;
+        }
+        if (unconfirmed->handle) {
+            chimera_vfs_release(thread->vfs_thread, unconfirmed->handle);
+        }
+        nlm_lock_entry_free(unconfirmed);
+        /* A GRANTED still being retransmitted would now tell the client it
+         * holds a lock it does not.  The grant was submitted under the same
+         * nlm_state.mutex section that published grant_unconfirmed, so its
+         * submit is already on the granter's intake FIFO and this revoke is
+         * ordered after it -- and the granter we read under the mutex is
+         * the one that submit created. */
+        nlm_granter_revoke(granter, &revoke);
+    }
 
     nlm4_send_res(shared, evpl, conn, encoding, &args->cookie, NLM4_GRANTED,
                   proc);

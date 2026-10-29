@@ -19,6 +19,7 @@
 #include <unistd.h>
 #endif /* ifdef _WIN32 */
 #include "common/thread.h"
+#include "common/thread_name.h"
 #ifndef _WIN32
 #include <execinfo.h>
 #endif /* ifndef _WIN32 */
@@ -166,6 +167,8 @@ chimera_log_thread(void *arg)
     int   i;
     char *tmp;
     FILE *out = ChimeraLogFile ? ChimeraLogFile : stdout;
+
+    chimera_thread_set_name("chm_log");
 
     while (ChimeraLogRun || ChimeraLogBufPtr > ChimeraLogBuf) {
 
@@ -475,9 +478,18 @@ __chimera_fatal(
     chimera_vlog(level_string[CHIMERA_LOG_FATAL], mod, file, line, fmt, argp);
     va_end(argp);
 
+    /* A fatal error can come from any thread at any point, including during
+     * startup while a VFS module's init runs and service threads (metrics,
+     * listener) already hold live evpl contexts.  A plain exit() would run
+     * libevpl's atexit cleanup under those threads, which aborts on the live
+     * contexts and turns a clean fatal error into a core dump.  Flush the log
+     * so the error reaches the user, then exit without running atexit
+     * handlers, as startup_validation_fail() in the daemon does. */
     chimera_log_flush();
-
-    exit(1);
+#ifdef _WIN32
+    TerminateProcess(GetCurrentProcess(), 1);
+#endif /* ifdef _WIN32 */
+    _exit(1);
 } /* chimera_fatal */
 
 SYMBOL_EXPORT void
