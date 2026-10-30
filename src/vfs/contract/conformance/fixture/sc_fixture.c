@@ -101,6 +101,7 @@ static const char *const                        scf_profile_tokens[] = {
     [CHIMERA_SC_FIXTURE_RETURN_CORRUPT]              = "return_corrupt",
     [CHIMERA_SC_FIXTURE_S11_CHEAT]                   = "s11_cheat",
     [CHIMERA_SC_FIXTURE_DROP_COMPLETION]             = "drop_completion",
+    [CHIMERA_SC_FIXTURE_IGNORE_NO_SPACE]             = "ignore_no_space",
 };
 
 #define SCF_PROFILE_COUNT \
@@ -271,7 +272,9 @@ scf_obj_write(
         req->status = CHIMERA_SC_E_NOT_FOUND;
         return;
     }
-    if (s->full) {
+    /* The ignore_no_space cheat returns OK on an exhausted store (violates the
+     * section-11 NO_SPACE obligation); the honest fixture refuses. */
+    if (s->full && s->profile != CHIMERA_SC_FIXTURE_IGNORE_NO_SPACE) {
         req->status = CHIMERA_SC_E_NO_SPACE;
         return;
     }
