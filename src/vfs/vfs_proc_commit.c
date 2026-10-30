@@ -31,9 +31,22 @@ chimera_vfs_commit_complete(struct chimera_vfs_request *request)
         request->io_pnfs_backing = NULL;
     }
 
+    /* No level clamp on COMMIT (the arm has no r_sync); only fill the boot-stamp
+    * fallback when the module reported no verifier, and pass verf only on OK. */
+    uint64_t *verf = NULL;
+
+    if (request->status == CHIMERA_VFS_OK) {
+        if (!request->commit.r_verifier_valid) {
+            request->commit.r_verifier       = request->thread->vfs->boot_verifier;
+            request->commit.r_verifier_valid = 1;
+        }
+        verf = &request->commit.r_verifier;
+    }
+
     callback(request->status,
              &request->commit.r_pre_attr,
              &request->commit.r_post_attr,
+             verf,
              request->proto_private_data);
 
     chimera_vfs_request_free(request->thread, request);
@@ -56,15 +69,19 @@ chimera_vfs_commit(
     request = chimera_vfs_request_alloc_by_handle(thread, cred, handle);
 
     if (CHIMERA_VFS_IS_ERR(request)) {
-        callback(CHIMERA_VFS_PTR_ERR(request), NULL, NULL, private_data);
+        callback(CHIMERA_VFS_PTR_ERR(request), NULL, NULL, NULL, private_data);
         return;
     }
 
-    request->opcode                         = CHIMERA_VFS_OP_COMMIT;
-    request->complete                       = chimera_vfs_commit_complete;
-    request->commit.handle                  = handle;
-    request->commit.offset                  = offset;
-    request->commit.length                  = count;
+    request->opcode        = CHIMERA_VFS_OP_COMMIT;
+    request->complete      = chimera_vfs_commit_complete;
+    request->commit.handle = handle;
+    request->commit.offset = offset;
+    request->commit.length = count;
+    /* Mandatory preset on the pooled (not memset) request: no verifier until a
+     * module stores one; core fills the boot-stamp fallback in commit_complete. */
+    request->commit.r_verifier              = 0;
+    request->commit.r_verifier_valid        = 0;
     request->commit.r_pre_attr.va_req_mask  = pre_attr_mask;
     request->commit.r_pre_attr.va_set_mask  = 0;
     request->commit.r_post_attr.va_req_mask = post_attr_mask | CHIMERA_VFS_ATTR_MASK_CACHEABLE;

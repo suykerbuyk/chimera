@@ -28,6 +28,7 @@ chimera_nfs4_write_complete(
     uint32_t                  sync,
     struct chimera_vfs_attrs *pre_attr,
     struct chimera_vfs_attrs *post_attr,
+    uint64_t                 *verf,
     void                     *private_data)
 {
     struct nfs_request *req  = private_data;
@@ -48,9 +49,14 @@ chimera_nfs4_write_complete(
          * metadata, reporting DATA_SYNC4. */
         res->resok4.committed = sync;
 
-        memcpy(res->resok4.writeverf,
-               &req->thread->shared->nfs_verifier,
-               sizeof(res->resok4.writeverf));
+        /* Verifier from the module reply when it carried one, else the VFS boot
+         * stamp.  The zero-length WRITE short-circuit below reaches this arm on
+         * OK with verf == NULL; the fallback returns the boot stamp for it
+         * (correct -- a zero-length write persists nothing).  Never deref NULL. */
+        {
+            const uint64_t *src = verf ? verf : &req->thread->shared->nfs_verifier;
+            memcpy(res->resok4.writeverf, src, sizeof(res->resok4.writeverf));
+        }
     } else {
         res->status = chimera_nfs4_errno_to_nfsstat4(error_code);
     }
@@ -361,7 +367,7 @@ chimera_nfs4_write(
     req->args_write4    = args;
 
     if (args->data.length == 0) {
-        chimera_nfs4_write_complete(CHIMERA_VFS_OK, 0, FILE_SYNC4, NULL, NULL, req);
+        chimera_nfs4_write_complete(CHIMERA_VFS_OK, 0, FILE_SYNC4, NULL, NULL, NULL, req);
         return;
     }
 

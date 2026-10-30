@@ -73,7 +73,14 @@ chimera_nfs4_write_callback(
 
     request->write.r_sync   = write_res->opwrite.resok4.committed;
     request->write.r_length = write_res->opwrite.resok4.count;
-    request->status         = CHIMERA_VFS_OK;
+    /* Carry the remote server's writeverf up instead of discarding it (verifier4
+     * is the same 8 opaque bytes as r_verifier); a change in it reaches the NFS
+     * reply so the upper client resends unstable data.  Native byte order. */
+    memcpy(&request->write.r_verifier,
+           write_res->opwrite.resok4.writeverf,
+           sizeof(request->write.r_verifier));
+    request->write.r_verifier_valid = 1;
+    request->status                 = CHIMERA_VFS_OK;
     request->complete(request);
 } /* chimera_nfs4_write_callback */
 

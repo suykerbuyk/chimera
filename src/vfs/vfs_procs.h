@@ -849,6 +849,7 @@ typedef void (*chimera_vfs_write_callback_t)(
     uint32_t                  sync,
     struct chimera_vfs_attrs *pre_attr,
     struct chimera_vfs_attrs *post_attr,
+    uint64_t                 *verf,          /* optional NFS write verifier; NULL = ignore */
     void                     *private_data);
 
 SYMBOL_EXPORT void
@@ -891,6 +892,7 @@ typedef void (*chimera_vfs_commit_callback_t)(
     enum chimera_vfs_error    error_code,
     struct chimera_vfs_attrs *pre_attr,
     struct chimera_vfs_attrs *post_attr,
+    uint64_t                 *verf,          /* optional NFS write verifier; NULL = ignore */
     void                     *private_data);
 
 SYMBOL_EXPORT void

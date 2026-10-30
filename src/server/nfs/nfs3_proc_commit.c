@@ -16,6 +16,7 @@ chimera_nfs3_commit_complete(
     enum chimera_vfs_error    error_code,
     struct chimera_vfs_attrs *pre_attr,
     struct chimera_vfs_attrs *post_attr,
+    uint64_t                 *verf,
     void                     *private_data)
 {
     struct nfs_request               *req    = private_data;
@@ -30,9 +31,12 @@ chimera_nfs3_commit_complete(
     if (res.status == NFS3_OK) {
         chimera_nfs3_set_wcc_data(&res.resok.file_wcc, pre_attr, post_attr);
 
-        memcpy(res.resok.verf,
-               &shared->nfs_verifier,
-               sizeof(res.resok.verf));
+        /* Verifier from the module COMMIT reply when it carried one, else the
+         * VFS boot stamp (NULL-on-OK fallback; never deref NULL, never abort). */
+        {
+            const uint64_t *src = verf ? verf : &shared->nfs_verifier;
+            memcpy(res.resok.verf, src, sizeof(res.resok.verf));
+        }
     } else {
         chimera_nfs3_set_wcc_data(&res.resfail.file_wcc, pre_attr, post_attr);
     }

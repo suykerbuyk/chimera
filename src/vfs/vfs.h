@@ -224,6 +224,10 @@ struct chimera_vfs {
     uint64_t                              umount_timeout_us;
     int                                   machine_name_len;
     char                                  machine_name[256];
+    /* Opaque NFS write-verifier fallback.  Stamped once at chimera_vfs_init from
+     * CLOCK_REALTIME.  Native byte order.  Modules that leave r_verifier_valid
+     * clear get this; it is a process-lifetime stamp, not a durability epoch. */
+    uint64_t                              boot_verifier;
 };
 
 struct chimera_vfs_thread {

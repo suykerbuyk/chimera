@@ -19,6 +19,7 @@ chimera_nfs3_write_complete(
     uint32_t                  sync,
     struct chimera_vfs_attrs *pre_attr,
     struct chimera_vfs_attrs *post_attr,
+    uint64_t                 *verf,
     void                     *private_data)
 {
     struct nfs_request               *req    = private_data;
@@ -45,9 +46,14 @@ chimera_nfs3_write_complete(
          * FILE_SYNC (0/1/2), which match the stable_how enum directly. */
         res.resok.committed = sync;
 
-        memcpy(res.resok.verf,
-               &shared->nfs_verifier,
-               sizeof(res.resok.verf));
+        /* Verifier from the module reply when it carried one, else the VFS boot
+         * stamp.  verf is NULL on OK only for the zero-length v4-style direct
+         * completion; v3 WRITE always traverses the core, but keep the uniform
+         * NULL-on-OK fallback (never deref NULL, never abort). */
+        {
+            const uint64_t *src = verf ? verf : &shared->nfs_verifier;
+            memcpy(res.resok.verf, src, sizeof(res.resok.verf));
+        }
 
         chimera_nfs3_set_wcc_data(&res.resok.file_wcc, pre_attr, post_attr);
     } else {

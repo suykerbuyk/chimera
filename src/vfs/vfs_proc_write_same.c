@@ -81,6 +81,7 @@ chimera_vfs_write_same_fallback_write_cb(
     uint32_t                  sync,
     struct chimera_vfs_attrs *pre_attr,
     struct chimera_vfs_attrs *post_attr,
+    uint64_t                 *verf,
     void                     *private_data)
 {
     struct chimera_vfs_write_same_fallback *ctx = private_data;

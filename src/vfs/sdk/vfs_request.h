@@ -518,6 +518,9 @@ struct chimera_vfs_stream_entry {
  * truthiness for FUA still behave correctly (UNSTABLE=0 is the only falsy one).
  * A backend that makes data durable but defers metadata durability returns
  * DATASYNC; one that makes everything durable returns FILESYNC.
+ * Core presets r_sync to CHIMERA_VFS_WRITE_UNSTABLE before dispatch and clamps a
+ * stronger module report back down to the requested sync (never upgrades); a
+ * weaker report stands.
  */
 #define CHIMERA_VFS_WRITE_UNSTABLE 0
 #define CHIMERA_VFS_WRITE_DATASYNC 1
@@ -1097,6 +1100,16 @@ struct chimera_vfs_request {
             uint32_t                        r_length;
             struct chimera_vfs_attrs        r_pre_attr;
             struct chimera_vfs_attrs        r_post_attr;
+            /* Backend durability token for this reply.  Core presets
+             * r_verifier_valid = 0 on the pooled request before dispatch (the
+             * union is not memset on reuse).  A module with a real token writes
+             * r_verifier and sets r_verifier_valid = 1; core substitutes the
+             * process boot stamp when the bit is still 0.  uint64_t matches
+             * NFS3_WRITEVERFSIZE (8).  Native byte order.  Appended at the END of
+             * the arm so existing field offsets are preserved (ABI: no SDK
+             * version bump -- see vfs_module.h). */
+            uint64_t                        r_verifier;
+            uint8_t                         r_verifier_valid;
         } write;
 
         struct {
@@ -1105,6 +1118,10 @@ struct chimera_vfs_request {
             uint64_t                        length;
             struct chimera_vfs_attrs        r_pre_attr;
             struct chimera_vfs_attrs        r_post_attr;
+            /* Backend durability token for this COMMIT reply; same contract and
+             * end-of-arm placement as the write arm above. */
+            uint64_t                        r_verifier;
+            uint8_t                         r_verifier_valid;
         } commit;
 
         struct {

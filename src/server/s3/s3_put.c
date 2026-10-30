@@ -143,8 +143,9 @@ CHIMERA_S3_REQUEST_CALLBACK(chimera_s3_put_data_commit_callback,
                             (enum chimera_vfs_error error_code,
                              struct chimera_vfs_attrs *pre_attr,
                              struct chimera_vfs_attrs *post_attr,
+                             uint64_t * verf,
                              void *private_data),
-                            (error_code, pre_attr, post_attr, private_data))
+                            (error_code, pre_attr, post_attr, verf, private_data))
 {
     struct chimera_s3_request *request = private_data;
 
@@ -237,6 +238,7 @@ chimera_s3_put_recv_callback(
     uint32_t                  sync,
     struct chimera_vfs_attrs *pre_attr,
     struct chimera_vfs_attrs *post_attr,
+    uint64_t                 *verf,
     void                     *private_data)
 {
     struct chimera_s3_io            *io      = private_data;

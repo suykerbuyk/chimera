@@ -72,6 +72,7 @@ chimera_smb_write_callback(
     uint32_t                  sync,
     struct chimera_vfs_attrs *pre_attr,
     struct chimera_vfs_attrs *post_attr,
+    uint64_t                 *verf,
     void                     *private_data)
 {
     struct chimera_smb_request       *request = private_data;

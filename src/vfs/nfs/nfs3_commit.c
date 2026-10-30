@@ -30,13 +30,15 @@ chimera_nfs3_commit_callback(
     }
 
     if (res->status != NFS3_OK) {
-        chimera_nfs3_get_wcc_data(&request->write.r_pre_attr, &request->write.r_post_attr, &res->resfail.file_wcc);
+        /* COMMIT fills the commit arm, not the write arm (the union overlaps);
+         * a failed proxied COMMIT must report its WCC where the core reads it. */
+        chimera_nfs3_get_wcc_data(&request->commit.r_pre_attr, &request->commit.r_post_attr, &res->resfail.file_wcc);
         request->status = nfs3_client_status_to_chimera_vfs_error(res->status);
         request->complete(request);
         return;
     }
 
-    chimera_nfs3_get_wcc_data(&request->write.r_pre_attr, &request->write.r_post_attr, &res->resok.file_wcc);
+    chimera_nfs3_get_wcc_data(&request->commit.r_pre_attr, &request->commit.r_post_attr, &res->resok.file_wcc);
 
     /* Clear the dirty count we captured before commit.
      * If writes happened during the commit, they added to the counter,
@@ -45,7 +47,13 @@ chimera_nfs3_commit_callback(
         chimera_nfs3_open_state_clear_dirty(ctx->open_state, ctx->dirty_count);
     }
 
-    request->status = CHIMERA_VFS_OK;
+    /* Carry the remote server's COMMIT verifier up (writeverf3 opaque[8]); a
+     * proxied v3 WRITE and COMMIT then publish the same remote token, including
+     * across a remote restart that does not restart Chimera (D5). */
+    memcpy(&request->commit.r_verifier, res->resok.verf,
+           sizeof(request->commit.r_verifier));
+    request->commit.r_verifier_valid = 1;
+    request->status                  = CHIMERA_VFS_OK;
     request->complete(request);
 } /* chimera_nfs3_commit_callback */
 

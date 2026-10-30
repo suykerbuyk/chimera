@@ -121,6 +121,7 @@ chimera_nfs4_copy_write_complete(
     uint32_t                  sync,
     struct chimera_vfs_attrs *pre_attr,
     struct chimera_vfs_attrs *post_attr,
+    uint64_t                 *verf,
     void                     *private_data)
 {
     struct nfs4_copy_state_refs *refs = private_data;

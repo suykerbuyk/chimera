@@ -376,6 +376,7 @@ chimera_fuse_fsyncdir_complete(
     enum chimera_vfs_error    error_code,
     struct chimera_vfs_attrs *pre_attr,
     struct chimera_vfs_attrs *post_attr,
+    uint64_t                 *verf,
     void                     *private_data)
 {
     struct chimera_fuse_request *req = private_data;

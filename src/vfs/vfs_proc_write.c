@@ -67,11 +67,29 @@ chimera_vfs_write_finish(struct chimera_vfs_request *request)
         request->io_pnfs_backing = NULL;
     }
 
+    /* Clamp the achieved level down to what was requested (never upgrade) and
+    * fill the boot-stamp fallback when the module reported no verifier.  Its
+    * own OK guard: on the error path we neither clamp nor invent a verifier,
+    * and we pass verf == NULL so a caller cannot read a stale out-pointer. */
+    uint64_t *verf = NULL;
+
+    if (request->status == CHIMERA_VFS_OK) {
+        if (request->write.r_sync > request->write.sync) {
+            request->write.r_sync = request->write.sync;
+        }
+        if (!request->write.r_verifier_valid) {
+            request->write.r_verifier       = request->thread->vfs->boot_verifier;
+            request->write.r_verifier_valid = 1;
+        }
+        verf = &request->write.r_verifier;
+    }
+
     callback(request->status,
              request->write.r_length,
              request->write.r_sync,
              &request->write.r_pre_attr,
              &request->write.r_post_attr,
+             verf,
              request->proto_private_data);
 
     chimera_vfs_request_free(request->thread, request);
@@ -105,7 +123,7 @@ chimera_vfs_write_dispatch(
         if (redirected) {
             chimera_vfs_release(thread, io_handle);
         }
-        callback(CHIMERA_VFS_PTR_ERR(request), 0, 0, NULL, NULL, private_data);
+        callback(CHIMERA_VFS_PTR_ERR(request), 0, 0, NULL, NULL, NULL, private_data);
         return;
     }
 
@@ -116,10 +134,17 @@ chimera_vfs_write_dispatch(
     /* Anchor the implicit claim on the cached handle (chimera_vfs_io_claim_acquire).
      * The CALLER-named handle even when redirected: leases and oplocks are held
      * against the MDS file, not the backing file its bytes live in. */
-    request->io_handle                     = handle;
-    request->write.offset                  = offset;
-    request->write.length                  = count;
-    request->write.sync                    = sync;
+    request->io_handle    = handle;
+    request->write.offset = offset;
+    request->write.length = count;
+    request->write.sync   = sync;
+    /* Mandatory preset on the pooled (not memset) request before dispatch: a
+     * module that reports nothing leaves UNSTABLE and no verifier, so a stale
+     * level or a recycled epoch from a prior op can never leak (mirrors the
+     * r_created idiom).  Core clamps/fills the fallback in write_finish. */
+    request->write.r_sync                  = CHIMERA_VFS_WRITE_UNSTABLE;
+    request->write.r_verifier              = 0;
+    request->write.r_verifier_valid        = 0;
     request->write.r_pre_attr.va_req_mask  = pre_attr_mask;
     request->write.r_pre_attr.va_set_mask  = 0;
     request->write.r_post_attr.va_req_mask = post_attr_mask | CHIMERA_VFS_ATTR_MASK_CACHEABLE;
@@ -175,7 +200,7 @@ chimera_vfs_write_resolve_complete(
     struct chimera_vfs_write_resolve_ctx *ctx = private_data;
 
     if (error_code != CHIMERA_VFS_OK) {
-        ctx->callback(error_code, 0, 0, NULL, NULL, ctx->private_data);
+        ctx->callback(error_code, 0, 0, NULL, NULL, NULL, ctx->private_data);
         chimera_vfs_gate_scratch_free(ctx->thread, ctx);
         return;
     }
@@ -277,7 +302,7 @@ chimera_vfs_write_gate_complete(
     struct chimera_vfs_write_gate *gate = private_data;
 
     if (error_code != CHIMERA_VFS_OK) {
-        gate->callback(error_code, 0, 0, NULL, NULL, gate->private_data);
+        gate->callback(error_code, 0, 0, NULL, NULL, NULL, gate->private_data);
         chimera_vfs_gate_scratch_free(gate->thread, gate);
         return;
     }
@@ -318,7 +343,7 @@ chimera_vfs_write_gate_complete(
     }
 
     if (!(granted & CHIMERA_ACE_WRITE_DATA)) {
-        gate->callback(CHIMERA_VFS_EACCES, 0, 0, NULL, NULL, gate->private_data);
+        gate->callback(CHIMERA_VFS_EACCES, 0, 0, NULL, NULL, NULL, gate->private_data);
         chimera_vfs_gate_scratch_free(gate->thread, gate);
         return;
     }
@@ -365,7 +390,7 @@ chimera_vfs_write_owned(
              * unbound handle re-gates against current attrs on every write --
              * see the matching note in vfs_proc_read.c. */
             if (!(handle->granted_access & CHIMERA_ACE_WRITE_DATA)) {
-                callback(CHIMERA_VFS_EACCES, 0, 0, NULL, NULL, private_data);
+                callback(CHIMERA_VFS_EACCES, 0, 0, NULL, NULL, NULL, private_data);
                 return;
             }
         } else {

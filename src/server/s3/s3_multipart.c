@@ -625,6 +625,7 @@ chimera_s3_upload_part_write_callback(
     uint32_t                  sync,
     struct chimera_vfs_attrs *pre_attr,
     struct chimera_vfs_attrs *post_attr,
+    uint64_t                 *verf,
     void                     *private_data)
 {
     struct chimera_s3_io            *io      = private_data;
@@ -1242,6 +1243,7 @@ chimera_s3_upc_write_callback(
     uint32_t                  sync,
     struct chimera_vfs_attrs *pre_attr,
     struct chimera_vfs_attrs *post_attr,
+    uint64_t                 *verf,
     void                     *private_data)
 {
     struct chimera_s3_upload_copy_ctx *ctx    = private_data;
@@ -1305,6 +1307,7 @@ chimera_s3_upc_data_commit_callback(
     enum chimera_vfs_error    error_code,
     struct chimera_vfs_attrs *pre_attr,
     struct chimera_vfs_attrs *post_attr,
+    uint64_t                 *verf,
     void                     *private_data)
 {
     struct chimera_s3_upload_copy_ctx *ctx = private_data;
@@ -2131,6 +2134,7 @@ static void chimera_s3_complete_data_commit_callback(
     enum chimera_vfs_error    error_code,
     struct chimera_vfs_attrs *pre_attr,
     struct chimera_vfs_attrs *post_attr,
+    uint64_t                 *verf,
     void                     *private_data);
 static void chimera_s3_complete_assemble_next(
     struct chimera_s3_complete_ctx *ctx);
@@ -2225,6 +2229,7 @@ chimera_s3_complete_rw_write_callback(
     uint32_t                  sync,
     struct chimera_vfs_attrs *pre_attr,
     struct chimera_vfs_attrs *post_attr,
+    uint64_t                 *verf,
     void                     *private_data)
 {
     struct chimera_s3_complete_ctx  *ctx    = private_data;
@@ -2324,6 +2329,7 @@ chimera_s3_complete_data_commit_callback(
     enum chimera_vfs_error    error_code,
     struct chimera_vfs_attrs *pre_attr,
     struct chimera_vfs_attrs *post_attr,
+    uint64_t                 *verf,
     void                     *private_data)
 {
     struct chimera_s3_complete_ctx *ctx = private_data;

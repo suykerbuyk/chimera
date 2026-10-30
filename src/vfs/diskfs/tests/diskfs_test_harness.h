@@ -233,6 +233,7 @@ dh_write_cb(
     uint32_t                  sync,
     struct chimera_vfs_attrs *pre,
     struct chimera_vfs_attrs *post,
+    uint64_t                 *verf,
     void                     *pd)
 {
     struct dh *dh = pd;

@@ -895,6 +895,17 @@ chimera_vfs_init(
 
     vfs = calloc(1, sizeof(*vfs));
 
+    /* One process-lifetime NFS write-verifier fallback, shared by every NFS
+     * shared instance (nfs.c copies it) so a WRITE and its COMMIT never disagree
+     * for lack of a backend token.  Native byte order; no byteswap downstream. */
+    {
+        struct timespec now;
+
+        clock_gettime(CLOCK_REALTIME, &now);
+        vfs->boot_verifier = (uint64_t) now.tv_sec * 1000000000ULL +
+            (uint64_t) now.tv_nsec;
+    }
+
     /* Sane default for a VFS brought up without a server or client config
      * behind it (in-process module tests); chimera_vfs_set_umount_timeout
      * overrides it from common.umount_timeout_ms. */

@@ -16,6 +16,7 @@ chimera_write_complete(
     uint32_t                  sync,
     struct chimera_vfs_attrs *pre_attr,
     struct chimera_vfs_attrs *post_attr,
+    uint64_t                 *verf,
     void                     *private_data)
 {
     struct chimera_client_request *request       = private_data;
@@ -41,6 +42,7 @@ chimera_writev_complete(
     uint32_t                  sync,
     struct chimera_vfs_attrs *pre_attr,
     struct chimera_vfs_attrs *post_attr,
+    uint64_t                 *verf,
     void                     *private_data)
 {
     struct chimera_client_request *request       = private_data;
@@ -66,6 +68,7 @@ chimera_writerv_complete(
     uint32_t                  sync,
     struct chimera_vfs_attrs *pre_attr,
     struct chimera_vfs_attrs *post_attr,
+    uint64_t                 *verf,
     void                     *private_data)
 {
     struct chimera_client_request *request       = private_data;
@@ -98,7 +101,7 @@ chimera_dispatch_write(
     if (niov < 0) {
         request->write.niov = 0;
         chimera_write_complete(CHIMERA_VFS_EIO, 0, 0,
-                               NULL, NULL, request);
+                               NULL, NULL, NULL, request);
         return;
     }
 
@@ -150,7 +153,7 @@ chimera_dispatch_writev(
     if (niov < 0) {
         request->writev.niov = 0;
         chimera_writev_complete(CHIMERA_VFS_EIO, 0, 0,
-                                NULL, NULL, request);
+                                NULL, NULL, NULL, request);
         return;
     }
 

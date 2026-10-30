@@ -171,7 +171,6 @@ nfs_server_init(
     struct prometheus_metrics          *metrics)
 {
     struct chimera_server_nfs_shared *shared;
-    struct timespec                   now;
     struct evpl_rpc2_program         *programs[3];
     int                               nfs_rdma;
     const char                       *nfs_rdma_hostname;
@@ -209,8 +208,6 @@ nfs_server_init(
     chimera_nfs_debug("NFS Lock Manager port: %d", nfs_lockmgr_port);
     chimera_nfs_debug("NSM/statd port: %d", nfs_nsm_port);
     chimera_nfs_debug("External Portmap: %s", external_portmap ? "enabled" : "disabled");
-
-    clock_gettime(CLOCK_REALTIME, &now);
 
     shared = calloc(1, sizeof(*shared));
 
@@ -273,10 +270,17 @@ nfs_server_init(
                          (cfg_node > 0) ? "configured" : "derived from machine name");
     }
 
-    shared->nfs_verifier = now.tv_sec * 1000000000ULL + now.tv_nsec;
+    /* Use the one VFS boot stamp rather than a second CLOCK_REALTIME sample:
+     * NFS write verifiers now flow up from the module reply (write.r_verifier)
+     * with this stamp as the fallback, and COPY/WRITE_SAME still copy
+     * shared->nfs_verifier, so a WRITE and its COMMIT/COPY must share one value.
+     * Two independent clocks would make them disagree for no durability reason. */
+    shared->nfs_verifier = vfs->boot_verifier;
 
     chimera_nfs_abort_if(sizeof(shared->nfs_verifier) != NFS3_WRITEVERFSIZE,
                          "nfs_verifier size mismatch");
+    chimera_nfs_abort_if(sizeof(vfs->boot_verifier) != sizeof(shared->nfs_verifier),
+                         "boot_verifier size mismatch");
 
     NFS_MOUNT_V3_init(&shared->mount_v3);
     NFS_V3_init(&shared->nfs_v3);

@@ -449,6 +449,7 @@ chimera_s3_copy_write_callback(
     uint32_t                  sync,
     struct chimera_vfs_attrs *pre_attr,
     struct chimera_vfs_attrs *post_attr,
+    uint64_t                 *verf,
     void                     *private_data)
 {
     struct chimera_s3_copy_ctx      *ctx    = private_data;
@@ -515,6 +516,7 @@ chimera_s3_copy_data_commit_callback(
     enum chimera_vfs_error    error_code,
     struct chimera_vfs_attrs *pre_attr,
     struct chimera_vfs_attrs *post_attr,
+    uint64_t                 *verf,
     void                     *private_data)
 {
     struct chimera_s3_copy_ctx *ctx = private_data;

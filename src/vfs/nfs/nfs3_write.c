@@ -47,7 +47,15 @@ chimera_nfs3_write_callback(
 
     request->write.r_sync   = res->resok.committed;
     request->write.r_length = res->resok.count;
-    request->status         = CHIMERA_VFS_OK;
+    /* Carry the remote server's write verifier up instead of discarding it:
+     * writeverf3 is opaque[8] (nfs3.x), matching r_verifier.  A change in this
+     * token (remote restart) now reaches the NFS reply so the upper client
+     * resends unstable data -- the end-to-end D5 demonstration for this module.
+     * Native byte order; no byteswap. */
+    memcpy(&request->write.r_verifier, res->resok.verf,
+           sizeof(request->write.r_verifier));
+    request->write.r_verifier_valid = 1;
+    request->status                 = CHIMERA_VFS_OK;
     request->complete(request);
 } /* chimera_nfs3_write_callback */
 
