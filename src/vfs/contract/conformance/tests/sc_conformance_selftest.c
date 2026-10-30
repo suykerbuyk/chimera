@@ -271,6 +271,12 @@ main(void)
     test_obligation(evpl, "corrupt_is_unrecoverable",
                     chimera_sc_oblig_corrupt_is_unrecoverable,
                     CHIMERA_SC_FIXTURE_RETURN_CORRUPT);
+    /* NO_SPACE (D13 / section 11): honest refuses an exhausted store; the
+     * ignore_no_space cheat returns OK on it and FAILs.  The in-mem fixture
+     * exhausts via its fill() hook (the obligation calls it when present). */
+    test_obligation(evpl, "no_space",
+                    chimera_sc_oblig_no_space,
+                    CHIMERA_SC_FIXTURE_IGNORE_NO_SPACE);
 
     evpl_destroy(evpl);
 

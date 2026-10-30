@@ -46,6 +46,9 @@ enum chimera_sc_fixture_profile {
     /* Every non-ATTACH request is dropped: it is never completed.  Used to
      * prove the harness's bounded pump reports FAIL instead of hanging. */
     CHIMERA_SC_FIXTURE_DROP_COMPLETION,
+    /* An exhausted store (full flag set) is ignored: OBJ_WRITE returns OK on a
+     * store that has no space (violates D13 / section 11 NO_SPACE). */
+    CHIMERA_SC_FIXTURE_IGNORE_NO_SPACE,
 };
 
 /* Fill fx with the in-memory backend, the cfgdata that selects the profile,

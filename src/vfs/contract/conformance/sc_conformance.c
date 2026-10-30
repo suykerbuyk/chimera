@@ -698,3 +698,84 @@ chimera_sc_oblig_corrupt_is_unrecoverable(struct chimera_sc_conformance_ctx *ctx
     CHIMERA_SC_EXPECT_STATUS(ctx, read.req.status, CHIMERA_SC_E_DATA_UNRECOVERABLE);
     return CHIMERA_SC_CONF_PASS;
 } /* chimera_sc_oblig_corrupt_is_unrecoverable */
+
+/* One block-sized OBJ_WRITE per loop iteration forces a fresh data-block
+ * allocation; 4096 matches the facade's block (kept a local literal so the
+ * backend-agnostic harness does not pull in a media header). The loop cap is a
+ * fixed literal -- NOT a facade-internal total -- chosen well above any test
+ * image's data region (a 128 KiB facade image has ~15 data blocks) and well
+ * below a count that would mask a bug. */
+#define SC_NO_SPACE_WRITE_LEN  4096u
+#define SC_NO_SPACE_MAX_WRITES 1024
+
+SYMBOL_EXPORT enum chimera_sc_conf_result
+chimera_sc_oblig_no_space(struct chimera_sc_conformance_ctx *ctx)
+{
+    struct chimera_sc_obj_id    id;
+    struct chimera_sc_conf_call get;
+    uint8_t block[SC_NO_SPACE_WRITE_LEN];
+    uint32_t status = CHIMERA_SC_OK;
+    int i;
+    int hit                             = 0;
+    static const uint8_t sentinel_key[] = "nospace/usable";
+    static const uint8_t sentinel_val[] = "1";
+
+    memset(block, 0x5A, sizeof(block));
+
+    /* Spend one object-table slot first: OBJ_CREATE's own NO_SPACE is the
+     * object-table budget (a different trigger).  Every further allocation is a
+     * data block, so pool exhaustion below comes from OBJ_WRITE. */
+    CHIMERA_SC_EXPECT_STATUS(ctx, conf_obj_create(ctx, &id), CHIMERA_SC_OK);
+
+    /* A namespace sentinel committed BEFORE exhaustion, read back AFTER it: the
+     * "allocator stays usable for a read-side op" check.  NS_GET is a pure read
+     * (no allocation) that both the in-mem fixture and the facade implement
+     * (OBJ_STAT is NOT_SUPPORTED by the in-mem fixture). */
+    CHIMERA_SC_EXPECT_STATUS(ctx,
+                             conf_ns_put(ctx, sentinel_key, sizeof(sentinel_key) - 1,
+                                         sentinel_val, sizeof(sentinel_val) - 1),
+                             CHIMERA_SC_OK);
+
+    /* fill() is an OPTIONAL accelerator (the in-mem fixture sets its full flag);
+    * it is not required, and a backend with no hook is exhausted by the loop. */
+    if (ctx->fixture->fill) {
+        CHIMERA_SC_EXPECT(ctx, ctx->fixture->fill(ctx->priv) == 0, "fill hook failed");
+    }
+
+    /* Write one block at a time at sequential block offsets to the one object
+     * until the pool refuses NO_SPACE.  Do not create more objects (that returns
+     * to the object-table trigger).  Expect NO_SPACE well before the cap; a cap
+     * hit with no NO_SPACE is a FAIL (a backend that never refuses), not a hang. */
+    for (i = 0; i < SC_NO_SPACE_MAX_WRITES; i++) {
+        status = conf_obj_write(ctx, &id, (uint64_t) i * SC_NO_SPACE_WRITE_LEN,
+                                block, SC_NO_SPACE_WRITE_LEN,
+                                CHIMERA_SC_WRITE_DURABLE);
+        if (status == CHIMERA_SC_E_NO_SPACE) {
+            hit = 1;
+            break;
+        }
+        CHIMERA_SC_EXPECT_STATUS(ctx, status, CHIMERA_SC_OK);
+    }
+    CHIMERA_SC_EXPECT(ctx, hit,
+                      "pool never returned NO_SPACE within %d writes",
+                      SC_NO_SPACE_MAX_WRITES);
+
+    /* Clean refusal, not a wedged store: the sentinel still reads back OK. */
+    chimera_sc_conf_call_init(&get, ctx, CHIMERA_SC_OP_NS_GET);
+    get.req.ns_get.key.data = sentinel_key;
+    get.req.ns_get.key.len  = sizeof(sentinel_key) - 1;
+    chimera_sc_conf_run(&get);
+    CHIMERA_SC_EXPECT_STATUS(ctx, get.req.status, CHIMERA_SC_OK);
+
+    return CHIMERA_SC_CONF_PASS;
+} /* chimera_sc_oblig_no_space */
+
+/*
+ * chimera_sc_oblig_buffered_loss_signals_epoch was removed (CONF-B1-FIX-1): on
+ * the write-through facade prototype a BUFFERED write is made durable
+ * (fsb_write_done reports DURABLE) and the crash-sim never drops a durable
+ * record, so the bytes always survive the crash -- the "lost" branch never
+ * fires and the obligation asserts nothing (vacuous GREEN).  It cannot be
+ * meaningfully tested until a backend exposes a genuinely non-durable BUFFERED
+ * write path; re-add it with that backend (tracked as a follow-on).
+ */

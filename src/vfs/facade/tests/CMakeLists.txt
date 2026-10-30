@@ -68,6 +68,7 @@ set_tests_properties(chimera/vfs/facade/facade_loopback_test PROPERTIES
 # backend-attach-capabilities: attach / version negotiation / epoch lease /
 # renew / fence / detach via the facade backend (facade_attach_test).
 foreach(_t facade_recover_crash_test facade_conformance_durability_test
+           facade_conformance_durability_sweep_test
            facade_conformance_ns_test facade_attach_test facade_data_verify_test
            facade_conformance_error_test)
     add_executable(${_t} ${_t}.c)
@@ -94,6 +95,9 @@ target_link_libraries(facade_data_verify_test
 target_link_libraries(facade_conformance_durability_test
     chimera_facade_sc_backend chimera_sc_conformance
     chimera_media_crashsim chimera_media_loopback evpl)
+target_link_libraries(facade_conformance_durability_sweep_test
+    chimera_facade_sc_backend chimera_sc_conformance
+    chimera_media_crashsim chimera_media_loopback evpl)
 target_link_libraries(facade_conformance_ns_test
     chimera_facade_sc_backend chimera_sc_conformance
     chimera_media_crashsim chimera_media_loopback evpl)
@@ -115,3 +119,26 @@ endif()
 target_link_libraries(facade_log_test chimera_facade facade_test_media)
 add_test(NAME chimera/vfs/facade/facade_log_test COMMAND facade_log_test)
 set_tests_properties(chimera/vfs/facade/facade_log_test PROPERTIES TIMEOUT 30)
+
+# conformance-error-obligations NO_SPACE over the in-RAM facade_test_media at
+# 128 KiB (NOT the crash-sim/loopback stack -- see the test header).  Hybrid:
+# the conformance + facade-sc-backend libs plus facade_test_media (whose PUBLIC
+# includes expose the facade white-box headers facade_test_util.h needs).
+add_executable(facade_conformance_nospace_test facade_conformance_nospace_test.c)
+target_include_directories(facade_conformance_nospace_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../media
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../contract
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../contract/conformance)
+if(MSVC)
+    target_compile_options(facade_conformance_nospace_test PRIVATE /UNDEBUG)
+else()
+    target_compile_options(facade_conformance_nospace_test PRIVATE -UNDEBUG)
+endif()
+target_link_libraries(facade_conformance_nospace_test
+    chimera_facade_sc_backend chimera_sc_conformance facade_test_media evpl)
+add_test(NAME chimera/vfs/facade/facade_conformance_nospace_test
+    COMMAND facade_conformance_nospace_test)
+set_tests_properties(chimera/vfs/facade/facade_conformance_nospace_test PROPERTIES
+    LABELS "facade_mbt"
+    TIMEOUT 60)

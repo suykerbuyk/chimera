@@ -268,6 +268,22 @@ enum chimera_sc_conf_result
 chimera_sc_oblig_corrupt_is_unrecoverable(
     struct chimera_sc_conformance_ctx *ctx);
 
+/* D13 / section 11: a pool exhausted by repeated OBJ_WRITE refuses further
+ * allocation with NO_SPACE (never a false OK), and a read-side op still works.
+ * Drives real pool exhaustion through the backend-contract dispatch, not the
+ * allocator unit.  `fill`, when present, is an optional accelerator; a backend
+ * with no hook is exhausted by the write loop itself.
+ *
+ * Gated section-11 errors recorded for later units (add a case when the
+ * capability lands; do NOT implement here):
+ *   QUOTA_EXCEEDED   -- E7 (quota):   S3 403 QuotaExceeded / NFS*ERR_DQUOT / STATUS_QUOTA_EXCEEDED
+ *   RECALL_PENDING   -- E6 (recall):  NFS3ERR_JUKEBOX / NFS4ERR_DELAY / STATUS_PENDING / S3 403 InvalidObjectState
+ *   RETENTION_LOCKED -- E9 (WORM/D8): NFS*ERR_ACCES / STATUS_ACCESS_DENIED / S3 403 AccessDenied
+ *   KEY_UNAVAILABLE  -- E9 (keys/D9): same mapping as RETENTION_LOCKED */
+enum chimera_sc_conf_result
+chimera_sc_oblig_no_space(
+    struct chimera_sc_conformance_ctx *ctx);
+
 #ifdef __cplusplus
 }
 #endif /* ifdef __cplusplus */
