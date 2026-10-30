@@ -2789,6 +2789,31 @@ chimera_io_uring_readlink(
     request->complete(request);
 } /* chimera_io_uring_readlink */
 
+/* CHIMERA_VFS_RENAME_DURABLE (Option A), io_uring: identical contract to the
+ * linux backend's helper -- a SEPARATE fsync-only fd opened by handle under the
+ * server's privilege (fsync of the O_PATH rename/link fd returns EBADF, and
+ * prep_fsync exists only on the commit op, so the reopen is mandatory here too).
+ * Never handed to map_attrs/getdents.  Call only after chimera_restore_privilege
+ * (rename); link sets no caller cred.  Returns EIO on reopen/fsync failure. */
+static enum chimera_vfs_error
+chimera_io_uring_durable_fsync_dir(
+    struct chimera_io_uring_thread *thread,
+    const void                     *fh,
+    uint32_t                        fh_len)
+{
+    int fd = linux_open_by_handle(&thread->mount_table, fh, fh_len,
+                                  O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+
+    if (fd < 0) {
+        return CHIMERA_VFS_EIO;
+    }
+
+    enum chimera_vfs_error status = (fsync(fd) < 0) ? CHIMERA_VFS_EIO : CHIMERA_VFS_OK;
+
+    close(fd);
+    return status;
+} /* chimera_io_uring_durable_fsync_dir */
+
 static void
 chimera_io_uring_rename_at(
     struct chimera_vfs_request *request,
@@ -2881,6 +2906,25 @@ chimera_io_uring_rename_at(
     } else {
         request->status = CHIMERA_VFS_OK;
     }
+
+    /* Option A: privilege restored above; fsync the destination parent (and the
+     * source parent on a cross-dir rename) via the fsync-only reopen. */
+    if (request->status == CHIMERA_VFS_OK &&
+        (request->rename_at.flags & CHIMERA_VFS_RENAME_DURABLE)) {
+        if (chimera_io_uring_durable_fsync_dir(thread, request->rename_at.new_fh,
+                                               request->rename_at.new_fhlen) !=
+            CHIMERA_VFS_OK) {
+            request->status = CHIMERA_VFS_EIO;
+        } else if ((request->rename_at.new_fhlen != request->fh_len ||
+                    memcmp(request->rename_at.new_fh, request->fh,
+                           request->fh_len) != 0) &&
+                   chimera_io_uring_durable_fsync_dir(thread, request->fh,
+                                                      request->fh_len) !=
+                   CHIMERA_VFS_OK) {
+            request->status = CHIMERA_VFS_EIO;
+        }
+    }
+
     close(old_fd);
     close(new_fd);
 
@@ -2973,6 +3017,17 @@ chimera_io_uring_link_at(
     chimera_linux_map_attrs(CHIMERA_VFS_FH_MAGIC_IO_URING,
                             &request->link_at.r_dir_post_attr,
                             dir_fd);
+
+    /* Option A: link sets no caller cred; fsync the parent via the fsync-only
+     * reopen so the new name binding is durable before the op is acknowledged. */
+    if (request->status == CHIMERA_VFS_OK &&
+        (request->link_at.flags & CHIMERA_VFS_RENAME_DURABLE)) {
+        if (chimera_io_uring_durable_fsync_dir(thread, request->link_at.dir_fh,
+                                               request->link_at.dir_fhlen) !=
+            CHIMERA_VFS_OK) {
+            request->status = CHIMERA_VFS_EIO;
+        }
+    }
 
     close(fd);
     close(dir_fd);

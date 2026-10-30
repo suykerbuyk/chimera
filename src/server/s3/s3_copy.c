@@ -358,7 +358,7 @@ chimera_s3_copy_finalize(struct chimera_s3_copy_ctx *ctx)
             request->name_len,
             NULL,
             0,
-            0,
+            CHIMERA_VFS_RENAME_DURABLE,
             0,
             0,
             NULL,
@@ -376,6 +376,7 @@ chimera_s3_copy_finalize(struct chimera_s3_copy_ctx *ctx)
             request->name,
             request->name_len,
             1,
+            CHIMERA_VFS_RENAME_DURABLE,
             CHIMERA_VFS_ATTR_FH | CHIMERA_VFS_ATTR_MASK_STAT,
             0,
             0,
@@ -502,6 +503,30 @@ chimera_s3_copy_read_callback(
         ctx);
 } /* chimera_s3_copy_read_callback */
 
+/* D4/Option A: the destination bytes were assembled via copy_range/clone_range
+* (which request no durability) or RW DATASYNC writes (data durable, metadata
+* not), so commit the destination object handle to make the copied data durable
+* before publishing the name.  The callback must NOT release file_handle
+* (chimera_s3_copy_finish is the sole releaser and getattr still needs it); a
+* commit failure maps to 500 via the finish error arm, never a false 200.
+* pre/post attrs are ignored (may be NULL on the inline alloc-failure path). */
+static void
+chimera_s3_copy_data_commit_callback(
+    enum chimera_vfs_error    error_code,
+    struct chimera_vfs_attrs *pre_attr,
+    struct chimera_vfs_attrs *post_attr,
+    void                     *private_data)
+{
+    struct chimera_s3_copy_ctx *ctx = private_data;
+
+    if (error_code) {
+        chimera_s3_copy_finish(ctx, error_code, CHIMERA_S3_STATUS_OK, NULL);
+        return;
+    }
+
+    chimera_s3_copy_apply_metadata(ctx);
+} /* chimera_s3_copy_data_commit_callback */
+
 static void
 chimera_s3_copy_step(struct chimera_s3_copy_ctx *ctx)
 {
@@ -512,7 +537,9 @@ chimera_s3_copy_step(struct chimera_s3_copy_ctx *ctx)
     remaining = ctx->src_size - ctx->offset;
 
     if (remaining == 0) {
-        chimera_s3_copy_apply_metadata(ctx);
+        chimera_vfs_commit(thread->vfs, &request->cred, request->file_handle,
+                           0, 0, 0, 0,
+                           chimera_s3_copy_data_commit_callback, ctx);
         return;
     }
 

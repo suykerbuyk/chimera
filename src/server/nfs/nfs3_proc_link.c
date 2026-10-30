@@ -96,6 +96,7 @@ chimera_nfs3_link(
                         args->link.name.str,
                         args->link.name.len,
                         0,
+                        0,
                         CHIMERA_NFS3_ATTR_MASK,
                         CHIMERA_NFS3_ATTR_WCC_MASK | CHIMERA_VFS_ATTR_ATOMIC,
                         CHIMERA_NFS3_ATTR_MASK,

@@ -175,6 +175,7 @@ chimera_smb_set_info_link_open_dir_callback(
         0,
         0,
         0,
+        0,
         /* SMB rename via link: self-exempt the directory lease named by the
          * operating open's ParentLeaseKey (dirlease.rename correct-parent case). */
         open_file->parent_lease_key,

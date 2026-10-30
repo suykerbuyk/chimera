@@ -70,6 +70,7 @@ chimera_vfs_link_dest_parent_lookup_complete(
         request->link.new_path + request->link.new_name_offset,
         request->link.new_pathlen - request->link.new_name_offset,
         request->link.replace,
+        0,
         request->link.attr_mask,
         0,
         0,

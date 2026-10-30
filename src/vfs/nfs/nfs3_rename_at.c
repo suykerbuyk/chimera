@@ -183,6 +183,17 @@ chimera_vfs_nfs3_rename_at(
     uint64_t                                 fh_hash;
     int                                      rc;
 
+    /* This proxy backend cannot make a name binding durable as part of the op
+     * (NFSv3 RENAME does not imply COMMIT, and no parent COMMIT is issued here),
+     * so it cannot honor CHIMERA_VFS_RENAME_DURABLE -- fail ENOTSUP rather than
+     * acknowledge a non-durable publish (contract D5).  Must come before any
+     * remote call so nothing is published. */
+    if (request->rename_at.flags & CHIMERA_VFS_RENAME_DURABLE) {
+        request->status = CHIMERA_VFS_ENOTSUP;
+        request->complete(request);
+        return;
+    }
+
     server_thread = chimera_nfs_thread_get_server_thread(thread, request->fh, request->fh_len);
 
     if (!server_thread) {

@@ -316,6 +316,7 @@ chimera_fuse_op_link(
                         req->fh, req->fh_len,
                         name, strlen(name),
                         0,
+                        0,
                         CHIMERA_FUSE_ATTR_MASK,
                         0, 0,
                         NULL, NULL,

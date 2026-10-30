@@ -1622,6 +1622,16 @@ snfs_rename_at(
     TERM_STR(fullname, request->rename_at.name, request->rename_at.namelen, scratch);
     TERM_STR(full_newname, request->rename_at.new_name, request->rename_at.new_namelen, scratch);
 
+    /* This backend does not make a name binding durable as part of the op (it
+     * renameat()s an O_PATH parent and never fsyncs it), so it cannot honor
+     * CHIMERA_VFS_RENAME_DURABLE.  Fail ENOTSUP rather than acknowledge a
+     * non-durable publish (contract D5); do not silently return OK. */
+    if (request->rename_at.flags & CHIMERA_VFS_RENAME_DURABLE) {
+        request->status = CHIMERA_VFS_ENOTSUP;
+        request->complete(request);
+        return;
+    }
+
     old_fd = snfs_open_by_handle(&thread->mount_table,
                                  request->fh,
                                  request->fh_len,
@@ -1681,6 +1691,14 @@ snfs_link_at(
     char               *scratch = (char *) request->plugin_data;
 
     TERM_STR(fullname, request->link_at.name, request->link_at.namelen, scratch);
+
+    /* Cannot honor CHIMERA_VFS_RENAME_DURABLE (no parent fsync) -- fail ENOTSUP
+     * rather than acknowledge a non-durable publish (contract D5). */
+    if (request->link_at.flags & CHIMERA_VFS_RENAME_DURABLE) {
+        request->status = CHIMERA_VFS_ENOTSUP;
+        request->complete(request);
+        return;
+    }
 
     fd = snfs_open_by_handle(&thread->mount_table,
                              request->fh,

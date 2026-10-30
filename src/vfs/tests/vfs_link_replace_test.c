@@ -250,11 +250,35 @@ link_as(
     unsigned int                   replace)
 {
     chimera_vfs_link_at(ctx->vfs_thread, cred, src_fh, src_fh_len,
-                        dir_fh, dir_fh_len, name, strlen(name), replace,
+                        dir_fh, dir_fh_len, name, strlen(name), replace, 0,
                         CHIMERA_VFS_ATTR_FH, 0, 0, NULL, NULL, link_cb, ctx);
     wait_done(ctx);
     return ctx->status;
 } /* link_as */
+
+/* As link_as, but requests CHIMERA_VFS_RENAME_DURABLE -- the Option A name-
+ * binding durability flag S3 passes on publish.  memfs is durable by
+ * construction, so it must accept the flag and still succeed (never ENOTSUP),
+ * and the flag must survive the gate path (chimera_vfs_gate_needed_dac is true
+ * for an AUTH_UNIX cred) down to the backend. */
+static enum chimera_vfs_error
+link_durable_as(
+    struct test_ctx               *ctx,
+    const struct chimera_vfs_cred *cred,
+    const uint8_t                 *src_fh,
+    uint32_t                       src_fh_len,
+    const uint8_t                 *dir_fh,
+    uint32_t                       dir_fh_len,
+    const char                    *name,
+    unsigned int                   replace)
+{
+    chimera_vfs_link_at(ctx->vfs_thread, cred, src_fh, src_fh_len,
+                        dir_fh, dir_fh_len, name, strlen(name), replace,
+                        CHIMERA_VFS_RENAME_DURABLE,
+                        CHIMERA_VFS_ATTR_FH, 0, 0, NULL, NULL, link_cb, ctx);
+    wait_done(ctx);
+    return ctx->status;
+} /* link_durable_as */
 
 int
 main(
@@ -391,6 +415,16 @@ main(
     assert(link_as(&ctx, &a_cred, src_fh, src_fh_len, dir_fh, dir_fh_len,
                    "src", 1) == CHIMERA_VFS_OK);
     TEST_PASS("link replace: same-inode self-overwrite succeeds");
+
+    /* Option A (S3 publish durability): a DURABLE link of a fresh name is
+     * accepted and succeeds on a durable-by-construction backend (memfs) -- the
+     * flag threads through the signature + gate path to the backend and is not
+     * rejected.  (The linux parent-fsync / write-only-bucket no-regression +
+     * no-attr-leak assertions need a privileged linux-backed harness; see the
+     * plan's S4 -- those run under the Chair's gate, not this in-process test.) */
+    assert(link_durable_as(&ctx, &a_cred, src_fh, src_fh_len, dir_fh, dir_fh_len,
+                           "durname", 0) == CHIMERA_VFS_OK);
+    TEST_PASS("link durable: DURABLE accepted on durable-by-construction backend");
 
     chimera_vfs_release(ctx.vfs_thread, dir_handle);
 

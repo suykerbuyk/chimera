@@ -3216,8 +3216,11 @@ diskfs_rename_at(
     (void) shared;
     (void) private_data;
 
-    p->thread         = thread;
-    p->txn            = diskfs_txn_begin(thread, DISKFS_TXN_WRITE);
+    p->thread = thread;
+    p->txn    = diskfs_txn_begin(thread, DISKFS_TXN_WRITE);
+    /* Option A: force this rename's intent-log record sync even under
+     * unsafe_async, so the published name binding is durable on ack (D5). */
+    p->txn->sync      = (request->rename_at.flags & CHIMERA_VFS_RENAME_DURABLE) ? 1 : 0;
     p->inode_stash[0] = NULL;
     p->inode_stash[1] = NULL;
     p->inode_stash[2] = NULL;
@@ -3501,8 +3504,11 @@ diskfs_link_at(
     (void) shared;
     (void) private_data;
 
-    p->thread     = thread;
-    p->txn        = diskfs_txn_begin(thread, DISKFS_TXN_WRITE);
+    p->thread = thread;
+    p->txn    = diskfs_txn_begin(thread, DISKFS_TXN_WRITE);
+    /* Option A: force this link's intent-log record sync even under
+     * unsafe_async, so the published name binding is durable on ack (D5). */
+    p->txn->sync  = (request->link_at.flags & CHIMERA_VFS_RENAME_DURABLE) ? 1 : 0;
     p->op_scratch = 0;     /* anonymous-source unorphan latch (link_at_finish) */
 
     diskfs_inode_get_fh_async(thread, p->txn, p->fs,

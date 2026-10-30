@@ -202,6 +202,15 @@ chimera_smb_client_rename_at(
     struct chimera_smb_client_conn *conn,
     struct chimera_vfs_request     *request)
 {
+    /* The SMB client backend cannot make a name binding durable as part of the
+     * op, so it cannot honor CHIMERA_VFS_RENAME_DURABLE -- fail ENOTSUP rather
+     * than acknowledge a non-durable publish (contract D5). */
+    if (request->rename_at.flags & CHIMERA_VFS_RENAME_DURABLE) {
+        request->status = CHIMERA_VFS_ENOTSUP;
+        request->complete(request);
+        return;
+    }
+
     /* Open the source by its full mount-relative path with DELETE (required to
      * rename) + READ_ATTRIBUTES.  Cross-mount renames are already rejected by
      * the VFS layer (EXDEV), so both paths are within this one share. */
@@ -941,6 +950,14 @@ chimera_smb_client_link_at(
     int         srclen = 0, destlen;
     uint32_t    link_options;
     char        dest[CHIMERA_SMB_PATH_MAX + 1];
+
+    /* Cannot honor CHIMERA_VFS_RENAME_DURABLE (no parent fsync as part of the
+     * op) -- fail ENOTSUP rather than acknowledge a non-durable publish. */
+    if (request->link_at.flags & CHIMERA_VFS_RENAME_DURABLE) {
+        request->status = CHIMERA_VFS_ENOTSUP;
+        request->complete(request);
+        return;
+    }
 
     /* Give the new name a re-openable child fh for the VFS name cache. */
     destlen = smb_child_path(conn->server, request->link_at.dir_fh,

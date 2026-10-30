@@ -847,7 +847,7 @@ dh_link(
 {
     chimera_vfs_link_at(dh->thread, &dh->cred, target_fh, target_fhlen,
                         dir_fh, dir_fhlen, name, (int) strlen(name), 0,
-                        0, 0, 0, NULL, NULL, dh_link_cb, dh);
+                        0, 0, 0, 0, NULL, NULL, dh_link_cb, dh);
     dh_wait(dh);
     return dh->status;
 } /* dh_link */

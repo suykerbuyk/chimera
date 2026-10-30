@@ -152,7 +152,8 @@ diskfs_il_write_redo(
     uint32_t                  num_entries,
     uint32_t                  nblocks,
     uint32_t                  num_deltas,
-    uint64_t                  end_txn_id);
+    uint64_t                  end_txn_id,
+    int                       sync);
 
 static uint32_t
 diskfs_il_txn_blocks(
@@ -1180,7 +1181,8 @@ diskfs_il_write_redo(
     uint32_t                  num_entries,
     uint32_t                  nblocks,
     uint32_t                  num_deltas,
-    uint64_t                  end_txn_id)
+    uint64_t                  end_txn_id,
+    int                       sync)
 {
     struct diskfs_redo_ctx          *ctx;
     struct diskfs_il_record         *rec;
@@ -1348,7 +1350,7 @@ diskfs_il_write_redo(
             }
 
             evpl_block_write(il->evpl, il->log_queue,
-                             &rec->iovs[done], cnt, woff, il->sync,
+                             &rec->iovs[done], cnt, woff, sync,
                              diskfs_redo_write_cb, ctx);
             diskfs_metric_il_block_io(il, DISKFS_METRIC_IO_WRITE,
                                       DISKFS_METRIC_IO_INTENT_LOG, bytes);
@@ -1431,6 +1433,11 @@ diskfs_iq_process_batch(struct diskfs_intent_log *il)
     uint32_t                 batch_deltas = 0;
     uint32_t                 i;
     uint64_t                 pos;
+    /* Per-record sync (Option A): the process default il->sync, raised to 1 for
+     * a CHIMERA_VFS_RENAME_DURABLE txn.  All txns coalesced into one record must
+     * share this value -- a DURABLE txn must never ride a sync=0 record, so the
+     * batch breaks when the next txn's effective sync differs. */
+    int                      batch_sync = 0;
 
     if (il->redo_inflight >= DISKFS_COMMIT_WATERMARK) {
         return 0;
@@ -1450,6 +1457,7 @@ diskfs_iq_process_batch(struct diskfs_intent_log *il)
         uint32_t                nblocks, next_blocks;
         uint32_t                ndeltas, next_deltas;
         uint64_t                reclen;
+        int                     txn_sync;
 
         if (chimera_atomic_load_n(&slot->turn, CHIMERA_MEMORY_ACQUIRE) != pos + 1) {
             break;                        /* empty or not yet published */
@@ -1461,9 +1469,21 @@ diskfs_iq_process_batch(struct diskfs_intent_log *il)
         ndeltas     = diskfs_il_txn_deltas(txn);
         next_deltas = batch_deltas + ndeltas;
 
+        /* Effective sync for this txn: the mount default, raised by a DURABLE
+         * txn (Option A).  Under the safe default (il->sync=1) every txn is
+         * already sync, so this never splits; only unsafe_async mixes 0 and 1. */
+        txn_sync = il->sync || txn->sync;
+
         /* Keep one normal record to one backend write.  A txn larger than the
          * iov cap goes alone via the segmented path. */
         if (batch_count > 0 && 1 + next_blocks > DISKFS_IL_MAX_IOV) {
+            break;
+        }
+
+        /* A DURABLE (sync) txn must not share a redo record with a non-sync
+         * txn: its ack is the watermark passing its id after a sync=1 record,
+         * so the record carrying it must itself be written sync. */
+        if (batch_count > 0 && txn_sync != batch_sync) {
             break;
         }
 
@@ -1487,6 +1507,7 @@ diskfs_iq_process_batch(struct diskfs_intent_log *il)
 
         entries[batch_count].entry.txn          = txn;
         entries[batch_count].entry.enqueue_time = slot->enqueue_time;
+        batch_sync                              = txn_sync;  /* equal for all in-batch */
 
         /* Free the slot for reuse (Vyukov consumer publish): the next producer
          * for this slot is at pos + DISKFS_GSQ_SIZE.  txn/enqueue were copied
@@ -1515,7 +1536,8 @@ diskfs_iq_process_batch(struct diskfs_intent_log *il)
     }
 
     il->gsq_head = pos;     /* == base + batch_count; the record covers [base, pos) */
-    diskfs_il_write_redo(il, entries, batch_count, batch_blocks, batch_deltas, pos);
+    diskfs_il_write_redo(il, entries, batch_count, batch_blocks, batch_deltas, pos,
+                         batch_sync);
     return 1;
 } /* diskfs_iq_process_batch */
 

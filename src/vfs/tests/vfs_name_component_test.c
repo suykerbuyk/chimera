@@ -295,7 +295,7 @@ op_link_at(
     int         namelen)
 {
     chimera_vfs_link_at(G.t, &root, src_fh, src_fh_len, dir->fh, dir->fh_len,
-                        name, namelen, 0, CHIMERA_VFS_ATTR_FH, 0, 0, NULL, NULL,
+                        name, namelen, 0, 0, CHIMERA_VFS_ATTR_FH, 0, 0, NULL, NULL,
                         link_cb, NULL);
     wait_done();
     return G.status;

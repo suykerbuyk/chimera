@@ -1380,6 +1380,13 @@ struct diskfs_txn_delta {
 
 struct diskfs_txn {
     enum diskfs_txn_type     type;
+    /* CHIMERA_VFS_RENAME_DURABLE (Option A): the op that opened this txn requires
+     * its intent-log redo record to be written sync/FUA even under unsafe_async.
+     * The IL thread groups only like-sync txns into one record (a DURABLE txn
+     * never shares a record with a non-sync one) and passes this per-record sync
+     * to the backend write, leaving the process-wide il->sync as the default for
+     * every other record.  Stamped 0 for ordinary txns. */
+    int                      sync;
     struct diskfs_thread    *thread;
     struct diskfs_txn       *next;         /* per-thread free list link */
     struct diskfs_txn_slot   inodes[DISKFS_TXN_MAX_INODES];
@@ -5286,6 +5293,7 @@ diskfs_txn_begin(
     }
 
     txn->type            = type;
+    txn->sync            = 0;   /* set by the op for CHIMERA_VFS_RENAME_DURABLE */
     txn->thread          = thread;
     txn->next            = NULL;
     txn->num_inodes      = 0;

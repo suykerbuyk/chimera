@@ -129,6 +129,33 @@ CHIMERA_S3_REQUEST_CALLBACK(chimera_s3_put_link_callback,
     chimera_s3_put_finish_common(error_code, private_data);
 } /* chimera_s3_put_link_callback */
 
+static void chimera_s3_put_publish(
+    struct chimera_s3_request *request);
+
+/* D4/Option A: the PUT body is written DATASYNC (data durable, metadata not),
+ * so commit the object handle to make its size/mtime durable BEFORE the name is
+ * published -- otherwise a 200 can outrun persistence of the object's metadata
+ * on linux/diskfs.  The commit callback must NOT release file_handle (getattr
+ * still needs it; finish is the sole releaser); a commit failure routes to the
+ * error arm, never a false 200.  pre/post attrs are ignored (may be NULL on the
+ * inline alloc-failure path). */
+CHIMERA_S3_REQUEST_CALLBACK(chimera_s3_put_data_commit_callback,
+                            (enum chimera_vfs_error error_code,
+                             struct chimera_vfs_attrs *pre_attr,
+                             struct chimera_vfs_attrs *post_attr,
+                             void *private_data),
+                            (error_code, pre_attr, post_attr, private_data))
+{
+    struct chimera_s3_request *request = private_data;
+
+    if (error_code) {
+        chimera_s3_put_finish_common(error_code, request);
+        return;
+    }
+
+    chimera_s3_put_publish(request);
+} /* chimera_s3_put_data_commit_callback */
+
 static inline void
 chimera_s3_put_rename(struct chimera_s3_request *request)
 {
@@ -142,6 +169,18 @@ chimera_s3_put_rename(struct chimera_s3_request *request)
         return;
     }
     request->put.published = 1;
+
+    /* Make the object data durable before publishing the name (see callback). */
+    chimera_s3_request_get(request);
+    chimera_vfs_commit(thread->vfs, &request->cred, request->file_handle,
+                       0, 0, 0, 0,
+                       chimera_s3_put_data_commit_callback, request);
+} /* chimera_s3_put_rename */
+
+static void
+chimera_s3_put_publish(struct chimera_s3_request *request)
+{
+    struct chimera_server_s3_thread *thread = request->thread;
 
     if (request->put.tmp_name_len) {
         chimera_s3_request_get(request);
@@ -159,7 +198,7 @@ chimera_s3_put_rename(struct chimera_s3_request *request)
             request->name_len,
             NULL,
             0,
-            0,
+            CHIMERA_VFS_RENAME_DURABLE,
             0,
             0,
             NULL,
@@ -179,6 +218,7 @@ chimera_s3_put_rename(struct chimera_s3_request *request)
             request->name,
             request->name_len,
             1,
+            CHIMERA_VFS_RENAME_DURABLE,
             CHIMERA_VFS_ATTR_FH | CHIMERA_VFS_ATTR_MASK_STAT,
             0,
             0,
@@ -187,7 +227,7 @@ chimera_s3_put_rename(struct chimera_s3_request *request)
             chimera_s3_put_link_callback,
             request);
     }
-} /* chimera_s3_put_finish */
+} /* chimera_s3_put_publish */
 
 
 static void

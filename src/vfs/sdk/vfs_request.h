@@ -523,6 +523,17 @@ struct chimera_vfs_stream_entry {
 #define CHIMERA_VFS_WRITE_DATASYNC 1
 #define CHIMERA_VFS_WRITE_FILESYNC 2
 
+/* rename_at/link_at `flags` bit (shared word; SRC_IS_DIR 0x1 is in vfs_procs.h).
+ * CHIMERA_VFS_RENAME_DURABLE: the published name binding must be durable before
+ * the op is acknowledged (contract D5).  Backends that make the binding durable
+ * as part of the op honor it (linux/io_uring fsync the parent via a separate
+ * fsync-only fd; diskfs forces this rename/link txn's own intent-log redo
+ * record sync even under unsafe_async).  Backends durable by construction
+ * (memfs/cairn/facade) treat it as a no-op.  A backend that cannot honor it
+ * must fail the op CHIMERA_VFS_ENOTSUP rather than acknowledge a non-durable
+ * publish (snfs/smb).  Defined here (not vfs_procs.h) so backend modules see it. */
+#define CHIMERA_VFS_RENAME_DURABLE 0x00000002
+
 struct chimera_vfs_notify_gate;
 struct chimera_vfs_request_memory;
 
@@ -1165,7 +1176,7 @@ struct chimera_vfs_request {
             uint64_t                 new_name_hash;
             const char              *new_name;
             int                      new_namelen;
-            unsigned int             flags;  /* CHIMERA_VFS_REMOVE_* (RECALL) */
+            unsigned int             flags;  /* CHIMERA_VFS_RENAME_* (SRC_IS_DIR, DURABLE) */
             const uint8_t           *target_fh; /* Optional: target FH if known (for silly rename) */
             int                      target_fh_len; /* 0 if target_fh not provided */
             /* Backing store for a target FH the VFS resolved itself (RECALL). */
@@ -1190,6 +1201,7 @@ struct chimera_vfs_request {
             const char              *name;
             int                      namelen;
             unsigned int             replace;
+            unsigned int             flags;  /* CHIMERA_VFS_RENAME_DURABLE */
             uint64_t                 name_hash;
             /* SMB3 directory-lease self-exemption: when this link/rename is
              * issued through a handle that supplied a ParentLeaseKey, that

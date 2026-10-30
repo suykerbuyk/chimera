@@ -60,6 +60,16 @@ chimera_vfs_nfs3_link_at(
     uint8_t                                 *fh, *dir_fh;
     int                                      fhlen, dir_fhlen;
 
+    /* This proxy backend cannot make a name binding durable as part of the op
+     * (NFSv3 LINK does not imply COMMIT, and no parent COMMIT is issued here),
+     * so it cannot honor CHIMERA_VFS_RENAME_DURABLE -- fail ENOTSUP rather than
+     * acknowledge a non-durable publish (contract D5).  Before any remote call. */
+    if (request->link_at.flags & CHIMERA_VFS_RENAME_DURABLE) {
+        request->status = CHIMERA_VFS_ENOTSUP;
+        request->complete(request);
+        return;
+    }
+
     if (!server_thread) {
         request->status = CHIMERA_VFS_ESTALE;
         request->complete(request);

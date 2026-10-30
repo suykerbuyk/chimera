@@ -102,6 +102,7 @@ chimera_vfs_link_at_dispatch(
     const char                     *name,
     int                             namelen,
     unsigned int                    replace,
+    unsigned int                    flags,
     uint64_t                        attr_mask,
     uint64_t                        pre_attr_mask,
     uint64_t                        post_attr_mask,
@@ -128,6 +129,7 @@ chimera_vfs_link_at_dispatch(
     request->link_at.namelen     = namelen;
     request->link_at.name_hash   = chimera_vfs_hash(name, namelen);
     request->link_at.replace     = replace;
+    request->link_at.flags       = flags;
     if (parent_lease_skip) {
         memcpy(request->link_at.parent_lease_skip, parent_lease_skip, 16);
         request->link_at.parent_lease_skip_valid = 1;
@@ -171,6 +173,7 @@ struct chimera_vfs_link_at_gate {
     const char                     *name;
     int                             namelen;
     unsigned int                    replace;
+    unsigned int                    flags;
     uint64_t                        attr_mask;
     uint64_t                        pre_attr_mask;
     uint64_t                        post_attr_mask;
@@ -197,7 +200,8 @@ chimera_vfs_link_at_gate_dispatch(struct chimera_vfs_link_at_gate *gate)
 {
     chimera_vfs_link_at_dispatch(gate->thread, gate->cred, gate->fh, gate->fhlen,
                                  gate->dir_fh, gate->dir_fhlen, gate->name,
-                                 gate->namelen, gate->replace, gate->attr_mask,
+                                 gate->namelen, gate->replace, gate->flags,
+                                 gate->attr_mask,
                                  gate->pre_attr_mask, gate->post_attr_mask,
                                  gate->parent_lease_skip_valid ?
                                  gate->parent_lease_skip : NULL,
@@ -336,6 +340,7 @@ chimera_vfs_link_at(
     const char                     *name,
     int                             namelen,
     unsigned int                    replace,
+    unsigned int                    flags,
     uint64_t                        attr_mask,
     uint64_t                        pre_attr_mask,
     uint64_t                        post_attr_mask,
@@ -351,7 +356,7 @@ chimera_vfs_link_at(
     }
 
     chimera_vfs_link_at_path(thread, cred, fh, fhlen, dir_fh, dir_fhlen, name,
-                             namelen, replace, attr_mask, pre_attr_mask,
+                             namelen, replace, flags, attr_mask, pre_attr_mask,
                              post_attr_mask, parent_lease_skip, op_handle,
                              callback, private_data);
 } /* chimera_vfs_link_at */
@@ -367,6 +372,7 @@ chimera_vfs_link_at_path(
     const char                     *name,
     int                             namelen,
     unsigned int                    replace,
+    unsigned int                    flags,
     uint64_t                        attr_mask,
     uint64_t                        pre_attr_mask,
     uint64_t                        post_attr_mask,
@@ -417,6 +423,7 @@ chimera_vfs_link_at_path(
         gate->name           = name;
         gate->namelen        = namelen;
         gate->replace        = replace;
+        gate->flags          = flags;
         gate->attr_mask      = attr_mask;
         gate->pre_attr_mask  = pre_attr_mask;
         gate->post_attr_mask = post_attr_mask;
@@ -441,7 +448,7 @@ chimera_vfs_link_at_path(
     }
 
     chimera_vfs_link_at_dispatch(thread, cred, fh, fhlen, dir_fh, dir_fhlen,
-                                 name, namelen, replace, attr_mask,
+                                 name, namelen, replace, flags, attr_mask,
                                  pre_attr_mask, post_attr_mask,
                                  parent_lease_skip, op_handle, callback,
                                  private_data);

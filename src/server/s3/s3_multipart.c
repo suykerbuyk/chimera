@@ -1294,6 +1294,29 @@ chimera_s3_upc_read_callback(
         ctx);
 } /* chimera_s3_upc_read_callback */
 
+/* D4/Option A: the copied part bytes were assembled via copy_range (no
+ * durability) or RW DATASYNC writes (metadata not durable), so commit the part
+ * object handle before the 200 that acknowledges UploadPartCopy.  On success the
+ * callback calls upc_done, which does NOT release file_handle (it is stolen onto
+ * the part); on failure it calls upc_fail (the existing write-error path, which
+ * does release).  pre/post attrs are ignored (may be NULL on inline failure). */
+static void
+chimera_s3_upc_data_commit_callback(
+    enum chimera_vfs_error    error_code,
+    struct chimera_vfs_attrs *pre_attr,
+    struct chimera_vfs_attrs *post_attr,
+    void                     *private_data)
+{
+    struct chimera_s3_upload_copy_ctx *ctx = private_data;
+
+    if (error_code) {
+        chimera_s3_upc_fail(ctx, CHIMERA_S3_STATUS_INTERNAL_ERROR);
+        return;
+    }
+
+    chimera_s3_upc_done(ctx);
+} /* chimera_s3_upc_data_commit_callback */
+
 static void
 chimera_s3_upc_step(struct chimera_s3_upload_copy_ctx *ctx)
 {
@@ -1303,7 +1326,9 @@ chimera_s3_upc_step(struct chimera_s3_upload_copy_ctx *ctx)
 
     remaining = ctx->length - ctx->copied;
     if (remaining == 0) {
-        chimera_s3_upc_done(ctx);
+        chimera_vfs_commit(thread->vfs, &request->cred, request->file_handle,
+                           0, 0, 0, 0,
+                           chimera_s3_upc_data_commit_callback, ctx);
         return;
     }
 
@@ -2102,6 +2127,11 @@ struct chimera_s3_complete_ctx {
  * eviction window while still well inside the client's request timeout. */
 #define CHIMERA_S3_COMPLETE_CREATE_RETRY_BACKOFF_US 1000
 
+static void chimera_s3_complete_data_commit_callback(
+    enum chimera_vfs_error    error_code,
+    struct chimera_vfs_attrs *pre_attr,
+    struct chimera_vfs_attrs *post_attr,
+    void                     *private_data);
 static void chimera_s3_complete_assemble_next(
     struct chimera_s3_complete_ctx *ctx);
 
@@ -2290,6 +2320,23 @@ chimera_s3_complete_assemble_rw(struct chimera_s3_complete_ctx *ctx)
 } /* chimera_s3_complete_assemble_rw */
 
 static void
+chimera_s3_complete_data_commit_callback(
+    enum chimera_vfs_error    error_code,
+    struct chimera_vfs_attrs *pre_attr,
+    struct chimera_vfs_attrs *post_attr,
+    void                     *private_data)
+{
+    struct chimera_s3_complete_ctx *ctx = private_data;
+
+    if (error_code) {
+        chimera_s3_complete_finish_common(error_code, ctx);
+        return;
+    }
+
+    chimera_s3_complete_finalize(ctx);
+} /* chimera_s3_complete_data_commit_callback */
+
+static void
 chimera_s3_complete_assemble_next(struct chimera_s3_complete_ctx *ctx)
 {
     struct chimera_s3_request       *request = ctx->request;
@@ -2305,8 +2352,15 @@ chimera_s3_complete_assemble_next(struct chimera_s3_complete_ctx *ctx)
     }
 
     if (ctx->client_idx >= ctx->part_count) {
-        /* All parts processed; finalize (link/rename into place). */
-        chimera_s3_complete_finalize(ctx);
+        /* All parts assembled (via move_range/copy_range with no durability, or
+         * RW DATASYNC writes): D4/Option A -- commit the assembled object handle
+         * to make the data durable before finalize publishes the name.  The
+         * callback must NOT release file_handle (finalize links from
+         * file_handle->fh; finish_common is the sole releaser); a commit failure
+         * routes to the finish_common error arm, never a false 200. */
+        chimera_vfs_commit(thread->vfs, &request->cred, request->file_handle,
+                           0, 0, 0, 0,
+                           chimera_s3_complete_data_commit_callback, ctx);
         return;
     }
 
@@ -2498,7 +2552,7 @@ chimera_s3_complete_finalize(struct chimera_s3_complete_ctx *ctx)
             request->name_len,
             NULL,
             0,
-            0,
+            CHIMERA_VFS_RENAME_DURABLE,
             0,
             0,
             NULL,
@@ -2516,6 +2570,7 @@ chimera_s3_complete_finalize(struct chimera_s3_complete_ctx *ctx)
             request->name,
             request->name_len,
             1,
+            CHIMERA_VFS_RENAME_DURABLE,
             CHIMERA_VFS_ATTR_FH | CHIMERA_VFS_ATTR_MASK_STAT,
             0,
             0,
@@ -3024,26 +3079,27 @@ chimera_s3_complete_multipart_upload_body_done(
 
     if (err == CHIMERA_S3_STATUS_OK && upload->completing) {
         /* Another CompleteMultipartUpload (or an earlier retry) already won the
-         * race to assemble this upload and is in flight. Treat this as an
-         * idempotent duplicate: replay the success response from the manifest
-         * rather than assembling again. */
-        uint64_t combined[2];
-
+         * race to assemble this upload and is still in flight (completing=1, not
+         * yet detached).  D5: its object commit and DURABLE publish may not have
+         * landed, so replaying a success 200 here would acknowledge durability
+         * the winner has not yet reached.  Return a retryable error instead; the
+         * client's retry lands on the safe upload-gone arm once the winner has
+         * detached (which happens only after it publishes durably).  503/409 are
+         * not in the S3 status enum, so 500 InternalError is the retryable code. */
         evpl_mutex_unlock(&upload->lock);
         free(server_parts);
         chimera_s3_multipart_upload_release(thread, upload);
 
-        if (chimera_s3_mp_combined_etag_from_manifest(client_parts, n_client,
-                                                      combined) != 0) {
-            combined[0] = 0;
-            combined[1] = 0;
-        }
         free(client_parts);
         free(request->multipart.body_buf);
         request->multipart.body_buf = NULL;
         request->multipart.body_len = 0;
         request->multipart.body_cap = 0;
-        chimera_s3_complete_send_response(evpl, request, n_client, combined);
+        request->status             = CHIMERA_S3_STATUS_INTERNAL_ERROR;
+        request->vfs_state          = CHIMERA_S3_VFS_STATE_COMPLETE;
+        if (request->http_state == CHIMERA_S3_HTTP_STATE_RECVED) {
+            s3_server_respond(evpl, request);
+        }
         return;
     }
 

@@ -1005,6 +1005,8 @@ typedef void (*chimera_vfs_rename_at_callback_t)(
  * file-name one.  Only the SMB path knows this (the open carries the type);
  * everything else leaves it clear and gets the both-filters class. */
 #define CHIMERA_VFS_RENAME_SRC_IS_DIR 0x00000001
+/* CHIMERA_VFS_RENAME_DURABLE (0x2) is defined in sdk/vfs_request.h so backend
+* modules (which read request->rename_at.flags / link_at.flags) can see it. */
 
 SYMBOL_EXPORT void
 chimera_vfs_rename_at(
@@ -1069,6 +1071,7 @@ chimera_vfs_link_at(
     const char                     *name,
     int                             namelen,
     unsigned int                    replace,
+    unsigned int                    flags,
     uint64_t                        attr_mask,
     uint64_t                        pre_attr_mask,
     uint64_t                        post_attr_mask,
@@ -1089,6 +1092,7 @@ chimera_vfs_link_at_path(
     const char                     *name,
     int                             namelen,
     unsigned int                    replace,
+    unsigned int                    flags,
     uint64_t                        attr_mask,
     uint64_t                        pre_attr_mask,
     uint64_t                        post_attr_mask,

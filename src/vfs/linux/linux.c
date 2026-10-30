@@ -1902,6 +1902,38 @@ chimera_linux_readlink(
     request->complete(request);
 } /* chimera_linux_readlink */
 
+/* CHIMERA_VFS_RENAME_DURABLE (Option A): make a just-published name binding
+ * durable by fsync-ing the parent directory, under the SERVER's own privilege.
+ *
+ * Opens a SEPARATE, fsync-only fd by handle (O_RDONLY|O_DIRECTORY so fsync is
+ * accepted -- fsync of the O_PATH fd the rename/link holds returns EBADF).  The
+ * new fd is NEVER handed to map_attrs/getdents/flistxattr: a real fd would make
+ * those surface parent attrs/xattrs an O_PATH fd cannot, leaking them into the
+ * RPC reply (a read-DAC bypass).  The caller must invoke this only AFTER
+ * chimera_restore_privilege (an O_RDONLY open_by_handle_at checks the fsuid, so
+ * issuing it while the caller's S3 identity is set would fail EACCES on a
+ * write-only directory -- the regression Option A exists to avoid).
+ *
+ * Returns CHIMERA_VFS_OK, or CHIMERA_VFS_EIO on reopen/fsync failure. */
+static enum chimera_vfs_error
+chimera_linux_durable_fsync_dir(
+    struct chimera_linux_thread *thread,
+    const void                  *fh,
+    uint32_t                     fh_len)
+{
+    int fd = linux_open_by_handle(&thread->mount_table, fh, fh_len,
+                                  O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+
+    if (fd < 0) {
+        return CHIMERA_VFS_EIO;
+    }
+
+    enum chimera_vfs_error status = (fsync(fd) < 0) ? CHIMERA_VFS_EIO : CHIMERA_VFS_OK;
+
+    close(fd);
+    return status;
+} /* chimera_linux_durable_fsync_dir */
+
 static void
 chimera_linux_rename_at(
     struct chimera_vfs_request *request,
@@ -1990,6 +2022,27 @@ chimera_linux_rename_at(
         request->status = chimera_linux_errno_to_status(renameat_errno);
     } else {
         request->status = CHIMERA_VFS_OK;
+    }
+
+    /* Option A: privilege is already restored above, so the fsync-only reopen
+     * runs under the server identity.  Make the destination parent (where the
+     * name now lives) durable; for a cross-dir rename the source parent changed
+     * too.  A reopen/fsync failure turns the publish into EIO (never a false
+     * OK); the request fds are still closed below. */
+    if (request->status == CHIMERA_VFS_OK &&
+        (request->rename_at.flags & CHIMERA_VFS_RENAME_DURABLE)) {
+        if (chimera_linux_durable_fsync_dir(thread, request->rename_at.new_fh,
+                                            request->rename_at.new_fhlen) !=
+            CHIMERA_VFS_OK) {
+            request->status = CHIMERA_VFS_EIO;
+        } else if ((request->rename_at.new_fhlen != request->fh_len ||
+                    memcmp(request->rename_at.new_fh, request->fh,
+                           request->fh_len) != 0) &&
+                   chimera_linux_durable_fsync_dir(thread, request->fh,
+                                                   request->fh_len) !=
+                   CHIMERA_VFS_OK) {
+            request->status = CHIMERA_VFS_EIO;
+        }
     }
 
     close(old_fd);
@@ -2083,6 +2136,18 @@ chimera_linux_link_at(
     chimera_linux_map_attrs(CHIMERA_VFS_FH_MAGIC_LINUX,
                             &request->link_at.r_dir_post_attr,
                             dir_fd);
+
+    /* Option A: link never sets a caller cred (so no restore is needed before
+     * the fsync-only reopen).  Make the parent directory the new name lives in
+     * durable; a reopen/fsync failure becomes EIO, not a false OK. */
+    if (request->status == CHIMERA_VFS_OK &&
+        (request->link_at.flags & CHIMERA_VFS_RENAME_DURABLE)) {
+        if (chimera_linux_durable_fsync_dir(thread, request->link_at.dir_fh,
+                                            request->link_at.dir_fhlen) !=
+            CHIMERA_VFS_OK) {
+            request->status = CHIMERA_VFS_EIO;
+        }
+    }
 
     close(fd);
     close(dir_fd);
