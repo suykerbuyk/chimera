@@ -172,10 +172,12 @@ fsb_attach_open_done(
     s->node       = req->caller.node;
     s->node_epoch = ++s->next_epoch;   /* re-attach revokes the old epoch */
 
-    /* A new epoch ends the previous one: release every OPEN && !HELD
-     * (epoch-held) object recovery may have resurrected -- a never-referenced,
-     * unheld working version does not survive an epoch change (only sealed/held
-     * objects do).  Made durable by a forced compaction inside the release. */
+    /* A new epoch ends the previous one: release every OPEN && !HELD && refs==0
+     * && !sealing (epoch-held) object recovery may have resurrected -- only a
+     * never-referenced, unheld working version does not survive an epoch change.
+     * A referenced (refs==1) object survives and is released only at refs->0
+     * (contract sc_types.h:192-200); sealed/held objects also survive.  Made
+     * durable by a forced compaction inside the release. */
     facade_obj_release_epoch_held(s->alloc, fsb_attach_finish, op);
 } /* fsb_attach_open_done */
 
@@ -309,10 +311,12 @@ fsb_detach(
     /* End the caller's own epoch (the gate proved it is live) and release its
      * epoch-held objects (sc_request.h:271-272): the lease-scoped,
      * never-referenced working versions (OBJ_CLONE_WORKING) and fresh opens --
-     * every OPEN && !HELD object.  This is DISTINCT from the namespace HOLD
-     * flag (FACADE_OBJ_HELD), which is a durable record state, not epoch-scoped,
-     * and survives.  The release is made durable (forced compaction) before the
-     * epoch is cleared and the DETACH completes. */
+     * every OPEN && !HELD && refs==0 && !sealing object.  A referenced (refs==1)
+     * object is NOT epoch-held: it survives DETACH and is released only when its
+     * refs return to 0 (contract sc_types.h:192-200).  This is also DISTINCT
+     * from the namespace HOLD flag (FACADE_OBJ_HELD), which is a durable
+     * record state, not epoch-scoped, and survives.  The release is made durable
+     * (forced compaction) before the epoch is cleared and the DETACH completes. */
     {
         struct fsb_op *op = calloc(1, sizeof(*op));
 

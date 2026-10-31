@@ -18,7 +18,9 @@
  * no-reuse-of-a-freed-block-until-its-FREE-is-durable invariant (a freed owned
  * block is returned to the allocatable free set only when the COMMIT is
  * durable).  An object release (discard, epoch-held) is made durable by a forced
- * compaction rather than a log record, and is also GC'd at re-ATTACH, so it
+ * compaction rather than a log record, and is also GC'd at re-ATTACH (the
+ * epoch-held set is OPEN && !HELD && refs==0 && !sealing -- never-referenced
+ * working versions only; a referenced object survives until refs->0), so it
  * never resurrects.
  *
  * Object state rules: writable only while OPEN; OPEN -> SEALED on seal; a mutator
@@ -234,9 +236,13 @@ facade_obj_discard(
     void                *private_data);
 
 /*
- * Release EVERY OPEN && !HELD object (an epoch ended: DETACH/FENCE/lease
- * expiry/re-ATTACH).  Removes them, frees their owned blocks, and forces one
- * compaction so the release is durable.  Completes OK even when none exist.
+ * Release every OPEN && !HELD && refs==0 && !sealing object -- the
+ * never-referenced working versions only -- when an epoch ends (DETACH/FENCE/
+ * lease expiry/re-ATTACH).  A referenced (refs==1) object survives the epoch
+ * change and is released only when its refs return to 0 (contract
+ * sc_types.h:192-200).  Removes the released objects, frees their owned blocks,
+ * and forces one compaction so the release is durable.  Completes OK even when
+ * none exist.
  */
 void
 facade_obj_release_epoch_held(

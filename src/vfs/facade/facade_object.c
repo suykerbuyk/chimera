@@ -21,8 +21,9 @@
  *
  * An object release (discard / epoch-held) takes the other durable path: mutate
  * in memory and force a compaction (crash-atomic free set + object table), still
- * under the FIFO; re-ATTACH also GCs OPEN && !HELD leftovers, so a release never
- * resurrects across a crash.
+ * under the FIFO; re-ATTACH also GCs OPEN && !HELD && refs==0 && !sealing
+ * leftovers (never-referenced working versions only; a referenced object survives
+ * until refs->0), so a release never resurrects across a crash.
  *
  * Links no libevpl; all media I/O is through the facade_media_* helpers.
  */
@@ -1450,13 +1451,18 @@ facade_release_start(void *arg)
         for (i = 0; i < n; i++) {
             struct facade_obj *o = facade_obj_at(a, i);
 
-            /* Skip a sealing object: the epoch-held sweep
-             * must NOT punch+free the blocks the in-flight seal hash is reading,
-             * or Step 3 would commit against a freed id.  The freeze defers the
-             * release -- once the seal commits the object is SEALED (no longer
-             * epoch-held), so it is correctly retained; a later sweep leaves it. */
-            if (o && o->state == CHIMERA_SC_OBJ_OPEN && !(o->flags & FACADE_OBJ_HELD) &&
-                !o->sealing) {
+            /* The released set is OPEN && !HELD && refs==0 && !sealing -- only a
+             * NEVER-REFERENCED working version.  A referenced (refs==1) object
+             * survives an epoch change and is released only when its refs return
+             * to 0 (DELETE, or the old side of REPLACE); it is NOT epoch-held
+             * (contract sc_types.h:192-200).  Skip a sealing object: the sweep
+             * must NOT punch+free the blocks the
+             * in-flight seal hash is reading, or Step 3 would commit against a
+             * freed id.  The freeze defers the release -- once the seal commits
+             * the object is SEALED (no longer epoch-held), so it is correctly
+             * retained; a later sweep leaves it. */
+            if (o && o->state == CHIMERA_SC_OBJ_OPEN && o->refs == 0 &&
+                !(o->flags & FACADE_OBJ_HELD) && !o->sealing) {
                 facade_release_one(a, o);
                 released = 1;
             }
@@ -1515,7 +1521,9 @@ facade_obj_release_epoch_held(
     c->a          = a;
     c->cb         = cb;
     c->priv       = private_data;
-    c->is_discard = 0;   /* sweep every OPEN && !HELD object inside the slot */
+    c->is_discard = 0;   /* sweep every OPEN && !HELD && refs==0 && !sealing object
+                          * inside the slot (never-referenced working versions only;
+                          * a referenced object survives until refs->0) */
     facade_txn_acquire(a, facade_release_start, c);
 } /* facade_obj_release_epoch_held */
 
