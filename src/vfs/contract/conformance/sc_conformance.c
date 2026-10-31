@@ -565,6 +565,29 @@ chimera_sc_oblig_txn_atomic_across_crash(struct chimera_sc_conformance_ctx *ctx)
     static const uint8_t v1[] = "aaaa";
     static const uint8_t v2[] = "bbbb";
 
+    /* Object-binding arms (contract surface only: OBJ_CREATE/NS_TXN deltas/
+     * NS_GET/OBJ_READ -- never facade internals).  Each NS_TXN stays <= 14 ops
+     * (facade refuses > FACADE_SC_MAX_TXN_OPS=15). */
+    struct chimera_sc_obj_id    id_c, old_id, new_id;
+    struct chimera_sc_conf_call tx, gk;
+    struct chimera_sc_record    put;
+    struct chimera_sc_bytes     del;
+    struct chimera_sc_delta     d;
+    struct chimera_sc_compare   cmp;
+    uint8_t rbuf[8];
+    uint32_t rlen = 0;
+    uint32_t s_dst, s_src, s_new, s_old;
+    int whole_new, whole_old;
+    static const uint8_t key_c[]  = "txn/bind/c";
+    static const uint8_t vc[]     = "cval";
+    static const uint8_t src_k[]  = "txn/rn/src";
+    static const uint8_t dst_k[]  = "txn/rn/dst";
+    static const uint8_t vo[]     = "oldv";
+    static const uint8_t vn[]     = "newv";
+    static const uint8_t cas_k[]  = "txn/cas/k";
+    static const uint8_t cas_v1[] = "cas-old";
+    static const uint8_t cas_v2[] = "cas-new";
+
     if (!ctx->fixture->crash || !ctx->fixture->recover) {
         return CHIMERA_SC_CONF_SKIP;
     }
@@ -622,6 +645,215 @@ chimera_sc_oblig_txn_atomic_across_crash(struct chimera_sc_conformance_ctx *ctx)
                       (unsigned) g1.ns_value_len, (unsigned) g2.ns_value_len);
     CHIMERA_SC_EXPECT_BYTES(ctx, g1.ns_value, v1, sizeof(v1) - 1);
     CHIMERA_SC_EXPECT_BYTES(ctx, g2.ns_value, v2, sizeof(v2) - 1);
+
+    /* ======================================================================
+     * Object-binding deltas asserted through the contract surface.
+     * After each committed binding txn we drive the SAME crash point
+     * (crash -> recover -> re-ATTACH) and inspect ONLY via NS_GET + OBJ_READ,
+     * by status.  OBJ_READ status is the "collected" oracle: a table miss ->
+     * E_NOT_FOUND; a live (even empty) object -> OK.  No DURABLE write / SEAL is
+     * needed -- a referenced (refs==1) OPEN object stays alive across the
+     * epoch change, so a committed CREATE reads back OBJ_READ=OK directly.
+     * ====================================================================== */
+
+    /* ---- CREATE: bind key_c -> id_c in one NS_TXN (put + CREATE delta).
+     * refcounts-match-bindings / nothing-referenced-collected: after the crash
+     * the binding AND the referenced object both survive. ---- */
+    CHIMERA_SC_EXPECT_STATUS(ctx, conf_obj_create(ctx, &id_c), CHIMERA_SC_OK);
+
+    memset(&put, 0, sizeof(put));
+    put.key.data   = key_c;
+    put.key.len    = sizeof(key_c) - 1;
+    put.value.data = vc;
+    put.value.len  = sizeof(vc) - 1;
+    memset(&d, 0, sizeof(d));
+    d.kind       = CHIMERA_SC_DELTA_CREATE;
+    d.create.obj = id_c;              /* create.stamps stays zero == OBJ_CREATE's */
+    chimera_sc_conf_call_init(&tx, ctx, CHIMERA_SC_OP_NS_TXN);
+    tx.req.ns_txn.puts    = &put;
+    tx.req.ns_txn.nputs   = 1;
+    tx.req.ns_txn.deltas  = &d;
+    tx.req.ns_txn.ndeltas = 1;
+    chimera_sc_conf_run(&tx);
+    CHIMERA_SC_EXPECT_STATUS(ctx, tx.req.status, CHIMERA_SC_OK);
+
+    CHIMERA_SC_EXPECT(ctx, ctx->fixture->crash(ctx->priv) == 0, "crash hook failed (CREATE)");
+    CHIMERA_SC_EXPECT(ctx, ctx->fixture->recover(ctx->priv) == 0, "recover hook failed (CREATE)");
+    status = chimera_sc_conf_attach(ctx, CHIMERA_SC_CONTRACT_MAJOR, CHIMERA_SC_CONTRACT_MINOR);
+    CHIMERA_SC_EXPECT_STATUS(ctx, status, CHIMERA_SC_OK);
+
+    chimera_sc_conf_call_init(&gk, ctx, CHIMERA_SC_OP_NS_GET);
+    gk.req.ns_get.key.data = key_c;
+    gk.req.ns_get.key.len  = sizeof(key_c) - 1;
+    chimera_sc_conf_run(&gk);
+    CHIMERA_SC_EXPECT_STATUS(ctx, gk.req.status, CHIMERA_SC_OK);
+    CHIMERA_SC_EXPECT_STATUS(ctx, conf_obj_read(ctx, &id_c, 1, rbuf, sizeof(rbuf), &rlen),
+                             CHIMERA_SC_OK);
+
+    /* ---- DELETE: drop the binding (delete key_c + DELETE delta).  After the
+     * crash the key is gone (NS_GET=NOT_FOUND) and the object's table entry is
+     * gone (OBJ_READ=NOT_FOUND), together -- collection is observed only as
+     * absence on the contract surface, not a free-set/GC-accounting claim. ---- */
+    memset(&del, 0, sizeof(del));
+    del.data = key_c;
+    del.len  = sizeof(key_c) - 1;
+    memset(&d, 0, sizeof(d));
+    d.kind    = CHIMERA_SC_DELTA_DELETE;
+    d.del.obj = id_c;
+    chimera_sc_conf_call_init(&tx, ctx, CHIMERA_SC_OP_NS_TXN);
+    tx.req.ns_txn.deletes  = &del;
+    tx.req.ns_txn.ndeletes = 1;
+    tx.req.ns_txn.deltas   = &d;
+    tx.req.ns_txn.ndeltas  = 1;
+    chimera_sc_conf_run(&tx);
+    CHIMERA_SC_EXPECT_STATUS(ctx, tx.req.status, CHIMERA_SC_OK);
+
+    CHIMERA_SC_EXPECT(ctx, ctx->fixture->crash(ctx->priv) == 0, "crash hook failed (DELETE)");
+    CHIMERA_SC_EXPECT(ctx, ctx->fixture->recover(ctx->priv) == 0, "recover hook failed (DELETE)");
+    status = chimera_sc_conf_attach(ctx, CHIMERA_SC_CONTRACT_MAJOR, CHIMERA_SC_CONTRACT_MINOR);
+    CHIMERA_SC_EXPECT_STATUS(ctx, status, CHIMERA_SC_OK);
+
+    chimera_sc_conf_call_init(&gk, ctx, CHIMERA_SC_OP_NS_GET);
+    gk.req.ns_get.key.data = key_c;
+    gk.req.ns_get.key.len  = sizeof(key_c) - 1;
+    chimera_sc_conf_run(&gk);
+    CHIMERA_SC_EXPECT_STATUS(ctx, gk.req.status, CHIMERA_SC_E_NOT_FOUND);
+    CHIMERA_SC_EXPECT_STATUS(ctx, conf_obj_read(ctx, &id_c, 1, rbuf, sizeof(rbuf), &rlen),
+                             CHIMERA_SC_E_NOT_FOUND);
+
+    /* ---- REPLACE / rename-replace in one NS_TXN (put dst + delete src +
+     * REPLACE delta old->new).  PROBE+SKIP: the in-mem honest double has no
+     * REPLACE and returns E_NOT_SUPPORTED -- skip the REPLACE / old-or-new
+     * sub-arms there; the facade implements REPLACE and runs the arm. ---- */
+    CHIMERA_SC_EXPECT_STATUS(ctx, conf_obj_create(ctx, &old_id), CHIMERA_SC_OK);
+    CHIMERA_SC_EXPECT_STATUS(ctx, conf_obj_create(ctx, &new_id), CHIMERA_SC_OK);
+
+    /* bind src_k -> old_id so REPLACE has a referenced old side */
+    memset(&put, 0, sizeof(put));
+    put.key.data   = src_k;
+    put.key.len    = sizeof(src_k) - 1;
+    put.value.data = vo;
+    put.value.len  = sizeof(vo) - 1;
+    memset(&d, 0, sizeof(d));
+    d.kind       = CHIMERA_SC_DELTA_CREATE;
+    d.create.obj = old_id;
+    chimera_sc_conf_call_init(&tx, ctx, CHIMERA_SC_OP_NS_TXN);
+    tx.req.ns_txn.puts    = &put;
+    tx.req.ns_txn.nputs   = 1;
+    tx.req.ns_txn.deltas  = &d;
+    tx.req.ns_txn.ndeltas = 1;
+    chimera_sc_conf_run(&tx);
+    CHIMERA_SC_EXPECT_STATUS(ctx, tx.req.status, CHIMERA_SC_OK);
+
+    /* the rename-replace: dst_k -> vn, drop src_k, REPLACE old_id -> new_id */
+    memset(&put, 0, sizeof(put));
+    put.key.data   = dst_k;
+    put.key.len    = sizeof(dst_k) - 1;
+    put.value.data = vn;
+    put.value.len  = sizeof(vn) - 1;
+    memset(&del, 0, sizeof(del));
+    del.data = src_k;
+    del.len  = sizeof(src_k) - 1;
+    memset(&d, 0, sizeof(d));
+    d.kind            = CHIMERA_SC_DELTA_REPLACE;
+    d.replace.old_obj = old_id;
+    d.replace.new_obj = new_id;
+    chimera_sc_conf_call_init(&tx, ctx, CHIMERA_SC_OP_NS_TXN);
+    tx.req.ns_txn.puts     = &put;
+    tx.req.ns_txn.nputs    = 1;
+    tx.req.ns_txn.deletes  = &del;
+    tx.req.ns_txn.ndeletes = 1;
+    tx.req.ns_txn.deltas   = &d;
+    tx.req.ns_txn.ndeltas  = 1;
+    chimera_sc_conf_run(&tx);
+
+    if (tx.req.status == CHIMERA_SC_E_NOT_SUPPORTED) {
+        /* Honest in-mem double: no REPLACE.  Note and skip the
+         * REPLACE/rename/old-or-new sub-arms; the CREATE/DELETE arms above and the
+         * CAS arm below still run (and the facade exercises REPLACE).  Use a
+         * plain stderr note, NOT chimera_sc_conf_logf -- that is the failure
+         * logger (it sets ctx->failed), and a SKIP must not touch failure
+         * state. */
+        fprintf(stderr,
+                "conformance: %s:%d: (replace-probe) REPLACE not supported by "
+                "this backend; skipping rename/replace sub-arms\n",
+                __FILE__, __LINE__);
+    } else {
+        CHIMERA_SC_EXPECT_STATUS(ctx, tx.req.status, CHIMERA_SC_OK);
+
+        CHIMERA_SC_EXPECT(ctx, ctx->fixture->crash(ctx->priv) == 0, "crash hook failed (REPLACE)");
+        CHIMERA_SC_EXPECT(ctx, ctx->fixture->recover(ctx->priv) == 0, "recover hook failed (REPLACE)");
+        status = chimera_sc_conf_attach(ctx, CHIMERA_SC_CONTRACT_MAJOR, CHIMERA_SC_CONTRACT_MINOR);
+        CHIMERA_SC_EXPECT_STATUS(ctx, status, CHIMERA_SC_OK);
+
+        /* A replace is old-or-new-in-full: the surviving side must be WHOLE,
+         * never a mix.  The single crash point is after the committed REPLACE, so the
+         * NEW side must win (committed => durable); the oracle still accepts the
+         * all-old image and rejects any mix, by reading all four handles and
+         * requiring one whole side. */
+        chimera_sc_conf_call_init(&gk, ctx, CHIMERA_SC_OP_NS_GET);
+        gk.req.ns_get.key.data = dst_k;
+        gk.req.ns_get.key.len  = sizeof(dst_k) - 1;
+        chimera_sc_conf_run(&gk);
+        s_dst = gk.req.status;
+
+        chimera_sc_conf_call_init(&gk, ctx, CHIMERA_SC_OP_NS_GET);
+        gk.req.ns_get.key.data = src_k;
+        gk.req.ns_get.key.len  = sizeof(src_k) - 1;
+        chimera_sc_conf_run(&gk);
+        s_src = gk.req.status;
+
+        s_new = conf_obj_read(ctx, &new_id, 1, rbuf, sizeof(rbuf), &rlen);
+        s_old = conf_obj_read(ctx, &old_id, 1, rbuf, sizeof(rbuf), &rlen);
+
+        whole_new = (s_dst == CHIMERA_SC_OK && s_new == CHIMERA_SC_OK &&
+                     s_src == CHIMERA_SC_E_NOT_FOUND && s_old == CHIMERA_SC_E_NOT_FOUND);
+        whole_old = (s_src == CHIMERA_SC_OK && s_old == CHIMERA_SC_OK &&
+                     s_dst == CHIMERA_SC_E_NOT_FOUND && s_new == CHIMERA_SC_E_NOT_FOUND);
+        CHIMERA_SC_EXPECT(ctx, whole_new || whole_old,
+                          "REPLACE left a mix: dst=%u src=%u new=%u old=%u",
+                          (unsigned) s_dst, (unsigned) s_src,
+                          (unsigned) s_new, (unsigned) s_old);
+    }
+
+    /* ---- CAS conflict fails cleanly, atomically (no partial effect).  A stale
+     * compare (revision 0 against a live key, whose revision is > 0) must abort
+     * the whole txn; the key still reads its OLD value. ---- */
+    CHIMERA_SC_EXPECT_STATUS(ctx, conf_ns_put(ctx, cas_k, sizeof(cas_k) - 1,
+                                              cas_v1, sizeof(cas_v1) - 1),
+                             CHIMERA_SC_OK);
+
+    memset(&cmp, 0, sizeof(cmp));
+    cmp.key.data = cas_k;
+    cmp.key.len  = sizeof(cas_k) - 1;
+    cmp.revision = 0;               /* stale: the live key's revision is > 0 */
+    memset(&put, 0, sizeof(put));
+    put.key.data   = cas_k;
+    put.key.len    = sizeof(cas_k) - 1;
+    put.value.data = cas_v2;
+    put.value.len  = sizeof(cas_v2) - 1;
+    chimera_sc_conf_call_init(&tx, ctx, CHIMERA_SC_OP_NS_TXN);
+    tx.req.ns_txn.compares  = &cmp;
+    tx.req.ns_txn.ncompares = 1;
+    tx.req.ns_txn.puts      = &put;
+    tx.req.ns_txn.nputs     = 1;
+    chimera_sc_conf_run(&tx);
+    CHIMERA_SC_EXPECT_STATUS(ctx, tx.req.status, CHIMERA_SC_E_COMPARE_FAILED);
+    CHIMERA_SC_EXPECT(ctx, tx.req.ns_txn.r_failed_part == CHIMERA_SC_TXN_COMPARE,
+                      "CAS r_failed_part=%u, want COMPARE",
+                      (unsigned) tx.req.ns_txn.r_failed_part);
+    CHIMERA_SC_EXPECT(ctx, tx.req.ns_txn.r_failed_index == 0,
+                      "CAS r_failed_index=%u, want 0",
+                      (unsigned) tx.req.ns_txn.r_failed_index);
+
+    chimera_sc_conf_call_init(&gk, ctx, CHIMERA_SC_OP_NS_GET);
+    gk.req.ns_get.key.data = cas_k;
+    gk.req.ns_get.key.len  = sizeof(cas_k) - 1;
+    chimera_sc_conf_run(&gk);
+    CHIMERA_SC_EXPECT_STATUS(ctx, gk.req.status, CHIMERA_SC_OK);
+    CHIMERA_SC_EXPECT(ctx, gk.ns_value_valid && gk.ns_value_len == sizeof(cas_v1) - 1,
+                      "CAS old value not intact (len=%u)", (unsigned) gk.ns_value_len);
+    CHIMERA_SC_EXPECT_BYTES(ctx, gk.ns_value, cas_v1, sizeof(cas_v1) - 1);
 
     return CHIMERA_SC_CONF_PASS;
 } /* chimera_sc_oblig_txn_atomic_across_crash */

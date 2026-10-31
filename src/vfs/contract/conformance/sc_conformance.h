@@ -246,9 +246,13 @@ enum chimera_sc_conf_result
 chimera_sc_oblig_durable_survives_crash(
     struct chimera_sc_conformance_ctx *ctx);
 
-/* A committed NS_TXN is atomic and durable: it survives a crash IN FULL -- every record present
- * with its committed value.  A backend that loses the whole committed txn FAILs
- * (all-or-nothing alone would pass it vacuously). */
+/* A committed NS_TXN is atomic and durable: it survives a crash IN FULL --
+ * every record present with its committed value.  A backend that loses the
+ * whole committed txn FAILs (all-or-nothing alone would pass it vacuously).
+ * The obligation also drives object-binding deltas (CREATE/DELETE/REPLACE +
+ * rename-replace) and a CAS conflict, asserting NS_GET<->OBJ_READ agreement
+ * across the crash by status (REPLACE is probe+skipped on a backend that does
+ * not support it). */
 enum chimera_sc_conf_result
 chimera_sc_oblig_txn_atomic_across_crash(
     struct chimera_sc_conformance_ctx *ctx);
