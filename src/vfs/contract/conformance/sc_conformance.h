@@ -246,7 +246,9 @@ enum chimera_sc_conf_result
 chimera_sc_oblig_durable_survives_crash(
     struct chimera_sc_conformance_ctx *ctx);
 
-/* The records of one NS_TXN are all present or all absent after a crash. */
+/* A committed NS_TXN is atomic and durable: it survives a crash IN FULL -- every record present
+ * with its committed value.  A backend that loses the whole committed txn FAILs
+ * (all-or-nothing alone would pass it vacuously). */
 enum chimera_sc_conf_result
 chimera_sc_oblig_txn_atomic_across_crash(
     struct chimera_sc_conformance_ctx *ctx);

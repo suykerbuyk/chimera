@@ -559,7 +559,6 @@ chimera_sc_oblig_txn_atomic_across_crash(struct chimera_sc_conformance_ctx *ctx)
     struct chimera_sc_conf_call call;
     struct chimera_sc_record    puts[2];
     struct chimera_sc_conf_call g1, g2;
-    int found1, found2;
     uint32_t status;
     static const uint8_t k1[] = "txn/atomic/a";
     static const uint8_t k2[] = "txn/atomic/b";
@@ -598,23 +597,31 @@ chimera_sc_oblig_txn_atomic_across_crash(struct chimera_sc_conformance_ctx *ctx)
     g1.req.ns_get.key.data = k1;
     g1.req.ns_get.key.len  = sizeof(k1) - 1;
     chimera_sc_conf_run(&g1);
-    CHIMERA_SC_EXPECT(ctx, g1.req.status == CHIMERA_SC_OK ||
-                      g1.req.status == CHIMERA_SC_E_NOT_FOUND,
-                      "unexpected status %u", (unsigned) g1.req.status);
 
     chimera_sc_conf_call_init(&g2, ctx, CHIMERA_SC_OP_NS_GET);
     g2.req.ns_get.key.data = k2;
     g2.req.ns_get.key.len  = sizeof(k2) - 1;
     chimera_sc_conf_run(&g2);
-    CHIMERA_SC_EXPECT(ctx, g2.req.status == CHIMERA_SC_OK ||
-                      g2.req.status == CHIMERA_SC_E_NOT_FOUND,
-                      "unexpected status %u", (unsigned) g2.req.status);
 
-    /* Transaction atomicity: all of the transaction survived, or none of it did. */
-    found1 = g1.req.status == CHIMERA_SC_OK;
-    found2 = g2.req.status == CHIMERA_SC_OK;
-    CHIMERA_SC_EXPECT(ctx, found1 == found2,
-                      "torn transaction: a=%d b=%d", found1, found2);
+    /* A committed NS_TXN is atomic and DURABLE on commit, so after the crash
+     * BOTH records must be present in full.  "all survived or none did" is too weak:
+     * a backend that loses the whole committed txn satisfies all==nothing
+     * vacuously (the clean-arm gap), passing while silently dropping committed
+     * data.  Requiring survives-in-full makes a lost committed record a FAIL and
+     * keeps the backend's dirty-window / compaction-before-log-wrap arms
+     * load-bearing.  The values must round-trip too (a backend that keeps the
+     * key but drops the value is caught); the driver snapshotted each NS_GET
+     * return into ns_value inside complete(), within its lifetime. */
+    CHIMERA_SC_EXPECT_STATUS(ctx, g1.req.status, CHIMERA_SC_OK);
+    CHIMERA_SC_EXPECT_STATUS(ctx, g2.req.status, CHIMERA_SC_OK);
+    CHIMERA_SC_EXPECT(ctx, g1.ns_value_valid && g2.ns_value_valid,
+                      "committed values not captured in complete()");
+    CHIMERA_SC_EXPECT(ctx, g1.ns_value_len == sizeof(v1) - 1 &&
+                      g2.ns_value_len == sizeof(v2) - 1,
+                      "committed value lengths wrong: a=%u b=%u",
+                      (unsigned) g1.ns_value_len, (unsigned) g2.ns_value_len);
+    CHIMERA_SC_EXPECT_BYTES(ctx, g1.ns_value, v1, sizeof(v1) - 1);
+    CHIMERA_SC_EXPECT_BYTES(ctx, g2.ns_value, v2, sizeof(v2) - 1);
 
     return CHIMERA_SC_CONF_PASS;
 } /* chimera_sc_oblig_txn_atomic_across_crash */
