@@ -384,19 +384,21 @@ test_txn_compares_and_deltas(void)
         TCHECK(!get_eq(a, "k", "v0") && get_eq(a, "k2", "v0"), "rename applied");
     }
 
-    /* per-txn log-block cap: too many deltas -> E_NO_SPACE. */
+    /* binding-ops cap (refcount-and-gc): more than FACADE_SC_MAX_TXN_OPS ops in
+     * one txn -> E_INVALID (the advertised r_limits.max_txn_ops, split from the
+     * log floor; exceeding a declared limit is E_INVALID, not NO_SPACE). */
     {
-        struct chimera_sc_delta       d[FACADE_NS_MAX_TXN_LOG_BLOCKS];
+        struct chimera_sc_delta       d[FACADE_SC_MAX_TXN_OPS + 1];
         struct chimera_sc_ns_txn_args args;
         uint32_t                      i;
 
         memset(d, 0, sizeof(d));
-        for (i = 0; i < FACADE_NS_MAX_TXN_LOG_BLOCKS; i++) {
-            d[i].kind = CHIMERA_SC_DELTA_RECALL_HINT;   /* cheap, but 2 blocks each in the bound */
+        for (i = 0; i < FACADE_SC_MAX_TXN_OPS + 1; i++) {
+            d[i].kind = CHIMERA_SC_DELTA_RECALL_HINT;   /* advisory; cheap, never fails */
         }
         memset(&args, 0, sizeof(args));
-        args.deltas = d; args.ndeltas = FACADE_NS_MAX_TXN_LOG_BLOCKS;
-        TCHECK(run_txn(a, &args).status == CHIMERA_SC_E_NO_SPACE, "over-cap -> E_NO_SPACE");
+        args.deltas = d; args.ndeltas = FACADE_SC_MAX_TXN_OPS + 1;
+        TCHECK(run_txn(a, &args).status == CHIMERA_SC_E_INVALID, "over-ops -> E_INVALID");
     }
 
     /* oversize key -> E_INVALID. */
@@ -460,21 +462,25 @@ test_crash_atomic(void)
 static void
 test_g1_compaction(void)
 {
-    /* Small media so log_nblocks is the raised floor (16); a run of small txns
-     * fills it and forces a G1 compaction-before-wrap mid-sequence. */
-    const uint64_t              small = 256ULL * CHIMERA_MEDIA_BLOCK_SIZE;
-    struct chimera_media_space *space = tu_media_open("ns://g1", small);
+    /* Media sized (2048 blocks) so nblocks/16 == 128 hits the geometry CAP and
+     * log_nblocks == FACADE_NS_MAX_TXN_LOG_BLOCKS (128); a longer run of small txns
+     * fills it and forces a G1 compaction-before-wrap mid-sequence.  (refcount-and-gc
+     * raised the gate ceiling and the CAP 64->128, NOT the geometry floor, which
+     * stays 16; the 128-block log here comes from the CAP on this 2048-block image,
+     * so the image and the loop grew to keep exercising compaction -- G1 landing note.) */
+    const uint64_t              img   = 2048ULL * CHIMERA_MEDIA_BLOCK_SIZE;
+    struct chimera_media_space *space = tu_media_open("ns://g1", img);
     struct facade_alloc        *a;
     uint32_t                    i;
     char                        key[16];
 
     tu_format(space);
     a = tu_open(space);
-    TCHECK(a->log_nblocks == FACADE_NS_MAX_TXN_LOG_BLOCKS, "small-media log floor = 16");
+    TCHECK(a->log_nblocks == FACADE_NS_MAX_TXN_LOG_BLOCKS, "log floor = 128");
 
-    /* 12 two-block txns (24 blocks) cannot fit a 16-block log without a
+    /* 70 two-block put txns (140 blocks) cannot fit a 128-block log without a
      * compaction partway, exercising the G1 path; all must commit. */
-    for (i = 0; i < 12; i++) {
+    for (i = 0; i < 70; i++) {
         snprintf(key, sizeof(key), "g/%02u", i);
         TCHECK(put_one(a, key, "v").status == CHIMERA_SC_OK, "g1 put %u", i);
     }
@@ -482,9 +488,9 @@ test_g1_compaction(void)
     /* Crash + reopen: every committed record survives (checkpoint + log replay). */
     facade_alloc_abandon(a);
     tu_media_close(space);
-    space = tu_media_open("ns://g1", small);
+    space = tu_media_open("ns://g1", img);
     a     = tu_open(space);
-    for (i = 0; i < 12; i++) {
+    for (i = 0; i < 70; i++) {
         snprintf(key, sizeof(key), "g/%02u", i);
         TCHECK(get_eq(a, key, "v"), "g1 record %u survived", i);
     }

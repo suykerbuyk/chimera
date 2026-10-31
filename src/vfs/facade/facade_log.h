@@ -42,11 +42,21 @@ struct facade_alloc;
 #define FACADE_LR_FORMAT 2u
 
 enum facade_lr_type {
-    FACADE_LR_ALLOC  = 1, /* a run of blocks was allocated (removed from free) */
-    FACADE_LR_FREE   = 2, /* a run of blocks was freed (returned to free) */
-    FACADE_LR_OBJ    = 3, /* an object record: full facade_obj_rec + extents */
-    FACADE_LR_COMMIT = 4, /* closes a transaction */
-    FACADE_LR_NS     = 5, /* a namespace record put/delete (namespace-record-store) */
+    FACADE_LR_ALLOC      = 1, /* a run of blocks was allocated (removed from free) */
+    FACADE_LR_FREE       = 2, /* a run of blocks was freed (returned to free) */
+    FACADE_LR_OBJ        = 3, /* an object record: full facade_obj_rec + extents */
+    FACADE_LR_COMMIT     = 4, /* closes a transaction */
+    FACADE_LR_NS         = 5, /* a namespace record put/delete (namespace-record-store) */
+    FACADE_LR_OBJ_REMOVE = 6, /* an object was collected (refcount->0): remove the
+                               * object-table entry (refcount-and-gc).  Rides the
+                               * same NS_TXN set as the binding drop and the FREEs of
+                               * the released object's owned runs, so the collection
+                               * is durable with the drop and replays on recovery. */
+};
+
+/* FACADE_LR_OBJ_REMOVE payload: the 16-byte id of the object to remove. */
+struct facade_lr_obj_remove {
+    uint8_t id[16];
 };
 
 /* FACADE_LR_NS op: a put installs key->value at revision; a delete removes key

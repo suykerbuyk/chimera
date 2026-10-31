@@ -37,6 +37,7 @@
 #include "facade_extent.h"
 #include "facade_log.h"
 #include "facade_object.h"
+#include "facade_ns.h"         /* refcount-and-gc: facade_ns_txn (collection path) */
 
 #define ONE_GIB (1ULL << 30)
 #define BS      CHIMERA_MEDIA_BLOCK_SIZE
@@ -250,6 +251,74 @@ ts_read_obj(
     evpl_iovec_release(t->evpl, &iov);
     return 1;
 } /* ts_read_obj */
+
+/* ---- refcount-and-gc: NS_TXN drivers (async on the crash-sim loopback) ---- */
+
+struct ns_w {
+    int                         done;
+    struct facade_ns_txn_result res;
+};
+
+static void
+ns_on_txn(
+    const struct facade_ns_txn_result *r,
+    void                              *priv)
+{
+    struct ns_w *w = priv;
+
+    w->res  = *r;
+    w->done = 1;
+} /* ns_on_txn */
+
+/* Bind an object: a CREATE delta drives refs 0 -> 1 (logs a survivor OBJ record
+ * in its own NS_TXN).  stamps must equal the object's (ts_write created it with
+ * zero stamps). */
+static uint32_t
+ts_bind(
+    struct ts                      *t,
+    const uint8_t                   id[16],
+    const struct chimera_sc_stamps *stamps)
+{
+    struct chimera_sc_delta       d;
+    struct chimera_sc_ns_txn_args args;
+    struct ns_w                   w;
+
+    memset(&d, 0, sizeof(d));
+    d.kind = CHIMERA_SC_DELTA_CREATE;
+    memcpy(d.create.obj.b, id, 16);
+    d.create.stamps = *stamps;
+    memset(&args, 0, sizeof(args));
+    args.deltas  = &d;
+    args.ndeltas = 1;
+    memset(&w, 0, sizeof(w));
+    facade_ns_txn(t->alloc, &args, ns_on_txn, &w);
+    pump(t->evpl, &w.done);
+    return w.res.status;
+} /* ts_bind */
+
+/* Delete a binding: a DELETE delta drives refs 1 -> 0, so the collection emits
+ * one FREE per owned run of the released object + an OBJ_REMOVE tombstone in the
+ * same NS_TXN durable set. */
+static uint32_t
+ts_delete_obj(
+    struct ts    *t,
+    const uint8_t id[16])
+{
+    struct chimera_sc_delta       d;
+    struct chimera_sc_ns_txn_args args;
+    struct ns_w                   w;
+
+    memset(&d, 0, sizeof(d));
+    d.kind = CHIMERA_SC_DELTA_DELETE;
+    memcpy(d.del.obj.b, id, 16);
+    memset(&args, 0, sizeof(args));
+    args.deltas  = &d;
+    args.ndeltas = 1;
+    memset(&w, 0, sizeof(w));
+    facade_ns_txn(t->alloc, &args, ns_on_txn, &w);
+    pump(t->evpl, &w.done);
+    return w.res.status;
+} /* ts_delete_obj */
 
 /* A park-aware id draw: on the async crash-sim fixture the first draw after an
  * open parks (id_next == id_floor until the floor-extension FUA lands), so the
@@ -500,11 +569,18 @@ main(void)
         ts_write(&t, id0, pat, sizeof(pat));
         gen_before = t.alloc->ckpt_generation;
 
-        /* Each write is a 3-record txn; log_nblocks is small, so a handful of
-        * writes forces at least one compaction (ckpt_generation advances). */
+        /* Each write is a 3-record txn; a run of log_nblocks + 4 writes forces at
+         * least one compaction (ckpt_generation advances).  The loop ids use a
+         * distinct 2-byte form ({0x01, i}) so they cannot collide with the
+         * single-byte id0 (0xC0) no matter how large log_nblocks is -- this image's
+         * log is 128 via the geometry CAP (refcount-and-gc raised the CAP and the
+         * gate ceiling 64->128; the geometry floor stayed 16), so the loop reaches
+         * i == 128, where a single-byte 0x40 + i would be 0xC0 and overwrite id0. */
         for (i = 0; i < (int) t.alloc->log_nblocks + 4; i++) {
             uint8_t fill[64];
-            mkid(idn, (uint8_t) (0x40 + i));
+            memset(idn, 0, 16);
+            idn[0] = 0x01;
+            idn[1] = (uint8_t) i;
             fillpat(fill, sizeof(fill), (uint8_t) (0x50 + i));
             ts_write(&t, idn, fill, sizeof(fill));
         }
@@ -593,6 +669,74 @@ main(void)
         CHECK(w != NULL && (w->flags & FACADE_OBJ_HELD));
         CHECK(ts_read_obj(&t, wid.b, rb, sizeof(patW)) == 1);
         CHECK(memcmp(rb, patW, sizeof(patW)) == 0);
+
+        ts_close_media(&t);
+    }
+
+    /* ---- F: refcount-and-gc -- a committed collection's FREE records and
+     * OBJ_REMOVE tombstone REPLAY across a crash before the next checkpoint
+     * (the unit's crash exit criterion; NOT the in-RAM empty-object tombstone
+     * test).  Write the target's data so ALLOC+OBJ are durably logged, bind it,
+     * then DELETE it so the collection emits FREE-per-owned-run + OBJ_REMOVE in
+     * one NS_TXN; crash before any checkpoint (a handful of txns forces none),
+     * recover, and assert the target is gone, its owned block is back in the
+     * free set (no double-free abort on replay), and a bound survivor is
+     * intact. ---- */
+    {
+        uint8_t                  tgt[16], surv[16];
+        uint64_t                 free0, free_after;
+        struct facade_extent     ext;
+        struct facade_obj       *o;
+        struct chimera_sc_stamps stamps;
+
+        mkid(tgt, 0xF1);
+        mkid(surv, 0xF2);
+        fillpat(pat, sizeof(pat), 0x41);
+        memset(&stamps, 0, sizeof(stamps));
+
+        ts_open_media(&t, dir, 6, 1, 0, 0);   /* keep-biased: durable records survive */
+        ts_format(&t);
+        ts_open(&t);
+        free0 = facade_alloc_free_blocks(t.alloc);   /* data region, nothing allocated */
+
+        /* target: durable data (ALLOC+OBJ logged), one owned data block, then bound. */
+        ts_write(&t, tgt, pat, sizeof(pat));
+        o = facade_obj_find(t.alloc, tgt);
+        CHECK(o != NULL && facade_extent_map_lookup(o->map, 0, &ext) &&
+              ext.kind == CHIMERA_SC_SEG_DATA && ext.owned);
+        CHECK(ts_bind(&t, tgt, &stamps) == CHIMERA_SC_OK);
+
+        /* survivor: durable data + bound; must remain after recovery. */
+        ts_write(&t, surv, pat, sizeof(pat));
+        CHECK(ts_bind(&t, surv, &stamps) == CHIMERA_SC_OK);
+        CHECK(facade_alloc_free_blocks(t.alloc) == free0 - 2);   /* two data blocks live */
+
+        /* DELETE the target: collection = FREE(tgt owned runs) + OBJ_REMOVE, one txn. */
+        CHECK(ts_delete_obj(&t, tgt) == CHIMERA_SC_OK);
+
+        /* Crash before any checkpoint, then recover + reopen: the committed
+         * collection replays (no compaction happened). */
+        ts_crash_recover(&t);
+        ts_reopen(&t);
+
+        /* target collected; survivor intact with its binding. */
+        CHECK(facade_obj_find(t.alloc, tgt) == NULL);
+        o = facade_obj_find(t.alloc, surv);
+        CHECK(o != NULL && o->refs == 1);
+        /* The target's owned block replayed into the free set: only the survivor's
+         * one block stays allocated.  (A leaked target would read free0 - 2; a
+         * double-free would have ABORTED recovery in facade_free_add, so reaching
+         * here proves no double-free.) */
+        free_after = facade_alloc_free_blocks(t.alloc);
+        CHECK(free_after == free0 - 1);
+
+        /* second open: the post-recovery checkpoint (empty log) is identical --
+         * target still gone, survivor still bound, free set unchanged. */
+        ts_reopen(&t);
+        CHECK(facade_obj_find(t.alloc, tgt) == NULL);
+        o = facade_obj_find(t.alloc, surv);
+        CHECK(o != NULL && o->refs == 1);
+        CHECK(facade_alloc_free_blocks(t.alloc) == free_after);
 
         ts_close_media(&t);
     }

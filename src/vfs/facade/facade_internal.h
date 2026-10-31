@@ -36,7 +36,7 @@ extern "C" {
  * long before the counter catches the floor.  Also the grow step the fresh
  * format seeds.
  */
-#define FACADE_ID_RESERVE            1024ULL
+#define FACADE_ID_RESERVE             1024ULL
 
 /* Prototype object-table budget: the maximum live objects and the maximum
  * extents per object the checkpoint, the log OBJ record and recovery are all
@@ -46,23 +46,50 @@ extern "C" {
  * (sizeof(facade_lr_hdr) + sizeof(facade_obj_rec) + CAP * sizeof(objext) <=
  * 4096), and an op that would exceed the cap is refused NO_SPACE-shaped rather
  * than corrupting the map. */
-#define FACADE_OBJ_BUDGET            256u
-#define FACADE_OBJ_MAX_EXT           64u
+#define FACADE_OBJ_BUDGET             256u
+#define FACADE_OBJ_MAX_EXT            64u
 
 /*
  * Namespace-record-store caps (v4).  A put/delete is one FACADE_LR_NS log block;
  * key + value stay well within one 4 KiB block (facade_lr_hdr 48 + facade_lr_ns
  * 24 + 256 + 512 = 840 <= 4096), so no multi-block record is ever needed.
- * FACADE_NS_MAX_TXN_LOG_BLOCKS bounds a whole NS transaction's log footprint
- * (NS records + OBJ records + COMMIT) to the raised log floor; the geometry's
- * log_nblocks floor is >= this, so any accepted txn fits an empty log.
+ * FACADE_NS_MAX_TXN_LOG_BLOCKS is the GATE CEILING on a whole NS transaction's
+ * log footprint (NS records + OBJ records + collection FREE/OBJ_REMOVE + COMMIT).
  * FACADE_NS_BUDGET is the full-size live/checkpoint record cap; it scales down on
  * a small media space (facade_compute_geometry, like obj_budget) into ns_budget.
  */
-#define FACADE_NS_MAX_KEY            256u
-#define FACADE_NS_MAX_VALUE          512u
-#define FACADE_NS_MAX_TXN_LOG_BLOCKS 16u
-#define FACADE_NS_BUDGET             256u
+#define FACADE_NS_MAX_KEY             256u
+#define FACADE_NS_MAX_VALUE           512u
+/* Raised (refcount-and-gc): a binding NS_TXN that RELEASES an object now also
+ * emits the collection in the SAME durable set -- one FACADE_LR_FREE per
+ * punch-reported owned run (<= FACADE_NS_MAX_TXN_COLLECT_EXT) plus one
+ * FACADE_LR_OBJ_REMOVE tombstone.  Worst case under the binding-ops cap:
+ * (nputs+ndeletes) + survivor-OBJ + FREE (<=64) + tombstones + COMMIT <= ~95, so
+ * this GATE CEILING is 128.  The geometry CAP (facade_compute_geometry) is raised
+ * to 128 too, so a large image (>= a few MiB, incl. every real >= 1 GiB media)
+ * gets a 128-block log and can collect a full-extent object inline.  A SMALL
+ * image keeps a proportionally smaller log (FACADE_LOG_MIN_BLOCKS floor) and
+ * formats normally; a release that would not fit its log is refused NO_SPACE at
+ * ns_txn_start -- the accepted small/old-image limitation (reformat on larger
+ * media to gain it).  Format version stays 5. */
+#define FACADE_NS_MAX_TXN_LOG_BLOCKS  128u
+/* Geometry log floor: a modest minimum so a tiny media space still formats (a
+ * 128-block floor would make the smallest formattable image ~140 blocks and
+ * break small allocator/NO_SPACE test fixtures).  Decoupled from the gate ceiling
+ * above: the CAP, not this floor, is what gives a real image its full 128-block
+ * log; this only keeps a small image's log sane. */
+#define FACADE_LOG_MIN_BLOCKS         16u
+/* The advertised contract binding-ops cap (r_limits.max_txn_ops), SPLIT from the
+ * log floor so raising the floor does not inflate the limit.  Stays 15 (today's
+ * effective FACADE_NS_MAX_TXN_LOG_BLOCKS-1).  facade_ns_txn refuses
+ * ncompares+nputs+ndeletes+ndeltas > this with CHIMERA_SC_E_INVALID. */
+#define FACADE_SC_MAX_TXN_OPS         15u
+/* Max total punch-reported OWNED RUNS one NS_TXN may collect inline (one run =
+ * one FACADE_LR_FREE; not blocks, not per-object).  Enforced in ns_evaluate
+ * (post-staging), where the extent maps are visible; the pre-slot gate carries
+ * it only as a map-blind worst-case reservation. */
+#define FACADE_NS_MAX_TXN_COLLECT_EXT FACADE_OBJ_MAX_EXT
+#define FACADE_NS_BUDGET              256u
 
 /*
  * One in-memory namespace record.  The store is a sorted array of these ordered
@@ -346,6 +373,17 @@ void
 facade_obj_remove(
     struct facade_alloc *alloc,
     struct facade_obj   *o);
+
+/* facade_ns.c (refcount-and-gc): override the retention lapse clock, a SEPARATE
+ * CLOCK_REALTIME seam from the monotonic lease clock (facade_sc_backend.c) so a
+ * test can drive retention lapse deterministically without moving the lease.
+ * fn(arg) returns nanoseconds on the CLOCK_REALTIME domain; fn == NULL restores
+ * the default clock_gettime(CLOCK_REALTIME).  Process-global; a test sets it,
+ * runs, and clears it. */
+void
+facade_ns_set_retention_clock(
+    uint64_t ( *fn )(void *arg),
+    void       *arg);
 
 /* facade_ns.c: namespace record store helpers used by facade_alloc.c (checkpoint
  * (de)serialize, teardown) and facade_recover.c (log replay).  The contract-typed

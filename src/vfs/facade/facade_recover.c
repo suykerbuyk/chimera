@@ -43,6 +43,8 @@ struct rec_entry {
     uint32_t                  ns_klen;
     uint8_t                  *ns_val;
     uint32_t                  ns_vlen;
+    /* OBJ_REMOVE payload (refcount-and-gc): the 16-byte id to collect. */
+    uint8_t                   rm_id[16];
 };
 
 struct facade_recover_ctx {
@@ -162,6 +164,16 @@ facade_recover_parse(
             }
             break;
         }
+        case FACADE_LR_OBJ_REMOVE: {
+            struct facade_lr_obj_remove rm;
+
+            if (hdr.len < sizeof(rm)) {
+                return 0;
+            }
+            memcpy(&rm, payload, sizeof(rm));
+            memcpy(e->rm_id, rm.id, sizeof(e->rm_id));
+            break;
+        }
         case FACADE_LR_COMMIT:
             break;   /* no fields needed beyond seq/txn */
         default:
@@ -256,6 +268,20 @@ facade_recover_apply(struct facade_recover_ctx *c)
                     return;
                 }
                 break;
+            case FACADE_LR_OBJ_REMOVE: {
+                /* refcount-and-gc: collect the object the committed NS_TXN
+                 * released.  Its owned blocks are freed by the FACADE_LR_FREE
+                 * records of the same txn (above); this drops the table entry,
+                 * matching ns_txn_apply_commit's facade_obj_remove on the live
+                 * path.  Guard a missing slot (a prior checkpoint may already
+                 * exclude it) so replay never derefs NULL. */
+                struct facade_obj *o = facade_obj_find(a, e->rm_id);
+
+                if (o) {
+                    facade_obj_remove(a, o);
+                }
+                break;
+            }
             case FACADE_LR_NS:
                 if (e->ns_op == FACADE_LR_NS_PUT) {
                     if (facade_ns_apply_put(a, e->ns_key, e->ns_klen,

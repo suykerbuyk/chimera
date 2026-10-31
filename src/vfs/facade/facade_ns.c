@@ -15,17 +15,22 @@
  * in the COMMIT-durable callback, so a crash with no COMMIT leaves memory at the
  * pre-transaction baseline (recovery drops a COMMIT-less txn).
  *
- * Object binding deltas drive a MINIMAL 0<->1 refcount (full refcount-and-gc is a
- * deferred unit).  A delta that releases an object (DELETE, REPLACE's old side)
- * removes it in memory on commit and returns its owned blocks to the free set;
- * crash-window reclamation rides on the existing epoch-held GC at re-ATTACH (the
- * released object is open and unheld), as the HOLD slice did.
+ * Object binding deltas drive a 0<->1 refcount (refcount-and-gc; hard links / an
+ * N-way counter are deferred to S8).  A delta that releases an object (DELETE,
+ * REPLACE's old side) COLLECTS it crash-durably: the SAME NS_TXN durable set
+ * carries one FACADE_LR_FREE per punch-reported owned run of the released object
+ * plus one FACADE_LR_OBJ_REMOVE tombstone, so the collection commits with the
+ * binding drop and replays on recovery -- ns_txn_apply_commit's in-memory
+ * punch+free+remove is then just the live application of records that are already
+ * durable.  A DELETE/REPLACE of a retention-locked object is refused with
+ * CHIMERA_SC_E_RETENTION_LOCKED before anything is staged or emitted.
  *
  * Links no libevpl; all media I/O is through the facade_media_* helpers.
  */
 
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "common/macros.h"
 #include "facade_internal.h"
@@ -34,6 +39,66 @@
 #include "facade_object.h"
 #include "facade_super.h"
 #include "media_types.h"
+
+/* ================================================================== */
+/* refcount-and-gc: retention lapse clock + snapshot-pin hook         */
+/* ================================================================== */
+
+/* Retention lapse clock: a SEPARATE CLOCK_REALTIME seam from the monotonic lease
+ * clock (facade_sc_backend.c), so moving the lease in a test never moves
+ * retention and vice versa.  NULL => clock_gettime(CLOCK_REALTIME). */
+static uint64_t (*g_retention_now_ns)(
+    void *arg);
+static void    *g_retention_now_arg;
+
+SYMBOL_EXPORT void
+facade_ns_set_retention_clock(
+    uint64_t ( *fn )(void *arg),
+    void       *arg)
+{
+    g_retention_now_ns  = fn;
+    g_retention_now_arg = arg;
+} /* facade_ns_set_retention_clock */
+
+static uint64_t
+ns_retention_now_ns(void)
+{
+    struct timespec ts;
+
+    if (g_retention_now_ns) {
+        return g_retention_now_ns(g_retention_now_arg);
+    }
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t) ts.tv_sec * 1000000000ULL + (uint64_t) ts.tv_nsec;
+} /* ns_retention_now_ns */
+
+/* D8 retention/immutability lock, MODE-FIRST (operator-confirmed): locked iff
+ * mode == LOCKED and (until_ns == 0 [indefinite] or now < until_ns).  NONE is
+ * never locked.  A locked object refuses DELETE/REPLACE (collection) up front. */
+static int
+ns_retention_locked(
+    uint32_t mode,
+    uint64_t until_ns)
+{
+    if (mode != CHIMERA_SC_RETENTION_LOCKED) {
+        return 0;
+    }
+    return until_ns == 0 || ns_retention_now_ns() < until_ns;
+} /* ns_retention_locked */
+
+/* E9 snapshot-pin hook (snapshot pins do not exist yet): a snapshot-pinned object
+ * keeps its storage when its last binding drops.  Stub returns 0 (not pinned), so
+ * a release collects as normal; E9 fills this in without re-touching the release
+ * path. */
+static int
+ns_snapshot_pinned(
+    struct facade_alloc            *a,
+    const struct chimera_sc_obj_id *id)
+{
+    (void) a;
+    (void) id;
+    return 0;
+} /* ns_snapshot_pinned */
 
 /* ================================================================== */
 /* key order + sorted-array store                                     */
@@ -529,9 +594,16 @@ struct ns_stage_obj {
     struct chimera_sc_stamps stamps;
 };
 
-/* one record to emit, in order (NS records, then OBJ records, then COMMIT). */
+/* one record to emit, in order (before the COMMIT the append machine adds). */
+enum ns_emit_kind {
+    NS_EMIT_NS = 0,      /* FACADE_LR_NS put/delete (calloc default) */
+    NS_EMIT_OBJ,         /* FACADE_LR_OBJ survivor record */
+    NS_EMIT_FREE,        /* FACADE_LR_FREE: one punch-reported owned run */
+    NS_EMIT_OBJ_REMOVE,  /* FACADE_LR_OBJ_REMOVE: collect a released object */
+};
+
 struct ns_emit {
-    int            is_obj;
+    int            kind;   /* enum ns_emit_kind */
     /* NS record */
     uint32_t       op;
     const uint8_t *key;
@@ -542,6 +614,11 @@ struct ns_emit {
     /* OBJ record */
     void          *payload;
     uint32_t       len;
+    /* FREE record (refcount-and-gc) */
+    uint64_t       free_start;
+    uint64_t       free_nblocks;
+    /* OBJ_REMOVE record (refcount-and-gc) */
+    uint8_t        rm_id[16];
 };
 
 struct ns_txn_ctx {
@@ -680,11 +757,20 @@ ns_apply_delta(
             if (od->refs != 1) {
                 return CHIMERA_SC_E_STATE;
             }
-            nw->refs     = 1;
-            nw->changed  = 1;
-            od->refs     = 0;
-            od->present  = 0;
-            od->released = 1;
+            /* D8: refuse collecting a retention-locked object BEFORE emit, so the
+             * binding change is not staged either (a punch-time skip would be too
+             * late -- the NS record would already be in the durable set). */
+            if (ns_retention_locked(od->ret_mode, od->ret_until)) {
+                return CHIMERA_SC_E_RETENTION_LOCKED;
+            }
+            nw->refs    = 1;
+            nw->changed = 1;
+            od->refs    = 0;
+            od->present = 0;
+            /* E9 hook: a snapshot-pinned object keeps its storage when its last
+             * binding drops (collected later when unpinned).  Stub is always 0, so
+             * the release collects now. */
+            od->released = ns_snapshot_pinned(c->a, &d->replace.old_obj) ? 0 : 1;
             return CHIMERA_SC_OK;
         }
         case CHIMERA_SC_DELTA_DELETE: {
@@ -696,9 +782,12 @@ ns_apply_delta(
             if (st->refs != 1) {
                 return CHIMERA_SC_E_STATE;
             }
+            if (ns_retention_locked(st->ret_mode, st->ret_until)) {
+                return CHIMERA_SC_E_RETENTION_LOCKED;   /* D8, before emit */
+            }
             st->refs     = 0;
             st->present  = 0;
-            st->released = 1;
+            st->released = ns_snapshot_pinned(c->a, &d->del.obj) ? 0 : 1;
             return CHIMERA_SC_OK;
         }
         case CHIMERA_SC_DELTA_SEAL: {
@@ -781,9 +870,9 @@ ns_build_obj_payload(
     hdr.retention_mode     = st->ret_mode;
     hdr.retention_until_ns = st->ret_until;
 
-    e->is_obj = 1;
-    e->len    = (uint32_t) (sizeof(hdr) + (uint64_t) hdr.nextents
-                            * sizeof(struct facade_ckpt_objext));
+    e->kind = NS_EMIT_OBJ;
+    e->len  = (uint32_t) (sizeof(hdr) + (uint64_t) hdr.nextents
+                          * sizeof(struct facade_ckpt_objext));
     e->payload = calloc(1, e->len ? e->len : 1);
     FACADE_CHECK(e->payload != NULL, "oom ns obj payload");
     memcpy(e->payload, &hdr, sizeof(hdr));
@@ -824,6 +913,37 @@ ns_delta_targets_sealing(
         default:                       return 0;   /* advisory: mutates no object */
     } /* switch */
 } /* ns_delta_targets_sealing */
+
+/* refcount-and-gc: enumerate a released object's PUNCH-REPORTED OWNED RUNS -- one
+ * per owned extent-map record (borrowed clone extents belong to the origin and
+ * are never freed, matching facade_report_freed's owned-only rule).  On the count
+ * pass (c == NULL) it only tallies; on the emit pass it appends one NS_EMIT_FREE
+ * per owned run.  The same runs facade_extent_map_punch frees in
+ * ns_txn_apply_commit, so the logged FREEs and the live free agree. */
+struct ns_free_emit {
+    struct ns_txn_ctx *c;     /* NULL => count only */
+    uint32_t           runs;
+};
+
+static void
+ns_release_owned_run_cb(
+    const struct facade_extent *rec,
+    void                       *priv)
+{
+    struct ns_free_emit *fe = priv;
+
+    if (!rec->owned) {
+        return;
+    }
+    if (fe->c) {
+        struct ns_emit *e = &fe->c->emit[fe->c->nemit++];
+
+        e->kind         = NS_EMIT_FREE;
+        e->free_start   = rec->phys_block;
+        e->free_nblocks = rec->nblocks;
+    }
+    fe->runs++;
+} /* ns_release_owned_run_cb */
 
 /* Evaluate the whole transaction into the staged state and the emit list.
  * Returns CHIMERA_SC_OK (emit list built, nothing applied to live yet) or an
@@ -896,7 +1016,35 @@ ns_evaluate(struct ns_txn_ctx *c)
         return CHIMERA_SC_E_NO_SPACE;
     }
 
-    /* 5. build the emit list: NS records, then OBJ records for survivors. */
+    /* 4b. collect-extent cap (refcount-and-gc): the EXACT check, here (not the
+     * map-blind pre-slot gate) because the released objects' extent maps are only
+     * visible after staging.  Sum the owned runs to be freed across every released
+     * object; a txn that would emit more than FACADE_NS_MAX_TXN_COLLECT_EXT FREE
+     * records is refused NO_SPACE with nothing emitted (the emit list is not even
+     * allocated yet). */
+    {
+        uint32_t collect_runs = 0;
+
+        for (i = 0; i < c->nstage; i++) {
+            if (c->stage[i].released) {
+                struct facade_obj  *o  = facade_obj_find(c->a, c->stage[i].id);
+                struct ns_free_emit fe = { NULL, 0 };
+
+                if (o) {
+                    facade_extent_map_foreach(o->map, ns_release_owned_run_cb, &fe);
+                }
+                collect_runs += fe.runs;
+            }
+        }
+        if (collect_runs > FACADE_NS_MAX_TXN_COLLECT_EXT) {
+            c->res.r_failed_part  = CHIMERA_SC_TXN_DELTA;
+            c->res.r_failed_index = 0;
+            return CHIMERA_SC_E_NO_SPACE;
+        }
+    }
+
+    /* 5. build the emit list: NS records, then OBJ records for survivors, then
+     * for each released object its owned-run FREEs + an OBJ_REMOVE tombstone. */
     c->emit = calloc(c->max_recs, sizeof(*c->emit));
     FACADE_CHECK(c->emit != NULL, "oom ns emit list");
 
@@ -925,9 +1073,24 @@ ns_evaluate(struct ns_txn_ctx *c)
         if (c->stage[i].changed && c->stage[i].present) {
             ns_build_obj_payload(c, &c->stage[i], &c->emit[c->nemit++]);
             obj_n++;
+        } else if (c->stage[i].released) {
+            /* refcount-and-gc: one FREE per owned run, then the tombstone. */
+            struct facade_obj  *o  = facade_obj_find(c->a, c->stage[i].id);
+            struct ns_free_emit fe = { c, 0 };
+            struct ns_emit     *rm;
+
+            if (o) {
+                facade_extent_map_foreach(o->map, ns_release_owned_run_cb, &fe);
+            }
+            rm       = &c->emit[c->nemit++];
+            rm->kind = NS_EMIT_OBJ_REMOVE;
+            memcpy(rm->rm_id, c->stage[i].id, sizeof(rm->rm_id));
         }
     }
-    FACADE_CHECK(c->nemit <= c->max_recs, "ns emit overflow");
+    /* nrecs = nemit + 1 (the COMMIT the append machine adds) must fit the bound
+     * the pre-slot gate reserved, so a miscount cannot pass the gate and then
+     * overflow the log at append (facade_ns.c ns_txn_append_next FACADE_CHECK). */
+    FACADE_CHECK(c->nemit + 1u <= c->max_recs, "ns emit overflow");
     (void) obj_n;
     return CHIMERA_SC_OK;
 } /* ns_evaluate */
@@ -949,11 +1112,13 @@ ns_txn_apply_commit(struct ns_txn_ctx *c)
     struct facade_alloc *a = c->a;
     uint32_t             i;
 
-    /* NS record puts/deletes. */
+    /* NS record puts/deletes.  OBJ / FREE / OBJ_REMOVE emit entries are applied
+     * by the staged-object loop below (survivor scalar writes, punch+free+remove
+     * for released objects), not here. */
     for (i = 0; i < c->nemit; i++) {
         struct ns_emit *e = &c->emit[i];
 
-        if (e->is_obj) {
+        if (e->kind != NS_EMIT_NS) {
             continue;
         }
         if (e->op == FACADE_LR_NS_PUT) {
@@ -1067,9 +1232,20 @@ ns_txn_append_next(struct ns_txn_ctx *c)
     if (c->cur < c->nemit) {
         struct ns_emit *e = &c->emit[c->cur];
 
-        if (e->is_obj) {
+        if (e->kind == NS_EMIT_OBJ) {
             facade_lr_build(c->rec_buf, FACADE_LR_OBJ, seq, c->txn_id,
                             e->payload, e->len);
+        } else if (e->kind == NS_EMIT_FREE) {
+            struct facade_lr_alloc fr = { e->free_start, e->free_nblocks };
+
+            facade_lr_build(c->rec_buf, FACADE_LR_FREE, seq, c->txn_id,
+                            &fr, (uint32_t) sizeof(fr));
+        } else if (e->kind == NS_EMIT_OBJ_REMOVE) {
+            struct facade_lr_obj_remove rm;
+
+            memcpy(rm.id, e->rm_id, sizeof(rm.id));
+            facade_lr_build(c->rec_buf, FACADE_LR_OBJ_REMOVE, seq, c->txn_id,
+                            &rm, (uint32_t) sizeof(rm));
         } else {
             uint8_t             payload[sizeof(struct facade_lr_ns)
                                         + FACADE_NS_MAX_KEY + FACADE_NS_MAX_VALUE];
@@ -1247,10 +1423,34 @@ facade_ns_txn(
         }
     }
 
-    /* Upper bound on log blocks: NS records + at most two OBJ records per delta
-     * + COMMIT.  The gate and G1 use this bound (the object-txn pattern). */
+    /* Binding-ops cap (refcount-and-gc, split from the log floor): the advertised
+     * r_limits.max_txn_ops.  Exceeding a declared limit is E_INVALID, not
+     * NO_SPACE (contract sc_types.h). */
+    if ((uint64_t) args->ncompares + args->nputs + args->ndeletes + args->ndeltas
+        > FACADE_SC_MAX_TXN_OPS) {
+        bad.status        = CHIMERA_SC_E_INVALID;
+        bad.r_failed_part = CHIMERA_SC_TXN_DELTA;
+        cb(&bad, private_data);
+        return;
+    }
+
+    /* Map-blind pre-slot upper bound on log blocks: NS records + at most two OBJ
+     * records per delta (survivor + released-side) + COMMIT, PLUS, ONLY when the
+     * txn carries a delta that can RELEASE an object (DELETE or REPLACE), the
+     * worst-case collection reservation FACADE_NS_MAX_TXN_COLLECT_EXT (one FREE
+     * per owned run; the exact run total is only knowable post-staging, where
+     * ns_evaluate enforces it).  A non-releasing txn (puts/deletes only, or
+     * CREATE/SEAL/RETAG/HOLD/UNHOLD/RECALL_HINT deltas) reserves nothing for
+     * collection, so it still fits a small log.  The gate and G1 use this bound. */
     max_recs = (uint64_t) args->nputs + args->ndeletes
         + (uint64_t) args->ndeltas * 2u + 1u;
+    for (i = 0; i < args->ndeltas; i++) {
+        if (args->deltas[i].kind == CHIMERA_SC_DELTA_DELETE ||
+            args->deltas[i].kind == CHIMERA_SC_DELTA_REPLACE) {
+            max_recs += FACADE_NS_MAX_TXN_COLLECT_EXT;
+            break;
+        }
+    }
     if (max_recs > FACADE_NS_MAX_TXN_LOG_BLOCKS) {
         bad.status        = CHIMERA_SC_E_NO_SPACE;
         bad.r_failed_part = CHIMERA_SC_TXN_PUT;

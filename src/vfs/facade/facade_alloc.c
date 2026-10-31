@@ -1075,13 +1075,31 @@ facade_compute_geometry(struct facade_alloc *a)
     /* Log region: a modest span, small enough that a prototype test can fill it
      * to force a compaction, large enough for ordinary bursts. */
     a->log_nblocks = a->nblocks / 16;
-    if (a->log_nblocks > 64) {
-        a->log_nblocks = 64;
+    if (a->log_nblocks > 128) {
+        /* Cap raised 64->128 (refcount-and-gc).  log_nblocks is nblocks/16
+         * clamped to [FACADE_LOG_MIN_BLOCKS, 128].  A full inline collect of a
+         * max-extent object is 1 NS delete + FACADE_OBJ_MAX_EXT (64) FREE + 1
+         * OBJ_REMOVE + 1 COMMIT = 67 records (pre-slot bound 68), and ns_txn_start
+         * refuses a txn whose max_recs exceeds this image's log_nblocks.  So a full
+         * collect needs log_nblocks >= ~68, i.e. nblocks/16 >= ~68 -> an image of
+         * about >= 8.5 MiB.  ACCEPTED LIMITATION: any image smaller than ~8.5 MiB
+         * (new or old) -- which gets a 16..67-block log -- refuses an over-budget
+         * collect with NO_SPACE (never half-applied); a 4 MiB image gets a 64-block
+         * log and NO_SPACEs a 64-extent collect.  Real backend media is >= 1 GiB
+         * (E14 loopback spec), always clamped to the full 128-block log, so the
+         * prototype's own media is unaffected -- only sub-8.5-MiB images (mostly
+         * small test fixtures) hit it.  A smaller object (fewer owned runs) collects
+         * on a proportionally smaller log. */
+        a->log_nblocks = 128;
     }
-    if (a->log_nblocks < FACADE_NS_MAX_TXN_LOG_BLOCKS) {
-        /* Floor raised (M1): a namespace transaction may emit up to
-         * FACADE_NS_MAX_TXN_LOG_BLOCKS records, and must fit an empty log. */
-        a->log_nblocks = FACADE_NS_MAX_TXN_LOG_BLOCKS;
+    if (a->log_nblocks < FACADE_LOG_MIN_BLOCKS) {
+        /* Modest floor so a tiny media space still FORMATS (a 128-block floor would
+         * make the smallest formattable image ~140 blocks and break small
+         * allocator/NO_SPACE test fixtures).  DECOUPLED from the gate ceiling
+         * FACADE_NS_MAX_TXN_LOG_BLOCKS: the cap above, not this floor, is what
+         * affords a large image its full 128-block log; this only keeps a tiny
+         * image's log sane, and its over-budget collects NO_SPACE as above. */
+        a->log_nblocks = FACADE_LOG_MIN_BLOCKS;
     }
 
     a->ckpt_a_block = FACADE_SUPER_BLOCK + 1;

@@ -137,7 +137,7 @@ fsb_attach_finish(
     a->r_lease_ns         = FSB_LEASE_NS;
     a->r_durability_epoch = facade_alloc_power_loss_generation(s->alloc);
     memset(&a->r_limits, 0, sizeof(a->r_limits));
-    a->r_limits.max_txn_ops   = FACADE_NS_MAX_TXN_LOG_BLOCKS - 1u; /* records + COMMIT */
+    a->r_limits.max_txn_ops   = FACADE_SC_MAX_TXN_OPS; /* split from the log floor (refcount-and-gc) */
     a->r_limits.max_key_len   = FACADE_NS_MAX_KEY;
     a->r_limits.max_value_len = FACADE_NS_MAX_VALUE;
     a->r_limits.max_io        = CHIMERA_MEDIA_BLOCK_SIZE;
