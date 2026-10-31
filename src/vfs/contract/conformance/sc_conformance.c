@@ -859,6 +859,67 @@ chimera_sc_oblig_txn_atomic_across_crash(struct chimera_sc_conformance_ctx *ctx)
 } /* chimera_sc_oblig_txn_atomic_across_crash */
 
 SYMBOL_EXPORT enum chimera_sc_conf_result
+chimera_sc_oblig_txn_delta_atomic_across_crash(struct chimera_sc_conformance_ctx *ctx)
+{
+    struct chimera_sc_obj_id    id;
+    struct chimera_sc_conf_call tx, gk;
+    struct chimera_sc_record    put;
+    struct chimera_sc_delta     d;
+    uint8_t rbuf[8];
+    uint32_t rlen = 0;
+    uint32_t status;
+    static const uint8_t key[] = "txn/delta/k";
+    static const uint8_t val[] = "dval";
+
+    if (!ctx->fixture->crash || !ctx->fixture->recover) {
+        return CHIMERA_SC_CONF_SKIP;
+    }
+
+    /* A SINGLE binding txn, with NO 2-PUT arm ahead of it, so the binding
+     * delta's durability is the SOLE thing a crash can tear (the put-tear needs
+     * nputs>1, which this never has).  This is the dedicated negative arm for
+     * "commits the deltas separately": a backend that makes the key PUT durable
+     * but the CREATE delta's refcount change non-durable is caught here, where
+     * the deepened txn_atomic_across_crash would short-circuit at its 2-PUT arm
+     * first and never reach a delta.  Contract surface only. */
+    CHIMERA_SC_EXPECT_STATUS(ctx, conf_obj_create(ctx, &id), CHIMERA_SC_OK);
+
+    memset(&put, 0, sizeof(put));
+    put.key.data   = key;
+    put.key.len    = sizeof(key) - 1;
+    put.value.data = val;
+    put.value.len  = sizeof(val) - 1;
+    memset(&d, 0, sizeof(d));
+    d.kind       = CHIMERA_SC_DELTA_CREATE;
+    d.create.obj = id;                /* create.stamps stays zero == OBJ_CREATE's */
+    chimera_sc_conf_call_init(&tx, ctx, CHIMERA_SC_OP_NS_TXN);
+    tx.req.ns_txn.puts    = &put;
+    tx.req.ns_txn.nputs   = 1;
+    tx.req.ns_txn.deltas  = &d;
+    tx.req.ns_txn.ndeltas = 1;
+    chimera_sc_conf_run(&tx);
+    CHIMERA_SC_EXPECT_STATUS(ctx, tx.req.status, CHIMERA_SC_OK);
+
+    CHIMERA_SC_EXPECT(ctx, ctx->fixture->crash(ctx->priv) == 0, "crash hook failed");
+    CHIMERA_SC_EXPECT(ctx, ctx->fixture->recover(ctx->priv) == 0, "recover hook failed");
+    status = chimera_sc_conf_attach(ctx, CHIMERA_SC_CONTRACT_MAJOR, CHIMERA_SC_CONTRACT_MINOR);
+    CHIMERA_SC_EXPECT_STATUS(ctx, status, CHIMERA_SC_OK);
+
+    /* A committed binding is atomic and durable -- the key AND the
+     * referenced object both survive a crash, or neither does.  A torn (separately-committed)
+     * delta leaves NS_GET(key)=OK but OBJ_READ(id)=E_NOT_FOUND -> CONF_FAIL. */
+    chimera_sc_conf_call_init(&gk, ctx, CHIMERA_SC_OP_NS_GET);
+    gk.req.ns_get.key.data = key;
+    gk.req.ns_get.key.len  = sizeof(key) - 1;
+    chimera_sc_conf_run(&gk);
+    CHIMERA_SC_EXPECT_STATUS(ctx, gk.req.status, CHIMERA_SC_OK);
+    CHIMERA_SC_EXPECT_STATUS(ctx, conf_obj_read(ctx, &id, 1, rbuf, sizeof(rbuf), &rlen),
+                             CHIMERA_SC_OK);
+
+    return CHIMERA_SC_CONF_PASS;
+} /* chimera_sc_oblig_txn_delta_atomic_across_crash */
+
+SYMBOL_EXPORT enum chimera_sc_conf_result
 chimera_sc_oblig_ns_get_byte_lifetime(struct chimera_sc_conformance_ctx *ctx)
 {
     struct chimera_sc_conf_call get;

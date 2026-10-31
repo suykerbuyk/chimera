@@ -29,7 +29,10 @@
 struct scf_obj {
     int                      used;
     struct chimera_sc_obj_id id;
-    uint32_t                 refs;          /* 0 or 1 */
+    uint32_t                 refs;          /* 0 or 1 (live binding refcount) */
+    uint32_t                 durable_refs;  /* 0 or 1: refs that would survive a crash
+                                             * (durable shadow; split_txn leaves it behind
+                                             * the live refs to tear a binding delta) */
     uint32_t                 held;          /* 0 or 1 */
     uint32_t                 state;         /* enum chimera_sc_obj_state */
     uint64_t                 creator_epoch;
@@ -249,6 +252,8 @@ scf_obj_create(
     memset(o, 0, sizeof(*o));
     o->used          = 1;
     o->state         = CHIMERA_SC_OBJ_OPEN;
+    o->refs          = 0;
+    o->durable_refs  = 0;   /* never-referenced until a CREATE/REPLACE binds it */
     o->creator_epoch = req->caller.fence_epoch;
     memset(&o->id, 0, sizeof(o->id));
     memcpy(o->id.b, &s->next_id, sizeof(s->next_id));
@@ -404,6 +409,17 @@ scf_delta_precondition(
                 return CHIMERA_SC_E_STATE;
             }
             return CHIMERA_SC_OK;
+        case CHIMERA_SC_DELTA_REPLACE: {
+            /* REPLACE (sc_request.h:147-152): new side 0 -> 1 (precondition refs 0),
+             * old side 1 -> 0 (precondition refs 1). */
+            struct scf_obj *n = scf_obj_find(s, &d->replace.new_obj);
+
+            o = scf_obj_find(s, &d->replace.old_obj);
+            if (!o || o->refs != 1 || !n || n->refs != 0) {
+                return CHIMERA_SC_E_STATE;
+            }
+            return CHIMERA_SC_OK;
+        }
         case CHIMERA_SC_DELTA_RECALL_HINT:
             return CHIMERA_SC_OK;   /* advisory; always accepted */
         default:
@@ -417,6 +433,12 @@ scf_delta_apply(
     const struct chimera_sc_delta *d)
 {
     struct scf_obj *o;
+    /* Under split_txn a binding delta's refcount change is acknowledged but
+     * NOT made durable -- leave durable_refs at its pre-txn value so the crash
+     * rollback (scf_crash) undoes the ref change while any companion PUT stays
+     * durable, tearing the transaction on the DELTA path.  Honest advances
+     * durable_refs with refs, so the rollback is a no-op. */
+    int             durable = (s->profile != CHIMERA_SC_FIXTURE_SPLIT_TXN);
 
     switch (d->kind) {
         case CHIMERA_SC_DELTA_HOLD:
@@ -430,12 +452,36 @@ scf_delta_apply(
         case CHIMERA_SC_DELTA_CREATE:
             o       = scf_obj_find(s, &d->create.obj);
             o->refs = 1;
+            if (durable) {
+                o->durable_refs = o->refs;   /* honest: 1 survives the crash */
+            }
             break;
         case CHIMERA_SC_DELTA_DELETE:
             o       = scf_obj_find(s, &d->del.obj);
             o->refs = 0;
-            o->used = 0;   /* released */
+            /* Do NOT release here -- leave used=1 so the object still exists
+             * at crash time; the crash sweep releases it AFTER rolling refs back
+             * to durable_refs (honest: 0 -> released; torn: 1 -> resurrected).
+             * The DELETE (and REPLACE-old) tear path is symmetric with the torn
+             * CREATE, but only the CREATE-delta arm is exercised in CI today (the
+             * dedicated obligation uses CREATE); honest-path deferred-release
+             * fidelity for DELETE/REPLACE-old is not yet covered. */
+            if (durable) {
+                o->durable_refs = o->refs;   /* honest: 0 -> swept at crash */
+            }
             break;
+        case CHIMERA_SC_DELTA_REPLACE: {
+            struct scf_obj *n = scf_obj_find(s, &d->replace.new_obj);
+
+            o       = scf_obj_find(s, &d->replace.old_obj);
+            n->refs = 1;
+            o->refs = 0;     /* old released at crash (used stays 1, like DELETE) */
+            if (durable) {
+                n->durable_refs = n->refs;   /* new: 1 survives */
+                o->durable_refs = o->refs;   /* old: 0 -> swept */
+            }
+            break;
+        }
         default:
             break;         /* RECALL_HINT: nothing to apply */
     } /* switch */
@@ -538,10 +584,13 @@ scf_ns_txn(
             memcpy(rec->val, p->value.data, p->value.len);
         }
         rec->revision = ++s->revision;
-        /* split_txn: the last put of a multi-put transaction is left
-         * non-durable, so a crash drops it and tears the transaction. */
+        /* split_txn put-tear: the last put of a DELTA-FREE multi-put transaction
+         * is left non-durable, so a crash drops it and tears the transaction
+         * (the 2-PUT arm).  A txn carrying a binding delta is torn on the
+         * DELTA path instead (scf_delta_apply), never the put -- so the two tears
+         * are mutually exclusive and a delta txn's puts stay durable. */
         rec->durable = !(s->profile == CHIMERA_SC_FIXTURE_SPLIT_TXN &&
-                         txn->nputs > 1 && i == txn->nputs - 1);
+                         txn->ndeltas == 0 && txn->nputs > 1 && i == txn->nputs - 1);
     }
 
     txn->r_revision = s->revision;
@@ -826,8 +875,18 @@ scf_crash(void *backend_private)
         if (!o->used) {
             continue;
         }
+        /* A binding delta's refcount change that was not made durable rolls
+         * back here (honest: durable_refs == refs, a no-op; split_txn torn: the
+         * live refs change is undone).  THEN the released set is swept, so a torn
+         * CREATE drops to refs 0 -> released, and a torn DELETE restores refs 1
+         * -> resurrected -- either way the object disagrees with its (durable)
+         * binding record.  The torn CREATE is caught by the dedicated obligation
+         * chimera_sc_oblig_txn_delta_atomic_across_crash (NS_GET=OK while
+         * OBJ_READ=NOT_FOUND); txn_atomic_across_crash cannot catch it under
+         * split_txn -- it dies at its leading 2-PUT put-tear first. */
+        o->refs = o->durable_refs;
         if (o->refs == 0 && o->held == 0) {
-            o->used = 0;                 /* epoch-held: released with the epoch */
+            o->used = 0;                 /* never-referenced: released with the epoch */
         } else {
             o->size = o->durable_size;   /* non-durable writes are lost */
         }

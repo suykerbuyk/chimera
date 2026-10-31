@@ -265,6 +265,12 @@ main(void)
     test_obligation(evpl, "txn_atomic_across_crash",
                     chimera_sc_oblig_txn_atomic_across_crash,
                     CHIMERA_SC_FIXTURE_SPLIT_TXN);
+    /* Dedicated delta negative arm: no 2-PUT arm precedes the binding delta, so
+    * under SPLIT_TXN the torn delta is the SOLE failure (NS_GET=OK but
+    * OBJ_READ=NOT_FOUND).  Honest PASS / split FAIL, like the sibling above. */
+    test_obligation(evpl, "txn_delta_atomic_across_crash",
+                    chimera_sc_oblig_txn_delta_atomic_across_crash,
+                    CHIMERA_SC_FIXTURE_SPLIT_TXN);
     test_obligation(evpl, "ns_get_byte_lifetime",
                     chimera_sc_oblig_ns_get_byte_lifetime,
                     CHIMERA_SC_FIXTURE_S11_CHEAT);

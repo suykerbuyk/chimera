@@ -8,8 +8,14 @@
  * file:
  *
  *   - chimera_sc_oblig_trivial_roundtrip     (NS_TXN put + NS_GET round trip)
- *   - chimera_sc_oblig_txn_atomic_across_crash (a 2-put NS_TXN is all-or-
- *                                             nothing across crash + recover)
+ *   - chimera_sc_oblig_txn_atomic_across_crash (a committed NS_TXN survives
+ *                                             a crash in full; object-binding
+ *                                             deltas + rename-replace + CAS)
+ *   - chimera_sc_oblig_txn_delta_atomic_across_crash (a single binding delta txn
+ *                                             survives in full -- key and
+ *                                             object reference both, or
+ *                                             neither; the dedicated
+ *                                             separate-commit arm)
  *   - chimera_sc_oblig_ns_get_byte_lifetime  (NS_GET bytes valid through
  *                                             complete())
  *
@@ -153,6 +159,8 @@ main(void)
     run_case(&fx, "trivial_roundtrip", chimera_sc_oblig_trivial_roundtrip, evpl);
     run_case(&fx, "txn_atomic_across_crash", chimera_sc_oblig_txn_atomic_across_crash,
              evpl);
+    run_case(&fx, "txn_delta_atomic_across_crash",
+             chimera_sc_oblig_txn_delta_atomic_across_crash, evpl);
     run_case(&fx, "ns_get_byte_lifetime", chimera_sc_oblig_ns_get_byte_lifetime, evpl);
 
     provider->close(ow.space, on_mclose, &ok);

@@ -257,6 +257,16 @@ enum chimera_sc_conf_result
 chimera_sc_oblig_txn_atomic_across_crash(
     struct chimera_sc_conformance_ctx *ctx);
 
+/* A committed binding is atomic (dedicated delta negative arm): a single txn
+ * (put key + CREATE delta) survives a crash with the key AND the referenced
+ * object both present.  No 2-PUT arm precedes it, so a backend that commits the
+ * binding delta separately from the key PUT is caught here (NS_GET(key)=OK but
+ * OBJ_READ(id)=NOT_FOUND) -- where txn_atomic_across_crash would short-circuit
+ * at its 2-PUT arm first.  Contract surface only. */
+enum chimera_sc_conf_result
+chimera_sc_oblig_txn_delta_atomic_across_crash(
+    struct chimera_sc_conformance_ctx *ctx);
+
 /* An NS_GET return is valid through complete(); the driver copies it there
  * and the bytes must match what was written. */
 enum chimera_sc_conf_result
